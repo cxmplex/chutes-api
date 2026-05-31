@@ -16,7 +16,7 @@ engine = create_async_engine(
     pool_timeout=30,
     pool_recycle=900,
     pool_use_lifo=True,
-    connect_args={"ssl": "require"},
+    connect_args={"ssl": settings.db_ssl},
 )
 iengine = create_async_engine(
     settings.invocations_db_url,
@@ -28,7 +28,7 @@ iengine = create_async_engine(
     pool_timeout=30,
     pool_recycle=900,
     pool_use_lifo=True,
-    connect_args={"ssl": "require"},
+    connect_args={"ssl": settings.db_ssl},
 )
 
 SessionLocal = sessionmaker(
@@ -55,7 +55,7 @@ if settings.postgres_ro:
         pool_timeout=30,
         pool_recycle=900,
         pool_use_lifo=True,
-        connect_args={"ssl": "require"},
+        connect_args={"ssl": settings.db_ssl},
     )
     SessionLocalRead = sessionmaker(
         bind=ro_engine,

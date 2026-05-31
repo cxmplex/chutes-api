@@ -46,6 +46,9 @@ class TeeMeasurementConfig:
     runtime_rtmrs: Dict[str, str]
     expected_gpus: List[str]
     gpu_count: Optional[int] = None
+    # Optional infrastructure provider hint ("gcp" | "bare-metal"). Used for CPU (gpu_count==0)
+    # measurement configs; None for legacy GPU configs that don't specify it.
+    provider: Optional[str] = None
 
 
 class Settings(BaseSettings):
@@ -100,6 +103,10 @@ class Settings(BaseSettings):
         "INVOCATIONS_DB_URL",
         os.getenv("POSTGRESQL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes"),
     )
+
+    # asyncpg sslmode for the postgres connections. Defaults to "require" (prod hosted
+    # postgres); set DB_SSL=disable for a local postgres that has no TLS.
+    db_ssl: str = os.getenv("DB_SSL", "require")
 
     aws_access_key_id: str = os.getenv("AWS_ACCESS_KEY_ID", "REPLACEME")
     aws_secret_access_key: str = os.getenv("AWS_SECRET_ACCESS_KEY", "REPLACEME")
@@ -257,6 +264,10 @@ class Settings(BaseSettings):
     payment_recovery_blocks: int = int(os.getenv("PAYMENT_RECOVERY_BLOCKS", "256"))
     device_info_challenge_count: int = int(os.getenv("DEVICE_INFO_CHALLENGE_COUNT", "20"))
     skip_gpu_verification: bool = os.getenv("SKIP_GPU_VERIFICATION", "false").lower() == "true"
+    # Dev-only: bypass the requirement that a self-registering CPU server's miner hotkey already
+    # exists on the metagraph. When set, a metagraph_nodes row is auto-created on registration to
+    # satisfy the servers FK. NEVER enable in production.
+    skip_metagraph_check: bool = os.getenv("SKIP_METAGRAPH_CHECK", "false").lower() == "true"
     graval_url: str = os.getenv("GRAVAL_URL", "https://graval.chutes.ai:11443")
 
     # Database settings.
@@ -361,26 +372,44 @@ class Settings(BaseSettings):
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
-            rtmr0_upper = measurement_config["boot_rtmrs"]["rtmr0"].upper().strip()
-            if len(rtmr0_upper) != 96:
-                raise ValueError(
-                    f"Invalid RTMR0 length for measurement config '{config_name}': "
-                    f"{len(rtmr0_upper)} chars (expected 96)."
-                )
+            def _require_hex96(value: object, field: str) -> str:
+                text = str(value if value is not None else "").upper().strip()
+                if len(text) != 96 or any(c not in "0123456789ABCDEF" for c in text):
+                    raise ValueError(
+                        f"Invalid {field} for measurement config '{config_name}': "
+                        f"expected 96 hex characters, got {len(text)}."
+                    )
+                return text
 
-            mrtd_upper = measurement_config["mrtd"].upper().strip()
-            if len(mrtd_upper) != 96:
-                raise ValueError(
-                    f"Invalid MRTD length for measurement config '{config_name}': "
-                    f"{len(mrtd_upper)} chars (expected 96)."
-                )
+            mrtd_upper = _require_hex96(measurement_config.get("mrtd"), "MRTD")
 
+            # Every config MUST fully pin all four RTMRs in BOTH the boot and runtime
+            # sets. The matcher only compares the RTMRs that are present in the config,
+            # so a partially-specified config silently leaves the unlisted RTMRs
+            # unconstrained -- a measurement-bypass footgun (e.g. omitting RTMR3 would
+            # drop all runtime guest-stack enforcement). Reject it at load time.
+            if not isinstance(measurement_config.get("boot_rtmrs"), dict) or not isinstance(
+                measurement_config.get("runtime_rtmrs"), dict
+            ):
+                raise ValueError(
+                    f"Measurement config '{config_name}' must define both 'boot_rtmrs' and "
+                    "'runtime_rtmrs' mappings."
+                )
             boot_rtmrs = {
-                k.upper(): v.upper().strip() for k, v in measurement_config["boot_rtmrs"].items()
+                k.upper(): _require_hex96(v, f"boot_rtmrs.{k}")
+                for k, v in measurement_config["boot_rtmrs"].items()
             }
             runtime_rtmrs = {
-                k.upper(): v.upper().strip() for k, v in measurement_config["runtime_rtmrs"].items()
+                k.upper(): _require_hex96(v, f"runtime_rtmrs.{k}")
+                for k, v in measurement_config["runtime_rtmrs"].items()
             }
+            for set_name, rtmr_set in (("boot_rtmrs", boot_rtmrs), ("runtime_rtmrs", runtime_rtmrs)):
+                missing = [r for r in ("RTMR0", "RTMR1", "RTMR2", "RTMR3") if r not in rtmr_set]
+                if missing:
+                    raise ValueError(
+                        f"Measurement config '{config_name}' is missing {', '.join(missing)} in "
+                        f"{set_name}; every config must pin RTMR0-3 in both the boot and runtime sets."
+                    )
 
             if boot_rtmrs.get("RTMR0") != runtime_rtmrs.get("RTMR0"):
                 logger.warning(
@@ -388,12 +417,15 @@ class Settings(BaseSettings):
                     "This is unexpected - RTMR0 should be the same (ACPI tables don't change)."
                 )
 
-            gpu_count = measurement_config.get("gpu_count")
-            if gpu_count is None:
-                raise ValueError(
-                    f"Missing 'gpu_count' for measurement config '{config_name}'. "
-                    "All TEE measurement configs must specify gpu_count."
-                )
+            # gpu_count is optional: 0 (or absent) denotes a CPU-only (GPU-less) measurement
+            # config. For gpu_count == 0 the validator verifies MRTD + RTMRs only and skips
+            # GPU evidence / GPU-count matching.
+            gpu_count = measurement_config.get("gpu_count") or 0
+
+            # Optional infrastructure provider hint ("gcp" | "bare-metal").
+            provider = measurement_config.get("provider")
+            if provider is not None:
+                provider = str(provider).strip().lower() or None
 
             measurements.append(
                 TeeMeasurementConfig(
@@ -404,6 +436,7 @@ class Settings(BaseSettings):
                     runtime_rtmrs=runtime_rtmrs,
                     expected_gpus=[gpu.lower() for gpu in measurement_config["expected_gpus"]],
                     gpu_count=gpu_count,
+                    provider=provider,
                 )
             )
 

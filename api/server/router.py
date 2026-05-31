@@ -15,12 +15,14 @@ from api.config import settings
 from api.node.util import check_node_inventory
 from api.user.schemas import User
 from api.user.service import get_current_user
-from api.constants import HOTKEY_HEADER, NoncePurpose, SUPPORTED_LUKS_VOLUMES
+from api.constants import HOTKEY_HEADER, SIGNATURE_HEADER, NoncePurpose, SUPPORTED_LUKS_VOLUMES
 
 from api.server.schemas import (
     BootAttestationArgs,
     RuntimeAttestationArgs,
     ServerArgs,
+    CpuServerRegistrationArgs,
+    CpuServerRegistrationResponse,
     Server,
     NonceResponse,
     BootAttestationResponse,
@@ -43,6 +45,7 @@ from api.server.service import (
     create_nonce,
     process_boot_attestation,
     register_server,
+    register_cpu_server,
     check_server_ownership,
     get_server_by_name_or_id,
     update_server_name,
@@ -137,6 +140,80 @@ async def verify_boot_attestation(
         logger.error(f"Unexpected error in boot attestation: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Boot attestation failed"
+        )
+
+
+# 1-Click CPU TEE Server Self-Registration (push attestation; anonymous nonce, signed register)
+
+
+@router.get("/cpu/nonce", response_model=NonceResponse)
+async def get_cpu_register_nonce(request: Request):
+    """
+    Issue a single-use attestation nonce for 1-click CPU TEE server self-registration.
+
+    Called by a freshly-booted CPU TEE server before it submits its quote. No auth is required
+    (the server is not yet registered); the nonce is bound to the caller IP + purpose and is
+    consumed when the server posts to /cpu/register.
+    """
+    try:
+        server_ip = extract_ip(request)
+        nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.CPU_REGISTER)
+        return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
+    except Exception as e:
+        logger.error(f"Failed to generate CPU register nonce: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate nonce"
+        )
+
+
+@router.post("/cpu/register", response_model=CpuServerRegistrationResponse)
+async def register_cpu_server_endpoint(
+    request: Request,
+    args: CpuServerRegistrationArgs,
+    db: AsyncSession = Depends(get_db_session),
+    nonce=Depends(validate_request_nonce(NoncePurpose.CPU_REGISTER)),
+    expected_cert_hash=Depends(extract_client_cert_hash()),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    signature: str | None = Header(None, alias=SIGNATURE_HEADER),
+):
+    """
+    Self-registration for a 1-click CPU TEE server (push attestation).
+
+    The booted server submits its own runtime TDX quote + CPU benchmark. Trust is established by:
+    the single-use attestation nonce (X-Chutes-Nonce, bound into the quote report_data), the mTLS
+    client cert (also bound into report_data), the owning miner's signature (X-Chutes-Signature
+    over "{hotkey}:{nonce}:cpu_register"), and the quote measurements matching a CPU config.
+    """
+    if not hotkey or not signature:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing miner hotkey/signature headers.",
+        )
+    try:
+        # In dev (skip_metagraph_check) the self-registering hotkey is not on the metagraph yet;
+        # register_cpu_server auto-creates the row + verifies the signature. Mirror that bypass here
+        # so the route-level membership/blacklist check does not reject the first registration.
+        if not settings.skip_metagraph_check:
+            reason = await is_miner_blacklisted(db, hotkey)
+            if reason:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
+        server_ip = extract_ip(request)
+        return await register_cpu_server(
+            db, server_ip, args, hotkey, nonce, signature, expected_cert_hash
+        )
+    except (AttestationError, ServerRegistrationError):
+        raise
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(
+            f"Unexpected error in CPU server registration: server_id={args.server_id} "
+            f"miner_hotkey={hotkey} error={str(e)}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="CPU server registration failed",
         )
 
 

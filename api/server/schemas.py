@@ -2,12 +2,13 @@
 ORM definitions for servers and TDX attestations.
 """
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from sqlalchemy import (
     Column,
     Integer,
+    Float,
     String,
     DateTime,
     Boolean,
@@ -196,13 +197,57 @@ class GpuAttestationResponse(BaseModel):
     gpu_info: Dict[str, Any]  # GPU details from evidence
 
 
+class CpuServerRegistrationArgs(BaseModel):
+    """Request body for 1-click CPU TEE server self-registration (POST /servers/cpu/register).
+
+    The booted server self-submits its own runtime TDX quote + CPU benchmark. The Redis-issued
+    attestation nonce travels in the X-Chutes-Nonce header, the owning miner hotkey in
+    X-Chutes-Hotkey, and the miner-hotkey signature over "{hotkey}:{nonce}:cpu_register" in
+    X-Chutes-Signature. The quote's report_data binds nonce || sha256(mTLS client cert pubkey).
+    """
+
+    server_id: str = Field(..., description="Stable server identifier (e.g. VM instance id)")
+    name: Optional[str] = Field(None, description="Server name (defaults to server_id)")
+    quote: str = Field(..., description="Base64-encoded runtime TDX quote (configfs-tsm)")
+    benchmark: Dict[str, Any] = Field(..., description="sek8s CPU benchmark result JSON")
+
+
+class CpuServerRegistrationResponse(BaseModel):
+    """Response for a successful CPU TEE server self-registration."""
+
+    server_id: str
+    measurement_version: Optional[str] = None
+    benchmark_score: float
+    verified_at: str
+    status: str = "registered"
+
+
 class ServerArgs(BaseModel):
     """Request model for server registration."""
 
     host: str = Field(..., description="Public IP address or DNS Name of the server")
     id: str = Field(..., description="Server ID (e.g. k8s node uid)")
     name: Optional[str] = Field(None, description="Server name (defaults to server id if omitted)")
-    gpus: list[NodeArgs] = Field(..., description="GPU info for this server")
+    compute_type: str = Field(
+        "gpu", description="Compute type for this server: 'gpu' (default) or 'cpu'"
+    )
+    gpus: Optional[list[NodeArgs]] = Field(
+        None, description="GPU info for this server (None/omitted for CPU servers)"
+    )
+
+    @field_validator("compute_type")
+    def validate_compute_type(cls, value):
+        normalized = str(value or "gpu").lower()
+        if normalized not in ("gpu", "cpu"):
+            raise ValueError(f"Invalid compute_type: {value!r} (must be 'gpu' or 'cpu')")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_gpus_for_compute_type(self):
+        if self.compute_type == "gpu":
+            if not self.gpus:
+                raise ValueError("gpus is required for GPU servers (compute_type='gpu')")
+        return self
 
 
 class TeeChuteEvidence(BaseModel):
@@ -361,6 +406,16 @@ class Server(Base):
 
     is_tee = Column(Boolean, default=False, server_default="false")
 
+    # Compute inventory: "gpu" (default) or "cpu" for GPU-less, CPU-only TEE servers.
+    # For CPU servers, GPU Node rows are NOT created; capacity/benchmark live on the Server.
+    compute_type = Column(String, nullable=False, default="gpu", server_default="gpu")
+    cpu_cores = Column(Integer, nullable=True)
+    ram_gb = Column(Integer, nullable=True)
+    # Canonical CPU benchmark composite_score (used for pricing + scheduling); NULL for GPU.
+    benchmark_score = Column(Float, nullable=True)
+    # Raw CPU benchmark result JSON (sek8s schema); NULL for GPU servers.
+    benchmark = Column(JSONB, nullable=True)
+
     # Maintenance: set at confirm, cleared on successful boot completion or lazily when window closes.
     maintenance_pending_window_id = Column(
         String,
@@ -369,6 +424,10 @@ class Server(Base):
     )
     # Current attested measurement version, updated on every successful boot attestation.
     version = Column(Text, nullable=True)
+
+    # True for 1-click CPU servers that self-registered via POST /servers/cpu/register
+    # (the server attested + checked in itself), vs servers advertised by a miner control plane.
+    self_registered = Column(Boolean, default=False, server_default="false")
 
     @property
     def in_maintenance(self) -> bool:

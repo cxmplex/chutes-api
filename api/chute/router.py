@@ -1640,6 +1640,7 @@ async def _deploy_chute(
         )
 
     allowed_gpus = set(chute_args.node_selector.supported_gpus)
+    is_cpu = chute_args.node_selector.compute_type == "cpu"
 
     # Fee estimate, as an error, if the user hasn't used the confirmed param.
     estimate = await chute_args.node_selector.current_estimated_price()
@@ -1649,26 +1650,40 @@ async def _deploy_chute(
         else 0
     )
     if deployment_fee and not accept_fee:
-        gpu_count = chute_args.node_selector.gpu_count or 1
-        prices = {gpu: SUPPORTED_GPUS[gpu]["hourly_rate"] for gpu in allowed_gpus}
-        min_price = min(prices.values())
-        max_price = max(prices.values())
-        if len(allowed_gpus) > 1:
+        if is_cpu:
+            hourly = estimate["usd"]["hour"]
+            ns = chute_args.node_selector
+            fee_basis_msg = "There is a deployment fee of (hourly CPU price * 3), "
             hourly_range_msg = (
-                f"Your hourly rate per instance will range from ~${round(min_price * gpu_count, 2)}/hr "
-                f"to ~${round(max_price * gpu_count, 2)}/hr ({gpu_count} GPU(s)), subject to change with pricing/market rate adjustments, "
-                "based on the *actual* GPU assigned when an instance is created.\n"
-                "You can control max prices in the node selector by specifying either explicit include=[..] lists, or setting max_hourly_price_per_gpu=\n"
+                f"Your hourly rate per instance will be ~${round(hourly, 2)}/hr "
+                f"(CPU: {ns.cpu_cores} core(s), {ns.ram_gb}GB RAM), subject to change with "
+                "pricing/market rate adjustments.\n"
             )
         else:
-            hourly_range_msg = (
-                f"Your hourly rate per instance will be ~${round(min_price * gpu_count, 2)}/hr "
-                f"({gpu_count} GPU(s)), subject to change with pricing/market rate adjustments.\n"
+            fee_basis_msg = (
+                "There is a deployment fee of (hourly price per GPU * number of GPUs * 3), "
             )
+            gpu_count = chute_args.node_selector.gpu_count or 1
+            prices = {gpu: SUPPORTED_GPUS[gpu]["hourly_rate"] for gpu in allowed_gpus}
+            min_price = min(prices.values())
+            max_price = max(prices.values())
+            if len(allowed_gpus) > 1:
+                hourly_range_msg = (
+                    f"Your hourly rate per instance will range from ~${round(min_price * gpu_count, 2)}/hr "
+                    f"to ~${round(max_price * gpu_count, 2)}/hr ({gpu_count} GPU(s)), subject to change with pricing/market rate adjustments, "
+                    "based on the *actual* GPU assigned when an instance is created.\n"
+                    "You can control max prices in the node selector by specifying either explicit include=[..] lists, or setting max_hourly_price_per_gpu=\n"
+                )
+            else:
+                hourly_range_msg = (
+                    f"Your hourly rate per instance will be ~${round(min_price * gpu_count, 2)}/hr "
+                    f"({gpu_count} GPU(s)), subject to change with pricing/market rate adjustments.\n"
+                )
         raise HTTPException(
             status_code=status.HTTP_402_PAYMENT_REQUIRED,
             detail=(
-                "DEPLOYMENT FEE NOTICE:\n===\nThere is a deployment fee of (hourly price per GPU * number of GPUs * 3), "
+                "DEPLOYMENT FEE NOTICE:\n===\n"
+                f"{fee_basis_msg}"
                 f"which for this configuration is: ${round(deployment_fee, 2)}\n"
                 f"{hourly_range_msg}"
                 "To acknowledge this fee and hourly rate, ensure you have chutes>=0.3.23 and re-run the deployment command with `--accept-fee`"
@@ -1692,7 +1707,8 @@ async def _deploy_chute(
 
     affine_dev = await is_registered_to_subnet(db, current_user, 120)
     if (
-        current_user.user_id != await chutes_user_id()
+        not is_cpu
+        and current_user.user_id != await chutes_user_id()
         and not current_user.has_role(Permissioning.unlimited_dev)
         and not affine_dev
     ):
@@ -2184,16 +2200,17 @@ async def deploy_chute(
             "code check and prelim model config/node selector config passed."
         )
 
-    # Non-subnet chutes cannot be created with tee=True directly, unless
-    # it's a single pro_6000 GPU deployment.
+    # Non-subnet chutes cannot be created with tee=True directly, unless it's a single
+    # pro_6000 GPU deployment or a CPU (GPU-less) deployment.
     if (
         chute_args.tee
         and not is_subnet_model
         and not current_user.has_role(Permissioning.unlimited_dev)
     ):
+        is_cpu = chute_args.node_selector.compute_type == "cpu"
         include_gpus = [gpu.lower() for gpu in (chute_args.node_selector.include or [])]
         is_single_pro6000 = chute_args.node_selector.gpu_count == 1 and include_gpus == ["pro_6000"]
-        if not is_single_pro6000:
+        if not is_single_pro6000 and not is_cpu:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="TEE private deployments are limited at this time due to infrastructure capacity limitations.",

@@ -52,7 +52,8 @@ class PortMap(BaseModel):
 
 
 class LaunchConfigArgs(BaseModel):
-    gpus: list[dict]
+    # Optional: CPU (GPU-less) chutes claim launch configs without GPU node info.
+    gpus: Optional[list[dict]] = None
     host: str
     port_mappings: list[PortMap]
     fsv: Optional[str] = None
@@ -121,6 +122,13 @@ class Instance(Base):
         String,
         nullable=True,
     )
+    # Explicit owning server for 1-click self-registered CPU servers (no GPU nodes to link
+    # through, and no per-miner control plane). NULL for the legacy miner-run GPU/CPU path.
+    server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="SET NULL"),
+        nullable=True,
+    )
     cacert = Column(String, nullable=True)
     port_mappings = Column(JSONB, nullable=True)
     inspecto = Column(String, nullable=True)
@@ -179,6 +187,13 @@ class LaunchConfig(Base):
     miner_uid = Column(Integer, nullable=False)
     miner_hotkey = Column(String, nullable=False)
     miner_coldkey = Column(String, nullable=False)
+    # Target self-registered server for 1-click CPU deployments (stamped by the scheduler);
+    # propagated to the created Instance. NULL for the legacy miner-run path.
+    server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(DateTime, server_default=func.now())
     retrieved_at = Column(DateTime, nullable=True)
     verified_at = Column(DateTime, nullable=True)

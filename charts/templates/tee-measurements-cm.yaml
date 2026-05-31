@@ -31,3 +31,24 @@ data:
         expected_gpus:
           - "h200"
         gpu_count: 8
+      # Example CPU-only (GPU-less) TEE configuration.
+      # gpu_count: 0 + expected_gpus: [] mark a CPU measurement: MRTD + RTMRs are verified and
+      # all GPU-evidence / GPU-count checks are skipped. provider is an optional infra hint
+      # ("gcp" | "bare-metal").
+      - version: "1"
+        mrtd: "PLACEHOLDER_CPU_MRTD_96_HEX_CHARS"
+        name: "cpu-gcp"
+        description: "CPU-only TEE configuration (no GPU)"
+        provider: "gcp"
+        boot_rtmrs:
+          rtmr0: "PLACEHOLDER_CPU_RTMR0_96_HEX_CHARS"
+          rtmr1: "PLACEHOLDER_CPU_RTMR1_96_HEX_CHARS"
+          rtmr2: "PLACEHOLDER_CPU_RTMR2_96_HEX_CHARS"
+          rtmr3: "PLACEHOLDER_CPU_RTMR3_96_HEX_CHARS"
+        runtime_rtmrs:
+          rtmr0: "PLACEHOLDER_CPU_RTMR0_96_HEX_CHARS"
+          rtmr1: "PLACEHOLDER_CPU_RTMR1_96_HEX_CHARS"
+          rtmr2: "PLACEHOLDER_CPU_RTMR2_96_HEX_CHARS"
+          rtmr3: "PLACEHOLDER_CPU_RTMR3_96_HEX_CHARS"
+        expected_gpus: []
+        gpu_count: 0

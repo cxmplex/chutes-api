@@ -24,7 +24,15 @@ from api.gpu import (
     COMPUTE_UNIT_PRICE_BASIS,
 )
 from api.fmv.fetcher import get_fetcher
-from pydantic import BaseModel, Field, computed_field, validator, constr, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    computed_field,
+    validator,
+    constr,
+    field_validator,
+    model_validator,
+)
 from typing import List, Optional, Dict, Any
 
 
@@ -75,12 +83,17 @@ class Job(BaseModel):
 
 
 class NodeSelector(BaseModel):
+    compute_type: str = Field("gpu")
     gpu_count: Optional[int] = Field(1, ge=1, le=8)
     min_vram_gb_per_gpu: Optional[int] = Field(16, ge=16, le=140)
     max_hourly_price_per_gpu: Optional[float] = Field(None, gt=0, lt=10)
     exclude: Optional[List[str]] = None
     include: Optional[List[str]] = None
     dynamic: Optional[bool] = False
+    # CPU-only fields, used when compute_type == "cpu" (ignored for GPU node selectors).
+    cpu_cores: int = Field(1, ge=1, le=256)
+    ram_gb: int = Field(1, ge=1, le=2048)
+    min_benchmark_score: Optional[float] = None
 
     def __init__(self, **data):
         """
@@ -89,6 +102,39 @@ class NodeSelector(BaseModel):
         super().__init__(
             **{k: v for k, v in data.items() if k not in ("compute_multiplier", "supported_gpus")}
         )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_gpu_count_for_cpu(cls, data):
+        """
+        For CPU node selectors there are no GPUs. Drop any supplied gpu_count before field
+        validation (it is forced to 0 afterwards) so the GPU-only ge=1 constraint never
+        rejects a CPU selector, and so a serialized CPU selector (gpu_count=0) round-trips.
+        """
+        if isinstance(data, dict):
+            compute_type = str(data.get("compute_type") or "gpu").lower()
+            if compute_type == "cpu" and "gpu_count" in data:
+                data = {k: v for k, v in data.items() if k != "gpu_count"}
+        return data
+
+    @field_validator("compute_type")
+    def validate_compute_type(cls, value):
+        """
+        Only "gpu" (default) and "cpu" compute types are supported.
+        """
+        normalized = str(value or "gpu").lower()
+        if normalized not in ("gpu", "cpu"):
+            raise ValueError(f"Invalid compute_type: {value!r} (must be 'gpu' or 'cpu')")
+        return normalized
+
+    @model_validator(mode="after")
+    def _force_cpu_gpu_count(self):
+        """
+        CPU node selectors are treated as having 0 GPUs.
+        """
+        if self.compute_type == "cpu":
+            self.gpu_count = 0
+        return self
 
     @validator("include")
     def include_supported_gpus(cls, gpus):
@@ -120,6 +166,17 @@ class NodeSelector(BaseModel):
 
         This operates on the MINIMUM value specified by the node multiplier.
         """
+        if self.compute_type == "cpu":
+            # CPU chutes are priced from the benchmark composite_score (here the chute's
+            # required minimum), weighted by requested cores/RAM. See api/cpu.py.
+            from api.cpu import cpu_compute_multiplier
+
+            return cpu_compute_multiplier(
+                self.min_benchmark_score,
+                cpu_cores=self.cpu_cores,
+                ram_gb=self.ram_gb,
+            )
+
         supported_gpus = self.supported_gpus
         if not supported_gpus:
             raise ValueError("No GPUs match specified node_selector criteria")
@@ -155,6 +212,9 @@ class NodeSelector(BaseModel):
         """
         Generate the list of all supported GPUs (short ref string).
         """
+        # CPU node selectors never match any GPU.
+        if self.compute_type == "cpu":
+            return []
         allowed_gpus = set(SUPPORTED_GPUS)
         if self.include:
             allowed_gpus = set(self.include)

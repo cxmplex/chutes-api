@@ -80,6 +80,13 @@ class InvalidGpuEvidenceError(AttestationError):
         super().__init__(detail=detail)
 
 
+class InvalidCpuBenchmarkError(AttestationError):
+    """Raised when a CPU benchmark result is missing or invalid during attestation."""
+
+    def __init__(self, detail: str = "Invalid CPU benchmark result."):
+        super().__init__(detail=detail)
+
+
 class NonceError(AttestationError):
     """Raised when nonce validation fails."""
 

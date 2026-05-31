@@ -117,3 +117,40 @@ class RedisListener:
                 pass
             self.pubsub = None
         await asyncio.sleep(delay)
+
+
+class AgentCommandListener(RedisListener):
+    """
+    Routes per-server 1-click agent commands.
+
+    Unlike the miner ``miner_broadcast`` channel (fan-out filtered by hotkey via ``reverse_map``),
+    agent commands target a single server. Each message carries a ``server_id``; this listener
+    looks up the connected agent session in ``sio.agent_sessions`` and emits an ``agent_command``
+    event only to that session. Other socket-server replicas (which do not hold the session)
+    simply find no mapping and skip it.
+    """
+
+    async def _listen(self):
+        async for message in self.pubsub.listen():
+            if not self.is_running:
+                break
+            if message["type"] != "message":
+                continue
+            try:
+                data = json.loads(message["data"].decode())
+                server_id = data.get("server_id")
+                agent_sessions = getattr(self.sio, "agent_sessions", {})
+                session_id = agent_sessions.get(server_id) if server_id else None
+                if session_id is not None:
+                    await self.sio.emit("agent_command", data, room=session_id)
+                    logger.info(
+                        f"Dispatched agent command to server_id={server_id}: "
+                        f"{data.get('command')} ({data.get('command_id')})"
+                    )
+                else:
+                    logger.debug(
+                        f"No connected agent for server_id={server_id}; command "
+                        f"{data.get('command_id')} not delivered here"
+                    )
+            except Exception as exc:
+                logger.error(f"Error processing agent command: {exc}")

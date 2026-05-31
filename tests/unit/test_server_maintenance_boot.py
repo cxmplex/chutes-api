@@ -180,6 +180,7 @@ async def test_register_server_sets_version(mock_track_server, mock_verify, mock
     args.id = TEST_SERVER_ID
     args.name = TEST_VM_NAME
     args.host = "10.0.0.1"
+    args.compute_type = "gpu"
     args.gpus = [gpu]
 
     await register_server(db, args, TEST_HOTKEY)
@@ -215,6 +216,7 @@ async def test_register_server_version_none_when_verify_returns_none(
     args.id = TEST_SERVER_ID
     args.name = TEST_VM_NAME
     args.host = "10.0.0.1"
+    args.compute_type = "gpu"
     args.gpus = [gpu]
 
     await register_server(db, args, TEST_HOTKEY)

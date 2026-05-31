@@ -63,6 +63,7 @@ from api.instance.util import (
     generate_fs_key,
     get_instance_by_chute_and_id,
     get_server_for_gpus,
+    get_cpu_server_for_host,
     create_launch_jwt,
     create_job_jwt,
     load_launch_config_from_jwt,
@@ -829,6 +830,11 @@ async def _validate_nodes(
     db, chute, node_ids: list[str], hotkey: str, instance: Instance
 ) -> list[Node]:
     host = instance.host
+    # CPU (GPU-less) chutes have no GPU Node rows; the instance<->server linkage is by
+    # host + miner_hotkey (see verify_tee_chute), so there is no node count to enforce or
+    # instance_nodes association to create.
+    if str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu":
+        return []
     gpu_count = chute.node_selector.get("gpu_count", 1)
     if len(set(node_ids)) != gpu_count:
         logger.warning(
@@ -1412,6 +1418,7 @@ async def _validate_launch_config_instance(
 
     # Create the instance now that we've verified the envdump/k8s env.
     node_selector = NodeSelector(**chute.node_selector)
+    is_cpu = node_selector.compute_type == "cpu"
     extra_fields = {
         "e2e_pubkey": getattr(args, "e2e_pubkey", None),
     }
@@ -1517,6 +1524,11 @@ async def _validate_launch_config_instance(
             f"for total {instance.compute_multiplier=} for {chute.name=} {chute.chute_id=}"
         )
 
+    # 1-click CPU servers: carry the scheduler-stamped target server onto the instance so it can
+    # be linked back to its self-registered server (no GPU nodes / host+hotkey inference needed).
+    if getattr(launch_config, "server_id", None):
+        instance.server_id = launch_config.server_id
+
     db.add(instance)
 
     # Mark the job as associated with this instance.
@@ -1553,13 +1565,17 @@ async def _validate_launch_config_instance(
                 detail=f"Invalid port mappings provided: {expected=} {received=}",
             )
 
-    # Verify the GPUs are suitable.
-    if len(set([node["uuid"] for node in args.gpus])) != len(args.gpus):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Duplicate GPUs in request!",
-        )
-    node_ids = [node["uuid"] for node in args.gpus]
+    # Verify the GPUs are suitable. CPU (GPU-less) chutes have no GPU nodes; their pricing
+    # stays at the node-selector CPU estimate (no actual-GPU re-pricing).
+    if is_cpu:
+        node_ids = []
+    else:
+        if len(set([node["uuid"] for node in args.gpus])) != len(args.gpus):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Duplicate GPUs in request!",
+            )
+        node_ids = [node["uuid"] for node in args.gpus]
     try:
         nodes = await _validate_nodes(
             db,
@@ -1582,26 +1598,27 @@ async def _validate_launch_config_instance(
             await error_session.commit()
         raise
 
-    # Use the actual GPU's rate/multiplier instead of the
-    # minimum across all supported GPUs in the node selector.
-    actual_gpu = nodes[0].gpu_identifier
-    gpu_count = chute.node_selector.get("gpu_count", 1)
-    actual_base = gpu_count * COMPUTE_MULTIPLIER[actual_gpu]
-    ns_min_compute = node_selector.compute_multiplier
-    ns_min_hourly = instance.hourly_rate
-    if ns_min_compute > 0 and actual_base != ns_min_compute:
-        ratio = actual_base / ns_min_compute
-        instance.compute_multiplier *= ratio
-        warmup_compute_multiplier *= ratio
-    instance.hourly_rate = SUPPORTED_GPUS[actual_gpu]["hourly_rate"] * gpu_count
-    logger.info(
-        f"Adjusted instance {instance.instance_id} for "
-        f"chute_id={chute.chute_id} name={chute.name!r} to actual GPU {actual_gpu}: "
-        f"hourly_rate={ns_min_hourly:.4f}->{instance.hourly_rate:.4f} "
-        f"(delta={instance.hourly_rate - ns_min_hourly:+.4f}, ratio={instance.hourly_rate / ns_min_hourly if ns_min_hourly else 0:.2f}x), "
-        f"compute_multiplier={ns_min_compute:.4f}->{actual_base:.4f} "
-        f"(delta={actual_base - ns_min_compute:+.4f}, ratio={actual_base / ns_min_compute if ns_min_compute else 0:.2f}x)"
-    )
+    if not is_cpu:
+        # Use the actual GPU's rate/multiplier instead of the
+        # minimum across all supported GPUs in the node selector.
+        actual_gpu = nodes[0].gpu_identifier
+        gpu_count = chute.node_selector.get("gpu_count", 1)
+        actual_base = gpu_count * COMPUTE_MULTIPLIER[actual_gpu]
+        ns_min_compute = node_selector.compute_multiplier
+        ns_min_hourly = instance.hourly_rate
+        if ns_min_compute > 0 and actual_base != ns_min_compute:
+            ratio = actual_base / ns_min_compute
+            instance.compute_multiplier *= ratio
+            warmup_compute_multiplier *= ratio
+        instance.hourly_rate = SUPPORTED_GPUS[actual_gpu]["hourly_rate"] * gpu_count
+        logger.info(
+            f"Adjusted instance {instance.instance_id} for "
+            f"chute_id={chute.chute_id} name={chute.name!r} to actual GPU {actual_gpu}: "
+            f"hourly_rate={ns_min_hourly:.4f}->{instance.hourly_rate:.4f} "
+            f"(delta={instance.hourly_rate - ns_min_hourly:+.4f}, ratio={instance.hourly_rate / ns_min_hourly if ns_min_hourly else 0:.2f}x), "
+            f"compute_multiplier={ns_min_compute:.4f}->{actual_base:.4f} "
+            f"(delta={actual_base - ns_min_compute:+.4f}, ratio={actual_base / ns_min_compute if ns_min_compute else 0:.2f}x)"
+        )
 
     # Store the warmup (base) compute multiplier for use at activation time.
     if instance.extra is None:
@@ -1750,7 +1767,12 @@ async def _validate_tee_launch_config_instance(
         )
 
     # Deny launches on servers in TEE maintenance mode before creating any instance/node records.
-    server = await get_server_for_gpus(db, [g["uuid"] for g in args.gpus])
+    # CPU (GPU-less) chutes have no GPU nodes, so the server is resolved by host + miner_hotkey.
+    is_cpu = str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
+    if is_cpu:
+        server = await get_cpu_server_for_host(db, args.host, launch_config.miner_hotkey)
+    else:
+        server = await get_server_for_gpus(db, [g["uuid"] for g in args.gpus])
     if server and server.in_maintenance:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -2057,15 +2079,18 @@ async def claim_tee_launch_config(
             {"config_id": config_id},
         )
 
-    # Send event.
+    # Send event. CPU (GPU-less) chutes have no GPU nodes (nodes == []).
     await db.refresh(instance)
     gpu_count = len(nodes)
-    gpu_type = nodes[0].gpu_identifier
+    gpu_type = nodes[0].gpu_identifier if nodes else None
     asyncio.create_task(notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type))
     asyncio.create_task(_maybe_start_log_capture(instance, config_id))
 
-    # Verify TEE attestation evidence
-    await verify_tee_chute(db, instance, launch_config, args.deployment_id, expected_nonce)
+    # Verify TEE attestation evidence. CPU chutes have no GPU nodes; skip GPU evidence.
+    compute_type = "cpu" if not nodes else "gpu"
+    await verify_tee_chute(
+        db, instance, launch_config, args.deployment_id, expected_nonce, compute_type=compute_type
+    )
 
     instance.deployment_id = args.deployment_id
     await db.commit()

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import unquote
 from aiohttp import ClientResponse
 from cryptography.fernet import Fernet
-from fastapi import Request, status
+from fastapi import HTTPException, Request
 from loguru import logger
 from dcap_qvl import get_collateral_and_verify
 from api.config import settings, TeeMeasurementConfig
@@ -56,12 +56,12 @@ def extract_client_cert_hash():
     async def _extract_request_client_cert(request: Request):
         try:
             cert = _get_client_certificate(request)
-            cert_hash = get_public_key_hash(cert)
-
-            return cert_hash
+            return get_public_key_hash(cert)
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"Boot attestation failed, no client cert provided:\n{e}")
-            raise NoClientCertError(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+            logger.error(f"Boot attestation failed, could not extract client cert:\n{e}")
+            raise NoClientCertError(detail=str(e))
 
     return _extract_request_client_cert
 

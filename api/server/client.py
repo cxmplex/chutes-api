@@ -74,7 +74,16 @@ class TeeServerClient:
         async with aiohttp.ClientSession(connector=connector, raise_for_status=True) as session:
             yield session
 
-    async def get_server_evidence(self, nonce: str) -> Tuple[TdxQuote, Dict[str, str], Certificate]:
+    async def get_server_evidence(
+        self, nonce: str
+    ) -> Tuple[TdxQuote, Optional[Any], Certificate, Optional[Dict[str, Any]]]:
+        """Fetch server attestation evidence.
+
+        Returns (quote, gpu_evidence, cert, benchmark):
+          - GPU servers: nvtrust_evidence is a JSON string -> gpu_evidence is parsed; benchmark is None.
+          - CPU servers: nvtrust_evidence is null -> gpu_evidence is None; benchmark is the CPU
+            benchmark result dict (sek8s schema).
+        """
         try:
             url = urljoin(self._url, "server/attest")
             headers, _ = self._sign_request(purpose="attest")
@@ -89,9 +98,11 @@ class TeeServerClient:
                     cert = _get_server_certificate(resp)
                     data = await resp.json()
                     quote = RuntimeTdxQuote.from_base64(data["tdx_quote"])
-                    gpu_evidence = json.loads(data["nvtrust_evidence"])
+                    nvtrust_evidence = data.get("nvtrust_evidence")
+                    gpu_evidence = json.loads(nvtrust_evidence) if nvtrust_evidence else None
+                    benchmark = data.get("benchmark")
 
-                    return quote, gpu_evidence, cert
+                    return quote, gpu_evidence, cert, benchmark
         except Exception as exc:
             logger.error(f"Failed to get attestation evidence from {self._url}: {exc}")
             raise GetEvidenceError(f"Failed to get evidence for attestation: {str(exc)}")
@@ -124,7 +135,9 @@ class TeeServerClient:
                     cert = _get_server_certificate(resp)
                     data = await resp.json()
                     quote = RuntimeTdxQuote.from_base64(data["evidence"]["tdx_quote"])
-                    gpu_evidence = json.loads(data["evidence"]["nvtrust_evidence"])
+                    # CPU (GPU-less) chutes report nvtrust_evidence: null; GPU chutes a JSON string.
+                    nvtrust_evidence = data["evidence"].get("nvtrust_evidence")
+                    gpu_evidence = json.loads(nvtrust_evidence) if nvtrust_evidence else None
                     return quote, gpu_evidence, cert
         except Exception as exc:
             logger.error(f"Failed to get chute evidence from {self._url}: {exc}")

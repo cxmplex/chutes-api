@@ -15,6 +15,7 @@ from api.server.service import (
     create_nonce,
     validate_and_consume_nonce,
     verify_quote,
+    verify_server,
     process_boot_attestation,
     process_runtime_attestation,
     register_server,
@@ -1476,3 +1477,159 @@ async def test_verify_quote_with_different_quote_types(mock_verify_measurements)
     assert isinstance(runtime_verify_result, TdxVerificationResult)
     assert mock_sig.call_count == 2
     assert mock_verify_measurements.call_count == 2
+
+
+# CPU (GPU-less) server registration + verification tests
+
+
+def _cpu_measurement_config():
+    return TeeMeasurementConfig(
+        version="1",
+        mrtd="a" * 96,
+        name="cpu-gcp",
+        boot_rtmrs={"RTMR0": "d" * 96, "RTMR1": "e" * 96, "RTMR2": "f" * 96, "RTMR3": "0" * 96},
+        runtime_rtmrs={"RTMR0": "d" * 96, "RTMR1": "e" * 96, "RTMR2": "f" * 96, "RTMR3": "0" * 96},
+        expected_gpus=[],
+        gpu_count=0,
+        provider="gcp",
+    )
+
+
+def _valid_cpu_benchmark(**overrides):
+    benchmark = {
+        "schema_version": 1,
+        "cpu_cores": 8,
+        "ram_gb": 32,
+        "int_score": 1234.5,
+        "float_score": 2345.6,
+        "memory_bandwidth_mb_s": 15000.0,
+        "hash_score": 999.9,
+        "composite_score": 1500.0,
+        "duration_ms": 4200,
+    }
+    benchmark.update(overrides)
+    return benchmark
+
+
+@pytest.fixture
+def cpu_server_args():
+    return ServerArgs(
+        id="cpu-server-1",
+        host="127.0.0.2",
+        name="cpu-vm",
+        compute_type="cpu",
+        gpus=None,
+    )
+
+
+def test_server_args_cpu_allows_no_gpus():
+    args = ServerArgs(id="s", host="1.2.3.4", compute_type="cpu")
+    assert args.compute_type == "cpu"
+    assert args.gpus is None
+
+
+def test_server_args_gpu_requires_gpus():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ServerArgs(id="s", host="1.2.3.4")  # default compute_type gpu, no gpus
+
+
+def test_server_args_invalid_compute_type():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ServerArgs(id="s", host="1.2.3.4", compute_type="tpu", gpus=None)
+
+
+@pytest.mark.asyncio
+async def test_register_server_cpu_skips_node_tracking(
+    mock_db_session, cpu_server_args, sample_server
+):
+    """CPU servers must verify but never create GPU Node rows."""
+    miner_hotkey = "5FTestHotkey123"
+
+    with patch("api.server.service._track_server", return_value=sample_server):
+        with patch("api.server.service._track_nodes", new_callable=AsyncMock) as mock_track_nodes:
+            with patch(
+                "api.server.service.verify_server", new_callable=AsyncMock, return_value="1"
+            ) as mock_verify:
+                await register_server(mock_db_session, cpu_server_args, miner_hotkey)
+
+    mock_track_nodes.assert_not_called()
+    mock_verify.assert_awaited_once()
+    # verify_server is called with gpus=None for CPU servers.
+    assert mock_verify.call_args.kwargs.get("gpus") is None
+    assert sample_server.version == "1"
+
+
+@pytest.mark.asyncio
+async def test_verify_server_cpu_skips_gpu_evidence_and_persists_benchmark(
+    mock_db_session, sample_server, sample_runtime_quote, mock_util_functions
+):
+    """CPU verify_server skips GPU evidence + GPU matching and persists CPU capacity."""
+    benchmark = _valid_cpu_benchmark()
+    cpu_cert = Mock()
+
+    mock_client = Mock()
+    mock_client.get_server_evidence = AsyncMock(
+        return_value=(sample_runtime_quote, None, cpu_cert, benchmark)
+    )
+
+    with (
+        patch("api.server.service.TeeServerClient", return_value=mock_client),
+        patch(
+            "api.server.service.get_matching_measurement_config",
+            return_value=_cpu_measurement_config(),
+        ),
+        patch("api.server.service.get_public_key_hash", return_value=TEST_CERT_HASH),
+        patch("api.server.service.verify_quote", new_callable=AsyncMock),
+        patch("api.server.service.validate_gpus_for_measurements") as mock_validate_gpus,
+    ):
+        version = await verify_server(mock_db_session, sample_server, "5FTestHotkey123", gpus=None)
+
+    assert version == "1"
+    # GPU evidence + GPU matching must be skipped for CPU servers.
+    mock_util_functions["mock_verify_gpu"].assert_not_called()
+    mock_validate_gpus.assert_not_called()
+    # CPU capacity + composite_score persisted on the server.
+    assert sample_server.compute_type == "cpu"
+    assert sample_server.cpu_cores == 8
+    assert sample_server.ram_gb == 32
+    assert sample_server.benchmark_score == 1500.0
+    assert sample_server.benchmark == benchmark
+    mock_db_session.add.assert_called_once()
+    mock_db_session.commit.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_verify_server_cpu_invalid_benchmark_raises(
+    mock_db_session, sample_server, sample_runtime_quote, mock_util_functions
+):
+    """An invalid/missing CPU benchmark fails verification (validator never trusts the miner)."""
+    from api.server.exceptions import InvalidCpuBenchmarkError
+
+    bad_benchmark = _valid_cpu_benchmark()
+    del bad_benchmark["composite_score"]
+    cpu_cert = Mock()
+
+    mock_client = Mock()
+    mock_client.get_server_evidence = AsyncMock(
+        return_value=(sample_runtime_quote, None, cpu_cert, bad_benchmark)
+    )
+
+    with (
+        patch("api.server.service.TeeServerClient", return_value=mock_client),
+        patch(
+            "api.server.service.get_matching_measurement_config",
+            return_value=_cpu_measurement_config(),
+        ),
+        patch("api.server.service.get_public_key_hash", return_value=TEST_CERT_HASH),
+        patch("api.server.service.verify_quote", new_callable=AsyncMock),
+    ):
+        with pytest.raises(InvalidCpuBenchmarkError):
+            await verify_server(mock_db_session, sample_server, "5FTestHotkey123", gpus=None)
+
+    # A failed CPU attestation record is still persisted (finally block).
+    mock_util_functions["mock_verify_gpu"].assert_not_called()
+    mock_db_session.add.assert_called()

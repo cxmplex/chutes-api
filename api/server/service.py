@@ -10,13 +10,16 @@ import secrets
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
-from sqlalchemy import delete, or_, select, func
+from sqlalchemy import delete, exists, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from api.config import settings
 from api.constants import NONCE_HEADER, NoncePurpose, HOTKEY_HEADER, LUKS_STORAGE_VOLUME
+from api.cpu import validate_cpu_benchmark
 from api.gpu import SUPPORTED_GPUS
+from api.metagraph import MetagraphNode
+from bittensor_wallet.keypair import Keypair
 from api.node.util import _track_nodes
 from api.server.client import TeeServerClient
 from api.server.quote import BootTdxQuote, RuntimeTdxQuote, TdxQuote
@@ -27,6 +30,7 @@ from api.server.schemas import (
     BootAttestationArgs,
     RuntimeAttestationArgs,
     ServerArgs,
+    CpuServerRegistrationArgs,
     TeeUpgradeWindow,
     MaintenanceReason,
     SoleSurvivorBlock,
@@ -42,6 +46,7 @@ from api.server.exceptions import (
     AttestationError,
     GetEvidenceError,
     GpuEvidenceError,
+    InvalidCpuBenchmarkError,
     InvalidGpuEvidenceError,
     InvalidQuoteError,
     MeasurementMismatchError,
@@ -475,21 +480,28 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
             db, args.id, args.name or args.id, args.host, miner_hotkey, is_tee=True
         )
 
-        # Set the attributes we can't get from pynvml
-        for gpu in args.gpus:
-            gpu_info = SUPPORTED_GPUS[gpu.gpu_identifier]
-            for key in ["processors", "max_threads_per_processor"]:
-                setattr(gpu, key, gpu_info.get(key))
+        is_cpu = args.compute_type == "cpu"
 
-        # Start verification process (pass GPUs for validation)
-        measurement_version = await verify_server(db, server, miner_hotkey, gpus=args.gpus)
+        if not is_cpu:
+            # Set the attributes we can't get from pynvml
+            for gpu in args.gpus:
+                gpu_info = SUPPORTED_GPUS[gpu.gpu_identifier]
+                for key in ["processors", "max_threads_per_processor"]:
+                    setattr(gpu, key, gpu_info.get(key))
+
+        # Start verification process. For CPU servers (gpus=None) verify_server skips GPU
+        # evidence + GPU matching and gathers/persists the CPU benchmark itself.
+        measurement_version = await verify_server(
+            db, server, miner_hotkey, gpus=None if is_cpu else args.gpus
+        )
 
         if measurement_version is not None:
             server.version = measurement_version
             await db.commit()
 
-        # Track nodes once verified
-        await _track_nodes(db, miner_hotkey, server.server_id, args.gpus, "0", func.now())
+        # Track GPU nodes once verified. CPU servers have no GPU Node rows.
+        if not is_cpu:
+            await _track_nodes(db, miner_hotkey, server.server_id, args.gpus, "0", func.now())
 
     except AttestationError as e:
         # Clean up orphan server: _track_server committed before verify_server failed.
@@ -527,14 +539,170 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
         )
 
 
+async def register_cpu_server(
+    db: AsyncSession,
+    server_ip: str,
+    args: CpuServerRegistrationArgs,
+    miner_hotkey: str,
+    nonce: str,
+    signature: str,
+    expected_cert_hash: str,
+) -> Dict[str, Any]:
+    """
+    Self-registration for a 1-click CPU TEE server (push attestation model).
+
+    Unlike register_server (which the validator drives by dialing the server's :30443 proxy),
+    here the booted server submits its own runtime TDX quote + CPU benchmark over an outbound
+    request. The validator verifies:
+      1. the owning miner is registered on the subnet and signed this registration,
+      2. the TDX quote: report_data == nonce || sha256(mTLS client cert pubkey), a valid Intel
+         signature, and MRTD/RTMRs matching a CPU-only (gpu_count=0) measurement config, and
+      3. the CPU benchmark shape (never trusted from the server),
+    then upserts a self-registered CPU Server row (idempotent across reboots by server_id) and
+    writes a ServerAttestation audit record. Returns a dict for CpuServerRegistrationResponse.
+    """
+    # 1. Miner must have signed this registration over the single-use attestation nonce and, in
+    # production, be registered on the subnet. In dev (skip_metagraph_check) the metagraph
+    # membership requirement is bypassed and a metagraph_nodes row is auto-created so the servers
+    # foreign key is satisfied. The signature is verified in both cases.
+    if settings.skip_metagraph_check:
+        existing_node = await db.get(MetagraphNode, (miner_hotkey, settings.netuid))
+        if existing_node is None:
+            db.add(
+                MetagraphNode(
+                    hotkey=miner_hotkey,
+                    netuid=settings.netuid,
+                    checksum="dev",
+                    coldkey=miner_hotkey,
+                    node_id=0,
+                )
+            )
+            await db.commit()
+            logger.warning(
+                f"skip_metagraph_check: auto-created dev metagraph_nodes row for {miner_hotkey}"
+            )
+    else:
+        is_registered = (
+            await db.execute(
+                select(
+                    exists()
+                    .where(MetagraphNode.hotkey == miner_hotkey)
+                    .where(MetagraphNode.netuid == settings.netuid)
+                )
+            )
+        ).scalar()
+        if not is_registered:
+            raise ServerRegistrationError(
+                f"Miner hotkey {miner_hotkey} is not registered on netuid {settings.netuid}"
+            )
+    signing_message = f"{miner_hotkey}:{nonce}:{NoncePurpose.CPU_REGISTER.value}"
+    try:
+        if not Keypair(ss58_address=miner_hotkey).verify(
+            signing_message, bytes.fromhex(signature)
+        ):
+            raise ServerRegistrationError("Invalid miner signature for CPU server registration")
+    except ServerRegistrationError:
+        raise
+    except Exception as exc:
+        raise ServerRegistrationError(f"Invalid miner signature: {exc}")
+
+    # 2. Verify the runtime TDX quote (RTMR3 extended by our guest stack) and match a CPU config.
+    quote = RuntimeTdxQuote.from_base64(args.quote)
+    # Logged on every attempt so the GCP firmware/boot measurements (MRTD/RTMR0-2) can be captured
+    # on first boot and pinned in tee_measurements.yaml alongside the offline-computed RTMR3.
+    logger.info(
+        f"CPU register quote measurements for server_id={args.server_id}: "
+        f"mrtd={quote.mrtd} rtmr0={quote.rtmrs.get('rtmr0')} rtmr1={quote.rtmrs.get('rtmr1')} "
+        f"rtmr2={quote.rtmrs.get('rtmr2')} rtmr3={quote.rtmrs.get('rtmr3')}"
+    )
+    await verify_quote(quote, nonce, expected_cert_hash)
+    measurement_config = get_matching_measurement_config(quote)
+    if (measurement_config.gpu_count or 0) != 0:
+        raise MeasurementMismatchError(
+            "Matched a GPU measurement config; CPU self-registration requires a gpu_count=0 config."
+        )
+
+    # 3. Validate the benchmark shape (the validator never trusts the raw value).
+    try:
+        benchmark = validate_cpu_benchmark(args.benchmark)
+    except ValueError as benchmark_error:
+        raise InvalidCpuBenchmarkError(f"Invalid CPU benchmark: {benchmark_error}")
+
+    # 4. Upsert the self-registered CPU server (idempotent across reboots by server_id).
+    name = args.name or args.server_id
+    server = await db.get(Server, args.server_id)
+    if server is not None and server.miner_hotkey != miner_hotkey:
+        raise ServerRegistrationError(
+            f"Server {args.server_id} is already registered to a different miner."
+        )
+    ip_owner = (
+        await db.execute(
+            select(Server).where(Server.ip == server_ip, Server.server_id != args.server_id)
+        )
+    ).scalar_one_or_none()
+    if ip_owner is not None:
+        raise ServerRegistrationError(
+            f"IP {server_ip} is already registered to server {ip_owner.server_id}."
+        )
+
+    if server is None:
+        server = Server(server_id=args.server_id, netuid=settings.netuid)
+        db.add(server)
+    server.name = name
+    server.ip = server_ip
+    server.miner_hotkey = miner_hotkey
+    server.is_tee = True
+    server.self_registered = True
+    server.compute_type = "cpu"
+    server.cpu_cores = int(benchmark["cpu_cores"])
+    server.ram_gb = int(benchmark["ram_gb"])
+    server.benchmark_score = float(benchmark["composite_score"])
+    server.benchmark = benchmark
+    server.version = measurement_config.version
+
+    attestation = ServerAttestation(
+        quote_data=args.quote,
+        server_id=args.server_id,
+        created_at=func.now(),
+        verified_at=func.now(),
+        measurement_version=measurement_config.version,
+    )
+    db.add(attestation)
+    await db.commit()
+    await db.refresh(attestation)
+
+    logger.success(
+        f"CPU server self-registered: server_id={args.server_id} ip={server_ip} "
+        f"miner={miner_hotkey} score={server.benchmark_score} version={measurement_config.version}"
+    )
+    verified_at = attestation.verified_at
+    return {
+        "server_id": args.server_id,
+        "measurement_version": measurement_config.version,
+        "benchmark_score": float(server.benchmark_score),
+        "verified_at": (
+            verified_at.isoformat()
+            if hasattr(verified_at, "isoformat")
+            else datetime.now(timezone.utc).isoformat()
+        ),
+        "status": "registered",
+    }
+
+
 async def verify_server(
-    db: AsyncSession, server: Server, miner_hotkey: str, gpus: list[NodeArgs]
+    db: AsyncSession, server: Server, miner_hotkey: str, gpus: Optional[list[NodeArgs]]
 ) -> Optional[str]:
     """
     Verify server attestation and validate GPUs match measurement configuration.
 
+    For CPU servers (gpus is None) the TDX quote (MRTD + RTMRs) is still verified, but GPU
+    evidence verification and GPU-count/expected-GPU matching are skipped. The CPU benchmark
+    is read from the attestation response (gathered by the validator, never trusted from the
+    miner) and the CPU capacity + composite_score are persisted on the Server.
+
     Returns the measurement_version string on success, None on failure.
     """
+    is_cpu = gpus is None
     failure_reason = ""
     quote = None
     measurement_config = None
@@ -545,18 +713,31 @@ async def verify_server(
         logger.info(
             f"Verifying server server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} with nonce {nonce}"
         )
-        quote, gpu_evidence, cert = await client.get_server_evidence(nonce)
+        quote, gpu_evidence, cert, benchmark = await client.get_server_evidence(nonce)
         measurement_config = get_matching_measurement_config(quote)
         expected_cert_hash = get_public_key_hash(cert)
 
         # Verify quote measurements (matches by full MRTD + RTMRs; multiple configs may share RTMR0)
         await verify_quote(quote, nonce, expected_cert_hash)
 
-        # Verify GPU evidence
-        await verify_gpu_evidence(gpu_evidence, nonce)
+        if is_cpu:
+            # CPU server: skip GPU evidence + GPU matching. Validate and persist the benchmark
+            # the validator gathered itself from the attestation response.
+            try:
+                validated_benchmark = validate_cpu_benchmark(benchmark)
+            except ValueError as benchmark_error:
+                raise InvalidCpuBenchmarkError(f"Invalid CPU benchmark: {benchmark_error}")
+            server.compute_type = "cpu"
+            server.cpu_cores = int(validated_benchmark["cpu_cores"])
+            server.ram_gb = int(validated_benchmark["ram_gb"])
+            server.benchmark_score = float(validated_benchmark["composite_score"])
+            server.benchmark = validated_benchmark
+        else:
+            # Verify GPU evidence
+            await verify_gpu_evidence(gpu_evidence, nonce)
 
-        # Validate GPUs match measurement configuration
-        validate_gpus_for_measurements(quote, gpus)
+            # Validate GPUs match measurement configuration
+            validate_gpus_for_measurements(quote, gpus)
 
         logger.success(
             f"Verified server server_id={server.server_id} ip={server.ip} for miner: {miner_hotkey}"
@@ -601,6 +782,12 @@ async def verify_server(
             f"Server verification failed - GPU evidence error: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
         )
         failure_reason = "Server verification failed: Failed to verify GPU evidence"
+        raise e
+    except InvalidCpuBenchmarkError as e:
+        logger.error(
+            f"Server verification failed - invalid CPU benchmark: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
+        )
+        failure_reason = "Server verification failed: invalid CPU benchmark"
         raise e
     except Exception as e:
         logger.error(
@@ -1101,9 +1288,21 @@ async def get_instance_server(db: AsyncSession, instance_id: str) -> tuple[Serve
     if not instance.chute.tee:
         raise ChuteNotTeeError(instance.chute.chute_id)
 
-    # Instance always has nodes, get server from first node
-    node = instance.nodes[0]
-    server = node.server
+    # GPU chutes link to their server via GPU nodes. CPU (GPU-less) chutes have no Node rows,
+    # so the instance<->server linkage is by host + miner_hotkey.
+    if instance.nodes:
+        server = instance.nodes[0].server
+    else:
+        server = (
+            await db.execute(
+                select(Server).where(
+                    Server.ip == instance.host,
+                    Server.miner_hotkey == instance.miner_hotkey,
+                )
+            )
+        ).scalar_one_or_none()
+        if server is None:
+            raise ServerNotFoundError(f"server for instance {instance_id}")
 
     return (server, instance)
 
@@ -1150,11 +1349,18 @@ async def get_instance_evidence(
     return await _get_instance_evidence(server, instance.deployment_id, nonce)
 
 
-async def _fetch_instance_evidence(instance: Instance, nonce: str) -> TeeInstanceEvidence | None:
-    """Fetch evidence for a single instance, returning None on failure."""
+async def _fetch_instance_evidence(
+    instance: Instance, server: Optional[Server], nonce: str
+) -> TeeInstanceEvidence | None:
+    """Fetch evidence for a single instance, returning None on failure.
+
+    The server is resolved by the caller (GPU chutes via Node rows, CPU chutes via
+    host + miner_hotkey) so this coroutine performs no DB access and is safe under gather.
+    """
+    if server is None:
+        logger.error(f"No server resolved for instance {instance.instance_id}; cannot get evidence")
+        return None
     try:
-        node = instance.nodes[0]
-        server = node.server
         evidence = await _get_instance_evidence(server, instance.deployment_id, nonce)
         return TeeInstanceEvidence(
             quote=evidence.quote,
@@ -1209,7 +1415,27 @@ async def get_chute_instances_evidence(
     instances_result = await db.execute(instances_query)
     instances = instances_result.unique().scalars().all()
 
-    results = await asyncio.gather(*[_fetch_instance_evidence(inst, nonce) for inst in instances])
+    # Resolve each instance's server sequentially (DB access is not safe under gather):
+    # GPU chutes via their GPU nodes, CPU (GPU-less) chutes via host + miner_hotkey.
+    servers: list[Optional[Server]] = []
+    for inst in instances:
+        if inst.nodes:
+            servers.append(inst.nodes[0].server)
+        else:
+            servers.append(
+                (
+                    await db.execute(
+                        select(Server).where(
+                            Server.ip == inst.host,
+                            Server.miner_hotkey == inst.miner_hotkey,
+                        )
+                    )
+                ).scalar_one_or_none()
+            )
+
+    results = await asyncio.gather(
+        *[_fetch_instance_evidence(inst, server, nonce) for inst, server in zip(instances, servers)]
+    )
     evidence_list: list[TeeInstanceEvidence] = []
     failed_instance_ids: list[str] = []
     for instance, result in zip(instances, results):

@@ -7,6 +7,8 @@ class NoncePurpose(str, Enum):
     BOOT = "boot"
     RUNTIME = "runtime"
     INSTANCE_VERIFICATION = "instance_verification"
+    # 1-click CPU TEE server self-registration (POST /servers/cpu/register).
+    CPU_REGISTER = "cpu_register"
 
 
 ZERO_ADDRESS_HOTKEY = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # Public key is 0x00000...

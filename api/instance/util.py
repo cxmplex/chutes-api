@@ -1017,6 +1017,7 @@ async def verify_tee_chute(
     launch_config,
     deployment_id: str,
     expected_nonce: str,
+    compute_type: str = "gpu",
 ):
     """
     Verify TEE chute by fetching evidence from the attestation proxy and validating it.
@@ -1027,25 +1028,35 @@ async def verify_tee_chute(
         launch_config: LaunchConfig object
         deployment_id: Deployment ID for the chute
         expected_nonce: Expected nonce for verification
+        compute_type: "gpu" (default) or "cpu". For CPU chutes the TDX quote is still
+            verified but GPU evidence verification is skipped (there is no GPU).
 
     Raises:
         HTTPException: If verification fails
     """
+    is_cpu = compute_type == "cpu"
     try:
-        # Get the server from the database
-        server_query = select(Server).where(
-            Server.ip == instance.host, Server.miner_hotkey == launch_config.miner_hotkey
-        )
-        try:
-            server = (await db.execute(server_query)).scalar_one_or_none()
-        except MultipleResultsFound:
-            logger.error(
-                f"Multiple TEE servers share IP {instance.host} for miner {launch_config.miner_hotkey}"
+        # Resolve the server. 1-click self-registered servers are linked explicitly by server_id
+        # (stamped on the launch config / instance); the legacy path resolves by host + hotkey.
+        server = None
+        if getattr(instance, "server_id", None):
+            server = (
+                await db.execute(select(Server).where(Server.server_id == instance.server_id))
+            ).scalar_one_or_none()
+        if server is None:
+            server_query = select(Server).where(
+                Server.ip == instance.host, Server.miner_hotkey == launch_config.miner_hotkey
             )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Multiple TEE servers share the same IP. Each TEE server must have a unique IP. Use GET /miner/servers to review your inventory and remove duplicate servers.",
-            )
+            try:
+                server = (await db.execute(server_query)).scalar_one_or_none()
+            except MultipleResultsFound:
+                logger.error(
+                    f"Multiple TEE servers share IP {instance.host} for miner {launch_config.miner_hotkey}"
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Multiple TEE servers share the same IP. Each TEE server must have a unique IP. Use GET /miner/servers to review your inventory and remove duplicate servers.",
+                )
         if not server:
             logger.error(
                 f"Server not found for IP {instance.host} and miner {launch_config.miner_hotkey}"
@@ -1054,6 +1065,18 @@ async def verify_tee_chute(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Server not found for this instance.",
             )
+
+        # Self-registered CPU servers have no per-node attestation proxy (:30443) to dial. The VM
+        # is attested at server registration and the chute's launch-config self-attestation
+        # (runtime-integrity commitment + TLS cert + e2e pubkey, validated upstream) covers
+        # chute-level integrity, so there is no separate per-chute TDX quote to fetch here.
+        if getattr(server, "self_registered", False):
+            logger.success(
+                f"Chute deployment {deployment_id} on self-registered server "
+                f"{server.server_id}: trust anchored by server attestation + launch-config "
+                "self-attestation (no proxy dial)."
+            )
+            return
 
         # Use the TeeServerClient to get evidence from the chute proxy
         client = TeeServerClient(server)
@@ -1074,10 +1097,12 @@ async def verify_tee_chute(
                 hashlib.sha256((expected_nonce + e2e_pubkey).encode()).hexdigest().lower()
             )
             await verify_quote(quote, expected_report_data, expected_cert_hash)
-            await verify_gpu_evidence(gpu_evidence, expected_report_data)
+            if not is_cpu:
+                await verify_gpu_evidence(gpu_evidence, expected_report_data)
         else:
             await verify_quote(quote, expected_nonce, expected_cert_hash)
-            await verify_gpu_evidence(gpu_evidence, expected_nonce)
+            if not is_cpu:
+                await verify_gpu_evidence(gpu_evidence, expected_nonce)
 
         logger.success(f"Successfully verified attestation for chute deployment {deployment_id}")
     except GetEvidenceError as exc:
@@ -1121,6 +1146,30 @@ async def get_server_for_gpus(db, gpu_uuids: list[str]) -> Server | None:
             detail="GPUs must belong to a single server.",
         )
     return servers[0] if servers else None
+
+
+async def get_cpu_server_for_host(db, host: str, miner_hotkey: str) -> Server | None:
+    """Resolve the single CPU (GPU-less) TEE server for an instance by host IP + miner_hotkey.
+
+    CPU servers have no GPU Node rows, so the instance<->server linkage is by
+    (Server.ip == host AND Server.miner_hotkey == miner_hotkey). TEE servers are registered
+    with globally unique IPs, so this resolves to at most one server (same linkage used by
+    verify_tee_chute).
+
+    Returns None if no server is found. Raises HTTPException if multiple servers share the IP.
+    """
+    query = select(Server).where(Server.ip == host, Server.miner_hotkey == miner_hotkey)
+    try:
+        return (await db.execute(query)).scalar_one_or_none()
+    except MultipleResultsFound:
+        logger.error(f"Multiple TEE servers share IP {host} for miner {miner_hotkey}")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Multiple TEE servers share the same IP. Each TEE server must have a unique IP. "
+                "Use GET /miner/servers to review your inventory and remove duplicate servers."
+            ),
+        )
 
 
 async def purge(target, reason, valid_termination=False):

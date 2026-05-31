@@ -108,6 +108,42 @@ async def test_verify_tee_chute_chutes_060_uses_e2e_pubkey_hash(mock_db, sample_
 
 
 @pytest.mark.asyncio
+async def test_verify_tee_chute_cpu_skips_gpu_evidence(mock_db, sample_quote, mock_cert):
+    """For CPU chutes (compute_type='cpu'), verify_quote runs but verify_gpu_evidence is skipped."""
+    instance = _make_instance("0.6.0", {"e2e_pubkey": E2E_PUBKEY})
+    launch_config = _make_launch_config()
+
+    expected_report_data = (
+        hashlib.sha256((EXPECTED_NONCE + E2E_PUBKEY).encode()).hexdigest().lower()
+    )
+
+    with (
+        patch("api.instance.util.TeeServerClient") as mock_client_cls,
+        patch("api.instance.util.verify_quote", new_callable=AsyncMock) as mock_verify_quote,
+        patch("api.instance.util.verify_gpu_evidence", new_callable=AsyncMock) as mock_verify_gpu,
+        patch("api.instance.util.get_public_key_hash", return_value=EXPECTED_CERT_HASH),
+    ):
+        mock_client = MagicMock()
+        # CPU chute proxies return null nvtrust_evidence -> get_chute_evidence yields None.
+        mock_client.get_chute_evidence = AsyncMock(return_value=(sample_quote, None, mock_cert))
+        mock_client_cls.return_value = mock_client
+
+        await verify_tee_chute(
+            mock_db,
+            instance,
+            launch_config,
+            "deploy-123",
+            EXPECTED_NONCE,
+            compute_type="cpu",
+        )
+
+        mock_verify_quote.assert_called_once_with(
+            sample_quote, expected_report_data, EXPECTED_CERT_HASH
+        )
+        mock_verify_gpu.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_verify_tee_chute_chutes_059_uses_raw_nonce(mock_db, sample_quote, mock_cert):
     """For chutes < 0.6.0, verify_quote receives expected_nonce directly (old behavior)."""
     instance = _make_instance("0.5.9", {"e2e_pubkey": E2E_PUBKEY})
