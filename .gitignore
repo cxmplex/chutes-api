@@ -177,3 +177,6 @@ tests/integration/keys
 .vscode
 *.code-workspace
 **/config/*.yaml
+# Private signing keys (launch-config JWT signer, etc.) — must never be committed.
+**/config/*.pem
+*.pem

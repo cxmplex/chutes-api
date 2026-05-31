@@ -101,6 +101,22 @@ async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
     if semcomp(chute.chutes_version or "0.0.0", "0.6.0") >= 0:
         ports["attestation"] = 8002
 
+    # Resolve the chute image's content digest validator-side (from the internal registry where the
+    # forge signed it) so the agent pulls + cosign-verifies BY DIGEST -- a tag/registry swap then
+    # cannot substitute a different image between schedule and run. Best-effort: a non-resolvable
+    # image (not signed/pushed to the chutes registry) deploys with cosign-only verification rather
+    # than being blocked; cosign against the baked key remains the primary anchor either way.
+    image_digest = None
+    try:
+        from api.image.forge import get_image_digest
+
+        image_digest = await get_image_digest(f"{settings.registry_host}/{_chute_image_ref(chute)}")
+    except Exception as exc:
+        logger.warning(
+            f"Could not resolve image digest for chute {chute.chute_id}; "
+            f"deploying with cosign-only verification: {exc}"
+        )
+
     await send_agent_command(
         server.server_id,
         "deploy_chute",
@@ -110,6 +126,7 @@ async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
             "config_id": config_id,
             "token": token,
             "image": _chute_image_ref(chute),
+            "image_digest": image_digest,
             "registry": settings.registry_external_host,
             "registry_insecure": settings.registry_insecure,
             "ref_str": chute.ref_str,
