@@ -847,6 +847,29 @@ def create_launch_jwt_v2(
     return encoded_jwt
 
 
+def create_provision_jwt(server_id: str, ttl_minutes: int = 30) -> str:
+    """Mint a short-lived, instance-bound provisioning-authorization token for a user-attestable
+    instance (sek8s docs/specs/user-attestable-instances.md, workstream #2).
+
+    The in-TEE chutes-provision service verifies it (ES256, iss "chutes", purpose "provision",
+    server_id bound, not expired) against the validator's launch PUBLIC key baked + measured into
+    the user-instance image, so only the holder of a validator-issued token can push their SSH key
+    or secrets. This is an authorization gate only -- confidentiality comes from TDX + the attested
+    channel, so the user does not have to trust the validator for confidentiality, only for who is
+    allowed to provision the instance they were given.
+    """
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=ttl_minutes)
+    payload = {
+        "iss": "chutes",
+        "iat": int(now.timestamp()),
+        "exp": int(expires_at.timestamp()),
+        "purpose": "provision",
+        "server_id": server_id,
+    }
+    return jwt.encode(payload, settings.launch_config_private_key_bytes, algorithm="ES256")
+
+
 def generate_fs_key(launch_config) -> str:
     """
     Generate a chutes secure FS code to unlock encrypted files.
