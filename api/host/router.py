@@ -17,7 +17,7 @@ from api.database import get_db_session
 from api.miner.util import is_miner_blacklisted
 from api.server.exceptions import ServerRegistrationError
 from api.server.schemas import Host, HostRegistrationArgs, HostRegistrationResponse
-from api.server.service import register_host
+from api.server.service import register_host, request_host_image_upgrade
 
 router = APIRouter()
 
@@ -56,6 +56,39 @@ async def register_host_endpoint(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Host registration failed due to an unexpected error.",
+        )
+
+
+@router.post("/{host_id}/upgrade-image")
+async def upgrade_host_image_endpoint(
+    host_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    signature: str | None = Header(None, alias=SIGNATURE_HEADER),
+    nonce: str | None = Header(None, alias=NONCE_HEADER),
+):
+    """Tell an online L0 host to refresh its chute guest image (sends the node-agent upgrade_image).
+
+    Auth: the owning miner's signature over "{hotkey}:{nonce}:host_upgrade" with a recent
+    unix-timestamp nonce. The host re-fetches the published guest image and rolls its per-chute TDs
+    onto it. Pin the new image's attestation measurement on the validator in lockstep.
+    """
+    if not hotkey or not signature or not nonce:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing miner hotkey/signature/nonce headers.",
+        )
+    try:
+        return await request_host_image_upgrade(db, host_id, hotkey, nonce, signature)
+    except ServerRegistrationError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Unexpected error in host image upgrade: host_id={host_id} error={exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Host image upgrade failed due to an unexpected error.",
         )
 
 

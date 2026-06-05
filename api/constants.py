@@ -13,6 +13,10 @@ class NoncePurpose(str, Enum):
     # and is NOT attested -- it registers by miner-hotkey signature over "{hotkey}:{nonce}:host_register".
     HOST_REGISTER = "host_register"
 
+    # Model B: trigger a chute-guest-image refresh on an L0 host (POST /hosts/{id}/upgrade-image).
+    # Owning-miner signature over "{hotkey}:{nonce}:host_upgrade"; sends the node-agent upgrade_image.
+    HOST_UPGRADE = "host_upgrade"
+
 
 ZERO_ADDRESS_HOTKEY = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # Public key is 0x00000...
 HOTKEY_HEADER = "X-Chutes-Hotkey"

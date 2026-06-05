@@ -827,6 +827,53 @@ async def register_host(
     return {"host_id": host.host_id, "capacity": host.capacity, "status": "registered"}
 
 
+async def request_host_image_upgrade(
+    db: AsyncSession, host_id: str, miner_hotkey: str, nonce: str, signature: str
+) -> Dict[str, Any]:
+    """Model B: tell an online L0 host to refresh its chute guest image (control-channel upgrade_image).
+
+    Owning-miner auth: signature over "{hotkey}:{nonce}:host_upgrade" with a recent unix-timestamp
+    nonce (same scheme as registration). The host re-fetches the published guest image and tears down
+    its running per-chute TDs so the scheduler re-places their chutes onto fresh TDs from the new image.
+    Remember to pin the new image's measurement on the validator in lockstep, or the new TDs fail attest.
+    """
+    from api.agent_channel import is_agent_online, send_agent_command
+
+    if not miner_hotkey or not signature:
+        raise ServerRegistrationError("Missing miner hotkey/signature for host upgrade")
+
+    try:
+        nonce_ts = int(str(nonce))
+    except (TypeError, ValueError):
+        raise ServerRegistrationError("Host upgrade nonce must be a unix timestamp")
+    skew = abs(int(time.time()) - nonce_ts)
+    if skew > HOST_REGISTER_NONCE_WINDOW_SECONDS:
+        raise ServerRegistrationError(
+            f"Host upgrade nonce is stale ({skew}s skew > {HOST_REGISTER_NONCE_WINDOW_SECONDS}s)"
+        )
+
+    signing_message = f"{miner_hotkey}:{nonce}:{NoncePurpose.HOST_UPGRADE.value}"
+    try:
+        if not Keypair(ss58_address=miner_hotkey).verify(signing_message, bytes.fromhex(signature)):
+            raise ServerRegistrationError("Invalid miner signature for host upgrade")
+    except ServerRegistrationError:
+        raise
+    except Exception as exc:
+        raise ServerRegistrationError(f"Invalid miner signature: {exc}")
+
+    host = await db.get(Host, host_id)
+    if host is None:
+        raise ServerRegistrationError(f"Host {host_id} is not registered")
+    if host.miner_hotkey != miner_hotkey:
+        raise ServerRegistrationError(f"Host {host_id} belongs to a different miner")
+    if not await is_agent_online(host_id):
+        raise ServerRegistrationError(f"Host {host_id} is not currently online (no control channel)")
+
+    command_id = await send_agent_command(host_id, "upgrade_image", {})
+    logger.success(f"Dispatched upgrade_image to host {host_id} (command_id={command_id})")
+    return {"host_id": host_id, "command_id": command_id, "status": "dispatched"}
+
+
 async def verify_server(
     db: AsyncSession, server: Server, miner_hotkey: str, gpus: Optional[list[NodeArgs]]
 ) -> Optional[str]:
