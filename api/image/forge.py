@@ -194,6 +194,28 @@ async def build_and_push_image(image, build_dir):
         if process.returncode != 0:
             raise BuildFailure("Build of original image failed!")
 
+        # CPU-TEE chutes ship NO chutes confidential-runtime layer at all: no aegis/netnanny/cfsv/
+        # inspecto/graval/bytecode-manifest. The Trust Domain itself (TDX memory encryption + dm-verity
+        # root + RTMR attestation) is the security boundary, so the in-image LD_PRELOAD machinery is
+        # redundant. GPU + GPU-TEE images keep the full confidential runtime below.
+        is_cpu = bool(getattr(image, "cpu", False))
+
+        # Dev: install the local SDK wheel (CHUTES_SDK_WHEEL) instead of PyPI -- the dev forge runs the
+        # modified 0.6.10 source (e.g. the CPU-TEE no-aegis branch) that isn't published to any index.
+        sdk_wheel = os.getenv("CHUTES_SDK_WHEEL")
+        use_local_sdk = bool(sdk_wheel) and os.path.exists(sdk_wheel)
+        if use_local_sdk:
+            # pip requires the PEP 427 wheel filename, so keep the original basename.
+            wheel_name = os.path.basename(sdk_wheel)
+            shutil.copy2(sdk_wheel, os.path.join(build_dir, wheel_name))
+            chutes_install = f"COPY {wheel_name} /tmp/{wheel_name}\nRUN pip install /tmp/{wheel_name}"
+        elif is_cpu:
+            # CPU-TEE never uses graval (now a GPU-only extra), so install base chutes -- no CUDA/torch.
+            chutes_install = f"RUN pip install chutes=={image.chutes_version}"
+        else:
+            # GPU chutes need graval; pull it via the gpu extra.
+            chutes_install = f"RUN pip install 'chutes[gpu]=={image.chutes_version}'"
+
         # Inject chutes.
         chutes_tag = f"{original_tag}-chutes"
         chutes_dockerfile_content = f"""FROM {original_tag}
@@ -207,11 +229,14 @@ RUN find / -xdev -type f -name '*.pyc' -exec rm -f {{}} \\; || true
 RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 ENV PYTHONDONTWRITEBYTECODE=1
-RUN pip install chutes=={image.chutes_version}
+{chutes_install}
 RUN uv cache clean --force
 """
-        # v4 (aegis) vs v3 (netnanny+logintercept) .so injection
-        if semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
+        # Confidential-runtime .so injection (GPU + GPU-TEE only). CPU-TEE ships none, so LD_PRELOAD
+        # stays "" (cleared above) and the image carries no aegis/netnanny/cfsv .so.
+        if is_cpu:
+            pass
+        elif semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
             chutes_dockerfile_content += """RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), "chutes-aegis.so"))') /usr/local/lib/chutes-aegis.so
 ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so
 """
@@ -220,6 +245,16 @@ ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so
 RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), "chutes-logintercept.so"))') /usr/local/lib/chutes-logintercept.so
 RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), "chutes-cfsv.so"))') /usr/local/lib/chutes-cfsv.so
 ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-logintercept.so
+"""
+        if is_cpu:
+            # No aegis to enforce HF_HOME, but the agent still sets HF_HOME=/cache for the workload and
+            # the CPU base may not ship one, so make it writable. Also make the chute workdir /app
+            # writable by the runtime user: with no aegis set_secure_fs to prepare a secure FS, run.py
+            # writes the validator-delivered chute code to /app directly as the chutes user.
+            chutes_dockerfile_content += """USER root
+RUN mkdir -p /cache && chmod 1777 /cache
+RUN mkdir -p /app && chown -R chutes:chutes /app
+USER chutes
 """
         chutes_dockerfile_content += """WORKDIR /app
 """
@@ -264,6 +299,10 @@ ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-loginterc
             raise BuildFailure(f"Failed waiting for chutes image image: {str(exc)}")
         if process.returncode != 0:
             raise BuildFailure("Failed to install chutes library into image!")
+
+        # cfsv filesystem-index + inspecto are GPU-chute integrity features; a CPU-only TEE chute does
+        # not need them, so the verification stage + extraction is skipped for CPU (is_cpu set above;
+        # aegis's bytecode-manifest was already generated in the chutes-inject stage for CPU).
 
         # Build filesystem verification image.
         verification_tag = f"{short_tag}-fsv-{uuid.uuid4().hex[:8]}"
@@ -343,54 +382,63 @@ RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
             build_cmd.extend(["--tls-verify=false"])
         build_cmd.append(build_dir)
 
-        process = await asyncio.create_subprocess_exec(
-            *build_cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=_BUILDAH_CLEAN_ENV,
-        )
-        try:
-            await asyncio.wait_for(process.wait(), timeout=settings.build_timeout)
-        except Exception as exc:
-            raise BuildFailure(f"Failed waiting for filesystem verification image: {str(exc)}")
-        if process.returncode != 0:
-            raise BuildFailure("Build of filesystem verification image failed!")
+        bytecode_manifest_path = bytecode_manifest_json_path = None
+        if not is_cpu:
+            process = await asyncio.create_subprocess_exec(
+                *build_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=_BUILDAH_CLEAN_ENV,
+            )
+            try:
+                await asyncio.wait_for(process.wait(), timeout=settings.build_timeout)
+            except Exception as exc:
+                raise BuildFailure(f"Failed waiting for filesystem verification image: {str(exc)}")
+            if process.returncode != 0:
+                raise BuildFailure("Build of filesystem verification image failed!")
 
-        # Extract the data file from the verification image
-        (
-            data_file_path,
-            package_hashes,
-            inspecto_hash,
-            bytecode_manifest_path,
-            bytecode_manifest_json_path,
-        ) = await extract_cfsv_data_from_verification_image(verification_tag, build_dir)
-        image.inspecto = inspecto_hash
-        image.package_hashes = package_hashes
-        await upload_filesystem_verification_data(image, data_file_path)
+            # Extract the data file from the verification image
+            (
+                data_file_path,
+                package_hashes,
+                inspecto_hash,
+                bytecode_manifest_path,
+                bytecode_manifest_json_path,
+            ) = await extract_cfsv_data_from_verification_image(verification_tag, build_dir)
+            image.inspecto = inspecto_hash
+            image.package_hashes = package_hashes
+            await upload_filesystem_verification_data(image, data_file_path)
 
-        # Upload bytecode manifest to S3 if generated.
-        if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
-            await upload_bytecode_manifest(image, bytecode_manifest_path)
+            # Upload bytecode manifest to S3 if generated.
+            if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
+                await upload_bytecode_manifest(image, bytecode_manifest_path)
 
-        # Upload JSON manifest to S3 for validator (no decryption needed).
-        if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
-            await upload_bytecode_manifest_json(image, bytecode_manifest_json_path)
+            # Upload JSON manifest to S3 for validator (no decryption needed).
+            if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
+                await upload_bytecode_manifest_json(image, bytecode_manifest_json_path)
 
         # Build final image that combines original + index file
         logger.info(f"Building final image as {short_tag}")
 
-        final_dockerfile_content = f"""FROM {verification_tag} as fsv
+        if is_cpu:
+            # CPU-only chute: no filesystem-verification image was built, so there is no
+            # chutesfs.index / bytecode manifest to copy into the final image.
+            final_dockerfile_content = f"""FROM {chutes_tag}
+ENV PYTHONDONTWRITEBYTECODE=1
+"""
+        else:
+            final_dockerfile_content = f"""FROM {verification_tag} as fsv
 FROM {chutes_tag}
 COPY --from=fsv /etc/chutesfs.index /etc/chutesfs.index
 ENV PYTHONDONTWRITEBYTECODE=1
 """
-        # Include bytecode manifest in final image if it was generated.
-        if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
-            final_dockerfile_content = final_dockerfile_content.rstrip() + "\n"
-            final_dockerfile_content += (
-                "COPY --from=fsv /tmp/bytecode.manifest /etc/bytecode.manifest\n"
-            )
-        if semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
+            # Include bytecode manifest in final image if it was generated.
+            if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
+                final_dockerfile_content = final_dockerfile_content.rstrip() + "\n"
+                final_dockerfile_content += (
+                    "COPY --from=fsv /tmp/bytecode.manifest /etc/bytecode.manifest\n"
+                )
+        if not is_cpu and semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0:
             final_dockerfile_content += (
                 "USER root\n"
                 "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"
@@ -1067,6 +1115,12 @@ async def update_chutes_lib(image_id: str, chutes_version: str, force: bool = Fa
             updated_tag = f"{target_tag}-updated-{uuid.uuid4().hex[:8]}"
             logger.info(f"Stage 1: Building updated image as {updated_tag}")
 
+            # graval is a GPU-only extra; CPU chutes install base chutes (no CUDA/torch).
+            _upd_install = (
+                f"RUN pip install chutes=={chutes_version}"
+                if bool(getattr(image, "cpu", False))
+                else f"RUN pip install 'chutes[gpu]=={chutes_version}'"
+            )
             dockerfile_content = f"""FROM {full_source_tag}
 USER root
 ENV LD_PRELOAD=""
@@ -1078,11 +1132,14 @@ RUN find / -xdev -type f -name '*.pyc' -exec rm -f {{}} \\; || true
 RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 ENV PYTHONDONTWRITEBYTECODE=1
-RUN pip install chutes=={chutes_version}
+{_upd_install}
 RUN uv cache clean --force
 """
-            # v4 (aegis) vs v3 (netnanny+logintercept) .so injection
-            if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
+            # Confidential-runtime .so injection (GPU + GPU-TEE only). CPU-TEE ships none, so LD_PRELOAD
+            # stays "" and the image carries no aegis/netnanny/cfsv .so (the TD is the boundary).
+            if bool(getattr(image, "cpu", False)):
+                pass
+            elif semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
                 dockerfile_content += """RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), "chutes-aegis.so"))') /usr/local/lib/chutes-aegis.so
 ENV LD_PRELOAD=/usr/local/lib/chutes-aegis.so
 """
@@ -1133,6 +1190,10 @@ ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-loginterc
 
             if process.returncode != 0:
                 raise BuildFailure("Failed to build updated image!")
+
+            # cfsv (filesystem verification) + inspecto are GPU-chute integrity features; CPU-only
+            # chutes don't need them, so the verification stage + extraction is skipped for CPU.
+            is_cpu = bool(getattr(image, "cpu", False))
 
             # Stage 2: Build filesystem verification image from the updated image
             verification_tag = f"{target_tag}-fsv-{uuid.uuid4().hex[:8]}"
@@ -1214,72 +1275,85 @@ RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
                 build_cmd.extend(["--tls-verify=false"])
             build_cmd.append(build_dir)
 
-            process = await asyncio.create_subprocess_exec(
-                *build_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_BUILDAH_CLEAN_ENV,
-            )
+            bytecode_manifest_path = bytecode_manifest_json_path = None
+            if not is_cpu:
+                process = await asyncio.create_subprocess_exec(
+                    *build_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_BUILDAH_CLEAN_ENV,
+                )
 
-            # Run without capturing logs to avoid noise
-            await asyncio.wait_for(
-                asyncio.gather(
-                    _capture_logs(process.stdout, "stdout", capture=False),
-                    _capture_logs(process.stderr, "stderr", capture=False),
-                    process.wait(),
-                ),
-                timeout=settings.build_timeout,
-            )
+                # Run without capturing logs to avoid noise
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        _capture_logs(process.stdout, "stdout", capture=False),
+                        _capture_logs(process.stderr, "stderr", capture=False),
+                        process.wait(),
+                    ),
+                    timeout=settings.build_timeout,
+                )
 
-            if process.returncode != 0:
-                raise BuildFailure("Failed to build filesystem verification image!")
+                if process.returncode != 0:
+                    raise BuildFailure("Failed to build filesystem verification image!")
 
-            # Extract and upload data file
-            (
-                data_file_path,
-                package_hashes,
-                inspecto_hash,
-                bytecode_manifest_path,
-                bytecode_manifest_json_path,
-            ) = await extract_cfsv_data_from_verification_image(verification_tag, build_dir)
-            s3_key = f"image_hash_blobs/{image_id}/{patch_version}.data"
-            async with settings.s3_client() as s3:
-                await s3.upload_file(data_file_path, settings.storage_bucket, s3_key)
-            logger.success(f"Uploaded filesystem verification data to {s3_key}")
-
-            # Upload bytecode manifest if generated.
-            if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
-                manifest_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest"
+                # Extract and upload data file
+                (
+                    data_file_path,
+                    package_hashes,
+                    inspecto_hash,
+                    bytecode_manifest_path,
+                    bytecode_manifest_json_path,
+                ) = await extract_cfsv_data_from_verification_image(verification_tag, build_dir)
+                s3_key = f"image_hash_blobs/{image_id}/{patch_version}.data"
                 async with settings.s3_client() as s3:
-                    await s3.upload_file(
-                        bytecode_manifest_path, settings.storage_bucket, manifest_s3_key
-                    )
-                logger.success(f"Uploaded bytecode manifest to {manifest_s3_key}")
+                    await s3.upload_file(data_file_path, settings.storage_bucket, s3_key)
+                logger.success(f"Uploaded filesystem verification data to {s3_key}")
 
-            # Upload JSON manifest for validator if generated.
-            if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
-                manifest_json_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest.json"
-                async with settings.s3_client() as s3:
-                    await s3.upload_file(
-                        bytecode_manifest_json_path, settings.storage_bucket, manifest_json_s3_key
-                    )
-                logger.success(f"Uploaded bytecode manifest JSON to {manifest_json_s3_key}")
+                # Upload bytecode manifest if generated.
+                if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
+                    manifest_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest"
+                    async with settings.s3_client() as s3:
+                        await s3.upload_file(
+                            bytecode_manifest_path, settings.storage_bucket, manifest_s3_key
+                        )
+                    logger.success(f"Uploaded bytecode manifest to {manifest_s3_key}")
+
+                # Upload JSON manifest for validator if generated.
+                if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
+                    manifest_json_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest.json"
+                    async with settings.s3_client() as s3:
+                        await s3.upload_file(
+                            bytecode_manifest_json_path, settings.storage_bucket, manifest_json_s3_key
+                        )
+                    logger.success(f"Uploaded bytecode manifest JSON to {manifest_json_s3_key}")
 
             # Stage 3: Build final image that combines updated + index file
             logger.info(f"Stage 3: Building final image as {target_tag}")
 
-            final_dockerfile_content = f"""FROM {verification_tag} as fsv
+            if is_cpu:
+                # CPU-only chute: no filesystem-verification image was built, nothing to copy in.
+                # Ensure /app is writable by the runtime user: with no aegis set_secure_fs, run.py
+                # writes the validator-delivered chute code to /app directly as the chutes user.
+                final_dockerfile_content = f"""FROM {updated_tag} as base
+ENV PYTHONDONTWRITEBYTECODE=1
+USER root
+RUN mkdir -p /app && chown -R chutes:chutes /app
+USER chutes
+"""
+            else:
+                final_dockerfile_content = f"""FROM {verification_tag} as fsv
 FROM {updated_tag} as base
 COPY --from=fsv /tmp/chutesfs.index /etc/chutesfs.index
 ENV PYTHONDONTWRITEBYTECODE=1
 """
-            # Include bytecode manifest in final image if it was generated.
-            if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
-                final_dockerfile_content = final_dockerfile_content.rstrip() + "\n"
-                final_dockerfile_content += (
-                    "COPY --from=fsv /tmp/bytecode.manifest /etc/bytecode.manifest\n"
-                )
-            if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
+                # Include bytecode manifest in final image if it was generated.
+                if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
+                    final_dockerfile_content = final_dockerfile_content.rstrip() + "\n"
+                    final_dockerfile_content += (
+                        "COPY --from=fsv /tmp/bytecode.manifest /etc/bytecode.manifest\n"
+                    )
+            if not is_cpu and semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
                 final_dockerfile_content += (
                     "USER root\n"
                     "RUN echo '/usr/local/lib/chutes-aegis.so' > /etc/ld.so.preload && chmod 0644 /etc/ld.so.preload\n"

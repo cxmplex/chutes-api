@@ -9,6 +9,9 @@ class NoncePurpose(str, Enum):
     INSTANCE_VERIFICATION = "instance_verification"
     # 1-click CPU TEE server self-registration (POST /servers/cpu/register).
     CPU_REGISTER = "cpu_register"
+    # Model B: bare-metal L0 host registration (POST /hosts/register). The host is a launcher only
+    # and is NOT attested -- it registers by miner-hotkey signature over "{hotkey}:{nonce}:host_register".
+    HOST_REGISTER = "host_register"
 
 
 ZERO_ADDRESS_HOTKEY = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # Public key is 0x00000...

@@ -73,7 +73,9 @@ class LaunchConfigArgs(BaseModel):
     tls_client_key_password: Optional[str] = None
     e2e_pubkey: Optional[str] = None
     cllmv_session_init: Optional[str] = None
-    env: str
+    # The aegis-backed envdump. CPU-TEE chutes ship no aegis and send no envdump; TD attestation
+    # (dm-verity + RTMR) + cosign image verification anchor integrity instead.
+    env: Optional[str] = None
     code: Optional[str] = None
     run_code: Optional[str] = None
     inspecto: Optional[str] = None

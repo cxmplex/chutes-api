@@ -65,6 +65,7 @@ from api.server.service import (
 )
 from api.server.util import (
     extract_client_cert_hash,
+    extract_client_cert_pem,
     get_luks_passphrase,
 )
 from api.server.exceptions import (
@@ -173,6 +174,7 @@ async def register_cpu_server_endpoint(
     db: AsyncSession = Depends(get_db_session),
     nonce=Depends(validate_request_nonce(NoncePurpose.CPU_REGISTER)),
     expected_cert_hash=Depends(extract_client_cert_hash()),
+    expected_cert_pem=Depends(extract_client_cert_pem()),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     signature: str | None = Header(None, alias=SIGNATURE_HEADER),
 ):
@@ -199,7 +201,7 @@ async def register_cpu_server_endpoint(
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
         server_ip = extract_ip(request)
         return await register_cpu_server(
-            db, server_ip, args, hotkey, nonce, signature, expected_cert_hash
+            db, server_ip, args, hotkey, nonce, signature, expected_cert_hash, expected_cert_pem
         )
     except (AttestationError, ServerRegistrationError):
         raise
@@ -215,6 +217,89 @@ async def register_cpu_server_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="CPU server registration failed",
         )
+
+
+def _manifest_for_version(version: str | None) -> dict | None:
+    """Build a chutes-attest measurement manifest from the pinned (published, reproducible) CPU
+    measurement config for this version. These are the EXPECTED measurements the client verifies the
+    live quote against -- they come from the published config, not from the instance itself."""
+    if not version:
+        return None
+    for m in settings.tee_measurements:
+        if m.version != version or (m.gpu_count or 0) != 0:
+            continue
+        tee_type = getattr(m, "tee_type", "tdx")
+        provider = getattr(m, "provider", None) or "bare-metal"
+        if tee_type in ("sev-snp", "snp", "amd-snp"):
+            # AMD SEV-SNP: a single launch measurement + policy + min-TCB (no MRTD/RTMRs).
+            return {
+                "schema_version": 1,
+                "image": f"chutes-cpu-snp-{m.name}",
+                "image_version": version,
+                "provider": provider,
+                "tee_type": "sev-snp",
+                "snp": {
+                    "measurement": m.measurement,
+                    "policy": m.policy,
+                    "processor_model": m.processor_model,
+                    "min_tcb": m.min_tcb,
+                },
+            }
+        # Intel TDX: MRTD + RTMR0-3. The config loader upper-cases RTMR keys (RTMR0..RTMR3).
+        rt = m.runtime_rtmrs or {}
+        return {
+            "schema_version": 1,
+            "image": f"chutes-cpu-tee-{m.name}",
+            "image_version": version,
+            "provider": provider,
+            "tee_type": "tdx",
+            "measurements": {
+                "mrtd": m.mrtd,
+                "rtmr0": rt.get("RTMR0") or rt.get("rtmr0"),
+                "rtmr1": rt.get("RTMR1") or rt.get("rtmr1"),
+                "rtmr2": rt.get("RTMR2") or rt.get("rtmr2"),
+                "rtmr3": rt.get("RTMR3") or rt.get("rtmr3"),
+            },
+        }
+    return None
+
+
+@router.get("/cpu/{server_id}/connection")
+async def get_cpu_server_connection(
+    server_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User = Depends(
+        get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
+    ),
+):
+    """Owner-authenticated DISCOVERY for a user-attestable CPU TEE instance.
+
+    Returns where the instance is (the host + attest/provision/ssh/wg ports its in-TEE agent
+    advertised), a short-lived provisioning token, and the expected-measurements manifest -- so
+    `chutes ssh/connect <server_id>` needs no flags. This is discovery + authorization ONLY: the
+    trust decision is the client verifying the TDX quote itself (Intel + the manifest), NOT this
+    response, and the connection goes directly to the instance, never through this API.
+    """
+    from api.instance.util import create_provision_jwt
+
+    server = await check_server_ownership(db, server_id, hotkey)
+    if not getattr(server, "self_registered", False) or server.compute_type != "cpu":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not a self-registered CPU TEE instance.",
+        )
+    endpoints = server.tee_endpoints or {}
+    return {
+        "server_id": server.server_id,
+        "host": endpoints.get("host") or server.ip,
+        "attest_port": endpoints.get("attest_port", 8443),
+        "provision_port": endpoints.get("provision_port", 8444),
+        "ssh_port": endpoints.get("ssh_port", 22),
+        "wg_port": endpoints.get("wg_port", 51820),
+        "provision_token": create_provision_jwt(server.server_id),
+        "manifest": _manifest_for_version(server.version),
+    }
 
 
 def _validate_luks_request(
@@ -484,11 +569,16 @@ async def get_tee_measurements():
         TeeMeasurementResponse(
             version=m.version,
             name=m.name,
+            tee_type=getattr(m, "tee_type", "tdx"),
             mrtd=m.mrtd,
             boot_rtmrs=m.boot_rtmrs,
             runtime_rtmrs=m.runtime_rtmrs,
             expected_gpus=m.expected_gpus,
             gpu_count=m.gpu_count,
+            measurement=getattr(m, "measurement", None),
+            policy=getattr(m, "policy", None),
+            min_tcb=getattr(m, "min_tcb", None),
+            processor_model=getattr(m, "processor_model", None),
         )
         for m in measurements
     ]

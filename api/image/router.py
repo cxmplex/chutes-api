@@ -246,6 +246,7 @@ async def create_image(
     dockerfile: str = Form(...),
     image: str = Form(...),
     public: bool = Form(...),
+    cpu: bool = Form(False),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user()),
 ):
@@ -333,6 +334,7 @@ async def create_image(
         tag=tag,
         public=public,
         chutes_version=settings.chutes_version,
+        cpu=cpu,
     )
     db.add(image)
     await db.commit()

@@ -70,3 +70,28 @@ measurements:
       rtmr3: "0A1B2C3D4E5F60718293A4B5C6D7E8F00A1B2C3D4E5F60718293A4B5C6D7E8F00A1B2C3D4E5F60718293A4B5C6D7E8F0"
     expected_gpus: []
     gpu_count: 0
+
+  # Example: CPU-only AMD SEV-SNP (tee_type: sev-snp) configuration.
+  # SNP has no MRTD/RTMRs -- instead pin a single 48B launch `measurement` (96 hex), the guest
+  # `policy` (the DEBUG bit MUST be off), a minimum reported TCB (anti-rollback), and the AMD
+  # `processor_model` (Genoa | Milan | Turin), which selects the KDS endpoint + pinned ARK root.
+  # The `measurement` is the SHA-384 launch digest (OVMF + per-vCPU VMSA, plus kernel/initrd/cmdline
+  # when booting via direct-kernel-boot with kernel-hashes), reproduced offline by `sev-snp-measure`.
+  # `id_key_digest` (optional, 96 hex) pins an owner id-block so the PSP enforces the measurement at
+  # launch. mrtd/boot_rtmrs/runtime_rtmrs are omitted for SNP.
+  - version: "1"
+    name: "cpu-snp-genoa"
+    description: "CPU-only AMD SEV-SNP configuration (no GPU)"
+    provider: "bare-metal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    # id_key_digest: "..."   # optional: pin an owner id-block digest (launch-time enforcement)
+    expected_gpus: []
+    gpu_count: 0

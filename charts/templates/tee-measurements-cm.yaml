@@ -52,3 +52,23 @@ data:
           rtmr3: "PLACEHOLDER_CPU_RTMR3_96_HEX_CHARS"
         expected_gpus: []
         gpu_count: 0
+      # Example AMD SEV-SNP (tee_type: sev-snp) CPU configuration. SNP has no MRTD/RTMRs: pin a
+      # single 48B launch `measurement` (96 hex; OVMF+VMSA [+kernel/initrd/cmdline under
+      # direct-kernel-boot]) reproduced offline by sev-snp-measure, the required guest `policy`
+      # (DEBUG bit must be off), a minimum reported TCB (anti-rollback), and the AMD `processor_model`
+      # (Genoa|Milan|Turin -> selects the KDS/ARK). `id_key_digest` optionally pins an owner id-block.
+      - version: "1"
+        name: "cpu-snp-genoa"
+        description: "CPU-only AMD SEV-SNP configuration (no GPU)"
+        provider: "baremetal"
+        tee_type: "sev-snp"
+        processor_model: "Genoa"
+        measurement: "PLACEHOLDER_SNP_MEASUREMENT_96_HEX_CHARS"
+        policy: "0x30000"
+        min_tcb:
+          bootloader: 0
+          tee: 0
+          snp: 0
+          microcode: 0
+        expected_gpus: []
+        gpu_count: 0

@@ -36,6 +36,7 @@ from api.secret.router import router as secrets_router
 from api.guesser import router as guess_router
 from api.audit.router import router as audit_router
 from api.server.router import router as servers_router
+from api.host.router import router as hosts_router
 from api.misc.router import router as misc_router
 from api.idp.router import router as idp_router
 from api.e2e.router import router as e2e_router
@@ -197,6 +198,7 @@ default_router.include_router(jobs_router, prefix="/jobs", tags=["Job"])
 default_router.include_router(secrets_router, prefix="/secrets", tags=["Secret"])
 default_router.include_router(misc_router, prefix="/misc", tags=["Miscellaneous"])
 default_router.include_router(servers_router, prefix="/servers", tags=["Servers"])
+default_router.include_router(hosts_router, prefix="/hosts", tags=["Hosts"])
 default_router.include_router(idp_router, prefix="/idp", tags=["Identity Provider"])
 default_router.include_router(e2e_router, prefix="/e2e", tags=["E2E Encryption"])
 default_router.include_router(

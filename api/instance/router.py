@@ -966,8 +966,9 @@ async def _validate_launch_config_env(
 ):
     from chutes.envdump import DUMPER
 
-    # Verify, decrypt, parse the envdump payload.
-    if "ENVDUMP_UNLOCK" in os.environ:
+    # Verify, decrypt, parse the envdump payload. CPU-TEE chutes send no envdump (no aegis), so there
+    # is nothing to decrypt -- their integrity is anchored by TD attestation + cosign image verification.
+    if "ENVDUMP_UNLOCK" in os.environ and args.env:
         code = None
         try:
             dump = await asyncio.to_thread(DUMPER.decrypt, launch_config.env_key, args.env)
@@ -1181,6 +1182,16 @@ async def _validate_launch_config_instance(
 
     config_id = launch_config.config_id
 
+    # CPU-TEE chutes ship NO aegis/netnanny, so the validator cannot (and must not) require aegis
+    # evidence from them: netnanny_hash, runtime-integrity commitment/nonce/pubkey, mTLS cert, cfsv
+    # filesystem hash, and the cllmv session blob are all skipped below. Their integrity is anchored in
+    # the TD attestation (dm-verity + RTMR), verified at server registration and by verify_tee_chute
+    # (which also short-circuits self-registered servers). Every other launch check (IP match,
+    # scalability, run_path tampering, job claim, instance pricing) still applies.
+    cpu_tee = bool(chute.tee) and (
+        str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
+    )
+
     # Generate a tentative instance ID.
     new_instance_id = generate_uuid()
 
@@ -1250,7 +1261,10 @@ async def _validate_launch_config_instance(
 
         # NetNanny / Aegis verification (match egress config and hash).
         nn_valid = True
-        if semcomp(chute.chutes_version or "0.0.0", "0.5.5") >= 0:
+        if cpu_tee:
+            # CPU-TEE: no in-image netnanny/aegis; the TD attestation is the integrity proof.
+            pass
+        elif semcomp(chute.chutes_version or "0.0.0", "0.5.5") >= 0:
             # v4 (aegis): netnanny_hash comes from aegis-verify; also verify egress config.
             if chute.allow_external_egress != args.egress:
                 logger.error(
@@ -1315,8 +1329,8 @@ async def _validate_launch_config_instance(
                 detail=launch_config.verification_error,
             )
 
-    # Runtime integrity (runint) verification for version >= 0.4.9
-    if semcomp(chute.chutes_version, "0.4.9") >= 0:
+    # Runtime integrity (runint) verification for version >= 0.4.9 (aegis-backed; skipped for CPU-TEE).
+    if not cpu_tee and semcomp(chute.chutes_version, "0.4.9") >= 0:
         if not launch_config.nonce or not args.rint_nonce:
             logger.error(f"{log_prefix} missing runint nonce in launch config")
             launch_config.failed_at = func.now()
@@ -1346,7 +1360,9 @@ async def _validate_launch_config_instance(
                     detail=launch_config.verification_error,
                 )
 
-    await _validate_launch_config_filesystem(db, launch_config, chute, args)
+    # Filesystem (cfsv) verification is aegis-backed; CPU-TEE has no cfsv index to verify.
+    if not cpu_tee:
+        await _validate_launch_config_filesystem(db, launch_config, chute, args)
 
     # Assign the job to this launch config.
     if launch_config.job_id:
@@ -1384,7 +1400,7 @@ async def _validate_launch_config_instance(
     tls_cert_sig = getattr(args, "tls_cert_sig", None)
     rint_commitment = getattr(args, "rint_commitment", None)
 
-    if is_v4:
+    if is_v4 and not cpu_tee:
         if not rint_commitment or rint_commitment[:2] != "04":
             logger.error(
                 f"{log_prefix} v4 instance (>= 0.5.5) must provide v4 (04-prefix) rint_commitment"
@@ -1416,12 +1432,47 @@ async def _validate_launch_config_instance(
             )
         validated_cacert = tls_cert
 
+    # CPU-TEE: pin the server's attestation-bound serving cert so the validator<->chute user-data
+    # transport is TLS terminated INSIDE the attested TD. The cert's pubkey hash is bound into the
+    # server's registration TDX quote (verify_quote at /servers/cpu/register), so a host-forged cert
+    # cannot match and the untrusted host (which routes the TD's traffic) cannot MITM/read/tamper it.
+    # Fail closed: no attested cert on record => no provably-private channel, so refuse to launch.
+    if cpu_tee:
+        server_row = None
+        if getattr(launch_config, "server_id", None):
+            server_row = (
+                await db.execute(
+                    select(Server).where(Server.server_id == launch_config.server_id)
+                )
+            ).scalar_one_or_none()
+        attested_cert = getattr(server_row, "attested_cert", None)
+        if not attested_cert:
+            logger.error(
+                f"{log_prefix} CPU-TEE server {getattr(launch_config, 'server_id', None)} has no "
+                "attestation-bound TLS cert on record"
+            )
+            launch_config.failed_at = func.now()
+            launch_config.verification_error = (
+                "CPU-TEE server has no attestation-bound TLS cert on record; re-register the server "
+                "(POST /servers/cpu/register) so the validator can pin its attested transport cert."
+            )
+            await db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=launch_config.verification_error,
+            )
+        validated_cacert = attested_cert
+
     # Create the instance now that we've verified the envdump/k8s env.
     node_selector = NodeSelector(**chute.node_selector)
     is_cpu = node_selector.compute_type == "cpu"
     extra_fields = {
         "e2e_pubkey": getattr(args, "e2e_pubkey", None),
     }
+    # CPU-TEE instances carry no aegis session key; mark them so the API sends plaintext (no cipher)
+    # over the TD-secured transport instead of raising on a missing rint_session_key.
+    if cpu_tee:
+        extra_fields["cpu_tee"] = True
     # Store CA cert for SSL verification (separate from server cert in cacert).
     tls_ca_cert = getattr(args, "tls_ca_cert", None)
     if tls_ca_cert:
@@ -1625,8 +1676,8 @@ async def _validate_launch_config_instance(
         instance.extra = {}
     instance.extra["warmup_compute_multiplier"] = warmup_compute_multiplier
 
-    # Enforce rint_pubkey for chutes >= 0.5.1
-    if semcomp(instance.chutes_version or "0.0.0", "0.5.1") >= 0:
+    # Enforce rint_pubkey for chutes >= 0.5.1 (aegis-backed; skipped for CPU-TEE).
+    if not cpu_tee and semcomp(instance.chutes_version or "0.0.0", "0.5.1") >= 0:
         if not instance.rint_pubkey or not instance.rint_nonce:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1660,7 +1711,7 @@ async def _validate_launch_config_instance(
     # CLLMV V2: decrypt miner's ephemeral HMAC session key from init blob
     cllmv_init = getattr(args, "cllmv_session_init", None)
     is_v4_instance = semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0
-    if is_v4_instance:
+    if is_v4_instance and not cpu_tee:
         if not cllmv_init:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1787,19 +1838,26 @@ async def _validate_tee_launch_config_instance(
     # Newer 0.2.0+ VMs can run both old and new chutes.
     # TODO: Remove this once TEE servers are upgraded to 0.2.0 or later
     if semcomp(instance.chutes_version or "0.0.0", "0.6.0") >= 0:
-        stmt = (
-            select(BootAttestation)
-            .where(BootAttestation.server_ip == instance.host)
-            .order_by(desc(BootAttestation.created_at))
-            .limit(1)
-        )
-        boot_result = await db.execute(stmt)
-        latest_boot = boot_result.scalar_one_or_none()
-        if (
-            latest_boot is None
-            or latest_boot.measurement_version is None
-            or semcomp(latest_boot.measurement_version, "0.2.0") < 0
-        ):
+        # Self-registered CPU-TEE servers attest via the CPU-register flow (recording the matched
+        # measurement version on server.version) and never run the boot/LUKS BootAttestation flow, so
+        # they have no BootAttestation row -- use the server's attested measurement version for them.
+        server = None
+        if getattr(instance, "server_id", None):
+            server = (
+                await db.execute(select(Server).where(Server.server_id == instance.server_id))
+            ).scalar_one_or_none()
+        if server is not None and getattr(server, "self_registered", False):
+            measurement_version = server.version
+        else:
+            stmt = (
+                select(BootAttestation)
+                .where(BootAttestation.server_ip == instance.host)
+                .order_by(desc(BootAttestation.created_at))
+                .limit(1)
+            )
+            latest_boot = (await db.execute(stmt)).scalar_one_or_none()
+            measurement_version = latest_boot.measurement_version if latest_boot else None
+        if measurement_version is None or semcomp(measurement_version, "0.2.0") < 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -2684,7 +2742,8 @@ async def _build_launch_config_verified_response(
     #    return_value["secrets"]["HF_HUB_DISABLE_XET"] = "1"
     #    return_value["secrets"]["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
     return_value["activation_url"] = (
-        f"https://api.{settings.base_domain}/instances/launch_config/{launch_config.config_id}/activate"
+        f"{(settings.launch_config_base_url or f'https://api.{settings.base_domain}').rstrip('/')}"
+        f"/instances/launch_config/{launch_config.config_id}/activate"
     )
 
     return return_value

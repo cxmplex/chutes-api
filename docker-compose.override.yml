@@ -1,0 +1,121 @@
+# Local dev overrides for the CPU-only validator bring-up (Phase 1).
+# Auto-merged by `docker compose`. NOT for production.
+#
+# Fixes / additions vs the base docker-compose.yml:
+#   1. Redis wiring: the API reads PRIMARY_REDIS_HOST/PRIMARY_REDIS_PORT/REDIS_PASSWORD
+#      (see api/config/__init__.py); it IGNORES the base file's REDIS_URL, so without
+#      this it tries 172.16.0.100:1600 and never reaches the compose redis.
+#   2. TEE measurements: mount the local CPU measurement config at the default path.
+#   3. SKIP_GPU_VERIFICATION: marks non-TEE /nodes registrations verified (no GPUs locally).
+#   4. socket/events entrypoints: the image installs deps via `uv`, so run with `uv run`
+#      (the base file's `poetry run` does not see the uv-managed venv).
+services:
+  # Host already runs native redis(6379)/postgres(5432); remap the published host
+  # ports to free ones so the containers can start. The API reaches these over the
+  # compose network (redis:6379 / postgres:5432), so internal connectivity is unaffected.
+  # `!override` replaces the base file's `ports` instead of appending (Compose >= 2.24).
+  redis:
+    ports: !override
+      - "127.0.0.1:6380:6379"
+
+  postgres:
+    ports: !override
+      - "127.0.0.1:5433:5432"
+
+  api:
+    environment:
+      PRIMARY_REDIS_HOST: redis
+      PRIMARY_REDIS_PORT: "6379"
+      REDIS_PASSWORD: redispassword
+      SKIP_GPU_VERIFICATION: "true"
+      # Dev: let a self-registering CPU server's hotkey register without being on the metagraph.
+      SKIP_METAGRAPH_CHECK: "true"
+      # Dev: ES256 key for signing launch-config JWTs (CPU scheduler -> agent deploy).
+      LAUNCH_CONFIG_PRIVATE_KEY_PATH: /etc/config/launch_config_private_key.pem
+      DB_SSL: disable
+      # Dev installs the local modified 0.6.10 SDK wheel (the CPU-TEE no-aegis branch) via the forge's
+      # CHUTES_SDK_WHEEL, so image.chutes_version matches the wheel that actually lands in the image.
+      CHUTES_VERSION: "0.6.10"
+      # The bare-metal agent reaches the dev registry via its bridge gateway (192.168.100.1:5000 ->
+      # socat -> ssh reverse tunnel -> registry_public). The scheduler delivers this as the pull
+      # registry in deploy_chute; the cosign signature lives in the same backing registry.
+      REGISTRY_EXTERNAL_HOST: "192.168.100.1:5000"
+      # The launched chute reads its verification callback URL from the launch JWT. Point it at this
+      # dev validator's reachable HTTP base (same endpoint the agent uses) instead of the prod
+      # https://api.<base_domain>, so the in-guest /tee handshake hits this stack.
+      LAUNCH_CONFIG_BASE_URL: "http://66.30.131.197:8000"
+    volumes:
+      - ./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro
+      - ./config/launch_config_private_key.pem:/etc/config/launch_config_private_key.pem:ro
+
+  socket:
+    entrypoint: ["uv", "run", "uvicorn", "api.socket_server:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+    environment:
+      PRIMARY_REDIS_HOST: redis
+      PRIMARY_REDIS_PORT: "6379"
+      REDIS_PASSWORD: redispassword
+      SKIP_GPU_VERIFICATION: "true"
+      DB_SSL: disable
+
+  events_socket:
+    entrypoint: ["uv", "run", "uvicorn", "api.event_socket_server:app", "--host", "0.0.0.0", "--port", "8081", "--reload"]
+    environment:
+      PRIMARY_REDIS_HOST: redis
+      PRIMARY_REDIS_PORT: "6379"
+      REDIS_PASSWORD: redispassword
+      DB_SSL: disable
+
+  # The forge signs by digest at {VALIDATOR_SS58}.localregistry.chutes.ai:5000 (it rewrites
+  # registry:5000 -> that host, mirroring prod's /etc/hosts). Give the internal registry that name
+  # as a network alias so the forge resolves it to the same registry on the compose network.
+  registry:
+    networks:
+      chutes:
+        aliases:
+          - 5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4.localregistry.chutes.ai
+
+  # Dev forge build worker: the base service is NOT wired for cosign/Redis/validator identity, so a
+  # build would fail at `cosign sign --key None`. Wire the dev cosign key (empty passphrase, matching
+  # the baked cosign-dev.pub), Redis (for build-log streams), and the validator ss58 (signing host).
+  forge:
+    # Stage 2 uses buildah `--isolation rootless`, whose crun needs to write
+    # /sys/fs/cgroup/cgroup.subtree_control (read-only in a normal container). Privileged (dev build
+    # worker only -- not network-exposed) provides the writable cgroup + device access buildah-in-docker
+    # needs; prod runs this with proper cgroup delegation instead.
+    privileged: true
+    environment:
+      PRIMARY_REDIS_HOST: redis
+      PRIMARY_REDIS_PORT: "6379"
+      REDIS_PASSWORD: redispassword
+      DB_SSL: disable
+      VALIDATOR_SS58: 5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4
+      COSIGN_KEY: /etc/cosign/cosign.key
+      COSIGN_PASSWORD: ""
+      # forge.py hardcodes overlay storage opts (--storage-opt overlay.mountopt/mount_program), so the
+      # base file's STORAGE_DRIVER=vfs is incompatible (vfs rejects those). Use the image's intended
+      # overlay + fuse-overlayfs driver, which needs /dev/fuse passed into the container.
+      STORAGE_DRIVER: overlay
+      # Dev: install the modified local 0.6.10 SDK (the CPU-TEE no-aegis branch) into built images
+      # instead of PyPI. forge.py copies this wheel into the build context and pip-installs it.
+      CHUTES_SDK_WHEEL: /sdk-wheels/chutes-0.6.10-py3-none-any.whl
+    volumes:
+      - ../sek8s/.dev-cosign/cosign.key:/etc/cosign/cosign.key:ro
+      # Buildah graphroot on a real ext4-backed named volume, NOT the container's overlay2 rootfs --
+      # rootless pivot_root fails on overlay-on-overlay ("pivot_root: Operation not permitted").
+      - forge_storage:/var/lib/containers/storage
+      # Dev: live-mount the api source so forge.py edits apply on container restart (no image rebuild).
+      - ./api:/forge/api
+      # Dev: the locally-built chutes 0.6.10 wheel (see CHUTES_SDK_WHEEL).
+      - ../chutes/dist:/sdk-wheels:ro
+    devices:
+      - /dev/fuse
+    # The base file's curated forge-seccomp.json doesn't allow pivot_root, which buildah's rootless
+    # isolation (stages 2-4) requires -> "pivot_root: Operation not permitted". Unconfined seccomp for the
+    # dev build worker (already privileged, not network-exposed); prod keeps the curated profile.
+    security_opt: !override
+      - seccomp:unconfined
+      - apparmor:unconfined
+      - label:disable
+
+volumes:
+  forge_storage:

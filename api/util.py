@@ -558,6 +558,17 @@ def aes_gcm_encrypt(plaintext: bytes, key: bytes) -> bytes:
     return nonce + ciphertext + encryptor.tag
 
 
+def _is_cpu_tee_instance(instance) -> bool:
+    """
+    CPU-TEE instances run with no aegis confidential runtime, so there is no session-key cipher and no
+    rint_session_key. They are marked at creation (extra.cpu_tee). For these, the API keeps the
+    base64/hex/gzip wire format but skips the encryption layer -- the TD memory-encryption boundary
+    (plus TLS at the validator/proxy edge) secures the transport, mirroring the in-image identity cipher.
+    """
+    extra = getattr(instance, "extra", None)
+    return bool(extra) and bool(extra.get("cpu_tee"))
+
+
 def decrypt_instance_response(
     ciphertext: bytes | str,
     instance,
@@ -584,6 +595,10 @@ def decrypt_instance_response(
         if iv is None:
             raise ValueError("iv required for legacy AES-CBC decryption")
         return aes_decrypt(ciphertext, instance.symmetric_key, iv)
+
+    # CPU-TEE: no cipher -- just undo the base64 wire encoding (the caller handles gzip).
+    if _is_cpu_tee_instance(instance):
+        return base64.b64decode(ciphertext)
 
     # chutes >= 0.5.5 uses ChaCha20-Poly1305 with X25519-derived session key
     if semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:
@@ -624,6 +639,13 @@ def encrypt_instance_request(
     """
     if isinstance(plaintext, str):
         plaintext = plaintext.encode()
+
+    # CPU-TEE: no cipher -- keep the base64/hex wire encoding (and the caller's gzip) but skip
+    # encryption. The TD memory-encryption boundary secures the transport.
+    if _is_cpu_tee_instance(instance):
+        if hex_encode:
+            return plaintext.hex(), None
+        return base64.b64encode(plaintext).decode(), None
 
     # chutes >= 0.5.5 uses ChaCha20-Poly1305 with X25519-derived session key
     if semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0:

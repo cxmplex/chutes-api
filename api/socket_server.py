@@ -13,7 +13,7 @@ from sqlalchemy import select
 import api.database.orms  # noqa
 from api.config import settings
 from api.database import get_session
-from api.server.schemas import Server
+from api.server.schemas import Host, Server
 from api.user.router import get_current_user
 from api.socket_shared import SyntheticRequest
 from api.redis_pubsub import RedisListener, AgentCommandListener
@@ -158,10 +158,24 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
                     )
                 )
             ).scalar_one_or_none()
-        if server is None:
+            # Model B: a bare-metal L0 launcher host connects with its host_id to receive per-chute
+            # launch/teardown commands. It is not a Server (it's a launcher, not attested), so accept
+            # the connection when server_id matches a registered Host owned by this miner.
+            if server is None:
+                host = (
+                    await session.execute(
+                        select(Host).where(
+                            Host.host_id == server_id,
+                            Host.miner_hotkey == hotkey,
+                        )
+                    )
+                ).scalar_one_or_none()
+            else:
+                host = None
+        if server is None and host is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Server {server_id} is not a self-registered server for {hotkey}",
+                detail=f"{server_id} is not a self-registered server or registered L0 host for {hotkey}",
             )
         sio.agent_sessions[server_id] = session_id
         sio.agent_meta[session_id] = {"hotkey": hotkey, "server_id": server_id}

@@ -36,7 +36,10 @@ from api.server.exceptions import (
     NonceError,
 )
 from api.server.quote import TdxQuote, TdxVerificationResult
+from api.server.snp_quote import SnpReport
+from api.server.snp_verify import SnpVerificationResult, verify_snp_report
 import hashlib
+import os
 
 from api.server.schemas import Server, VmCacheConfig, LuksVolumeRotation
 from api.util import semcomp
@@ -64,6 +67,27 @@ def extract_client_cert_hash():
             raise NoClientCertError(detail=str(e))
 
     return _extract_request_client_cert
+
+
+def extract_client_cert_pem():
+    """FastAPI dependency: return the client certificate as a canonical PEM string.
+
+    Used by CPU TEE self-registration so the validator can persist the exact attestation-bound
+    serving cert (whose pubkey hash is verified against the quote report_data) and later pin it as
+    the instance cacert for the validator<->chute transport.
+    """
+
+    async def _extract_request_client_cert_pem(request: Request):
+        try:
+            cert = _get_client_certificate(request)
+            return cert.public_bytes(serialization.Encoding.PEM).decode()
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Could not extract client cert PEM:\n{e}")
+            raise NoClientCertError(detail=str(e))
+
+    return _extract_request_client_cert_pem
 
 
 def extract_server_cert_hash(response: ClientResponse):
@@ -268,12 +292,119 @@ def get_matching_measurement_config(quote: TdxQuote) -> TeeMeasurementConfig:
         if quote.matches_measurement(config):
             return config
 
-    logger.info(
-        f"No measurement config matched quote (MRTD + RTMRs)\n{quote.mrtd=}\n{quote.rtmrs=}"
-    )
+    if isinstance(quote, SnpReport):
+        logger.info(
+            f"No SEV-SNP measurement config matched (measurement={quote.measurement[:16]}..., "
+            f"policy={hex(quote.policy)}, reported_tcb={quote.reported_tcb_parts})"
+        )
+    else:
+        logger.info(
+            f"No measurement config matched quote (MRTD + RTMRs)\n{quote.mrtd=}\n{quote.rtmrs=}"
+        )
     raise MeasurementMismatchError(
         "Quote does not match expected measurements. Ensure you are running a supported VM."
     )
+
+
+def get_snp_processor_model() -> str:
+    """Resolve the AMD processor model (Genoa/Milan/Turin) used to fetch the VCEK + pin the ARK.
+
+    Derived from the configured SEV-SNP measurement configs when unambiguous (a deployment runs one
+    AMD platform generation); falls back to SNP_PROCESSOR_MODEL or "Genoa".
+    """
+    models = {
+        m.processor_model
+        for m in settings.tee_measurements
+        if getattr(m, "tee_type", "tdx") in ("sev-snp", "snp", "amd-snp") and m.processor_model
+    }
+    if len(models) == 1:
+        return next(iter(models))
+    return os.getenv("SNP_PROCESSOR_MODEL", "Genoa")
+
+
+async def verify_snp_quote(quote: SnpReport, expected_nonce: str) -> SnpVerificationResult:
+    """Verify an AMD SEV-SNP report end-to-end and match it to a configured SNP measurement config.
+
+    Cryptographic verification (VCEK->ASK->ARK chain + ARK pin + ECDSA-P384 report signature +
+    reported-TCB binding + debug-policy gate) is done by snp_verify; measurement/policy/min-TCB
+    matching reuses the provider-agnostic get_matching_measurement_config.
+
+    Image identity: on bare-metal SNP the dm-verity roothash is folded into the SNP launch
+    measurement (direct-kernel-boot), so the measurement match IS the image-identity check. On GCP
+    the SNP measurement is only Google's firmware, so the matched config additionally pins ``vtpm_pcrs``;
+    when set, the report MUST carry a GCE vTPM quote, which is verified (AK->Google root + signature +
+    nonce) and whose PCRs must equal the pinned values -- the GCP image-identity layer (Google-rooted).
+    """
+    model = get_snp_processor_model()
+    # If the report carried an inline cert chain (GCP auxblob), use it; else fetch the VCEK from KDS.
+    cert_chain = getattr(quote, "cert_chain", None)
+    result = await verify_snp_report(
+        quote, model=model, cert_chain=cert_chain, redis=settings.redis_client
+    )
+    if not result.is_valid:
+        logger.error(f"SEV-SNP report verification failed: {result.errors}")
+        raise InvalidSignatureError("SEV-SNP report verification failed")
+    # Enforce the pinned measurement + policy + min-TCB (raises MeasurementMismatchError if none).
+    config = get_matching_measurement_config(quote)
+
+    # GCP image-identity: when the matched config pins vTPM PCRs, require + verify the vTPM quote.
+    vtpm_pcrs = getattr(config, "vtpm_pcrs", None)
+    if vtpm_pcrs:
+        await _verify_snp_vtpm(quote, config, expected_nonce)
+
+    logger.success(
+        f"SEV-SNP report verified + measurement matched: measurement={quote.measurement[:16]}..."
+        + (" + vTPM image identity" if vtpm_pcrs else "")
+    )
+    return result
+
+
+async def _verify_snp_vtpm(quote: SnpReport, config, expected_nonce: str) -> None:
+    """Verify the GCE vTPM measured-boot quote attached to a GCP SNP report against pinned PCRs.
+
+    The vTPM quote (AK cert + TPMS_ATTEST + signature + PCRs) is verified by gcp_vtpm (AK chains to
+    the pinned Google EK/AK CA Root, RSASSA/SHA256 signature, extraData == the registration nonce,
+    pcrDigest == sha256(PCRs)); then the verified PCRs must equal the config's pinned ``vtpm_pcrs``.
+    """
+    from api.server.gcp_vtpm import verify_vtpm_quote
+
+    vq = getattr(quote, "vtpm_quote", None)
+    if not vq:
+        raise MeasurementMismatchError(
+            "SNP config requires a GCE vTPM quote for image identity, but none was provided."
+        )
+    try:
+        ak = base64.b64decode(vq["ak_cert"])
+        msg = base64.b64decode(vq["quote_msg"])
+        sig = base64.b64decode(vq["quote_sig"])
+        pcrs = {int(k): bytes.fromhex(v) for k, v in vq["pcrs"].items()}
+        intermediate = base64.b64decode(vq["intermediate"]) if vq.get("intermediate") else None
+    except (KeyError, ValueError, TypeError) as exc:
+        raise InvalidQuoteError(f"Malformed vTPM quote: {exc}")
+
+    vres = await verify_vtpm_quote(
+        ak, msg, sig, pcrs,
+        bytes.fromhex(expected_nonce),
+        intermediate_der=intermediate,
+        redis=settings.redis_client,
+    )
+    if not vres.is_valid:
+        logger.error(f"GCE vTPM quote verification failed: {vres.errors}")
+        raise InvalidSignatureError("GCE vTPM quote verification failed")
+
+    # Compare the verified PCRs to the pinned per-image expected values (the image-identity check).
+    mismatches = []
+    for idx_str, expected_hex in config.vtpm_pcrs.items():
+        idx = int(idx_str)
+        actual = vres.pcrs.get(str(idx))
+        if not actual or actual.upper() != expected_hex.upper():
+            mismatches.append(f"PCR{idx}: expected {expected_hex[:16]}..., got {(actual or '')[:16]}...")
+    if mismatches:
+        logger.error(f"vTPM PCR mismatch (image identity): {'; '.join(mismatches)}")
+        raise MeasurementMismatchError(
+            "vTPM PCRs do not match the expected image measurements. "
+            "Ensure you are running a supported GCP confidential image."
+        )
 
 
 def verify_measurements(quote: TdxQuote) -> bool:
@@ -614,9 +745,12 @@ async def _track_server(
     return server
 
 
-async def verify_quote(
-    quote: TdxQuote, expected_nonce: str, expected_cert_hash: str
-) -> TdxVerificationResult:
+async def verify_quote(quote, expected_nonce: str, expected_cert_hash: str):
+    """Verify a TEE attestation (Intel TDX quote or AMD SEV-SNP report).
+
+    The nonce + client-cert-hash binding (report_data = nonce || sha256(pubkey)) is identical for
+    both providers; only the signature/measurement verification differs and is dispatched by type.
+    """
     nonce, cert_hash = extract_report_data(quote)
 
     if nonce != expected_nonce:
@@ -626,6 +760,12 @@ async def verify_quote(
     if cert_hash != expected_cert_hash:
         raise InvalidClientCertError()
 
+    # AMD SEV-SNP: VCEK chain + report signature + measurement (no DCAP / MRTD / RTMRs).
+    # On GCP, image identity is additionally enforced via the GCE vTPM quote (nonce-bound).
+    if isinstance(quote, SnpReport):
+        return await verify_snp_quote(quote, expected_nonce)
+
+    # Intel TDX: dcap-qvl signature verification + DCAP-result cross-check + MRTD/RTMR match.
     result = await verify_quote_signature(quote)
     verify_result(quote, result)
     verify_measurements(quote)

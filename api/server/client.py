@@ -11,7 +11,7 @@ from loguru import logger
 from cryptography.x509 import Certificate
 from api.constants import HOTKEY_HEADER, NONCE_HEADER, SIGNATURE_HEADER
 from api.server.exceptions import GetEvidenceError
-from api.server.quote import RuntimeTdxQuote, TdxQuote
+from api.server.quote import RuntimeTdxQuote, TdxQuote, quote_from_evidence  # noqa: F401
 from api.server.schemas import Server
 from api.server.util import _get_server_certificate
 from api.config import settings
@@ -97,7 +97,8 @@ class TeeServerClient:
                 ) as resp:
                     cert = _get_server_certificate(resp)
                     data = await resp.json()
-                    quote = RuntimeTdxQuote.from_base64(data["tdx_quote"])
+                    # TDX quote (tdx_quote) or SEV-SNP report (snp_report), selected by tee_type.
+                    quote = quote_from_evidence(data)
                     nvtrust_evidence = data.get("nvtrust_evidence")
                     gpu_evidence = json.loads(nvtrust_evidence) if nvtrust_evidence else None
                     benchmark = data.get("benchmark")
@@ -134,7 +135,7 @@ class TeeServerClient:
                 async with session.get(url, headers=headers, params=params) as resp:
                     cert = _get_server_certificate(resp)
                     data = await resp.json()
-                    quote = RuntimeTdxQuote.from_base64(data["evidence"]["tdx_quote"])
+                    quote = quote_from_evidence(data["evidence"])
                     # CPU (GPU-less) chutes report nvtrust_evidence: null; GPU chutes a JSON string.
                     nvtrust_evidence = data["evidence"].get("nvtrust_evidence")
                     gpu_evidence = json.loads(nvtrust_evidence) if nvtrust_evidence else None

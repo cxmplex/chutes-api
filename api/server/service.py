@@ -7,6 +7,7 @@ import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
 import secrets
+import time
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
@@ -22,9 +23,12 @@ from api.metagraph import MetagraphNode
 from bittensor_wallet.keypair import Keypair
 from api.node.util import _track_nodes
 from api.server.client import TeeServerClient
-from api.server.quote import BootTdxQuote, RuntimeTdxQuote, TdxQuote
+from api.server.quote import BootTdxQuote, RuntimeTdxQuote, TdxQuote, build_runtime_quote
+from api.server.snp_quote import SnpReport
 from api.server.schemas import (
     Server,
+    Host,
+    HostRegistrationArgs,
     ServerAttestation,
     BootAttestation,
     BootAttestationArgs,
@@ -547,6 +551,7 @@ async def register_cpu_server(
     nonce: str,
     signature: str,
     expected_cert_hash: str,
+    cert_pem: str,
 ) -> Dict[str, Any]:
     """
     Self-registration for a 1-click CPU TEE server (push attestation model).
@@ -606,15 +611,28 @@ async def register_cpu_server(
     except Exception as exc:
         raise ServerRegistrationError(f"Invalid miner signature: {exc}")
 
-    # 2. Verify the runtime TDX quote (RTMR3 extended by our guest stack) and match a CPU config.
-    quote = RuntimeTdxQuote.from_base64(args.quote)
-    # Logged on every attempt so the GCP firmware/boot measurements (MRTD/RTMR0-2) can be captured
-    # on first boot and pinned in tee_measurements.yaml alongside the offline-computed RTMR3.
-    logger.info(
-        f"CPU register quote measurements for server_id={args.server_id}: "
-        f"mrtd={quote.mrtd} rtmr0={quote.rtmrs.get('rtmr0')} rtmr1={quote.rtmrs.get('rtmr1')} "
-        f"rtmr2={quote.rtmrs.get('rtmr2')} rtmr3={quote.rtmrs.get('rtmr3')}"
+    # 2. Verify the runtime attestation (Intel TDX quote or AMD SEV-SNP report) + match a CPU config.
+    tee_type = (getattr(args, "tee_type", None) or "tdx").strip().lower()
+    quote = build_runtime_quote(
+        args.quote,
+        tee_type,
+        getattr(args, "snp_cert_chain", None),
+        getattr(args, "vtpm_quote", None),
     )
+    # Logged on every attempt so first-boot platform measurements can be captured and pinned in
+    # tee_measurements.yaml (TDX: MRTD/RTMR0-2 alongside the offline RTMR3; SNP: launch measurement).
+    if isinstance(quote, SnpReport):
+        logger.info(
+            f"CPU register SEV-SNP report for server_id={args.server_id}: "
+            f"measurement={quote.measurement} policy={hex(quote.policy)} "
+            f"reported_tcb={quote.reported_tcb_parts} chip_id={quote.chip_id[:16]}..."
+        )
+    else:
+        logger.info(
+            f"CPU register quote measurements for server_id={args.server_id}: "
+            f"mrtd={quote.mrtd} rtmr0={quote.rtmrs.get('rtmr0')} rtmr1={quote.rtmrs.get('rtmr1')} "
+            f"rtmr2={quote.rtmrs.get('rtmr2')} rtmr3={quote.rtmrs.get('rtmr3')}"
+        )
     await verify_quote(quote, nonce, expected_cert_hash)
     measurement_config = get_matching_measurement_config(quote)
     if (measurement_config.gpu_count or 0) != 0:
@@ -654,11 +672,27 @@ async def register_cpu_server(
     server.is_tee = True
     server.self_registered = True
     server.compute_type = "cpu"
+    server.tee_type = tee_type
+    # Model B: stamp the launching L0 host (per-host capacity accounting + teardown), if provided.
+    server.host_id = getattr(args, "host_id", None) or None
+    # Model B: record the per-TD public host + DNAT external ports so the scheduler advertises the
+    # externally reachable endpoint (public_host:<ext>) when it deploys a chute onto this TD.
+    server.external_host = getattr(args, "external_host", None) or None
+    server.external_ports = getattr(args, "external_ports", None) or None
     server.cpu_cores = int(benchmark["cpu_cores"])
     server.ram_gb = int(benchmark["ram_gb"])
     server.benchmark_score = float(benchmark["composite_score"])
     server.benchmark = benchmark
     server.version = measurement_config.version
+    # Persist the attestation-bound serving cert. Its pubkey hash was just verified against the
+    # quote report_data (verify_quote above), so this PEM is the attested TLS identity of the TD.
+    # The validator pins it as the instance cacert so the validator<->chute transport is TLS
+    # terminated inside the attested TD (the untrusted host cannot MITM/read/tamper it).
+    server.attested_cert = cert_pem
+    # Advertised user-attestable reach info (host + attest/provision/ssh/wg ports) for discovery via
+    # GET /servers/cpu/{id}/connection. Optional; pure convenience (trust is the client attestation).
+    if args.endpoints:
+        server.tee_endpoints = args.endpoints
 
     attestation = ServerAttestation(
         quote_data=args.quote,
@@ -671,9 +705,18 @@ async def register_cpu_server(
     await db.commit()
     await db.refresh(attestation)
 
+    # Model B: a TD launched by an L0 host has registered -> release that host's in-flight slot count
+    # (best-effort; the durable per-host usage is now this Server row's host_id).
+    if server.host_id:
+        try:
+            await settings.redis_client.decr(f"mb:host_inflight:{server.host_id}")
+        except Exception:  # noqa: BLE001 - inflight counter is a best-effort hint
+            pass
+
     logger.success(
         f"CPU server self-registered: server_id={args.server_id} ip={server_ip} "
         f"miner={miner_hotkey} score={server.benchmark_score} version={measurement_config.version}"
+        + (f" host_id={server.host_id}" if server.host_id else "")
     )
     verified_at = attestation.verified_at
     return {
@@ -687,6 +730,101 @@ async def register_cpu_server(
         ),
         "status": "registered",
     }
+
+
+# Accept a host-register timestamp nonce within this many seconds of now (replay bound). The host
+# uses a client unix-timestamp nonce (it is not yet known to the validator, so there is no
+# server-issued nonce); the signature + this freshness window authenticate the registration.
+HOST_REGISTER_NONCE_WINDOW_SECONDS = 300
+
+
+async def register_host(
+    db: AsyncSession,
+    args: HostRegistrationArgs,
+    miner_hotkey: str,
+    nonce: str,
+    signature: str,
+) -> Dict[str, Any]:
+    """Model B: register (or refresh) a bare-metal L0 launcher host.
+
+    The host is NOT attested -- it is a launcher only. Trust is established by the owning miner's
+    signature over "{hotkey}:{nonce}:host_register" (with a recent unix-timestamp nonce) plus, in
+    production, metagraph membership. The validator records the host + its capacity so the CPU
+    scheduler can dispatch per-chute TD launches to it; every launched TD attests itself.
+    """
+    if not miner_hotkey or not signature:
+        raise ServerRegistrationError("Missing miner hotkey/signature for host registration")
+
+    # Freshness: the nonce is a client unix timestamp; reject stale/skewed values to bound replay.
+    try:
+        nonce_ts = int(str(nonce))
+    except (TypeError, ValueError):
+        raise ServerRegistrationError("Host registration nonce must be a unix timestamp")
+    skew = abs(int(time.time()) - nonce_ts)
+    if skew > HOST_REGISTER_NONCE_WINDOW_SECONDS:
+        raise ServerRegistrationError(
+            f"Host registration nonce is stale ({skew}s skew > {HOST_REGISTER_NONCE_WINDOW_SECONDS}s)"
+        )
+
+    # Metagraph membership (dev: auto-create the row; the signature is verified in both cases).
+    if settings.skip_metagraph_check:
+        if await db.get(MetagraphNode, (miner_hotkey, settings.netuid)) is None:
+            db.add(
+                MetagraphNode(
+                    hotkey=miner_hotkey, netuid=settings.netuid,
+                    checksum="dev", coldkey=miner_hotkey, node_id=0,
+                )
+            )
+            await db.commit()
+    else:
+        is_registered = (
+            await db.execute(
+                select(
+                    exists()
+                    .where(MetagraphNode.hotkey == miner_hotkey)
+                    .where(MetagraphNode.netuid == settings.netuid)
+                )
+            )
+        ).scalar()
+        if not is_registered:
+            raise ServerRegistrationError(
+                f"Miner hotkey {miner_hotkey} is not registered on netuid {settings.netuid}"
+            )
+
+    signing_message = f"{miner_hotkey}:{nonce}:{NoncePurpose.HOST_REGISTER.value}"
+    try:
+        if not Keypair(ss58_address=miner_hotkey).verify(signing_message, bytes.fromhex(signature)):
+            raise ServerRegistrationError("Invalid miner signature for host registration")
+    except ServerRegistrationError:
+        raise
+    except Exception as exc:
+        raise ServerRegistrationError(f"Invalid miner signature: {exc}")
+
+    # Upsert the host (idempotent across reboots by host_id; ownership pinned to the first miner).
+    host = await db.get(Host, args.host_id)
+    if host is not None and host.miner_hotkey != miner_hotkey:
+        raise ServerRegistrationError(
+            f"Host {args.host_id} is already registered to a different miner."
+        )
+    if host is None:
+        host = Host(host_id=args.host_id, netuid=args.netuid or settings.netuid)
+        db.add(host)
+    host.name = args.name or args.host_id
+    host.miner_hotkey = miner_hotkey
+    host.netuid = args.netuid or settings.netuid
+    host.tee_type = (args.tee_type or "tdx").strip().lower()
+    host.capacity = int(args.capacity)
+    host.default_mem = args.default_mem
+    host.default_vcpus = args.default_vcpus
+    host.external_host = args.external_host or None
+    await db.commit()
+    await db.refresh(host)
+
+    logger.success(
+        f"L0 host registered: host_id={host.host_id} miner={miner_hotkey} "
+        f"tee_type={host.tee_type} capacity={host.capacity}"
+    )
+    return {"host_id": host.host_id, "capacity": host.capacity, "status": "registered"}
 
 
 async def verify_server(

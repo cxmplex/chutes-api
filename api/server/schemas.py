@@ -208,8 +208,45 @@ class CpuServerRegistrationArgs(BaseModel):
 
     server_id: str = Field(..., description="Stable server identifier (e.g. VM instance id)")
     name: Optional[str] = Field(None, description="Server name (defaults to server_id)")
-    quote: str = Field(..., description="Base64-encoded runtime TDX quote (configfs-tsm)")
+    quote: str = Field(
+        ...,
+        description="Base64-encoded runtime attestation (configfs-tsm): an Intel TDX quote "
+        "(tee_type='tdx') or an AMD SEV-SNP report (tee_type='sev-snp').",
+    )
+    tee_type: str = Field(
+        "tdx", description="TEE provider for the quote: 'tdx' (default) or 'sev-snp'."
+    )
+    host_id: Optional[str] = Field(
+        None,
+        description="Model B: the L0 launcher host (hosts.host_id) that launched this per-chute TD; "
+        "absent for standalone single-VM self-registrations. Enables per-host capacity accounting.",
+    )
+    external_host: Optional[str] = Field(
+        None,
+        description="Model B: the public host that reaches this per-chute TD (the L0 host's public IP).",
+    )
+    external_ports: Optional[dict] = Field(
+        None,
+        description="Model B: the per-TD DNAT'd external ports (e.g. {'primary':31000,'logging':31001,"
+        "'attestation':31002}); the validator advertises public_host:<ext> instead of the in-TD :8000.",
+    )
+    snp_cert_chain: Optional[str] = Field(
+        None,
+        description="Base64 SEV-SNP extended-report aux data (GHCB cert table: VCEK->ASK->ARK). "
+        "Provided by the hypervisor on GCP; absent on bare-metal (validator fetches VCEK from KDS).",
+    )
+    vtpm_quote: Optional[Dict[str, Any]] = Field(
+        None,
+        description="GCE vTPM measured-boot quote for GCP SNP image identity: "
+        "{ak_cert, quote_msg, quote_sig (base64), pcrs {idx: hex}, intermediate (base64, optional)}. "
+        "Required when the matched SNP measurement config pins vtpm_pcrs (GCP); absent on bare-metal.",
+    )
     benchmark: Dict[str, Any] = Field(..., description="sek8s CPU benchmark result JSON")
+    endpoints: Optional[Dict[str, Any]] = Field(
+        None,
+        description="User-attestable reach info advertised by the in-TEE agent: "
+        "{host, attest_port, provision_port, ssh_port, wg_port}. Discovery convenience only.",
+    )
 
 
 class CpuServerRegistrationResponse(BaseModel):
@@ -219,6 +256,32 @@ class CpuServerRegistrationResponse(BaseModel):
     measurement_version: Optional[str] = None
     benchmark_score: float
     verified_at: str
+    status: str = "registered"
+
+
+class HostRegistrationArgs(BaseModel):
+    """Request body for Model-B L0 host registration (POST /hosts/register).
+
+    The node-agent registers its launcher host (hotkey-authed, NOT attested) so the validator can
+    dispatch per-chute TD launches to it. The signed message is "{hotkey}:{nonce}:host_register"
+    with a recent unix-timestamp nonce (the host is not yet known, so there is no server-issued nonce).
+    """
+
+    host_id: str = Field(..., description="Stable launcher host id (e.g. hostname / GCP instance id)")
+    name: Optional[str] = Field(None, description="Host name (defaults to host_id)")
+    capacity: int = Field(1, ge=1, description="Max concurrent per-chute TDs this host can run")
+    default_mem: Optional[str] = Field(None, description="Default per-TD memory size class, e.g. 8G")
+    default_vcpus: Optional[int] = Field(None, description="Default per-TD vCPU size class")
+    external_host: Optional[str] = Field(None, description="Public IP/host advertised for chute TDs")
+    tee_type: str = Field("tdx", description="TEE provider the host launches guests with: tdx|sev-snp")
+    netuid: Optional[int] = Field(None, description="Subnet netuid (defaults to the validator's)")
+
+
+class HostRegistrationResponse(BaseModel):
+    """Response for a successful L0 host registration."""
+
+    host_id: str
+    capacity: int
     status: str = "registered"
 
 
@@ -328,15 +391,25 @@ class MaintenancePolicyResponse(BaseModel):
 
 
 class TeeMeasurementResponse(BaseModel):
-    """Public response model for a single accepted TEE measurement configuration."""
+    """Public response model for a single accepted TEE measurement configuration.
+
+    Covers both providers: Intel TDX pins mrtd + boot/runtime RTMRs; AMD SEV-SNP (tee_type
+    'sev-snp') pins a single launch measurement + policy + min_tcb (mrtd/rtmrs are empty).
+    """
 
     version: str
     name: str
+    tee_type: str = "tdx"
     mrtd: str
     boot_rtmrs: Dict[str, str]
     runtime_rtmrs: Dict[str, str]
     expected_gpus: List[str]
     gpu_count: int
+    # AMD SEV-SNP fields (null for TDX configs).
+    measurement: Optional[str] = None
+    policy: Optional[int] = None
+    min_tcb: Optional[Dict[str, int]] = None
+    processor_model: Optional[str] = None
 
 
 class BootAttestation(Base):
@@ -409,6 +482,19 @@ class Server(Base):
     # Compute inventory: "gpu" (default) or "cpu" for GPU-less, CPU-only TEE servers.
     # For CPU servers, GPU Node rows are NOT created; capacity/benchmark live on the Server.
     compute_type = Column(String, nullable=False, default="gpu", server_default="gpu")
+    # TEE provider for this server's attestation: "tdx" (default) or "sev-snp" (AMD). Stamped at
+    # CPU self-registration; selects the verifier (dcap-qvl vs VCEK chain) for re-attestations.
+    tee_type = Column(String, nullable=False, default="tdx", server_default="tdx")
+    # Model B (per-chute): the L0 host (hosts.host_id) that launched this per-chute TD, NULL for
+    # standalone single-VM self-registrations. Lets the validator account per-host capacity + tear
+    # down a host's TDs. Set by the in-guest agent from the config-volume CHUTES_HOST_ID at register.
+    host_id = Column(String, nullable=True)
+    # Model B (per-chute): the public host + per-TD DNAT'd external ports (e.g. {"primary":31000,...})
+    # reported by the in-guest agent from the config volume. The scheduler deploys with these so the
+    # chute advertises the externally reachable public_host:<ext> rather than the in-TD :8000 (which
+    # also keeps multiple TDs on one host from colliding on the unique (host, port) instance index).
+    external_host = Column(String, nullable=True)
+    external_ports = Column(JSONB, nullable=True)
     cpu_cores = Column(Integer, nullable=True)
     ram_gb = Column(Integer, nullable=True)
     # Canonical CPU benchmark composite_score (used for pricing + scheduling); NULL for GPU.
@@ -428,6 +514,19 @@ class Server(Base):
     # True for 1-click CPU servers that self-registered via POST /servers/cpu/register
     # (the server attested + checked in itself), vs servers advertised by a miner control plane.
     self_registered = Column(Boolean, default=False, server_default="false")
+
+    # Attestation-bound TLS serving cert (PEM) for self-registered CPU TEE servers. The cert's
+    # public-key hash is bound into the registration TDX quote report_data (verify_quote), so it is
+    # the attested TLS identity of the TD. Pinned as the instance cacert so the validator<->chute
+    # user-data transport is TLS terminated inside the attested TD (host cannot MITM/read/tamper).
+    attested_cert = Column(Text, nullable=True)
+
+    # User-attestable instance reach info advertised by the in-TEE agent at registration:
+    # {"host": <public ip/host>, "attest_port", "provision_port", "ssh_port", "wg_port"}. The
+    # owner-authenticated GET /servers/cpu/{id}/connection returns this (plus a minted provision
+    # token + manifest) so `chutes ssh/connect <id>` can find + attest the instance with no flags.
+    # Pure discovery convenience -- trust still comes from the client-side attestation, not this.
+    tee_endpoints = Column(JSONB, nullable=True)
 
     @property
     def in_maintenance(self) -> bool:
@@ -457,6 +556,37 @@ class Server(Base):
             ["netuid", "miner_hotkey"], ["metagraph_nodes.netuid", "metagraph_nodes.hotkey"]
         ),
     )
+
+
+class Host(Base):
+    """Model B: a bare-metal L0 launcher host (the one-click-miner appliance / node-agent).
+
+    A host is NOT attested -- it is a launcher only, registered purely by miner-hotkey signature.
+    The validator records it so the CPU scheduler can dispatch per-chute TD launches to it over the
+    control channel; all workload trust comes from each launched TD's own attestation, never the
+    host. Per-host capacity is the number of concurrent per-chute TDs it can run; usage is the count
+    of self-registered CPU Servers stamped with this host_id.
+    """
+
+    __tablename__ = "hosts"
+
+    host_id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    miner_hotkey = Column(String, nullable=False)
+    netuid = Column(Integer, nullable=False, default=64, server_default="64")
+    # TEE provider this host launches per-chute guests with: "tdx" | "sev-snp".
+    tee_type = Column(String, nullable=False, default="tdx", server_default="tdx")
+    # Max concurrent per-chute TDs (slot pool size on the node-agent).
+    capacity = Column(Integer, nullable=False, default=1, server_default="1")
+    # Default per-TD size class (overridable per launch); must match a pinned per-size-class measurement.
+    default_mem = Column(String, nullable=True)
+    default_vcpus = Column(Integer, nullable=True)
+    # Public IP/host the host advertises for its chute TDs (DNAT'd per-slot ports).
+    external_host = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (Index("idx_hosts_miner", "miner_hotkey"),)
 
 
 class ServerAttestation(Base):

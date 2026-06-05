@@ -37,7 +37,15 @@ def load_launch_config_private_key():
 
 @dataclass
 class TeeMeasurementConfig:
-    """Configuration for allowed measurements for a TEE VM."""
+    """Configuration for allowed measurements for a TEE VM.
+
+    Two TEE providers are supported, discriminated by ``tee_type``:
+      - ``tdx`` (default): Intel TDX -- pins ``mrtd`` + ``boot_rtmrs``/``runtime_rtmrs`` (RTMR0-3).
+      - ``sev-snp``: AMD SEV-SNP -- pins a single launch ``measurement`` (48B/96 hex) plus the
+        guest ``policy`` (DEBUG must be off) and a minimum reported TCB (anti-rollback); there is
+        no MRTD/RTMR concept. ``processor_model`` selects the AMD KDS/ARK (Genoa/Milan/Turin) and
+        ``id_key_digest`` optionally pins an owner id-block. mrtd/rtmrs are left empty for SNP.
+    """
 
     version: str
     mrtd: str
@@ -49,6 +57,20 @@ class TeeMeasurementConfig:
     # Optional infrastructure provider hint ("gcp" | "bare-metal"). Used for CPU (gpu_count==0)
     # measurement configs; None for legacy GPU configs that don't specify it.
     provider: Optional[str] = None
+    # TEE provider discriminator: "tdx" (default) or "sev-snp".
+    tee_type: str = "tdx"
+    # --- AMD SEV-SNP fields (only set when tee_type == "sev-snp") ---
+    measurement: Optional[str] = None  # 96 hex (48B SHA-384 launch digest)
+    policy: Optional[int] = None  # guest policy bits (DEBUG bit must be off)
+    min_tcb: Optional[Dict[str, int]] = None  # {bootloader,tee,snp,microcode} minimums
+    id_key_digest: Optional[str] = None  # 96 hex; optional owner id-block pin
+    processor_model: Optional[str] = None  # Genoa | Milan | Turin (selects KDS/ARK)
+    # GCP-only image identity: pinned GCE vTPM PCR values {pcr_index(str): sha256 hex}. On GCP the
+    # SNP launch measurement is Google firmware only (no RTMR3 analog), so image identity (our
+    # dm-verity rootfs) is bound via the Google-managed vTPM measured boot -- PCR8 (grub cmdline w/
+    # verity.roothash) + PCR9 (kernel/initrd). When set, registration requires a verified vTPM quote
+    # whose PCRs equal these. Unset for bare-metal SNP (image identity is in the SNP measurement).
+    vtpm_pcrs: Optional[Dict[str, str]] = None
 
 
 class Settings(BaseSettings):
@@ -295,6 +317,11 @@ class Settings(BaseSettings):
     # Base domain.
     base_domain: Optional[str] = os.getenv("BASE_DOMAIN", "chutes.ai")
 
+    # Base URL a launched chute calls back to for verification (the launch-JWT "url" claim). Defaults
+    # to the public https://api.{base_domain}. A dev validator that a chute reaches over plain HTTP at
+    # a raw IP:port (no api.<domain> DNS) sets LAUNCH_CONFIG_BASE_URL to its own reachable base.
+    launch_config_base_url: Optional[str] = os.getenv("LAUNCH_CONFIG_BASE_URL")
+
     # Launch config JWT signing key.
     launch_config_key: str = hashlib.sha256(
         os.getenv("LAUNCH_CONFIG_KEY", "launch-secret").encode()
@@ -381,6 +408,75 @@ class Settings(BaseSettings):
                     )
                 return text
 
+            # gpu_count is optional: 0 (or absent) denotes a CPU-only (GPU-less) measurement
+            # config. For gpu_count == 0 the validator verifies measurements only and skips
+            # GPU evidence / GPU-count matching.
+            gpu_count = measurement_config.get("gpu_count") or 0
+            # Optional infrastructure provider hint ("gcp" | "bare-metal").
+            provider = measurement_config.get("provider")
+            if provider is not None:
+                provider = str(provider).strip().lower() or None
+            expected_gpus = [gpu.lower() for gpu in measurement_config.get("expected_gpus", [])]
+            tee_type = (str(measurement_config.get("tee_type") or "tdx")).strip().lower()
+
+            # --- AMD SEV-SNP: single launch measurement + policy + min-TCB; no MRTD/RTMRs ---
+            if tee_type in ("sev-snp", "snp", "amd-snp"):
+                measurement_hex = _require_hex96(measurement_config.get("measurement"), "measurement")
+                raw_policy = measurement_config.get("policy")
+                policy = None
+                if raw_policy is not None:
+                    # Accept either an int or a hex string like "0x30000".
+                    policy = int(str(raw_policy), 0) if isinstance(raw_policy, str) else int(raw_policy)
+                    if policy & (1 << 19):
+                        raise ValueError(
+                            f"SNP measurement config '{config_name}' sets the guest policy DEBUG "
+                            "bit (0x80000); a debuggable guest offers no confidentiality. Refusing."
+                        )
+                raw_min_tcb = measurement_config.get("min_tcb")
+                min_tcb = (
+                    {str(k).lower(): int(v) for k, v in dict(raw_min_tcb).items()}
+                    if raw_min_tcb
+                    else None
+                )
+                id_key_digest = measurement_config.get("id_key_digest")
+                if id_key_digest:
+                    id_key_digest = _require_hex96(id_key_digest, "id_key_digest")
+                processor_model = (str(measurement_config.get("processor_model") or "Genoa")).strip()
+                # GCP image identity: optional pinned GCE vTPM PCRs (sha256, 64 hex each).
+                raw_vtpm = measurement_config.get("vtpm_pcrs")
+                vtpm_pcrs = None
+                if raw_vtpm:
+                    vtpm_pcrs = {}
+                    for k, v in dict(raw_vtpm).items():
+                        val = str(v).upper().strip()
+                        if len(val) != 64 or any(c not in "0123456789ABCDEF" for c in val):
+                            raise ValueError(
+                                f"Invalid vtpm_pcrs[{k}] for SNP config '{config_name}': "
+                                f"expected 64 hex chars (sha256), got {len(val)}."
+                            )
+                        vtpm_pcrs[str(k)] = val
+                measurements.append(
+                    TeeMeasurementConfig(
+                        version=str(version).strip(),
+                        mrtd="",
+                        name=measurement_config["name"],
+                        boot_rtmrs={},
+                        runtime_rtmrs={},
+                        expected_gpus=expected_gpus,
+                        gpu_count=gpu_count,
+                        provider=provider,
+                        tee_type="sev-snp",
+                        measurement=measurement_hex,
+                        policy=policy,
+                        min_tcb=min_tcb,
+                        id_key_digest=id_key_digest or None,
+                        processor_model=processor_model,
+                        vtpm_pcrs=vtpm_pcrs,
+                    )
+                )
+                continue
+
+            # --- Intel TDX (default): MRTD + RTMR0-3 in both boot and runtime sets ---
             mrtd_upper = _require_hex96(measurement_config.get("mrtd"), "MRTD")
 
             # Every config MUST fully pin all four RTMRs in BOTH the boot and runtime
@@ -417,16 +513,6 @@ class Settings(BaseSettings):
                     "This is unexpected - RTMR0 should be the same (ACPI tables don't change)."
                 )
 
-            # gpu_count is optional: 0 (or absent) denotes a CPU-only (GPU-less) measurement
-            # config. For gpu_count == 0 the validator verifies MRTD + RTMRs only and skips
-            # GPU evidence / GPU-count matching.
-            gpu_count = measurement_config.get("gpu_count") or 0
-
-            # Optional infrastructure provider hint ("gcp" | "bare-metal").
-            provider = measurement_config.get("provider")
-            if provider is not None:
-                provider = str(provider).strip().lower() or None
-
             measurements.append(
                 TeeMeasurementConfig(
                     version=str(version).strip(),
@@ -434,9 +520,10 @@ class Settings(BaseSettings):
                     name=measurement_config["name"],
                     boot_rtmrs=boot_rtmrs,
                     runtime_rtmrs=runtime_rtmrs,
-                    expected_gpus=[gpu.lower() for gpu in measurement_config["expected_gpus"]],
+                    expected_gpus=expected_gpus,
                     gpu_count=gpu_count,
                     provider=provider,
+                    tee_type="tdx",
                 )
             )
 

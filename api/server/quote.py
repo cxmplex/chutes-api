@@ -62,6 +62,9 @@ class TdxQuote(ABC):
         Compares MRTD (case-insensitive) and the appropriate RTMR set for
         this quote's type ("boot" -> config.boot_rtmrs, "runtime" -> config.runtime_rtmrs).
         """
+        # Only match Intel TDX configs; SEV-SNP configs are matched by SnpReport.matches_measurement.
+        if getattr(config, "tee_type", "tdx") != "tdx":
+            return False
         if self.mrtd.upper() != config.mrtd.upper():
             return False
         expected = config.boot_rtmrs if self.quote_type == "boot" else config.runtime_rtmrs
@@ -268,3 +271,58 @@ class TdxVerificationResult:
             "parsed_at": self.parsed_at,
             "is_valid": self.is_valid,
         }
+
+
+# --- Provider-agnostic quote factory (Intel TDX vs AMD SEV-SNP) ----------------------------------
+# A tee_type discriminator selects the parser; both products expose the same surface the validator
+# uses (report_data, matches_measurement, quote_type, raw_bytes), so the verify/registration paths
+# stay provider-agnostic. SnpReport is imported lazily to keep import order simple.
+
+_SNP_TEE_TYPES = ("sev-snp", "snp", "amd-snp")
+
+
+def build_runtime_quote(
+    quote_base64: str,
+    tee_type: str = "tdx",
+    cert_chain_base64: Optional[str] = None,
+    vtpm_quote: Optional[Dict[str, Any]] = None,
+):
+    """Build the runtime attestation object for the given TEE provider.
+
+    Returns a RuntimeTdxQuote (Intel TDX, default) or an SnpReport (AMD SEV-SNP). For SNP, an
+    optional ``cert_chain_base64`` (the report's auxblob / GHCB cert table, as GCP provides) is
+    decoded onto the report so the verifier can use it instead of fetching the VCEK from AMD KDS, and
+    an optional ``vtpm_quote`` (GCE vTPM measured-boot evidence) carries GCP image identity.
+    """
+    if (tee_type or "tdx").strip().lower() in _SNP_TEE_TYPES:
+        from api.server.snp_quote import SnpReport
+
+        report = SnpReport.from_base64(quote_base64)
+        if cert_chain_base64:
+            report.cert_chain = base64.b64decode(cert_chain_base64)
+        if vtpm_quote:
+            report.vtpm_quote = vtpm_quote
+        return report
+    return RuntimeTdxQuote.from_base64(quote_base64)
+
+
+def quote_from_evidence(evidence: Dict[str, Any]):
+    """Build the runtime quote from an attestation-evidence dict.
+
+    The guest advertises ``tee_type`` and supplies its report under a provider-specific key:
+    ``tdx_quote`` (Intel) or ``snp_report`` (AMD). For SNP, ``snp_cert_chain`` (base64 auxblob)
+    optionally carries the inline VCEK chain. Defaults to TDX for backward compatibility.
+    """
+    tee_type = (evidence.get("tee_type") or "tdx").strip().lower()
+    if tee_type in _SNP_TEE_TYPES:
+        from api.server.snp_quote import SnpReport
+
+        report_b64 = evidence.get("snp_report") or evidence.get("tdx_quote")
+        report = SnpReport.from_base64(report_b64)
+        cert_chain_b64 = evidence.get("snp_cert_chain")
+        if cert_chain_b64:
+            report.cert_chain = base64.b64decode(cert_chain_b64)
+        if evidence.get("vtpm_quote"):
+            report.vtpm_quote = evidence["vtpm_quote"]
+        return report
+    return RuntimeTdxQuote.from_base64(evidence["tdx_quote"])

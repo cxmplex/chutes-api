@@ -29,11 +29,19 @@ from api.database import get_session
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2
 from api.metagraph import MetagraphNode
-from api.server.schemas import Server
+from api.server.schemas import Host, Server
 from api.util import semcomp
 
 SCHEDULER_INTERVAL_SECONDS = 15
 DEFAULT_CPU_DISK_GB = 10
+# Model B: how long to consider a per-chute TD launch "in flight" (boot + self-register window),
+# so the scheduler does not re-launch the same chute on another host while its TD comes up.
+MB_LAUNCH_INFLIGHT_TTL = 300
+# Model B: a per-chute TD is a full confidential VM -- the guest OS (systemd, docker/podman, the
+# attestation service + agent) needs headroom ON TOP of the chute's own RAM request, or the chute
+# container is OOM-killed inside the TD. Size the TD = chute RAM + this overhead (mirrors Model-A
+# single-VM servers, which run ~8G for a 4G chute).
+MB_TD_MEM_OVERHEAD_GB = 4
 
 
 def _chute_image_ref(chute: Chute) -> str:
@@ -134,12 +142,71 @@ async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
             "validator": settings.validator_ss58,
             "tee": chute.tee,
             "ports": ports,
+            # Model B: when the TD is reached via the L0 host's DNAT, advertise the externally
+            # reachable ports (the container still publishes + the chute still binds the internal
+            # ports above). None for standalone single-VM servers (external == internal).
+            "external_ports": server.external_ports,
             "disk_gb": DEFAULT_CPU_DISK_GB,
         },
     )
     logger.success(
         f"Dispatched deploy of chute {chute.chute_id} (config {config_id}) to server {server.server_id}"
     )
+
+
+async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -> bool:
+    """Model B: ask an online L0 host with free capacity to launch a per-chute TD for ``chute``.
+
+    The host's node-agent launches a fresh confidential VM; that TD self-registers as a CPU server
+    (stamped with the host_id) and a subsequent scheduler tick places the chute on it via the normal
+    deploy path. Returns True if a launch was dispatched. Per-chute in-flight is tracked in redis so
+    we launch exactly one TD per unmet demand while it boots; per-host capacity = host.capacity minus
+    the self-registered TDs already stamped with that host_id minus its in-flight launches.
+    """
+    inflight_key = f"mb:launch:{chute.chute_id}"
+    if await settings.redis_client.exists(inflight_key):
+        return False  # a TD for this chute is already booting/registering
+
+    hosts = (
+        (await session.execute(select(Host))).scalars().all()
+    )
+    if not hosts:
+        return False
+
+    # Self-registered TDs already attributed to each host (durable per-host usage).
+    used_rows = (
+        await session.execute(
+            select(Server.host_id, func.count(Server.server_id))
+            .where(Server.host_id.isnot(None), Server.self_registered.is_(True))
+            .group_by(Server.host_id)
+        )
+    ).all()
+    used_by_host = {hid: cnt for hid, cnt in used_rows}
+
+    for host in hosts:
+        host_inflight = int(await settings.redis_client.get(f"mb:host_inflight:{host.host_id}") or 0)
+        available = (host.capacity or 0) - used_by_host.get(host.host_id, 0) - host_inflight
+        if available <= 0:
+            continue
+        if not await is_agent_online(host.host_id):
+            continue
+        mem = f"{req_ram + MB_TD_MEM_OVERHEAD_GB}G" if req_ram else (host.default_mem or "8G")
+        vcpus = req_cores or host.default_vcpus or 4
+        await send_agent_command(
+            host.host_id,
+            "deploy_chute",
+            {"chute_id": chute.chute_id, "mem": mem, "vcpus": vcpus},
+        )
+        # Mark the chute launch + bump the host's in-flight count for the boot window.
+        await settings.redis_client.set(inflight_key, host.host_id, ex=MB_LAUNCH_INFLIGHT_TTL)
+        await settings.redis_client.incr(f"mb:host_inflight:{host.host_id}")
+        await settings.redis_client.expire(f"mb:host_inflight:{host.host_id}", MB_LAUNCH_INFLIGHT_TTL)
+        logger.success(
+            f"Model B: dispatched per-chute TD launch for {chute.chute_id} to host {host.host_id} "
+            f"({mem}/{vcpus}vcpu; host avail was {available})"
+        )
+        return True
+    return False
 
 
 async def schedule_once() -> None:
@@ -172,8 +239,7 @@ async def schedule_once() -> None:
             .scalars()
             .all()
         )
-        if not servers:
-            return
+        # Note: do NOT bail on empty servers -- Model B can still launch per-chute TDs on L0 hosts.
 
         # A server is unavailable if it already runs an instance or has a deploy in flight
         # (an unverified, unfailed launch config). Single-tenant per CPU server.
@@ -218,6 +284,7 @@ async def schedule_once() -> None:
             if current >= await _target_count(chute.chute_id):
                 continue
 
+            placed = False
             for server in servers:
                 if server.server_id in occupied:
                     continue
@@ -229,7 +296,13 @@ async def schedule_once() -> None:
                     continue
                 await _dispatch_deploy(session, chute, server)
                 occupied.add(server.server_id)
+                placed = True
                 break
+
+            # Model B: no free attested CPU server for this chute -> ask an L0 host to launch a fresh
+            # per-chute TD. It self-registers (stamped with host_id) and a later tick places the chute.
+            if not placed:
+                await _launch_on_host(session, chute, req_cores, req_ram)
 
 
 async def main() -> None:
