@@ -1171,21 +1171,39 @@ async def get_server_for_gpus(db, gpu_uuids: list[str]) -> Server | None:
     return servers[0] if servers else None
 
 
-async def get_cpu_server_for_host(db, host: str, miner_hotkey: str) -> Server | None:
-    """Resolve the single CPU (GPU-less) TEE server for an instance by host IP + miner_hotkey.
+async def get_cpu_server_for_host(
+    db, host: str, miner_hotkey: str, server_id: str | None = None
+) -> Server | None:
+    """Resolve the CPU (GPU-less) TEE server for an instance.
 
-    CPU servers have no GPU Node rows, so the instance<->server linkage is by
-    (Server.ip == host AND Server.miner_hotkey == miner_hotkey). TEE servers are registered
-    with globally unique IPs, so this resolves to at most one server (same linkage used by
-    verify_tee_chute).
+    Model B: several per-chute TDs run on ONE L0 host and share that host's public IP, so
+    (ip, miner_hotkey) is no longer unique. When the launch config pins the exact ``server_id`` (the
+    scheduler stamps it at placement), resolve by that, scoped to the owning miner -- this is the
+    authoritative linkage for a co-tenant TD. Otherwise fall back to (Server.ip == host AND
+    Server.miner_hotkey == miner_hotkey) for single-tenant servers.
 
-    Returns None if no server is found. Raises HTTPException if multiple servers share the IP.
+    Returns None if no server is found. Raises HTTPException only if, with no pinned server_id,
+    multiple servers share the IP.
     """
+    if server_id:
+        server = (
+            await db.execute(
+                select(Server).where(
+                    Server.server_id == server_id,
+                    Server.miner_hotkey == miner_hotkey,
+                )
+            )
+        ).scalar_one_or_none()
+        if server is not None:
+            return server
     query = select(Server).where(Server.ip == host, Server.miner_hotkey == miner_hotkey)
     try:
         return (await db.execute(query)).scalar_one_or_none()
     except MultipleResultsFound:
-        logger.error(f"Multiple TEE servers share IP {host} for miner {miner_hotkey}")
+        logger.error(
+            f"Multiple TEE servers share IP {host} for miner {miner_hotkey} and the launch config "
+            f"pinned no server_id to disambiguate"
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(

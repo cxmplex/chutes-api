@@ -1499,6 +1499,10 @@ async def _validate_launch_config_instance(
         chutes_version=chute.chutes_version,
         symmetric_key=secrets.token_bytes(16).hex(),
         config_id=launch_config.config_id,
+        # Model B: stamp the exact server. Co-tenant TDs on one L0 host share its public IP, so the
+        # later instance<->server resolution (verify_tee_chute) must key off server_id, not host IP,
+        # or it 409s on the shared IP. NULL for the legacy miner-run path (resolved by IP/GPUs).
+        server_id=launch_config.server_id,
         port_mappings=[item.model_dump() for item in args.port_mappings],
         compute_multiplier=node_selector.compute_multiplier,
         billed_to=None,
@@ -1821,7 +1825,9 @@ async def _validate_tee_launch_config_instance(
     # CPU (GPU-less) chutes have no GPU nodes, so the server is resolved by host + miner_hotkey.
     is_cpu = str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
     if is_cpu:
-        server = await get_cpu_server_for_host(db, args.host, launch_config.miner_hotkey)
+        server = await get_cpu_server_for_host(
+            db, args.host, launch_config.miner_hotkey, server_id=launch_config.server_id
+        )
     else:
         server = await get_server_for_gpus(db, [g["uuid"] for g in args.gpus])
     if server and server.in_maintenance:
@@ -2660,11 +2666,18 @@ async def _validate_legacy_filesystem(
 async def _verify_job_ports(db: AsyncSession, instance: Instance):
     job = instance.job
     if job:
+        # Model B / TEE job chutes expose their declared (non-default) ports ONLY over the attested
+        # owner-connect wireguard tunnel, never a host DNAT -- the validator has no direct path to
+        # probe them (a directly-exposed port could only be MITM'd by the untrusted host). The TEE
+        # attestation already binds the measured image + launch config that runs the job, so the
+        # symmetric-key port handshake is redundant here; the owner confirms reachability on
+        # `chutes connect`. Legacy (non-server_id) pod instances keep the direct probe.
+        probe_ports = instance.server_id is None
         # Test the ports are open.
         for port_map in instance.port_mappings:
             if port_map["internal_port"] in (8000, 8001):
                 continue
-            if not await verify_port_map(instance, port_map):
+            if probe_ports and not await verify_port_map(instance, port_map):
                 reason = f"Failed port verification on {port_map=} for {instance.instance_id=} {instance.miner_hotkey=}"
                 logger.error(reason)
                 await db.execute(

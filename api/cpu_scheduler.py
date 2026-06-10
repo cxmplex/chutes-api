@@ -28,6 +28,7 @@ from api.config import settings
 from api.database import get_session
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2
+from api.job.schemas import Job
 from api.metagraph import MetagraphNode
 from api.server.schemas import Host, Server
 from api.util import semcomp
@@ -59,7 +60,27 @@ async def _target_count(chute_id: str) -> int:
     return max(target, 1)
 
 
-async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
+def _job_ports(chute: Chute, method: str) -> list[dict]:
+    """Ports a job declares (`@chute.job(ports=[...])`), as {port, proto}. The agent publishes each on
+    the TD AND advertises it to the chute harness (CHUTES_PORT_<PROTO>_<port>) so the harness reports
+    it in its activation port_mappings -- the validator checks those against the job's declared ports."""
+    for job_def in chute.jobs or []:
+        if job_def.get("name") == method:
+            return [
+                {"port": int(p["port"]), "proto": str(p.get("proto") or "tcp")}
+                for p in (job_def.get("ports") or [])
+                if p.get("port")
+            ]
+    return []
+
+
+async def _dispatch_deploy(session, chute: Chute, server: Server, job: "Job" = None) -> None:
+    """Place a chute (job=None) or a one-off job (job set) onto an attested CPU server.
+
+    Jobs ride the SAME launch-config flow as cords via ``LaunchConfig.job_id``: the in-guest harness
+    runs the job (not the cord server) because the activation response carries the job's
+    method/data, and we forward the job's declared ports so the agent publishes them for owner-connect.
+    """
     miner = (
         await session.execute(
             select(MetagraphNode).where(
@@ -82,6 +103,7 @@ async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
         config_id=config_id,
         env_key=secrets.token_bytes(16).hex(),
         chute_id=chute.chute_id,
+        job_id=job.job_id if job else None,
         miner_hotkey=server.miner_hotkey,
         miner_uid=miner.node_id,
         miner_coldkey=miner.coldkey,
@@ -94,6 +116,11 @@ async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
     await session.commit()
     await session.refresh(launch_config)
 
+    disk_gb = (
+        int((job.job_args or {}).get("_disk_gb") or DEFAULT_CPU_DISK_GB)
+        if job
+        else DEFAULT_CPU_DISK_GB
+    )
     token = create_launch_jwt_v2(
         launch_config,
         egress=chute.allow_external_egress,
@@ -102,7 +129,7 @@ async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
             if chute.standard_template
             else (chute.lock_modules if chute.lock_modules is not None else False)
         ),
-        disk_gb=DEFAULT_CPU_DISK_GB,
+        disk_gb=disk_gb,
     )
 
     ports = {"primary": 8000, "logging": 8001}
@@ -146,11 +173,15 @@ async def _dispatch_deploy(session, chute: Chute, server: Server) -> None:
             # reachable ports (the container still publishes + the chute still binds the internal
             # ports above). None for standalone single-VM servers (external == internal).
             "external_ports": server.external_ports,
-            "disk_gb": DEFAULT_CPU_DISK_GB,
+            "disk_gb": disk_gb,
+            # CPU jobs only: container ports the agent must publish on the TD so the owner can reach
+            # the job's services (e.g. JupyterLab :8888) over owner-connect. Empty for cord chutes.
+            "job_ports": _job_ports(chute, job.method) if job else [],
         },
     )
     logger.success(
-        f"Dispatched deploy of chute {chute.chute_id} (config {config_id}) to server {server.server_id}"
+        f"Dispatched {'job ' + job.job_id if job else 'chute ' + chute.chute_id} "
+        f"(config {config_id}) to server {server.server_id}"
     )
 
 
@@ -269,6 +300,10 @@ async def schedule_once() -> None:
         for chute in cpu_chutes:
             if chute.disabled:
                 continue
+            # Job-only chutes (no cords) are NOT kept as always-on cord instances; they are launched
+            # on demand by the job pass below (one per-job TD when a user creates a job).
+            if not chute.cords:
+                continue
             ns = chute.node_selector or {}
             min_score = ns.get("min_benchmark_score") or 0
             req_cores = ns.get("cpu_cores") or 1
@@ -281,7 +316,20 @@ async def schedule_once() -> None:
                     )
                 )
             ).scalar() or 0
-            if current >= await _target_count(chute.chute_id):
+            # Count in-flight launch configs (placed on a TD but not yet verified/activated) toward
+            # target too -- otherwise, while a TD is still pulling+booting the chute, the chute looks
+            # under-target and we re-place/re-launch it, producing a duplicate TD (same server_id) whose
+            # agent then fights the first one (flapping) and the chute never activates.
+            pending = (
+                await session.execute(
+                    select(func.count(LaunchConfig.config_id)).where(
+                        LaunchConfig.chute_id == chute.chute_id,
+                        LaunchConfig.verified_at.is_(None),
+                        LaunchConfig.failed_at.is_(None),
+                    )
+                )
+            ).scalar() or 0
+            if current + pending >= await _target_count(chute.chute_id):
                 continue
 
             placed = False
@@ -290,7 +338,11 @@ async def schedule_once() -> None:
                     continue
                 if (server.benchmark_score or 0) < min_score:
                     continue
-                if (server.cpu_cores or 0) < req_cores or (server.ram_gb or 0) < req_ram:
+                # Model B runs one chute per right-sized per-chute TD: require an EXACT vCPU match (a
+                # TD is launched with vcpus == the chute's req cores) so a small chute cannot grab a
+                # larger chute's TD (e.g. nginx 1-vCPU stealing jupyter's 4-vCPU TD), which both wastes
+                # the big TD and starves the big chute/job.
+                if (server.cpu_cores or 0) != req_cores or (server.ram_gb or 0) < req_ram:
                     continue
                 if not await is_agent_online(server.server_id):
                     continue
@@ -301,6 +353,58 @@ async def schedule_once() -> None:
 
             # Model B: no free attested CPU server for this chute -> ask an L0 host to launch a fresh
             # per-chute TD. It self-registers (stamped with host_id) and a later tick places the chute.
+            if not placed:
+                await _launch_on_host(session, chute, req_cores, req_ram)
+
+        # --- CPU jobs: validator-scheduled (WE place them onto hosts; miners do NOT choose, unlike
+        # the GPU job_created/miner_broadcast path). A job is a one-off workload that runs in its own
+        # per-job TD. Place each pending job (unclaimed, no instance, no launch config yet) onto a free
+        # attested server; else launch a fresh TD for it and a later tick places it. Shares the cord
+        # pass's `occupied` set so a given TD runs exactly one workload.
+        chute_map = {c.chute_id: c for c in cpu_chutes}
+        pending_jobs = (
+            (
+                await session.execute(
+                    select(Job)
+                    .outerjoin(LaunchConfig, LaunchConfig.job_id == Job.job_id)
+                    .where(
+                        Job.chute_id.in_(list(chute_map.keys())),
+                        Job.miner_hotkey.is_(None),
+                        Job.instance_id.is_(None),
+                        Job.finished_at.is_(None),
+                        LaunchConfig.config_id.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for job in pending_jobs:
+            chute = chute_map.get(job.chute_id)
+            if chute is None or chute.disabled:
+                continue
+            ns = chute.node_selector or {}
+            min_score = ns.get("min_benchmark_score") or 0
+            req_cores = ns.get("cpu_cores") or 1
+            req_ram = ns.get("ram_gb") or 1
+            placed = False
+            for server in servers:
+                if server.server_id in occupied:
+                    continue
+                if (server.benchmark_score or 0) < min_score:
+                    continue
+                # Model B runs one chute per right-sized per-chute TD: require an EXACT vCPU match (a
+                # TD is launched with vcpus == the chute's req cores) so a small chute cannot grab a
+                # larger chute's TD (e.g. nginx 1-vCPU stealing jupyter's 4-vCPU TD), which both wastes
+                # the big TD and starves the big chute/job.
+                if (server.cpu_cores or 0) != req_cores or (server.ram_gb or 0) < req_ram:
+                    continue
+                if not await is_agent_online(server.server_id):
+                    continue
+                await _dispatch_deploy(session, chute, server, job=job)
+                occupied.add(server.server_id)
+                placed = True
+                break
             if not placed:
                 await _launch_on_host(session, chute, req_cores, req_ram)
 

@@ -122,6 +122,9 @@ async def list_hosts(
                 "capacity": h.capacity,
                 "used": len(used),
                 "external_host": h.external_host,
+                "cpu_cores": h.cpu_cores,
+                "ram_gb": h.ram_gb,
+                "specs": h.specs,
             }
         )
     return out

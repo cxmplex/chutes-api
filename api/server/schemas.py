@@ -269,12 +269,16 @@ class HostRegistrationArgs(BaseModel):
 
     host_id: str = Field(..., description="Stable launcher host id (e.g. hostname / GCP instance id)")
     name: Optional[str] = Field(None, description="Host name (defaults to host_id)")
-    capacity: int = Field(1, ge=1, description="Max concurrent per-chute TDs this host can run")
+    capacity: int = Field(1, ge=1, description="Max concurrent per-chute TDs (auto-discovered by agent)")
     default_mem: Optional[str] = Field(None, description="Default per-TD memory size class, e.g. 8G")
     default_vcpus: Optional[int] = Field(None, description="Default per-TD vCPU size class")
     external_host: Optional[str] = Field(None, description="Public IP/host advertised for chute TDs")
     tee_type: str = Field("tdx", description="TEE provider the host launches guests with: tdx|sev-snp")
     netuid: Optional[int] = Field(None, description="Subnet netuid (defaults to the validator's)")
+    specs: Optional[dict] = Field(
+        None,
+        description="Host hardware inventory reported by the agent: cpu/memory/baseboard/system/bios",
+    )
 
 
 class HostRegistrationResponse(BaseModel):
@@ -583,6 +587,12 @@ class Host(Base):
     default_vcpus = Column(Integer, nullable=True)
     # Public IP/host the host advertises for its chute TDs (DNAT'd per-slot ports).
     external_host = Column(String, nullable=True)
+    # Auto-discovered hardware inventory reported by the node-agent (NOT attested -- informational).
+    # cpu_cores/ram_gb are denormalized for querying; full detail (cpu/memory/baseboard/system/bios)
+    # lives in the specs JSONB.
+    cpu_cores = Column(Integer, nullable=True)
+    ram_gb = Column(Integer, nullable=True)
+    specs = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

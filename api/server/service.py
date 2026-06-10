@@ -653,14 +653,27 @@ async def register_cpu_server(
         raise ServerRegistrationError(
             f"Server {args.server_id} is already registered to a different miner."
         )
-    ip_owner = (
-        await db.execute(
-            select(Server).where(Server.ip == server_ip, Server.server_id != args.server_id)
+    # Model B: several per-chute TDs run on ONE L0 host and self-register from that host's single
+    # public IP -- they are distinguished by their DNAT'd external_ports, not by IP. A co-tenant
+    # already registered under the SAME host_id is therefore expected and allowed; only a genuine
+    # cross-host IP collision (a server with no/different host_id claiming this IP) is rejected.
+    host_id = getattr(args, "host_id", None) or None
+    ip_owners = (
+        (
+            await db.execute(
+                select(Server).where(Server.ip == server_ip, Server.server_id != args.server_id)
+            )
         )
-    ).scalar_one_or_none()
-    if ip_owner is not None:
+        .scalars()
+        .all()
+    )
+    conflict = next(
+        (owner for owner in ip_owners if not (host_id and owner.host_id == host_id)),
+        None,
+    )
+    if conflict is not None:
         raise ServerRegistrationError(
-            f"IP {server_ip} is already registered to server {ip_owner.server_id}."
+            f"IP {server_ip} is already registered to server {conflict.server_id}."
         )
 
     if server is None:
@@ -674,7 +687,7 @@ async def register_cpu_server(
     server.compute_type = "cpu"
     server.tee_type = tee_type
     # Model B: stamp the launching L0 host (per-host capacity accounting + teardown), if provided.
-    server.host_id = getattr(args, "host_id", None) or None
+    server.host_id = host_id
     # Model B: record the per-TD public host + DNAT external ports so the scheduler advertises the
     # externally reachable endpoint (public_host:<ext>) when it deploys a chute onto this TD.
     server.external_host = getattr(args, "external_host", None) or None
@@ -817,12 +830,19 @@ async def register_host(
     host.default_mem = args.default_mem
     host.default_vcpus = args.default_vcpus
     host.external_host = args.external_host or None
+    # Hardware inventory (informational; the host is not attested). Denormalize cores/ram for queries.
+    specs = args.specs or {}
+    host.specs = specs or None
+    cpu = specs.get("cpu") or {}
+    mem = specs.get("memory") or {}
+    host.cpu_cores = cpu.get("physical_cores") or cpu.get("logical_cpus")
+    host.ram_gb = mem.get("total_gb")
     await db.commit()
     await db.refresh(host)
 
     logger.success(
-        f"L0 host registered: host_id={host.host_id} miner={miner_hotkey} "
-        f"tee_type={host.tee_type} capacity={host.capacity}"
+        f"L0 host registered: host_id={host.host_id} miner={miner_hotkey} tee_type={host.tee_type} "
+        f"capacity={host.capacity} cpu_cores={host.cpu_cores} ram_gb={host.ram_gb}"
     )
     return {"host_id": host.host_id, "capacity": host.capacity, "status": "registered"}
 
