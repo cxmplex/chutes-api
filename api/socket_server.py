@@ -4,7 +4,6 @@ Socket.IO poowered websocket server for continuous bi-directional vali/miner com
 
 import asyncio
 import socketio
-import orjson
 import api.constants as cst
 from typing import Dict
 from loguru import logger
@@ -17,9 +16,12 @@ from api.server.schemas import Host, Server
 from api.user.router import get_current_user
 from api.socket_shared import SyntheticRequest
 from api.redis_pubsub import RedisListener, AgentCommandListener
-from api.agent_channel import mark_agent_online, mark_agent_offline
-
-SERVER_ID_HEADER = "X-Chutes-Server-Id"
+from api.agent_channel import (
+    handle_agent_command_ack,
+    handle_agent_status,
+    mark_agent_online,
+    mark_agent_offline,
+)
 
 sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 fastapi_app = FastAPI()
@@ -38,7 +40,7 @@ async def initialize_socket_app():
     """
     fastapi_app.state.redis_listener = RedisListener(sio, "miner_broadcast")
     asyncio.create_task(fastapi_app.state.redis_listener.start())
-    fastapi_app.state.agent_listener = AgentCommandListener(sio, "agent_commands")
+    fastapi_app.state.agent_listener = AgentCommandListener(sio, cst.AGENT_COMMAND_CHANNEL)
     asyncio.create_task(fastapi_app.state.agent_listener.start())
 
 
@@ -143,7 +145,7 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
             nonce=headers.get(cst.NONCE_HEADER),
         )
         hotkey = headers.get(cst.HOTKEY_HEADER)
-        server_id = headers.get(SERVER_ID_HEADER)
+        server_id = headers.get(cst.SERVER_ID_HEADER)
         if not server_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Missing server id header"
@@ -201,8 +203,8 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
 async def agent_status(session_id: str, data) -> None:
     """
     Heartbeat / status update from a connected agent. Refreshes the liveness marker so the
-    scheduler keeps treating the server as online; capacity/instance status rides along for
-    later phases.
+    scheduler keeps treating the server as online, then reconciles validator state against the
+    heartbeat's running-workload inventory (containers for Model A, TD slots for Model B).
     """
     meta = sio.agent_meta.get(session_id)
     if meta is None:
@@ -211,22 +213,22 @@ async def agent_status(session_id: str, data) -> None:
         return
     await mark_agent_online(meta["server_id"])
     logger.debug(f"agent_status server_id={meta['server_id']}: {data}")
+    await handle_agent_status(meta["server_id"], data)
 
 
 @sio.event
 async def agent_command_ack(session_id: str, data) -> None:
     """
-    Acknowledgement from an agent that it received/processed a pushed command. Republished onto
-    the local 'agent_acks' redis channel so the scheduler can correlate by command_id.
+    Acknowledgement from an agent that it received/processed a pushed command. A terminally
+    failed deploy ack marks its launch config failed (by command_id correlation) so the
+    scheduler immediately frees the chute's pending slot + the server's occupancy.
     """
     meta = sio.agent_meta.get(session_id)
     if meta is None:
         logger.warning(f"agent_command_ack from unauthenticated session {session_id}")
         await sio.disconnect(session_id)
         return
-    payload = {"server_id": meta["server_id"], **(data if isinstance(data, dict) else {"data": data})}
     logger.info(f"agent_command_ack server_id={meta['server_id']}: {data}")
-    try:
-        await settings.redis_client.publish("agent_acks", orjson.dumps(payload))
-    except Exception as exc:
-        logger.error(f"Failed to publish agent ack: {exc}")
+    await handle_agent_command_ack(
+        meta["server_id"], data if isinstance(data, dict) else {"data": data}
+    )

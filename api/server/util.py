@@ -189,16 +189,40 @@ def cert_to_base64_der(cert: Certificate) -> str:
     return cert_base64
 
 
-def _get_client_certificate(request: Request) -> bytes:
+# The verification result the mTLS-terminating proxy must report (nginx $ssl_client_verify) for the
+# X-Client-Cert header to be trusted. A direct caller cannot produce this by setting a header,
+# provided the proxy overwrites any client-supplied X-Client-* and the backend is not directly
+# reachable -- so the cert in the header is the one the proxy actually verified PoP for in the
+# TLS handshake, not a forged one.
+CLIENT_CERT_VERIFY_SUCCESS = "SUCCESS"
+
+
+def _get_client_certificate(request: Request) -> Certificate:
+    """Extract the client certificate the mTLS-terminating proxy verified for this request.
+
+    The proxy performs the TLS client-auth handshake (proving the peer holds the cert's private
+    key), then forwards the verified peer cert as X-Client-Cert (URL-encoded PEM) and its result as
+    X-Client-Verify. We only trust X-Client-Cert when X-Client-Verify == "SUCCESS" (unless
+    REQUIRE_MTLS_CLIENT_VERIFY is disabled for a direct, plaintext dev validator with no mTLS
+    terminator), so a direct caller cannot forge the header without completing mTLS at the verifying
+    proxy. The proxy MUST overwrite any client-supplied X-Client-* headers and the backend MUST NOT
+    be directly reachable.
     """
-    Extract client certificate from Uvicorn request.
-    Simplified for FastAPI-to-FastAPI communication.
-    """
+    if settings.require_mtls_client_verify:
+        verify = (request.headers.get("X-Client-Verify") or "").strip().upper()
+        if verify != CLIENT_CERT_VERIFY_SUCCESS:
+            raise NoClientCertError(
+                detail=(
+                    "Client certificate was not verified by the mTLS terminator "
+                    f"(X-Client-Verify={verify or 'missing'}); refusing to trust X-Client-Cert."
+                )
+            )
+
     cert_header = request.headers.get("X-Client-Cert")
     if not cert_header:
         raise NoClientCertError(detail="No client certificate provided")
 
-    # Decode the URL-encoded PEM cert from nginx
+    # Decode the URL-encoded PEM cert from the verifying mTLS terminator.
     cert_pem = unquote(cert_header).encode()
 
     # Parse the certificate

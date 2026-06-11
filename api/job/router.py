@@ -183,25 +183,28 @@ async def create_job(
     await db.commit()
     await db.refresh(job)
 
-    # Notify the miners.
-    await settings.redis_client.publish(
-        "miner_broadcast",
-        json.dumps(
-            {
-                "reason": "job_created",
-                "data": {
-                    "job_id": job.job_id,
-                    "method": method,
-                    "chute_id": chute_id,
-                    "image_id": chute.image.image_id,
-                    "gpu_count": node_selector.gpu_count,
-                    "compute_multiplier": compute_multiplier,
-                    "exclude": [],
-                    "disk_gb": disk_gb,
-                },
-            }
-        ).decode(),
-    )
+    # Notify the miners. CPU jobs are validator-scheduled (the cpu_scheduler places them onto
+    # attested TEE servers itself; miners do not choose) -- broadcasting them would only invite
+    # GPU miners to mint launch configs they can never legitimately claim.
+    if node_selector.compute_type != "cpu":
+        await settings.redis_client.publish(
+            "miner_broadcast",
+            json.dumps(
+                {
+                    "reason": "job_created",
+                    "data": {
+                        "job_id": job.job_id,
+                        "method": method,
+                        "chute_id": chute_id,
+                        "image_id": chute.image.image_id,
+                        "gpu_count": node_selector.gpu_count,
+                        "compute_multiplier": compute_multiplier,
+                        "exclude": [],
+                        "disk_gb": disk_gb,
+                    },
+                }
+            ).decode(),
+        )
 
     return job
 

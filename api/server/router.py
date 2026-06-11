@@ -488,10 +488,12 @@ async def create_server(
                 detail="Invalid verification host provided.",
             )
 
-        # TEE servers require globally unique IPs (across TEE and non-TEE)
+        # TEE servers require globally unique IPs (across TEE and non-TEE). Model-B co-tenant
+        # TD servers legitimately share their L0 host's IP, so multiple rows may match; any
+        # match at all rejects this registration (first() avoids MultipleResultsFound).
         existing_server = (
-            await db.execute(select(Server).where(Server.ip == args.host))
-        ).scalar_one_or_none()
+            (await db.execute(select(Server).where(Server.ip == args.host))).scalars().first()
+        )
         if existing_server:
             logger.error(
                 f"TEE server registration rejected: IP {args.host} already registered to server_id={existing_server.server_id} name={existing_server.name} miner_hotkey={existing_server.miner_hotkey}; requesting miner_hotkey={hotkey}"

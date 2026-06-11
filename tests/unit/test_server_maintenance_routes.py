@@ -106,7 +106,7 @@ async def test_policy_returns_null_when_no_window(mock_get_window):
     result = await get_maintenance_policy(db=db, hotkey=TEST_HOTKEY, _=None)
     assert result.active_window is None
     assert result.current_slots == 0
-    assert result.pending_servers == []
+    assert result.servers == []
 
 
 @pytest.mark.asyncio
@@ -133,10 +133,11 @@ async def test_policy_includes_pending_servers(mock_get_window, _mock_slots):
 
     result = await get_maintenance_policy(db=db, hotkey=TEST_HOTKEY, _=None)
     assert result.current_slots == 1
-    assert len(result.pending_servers) == 1
-    assert result.pending_servers[0].server_id == TEST_SERVER_ID
-    assert result.pending_servers[0].version == TEST_VERSION_OLD
-    assert result.pending_servers[0].target_version == TEST_VERSION_TARGET
+    assert len(result.servers) == 1
+    assert result.servers[0].server_id == TEST_SERVER_ID
+    assert result.servers[0].version == TEST_VERSION_OLD
+    assert result.servers[0].needs_upgrade is True
+    assert result.active_window.target_measurement_version == TEST_VERSION_TARGET
 
 
 # ---------------------------------------------------------------------------

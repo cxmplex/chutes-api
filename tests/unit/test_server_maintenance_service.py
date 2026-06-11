@@ -434,7 +434,7 @@ async def test_confirm_success(mock_preflight, mock_window, mock_instances, mock
     assert result.window.id == TEST_WINDOW_ID
     mock_purge.assert_awaited_once_with(
         inst,
-        reason="tee maintenance",
+        reason="maintenance - server entering TEE upgrade window",
         valid_termination=True,
     )
     db.commit.assert_awaited_once()

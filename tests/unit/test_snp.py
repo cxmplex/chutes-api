@@ -97,6 +97,14 @@ def test_snp_matches_measurement_tcb_rollback(snp_report_bytes):
     assert r.matches_measurement(cfg) is False
 
 
+def test_snp_matches_measurement_wrong_policy(snp_report_bytes):
+    """The full guest policy is pinned: a non-DEBUG policy bit the launch measurement does not cover
+    (e.g. MIGRATE_MA, bit 20) must still fail the match when the config pins a different policy."""
+    r = SnpReport.from_bytes(snp_report_bytes)  # report policy == EXPECTED_POLICY (0x30000)
+    cfg = snp_measurement_config(policy=0x30000 | (1 << 20))  # not DEBUG (bit 19); differs from report
+    assert r.matches_measurement(cfg) is False
+
+
 def test_snp_does_not_match_tdx_config(snp_report_bytes):
     r = SnpReport.from_bytes(snp_report_bytes)
     tdx_cfg = TeeMeasurementConfig(

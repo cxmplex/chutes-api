@@ -83,6 +83,17 @@ class Settings(BaseSettings):
         if self.tee_measurement_config_path.exists():
             _ = self.tee_measurements
 
+        # SKIP_METAGRAPH_CHECK is a dev-only bypass (it auto-creates a metagraph row so an unregistered
+        # hotkey can self-register a CPU server). It must never run in the production posture, which is
+        # identified by the secure mTLS-client-verify default. Fail closed on the unsafe combination;
+        # the full dev posture (REQUIRE_MTLS_CLIENT_VERIFY=false) is still allowed for local bring-up.
+        if self.skip_metagraph_check and self.require_mtls_client_verify:
+            raise ValueError(
+                "SKIP_METAGRAPH_CHECK is a dev-only bypass and must not be enabled in a production "
+                "posture (REQUIRE_MTLS_CLIENT_VERIFY=true). Set SKIP_METAGRAPH_CHECK=false, or run a "
+                "full dev validator (REQUIRE_MTLS_CLIENT_VERIFY=false) for local bring-up."
+            )
+
     @cached_property
     def validator_keypair(self) -> Optional[Keypair]:
         if not self._validator_keypair and os.getenv("VALIDATOR_SEED"):
@@ -292,6 +303,16 @@ class Settings(BaseSettings):
     skip_metagraph_check: bool = os.getenv("SKIP_METAGRAPH_CHECK", "false").lower() == "true"
     graval_url: str = os.getenv("GRAVAL_URL", "https://graval.chutes.ai:11443")
 
+    # mTLS client-cert trust posture. The X-Client-Cert header is only honored when the mTLS-
+    # terminating proxy also sets X-Client-Verify=SUCCESS (proving the proxy verified the peer's
+    # private-key possession and set the header itself; the proxy must strip any client-supplied
+    # X-Client-* and the backend must not be directly reachable). It also gates the CPU-TEE attested-
+    # cert binding on the secret-returning /tee endpoints. Operator-controlled (trusted); set to
+    # false ONLY for a dev validator reached directly over plaintext with no mTLS terminator.
+    require_mtls_client_verify: bool = (
+        os.getenv("REQUIRE_MTLS_CLIENT_VERIFY", "true").lower() == "true"
+    )
+
     # Database settings.
     db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "16"))
     db_overflow: int = int(os.getenv("DB_OVERFLOW", "3"))
@@ -408,10 +429,17 @@ class Settings(BaseSettings):
                     )
                 return text
 
-            # gpu_count is optional: 0 (or absent) denotes a CPU-only (GPU-less) measurement
-            # config. For gpu_count == 0 the validator verifies measurements only and skips
-            # GPU evidence / GPU-count matching.
-            gpu_count = measurement_config.get("gpu_count") or 0
+            # gpu_count is REQUIRED and must be explicit. 0 denotes a CPU-only (GPU-less)
+            # measurement config (the validator verifies measurements only and skips GPU
+            # evidence / GPU-count matching). An absent gpu_count must NOT silently become a
+            # CPU config -- that would skip GPU evidence verification for a GPU image.
+            gpu_count = measurement_config.get("gpu_count")
+            if gpu_count is None:
+                raise ValueError(
+                    f"Missing 'gpu_count' for measurement config '{config_name}'. "
+                    "All TEE measurement configs must specify gpu_count (use 0 for CPU-only configs)."
+                )
+            gpu_count = int(gpu_count)
             # Optional infrastructure provider hint ("gcp" | "bare-metal").
             provider = measurement_config.get("provider")
             if provider is not None:

@@ -86,6 +86,12 @@ redis-access: "true"
 db-access: "true"
 {{- end }}
 
+{{- define "cpuScheduler.labels" -}}
+app.kubernetes.io/name: cpu-scheduler
+redis-access: "true"
+db-access: "true"
+{{- end }}
+
 {{- define "forge.labels" -}}
 app.kubernetes.io/name: forge
 redis-access: "true"

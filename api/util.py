@@ -780,6 +780,18 @@ async def notify_deleted(
         await settings.redis_client.publish("events", json.dumps(event_data).decode())
         event_data["filter_recipients"] = [instance.miner_hotkey]
         await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
+
+        # 1-click CPU TEE instances (Model A VM container / Model B per-chute TD) are torn down
+        # by an explicit agent command -- their agents do not consume miner_broadcast. No-op for
+        # GPU instances (no server_id).
+        from api.agent_channel import send_instance_teardown
+
+        await send_instance_teardown(
+            instance.chute_id,
+            instance_id=instance.instance_id,
+            server_id=getattr(instance, "server_id", None),
+            config_id=instance.config_id,
+        )
     except Exception:
         ...
 
@@ -832,6 +844,13 @@ async def notify_job_deleted(job):
                 }
             ).decode(),
         )
+
+        # CPU TEE job instances are agent-run: dispatch an explicit teardown. Resolves the
+        # instance row first, so it is a no-op when the instance purge already handled it
+        # (purge() -> notify_job_deleted) and a no-op for GPU jobs (no server_id).
+        from api.agent_channel import send_job_instance_teardown
+
+        await send_job_instance_teardown(job.instance_id)
     except Exception:
         ...
 

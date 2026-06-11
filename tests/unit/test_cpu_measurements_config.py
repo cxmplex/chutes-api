@@ -55,7 +55,10 @@ def test_loads_cpu_measurement_gpu_count_zero(tmp_path):
     assert cpu.mrtd == HEX96_MRTD
 
 
-def test_cpu_measurement_absent_gpu_count_defaults_zero(tmp_path):
+def test_measurement_absent_gpu_count_rejected(tmp_path):
+    """A config omitting gpu_count must hard-fail at load: silently treating it as a CPU
+    config would skip GPU evidence verification for a GPU image. CPU-ness is explicit
+    (gpu_count: 0)."""
     yaml_text = f"""
     measurements:
       - version: "1"
@@ -75,10 +78,8 @@ def test_cpu_measurement_absent_gpu_count_defaults_zero(tmp_path):
         expected_gpus: []
     """
     settings = _settings_for_yaml(tmp_path, yaml_text)
-    measurements = settings._load_tee_measurements()
-    assert len(measurements) == 1
-    assert measurements[0].gpu_count == 0
-    assert measurements[0].provider == "bare-metal"
+    with pytest.raises(ValueError, match="Missing 'gpu_count'"):
+        settings._load_tee_measurements()
 
 
 def test_gpu_measurement_still_loads_with_provider_none(tmp_path):
@@ -155,5 +156,5 @@ def test_invalid_rtmr0_length_still_raises(tmp_path):
         gpu_count: 0
     """
     settings = _settings_for_yaml(tmp_path, yaml_text)
-    with pytest.raises(ValueError, match="Invalid RTMR0 length"):
+    with pytest.raises(ValueError, match="Invalid boot_rtmrs.rtmr0"):
         settings._load_tee_measurements()

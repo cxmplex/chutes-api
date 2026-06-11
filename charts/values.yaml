@@ -539,3 +539,33 @@ autostaker:
               - autostaker
           topologyKey: kubernetes.io/hostname
   tolerations: []
+
+# Validator-side placement loop for 1-click CPU TEE chutes (api/cpu_scheduler.py): places CPU
+# chutes/jobs onto self-registered servers, dispatches Model-B per-chute TD launches, expires
+# stale launch configs. Per-tick redis lock makes extra replicas warm standbys.
+cpuScheduler:
+  enabled: true
+  replicaCount: 1
+  image: parachutes/validator:latest
+  imagePullPolicy: Always
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "2Gi"
+    limits:
+      cpu: "500m"
+      memory: "2Gi"
+  affinity:
+    nodeAffinity: {}
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+            - key: app.kubernetes.io/name
+              operator: In
+              values:
+              - cpu-scheduler
+          topologyKey: kubernetes.io/hostname
+  tolerations: []

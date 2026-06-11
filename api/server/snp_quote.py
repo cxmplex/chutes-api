@@ -116,6 +116,12 @@ class SnpReport:
         # A debug-enabled guest offers no confidentiality -- never match.
         if self.debug_enabled:
             return False
+        # Full guest-policy pin: the SNP launch measurement does NOT cover the policy field, so a host
+        # could flip non-DEBUG policy bits (e.g. MIGRATE_MA, SMT) the measurement would not catch.
+        # When the config pins a policy, require exact equality (DEBUG is also rejected above).
+        expected_policy = getattr(config, "policy", None)
+        if expected_policy is not None and self.policy != int(expected_policy):
+            return False
         # Minimum-TCB (anti-rollback): each reported component must be >= the pinned minimum.
         min_tcb = getattr(config, "min_tcb", None)
         if min_tcb:

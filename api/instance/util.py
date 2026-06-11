@@ -11,7 +11,7 @@ import asyncio
 import random
 import pickle
 import traceback
-from fastapi import HTTPException, status
+from fastapi import HTTPException, Request, status
 from datetime import datetime, timedelta, timezone
 from async_lru import alru_cache
 from loguru import logger
@@ -36,6 +36,8 @@ from sqlalchemy.future import select
 from sqlalchemy import text, func
 from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import aliased, joinedload
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from api.server.client import TeeServerClient
@@ -43,7 +45,7 @@ from api.server.schemas import Server
 from api.node.schemas import Node
 from api.server.exceptions import GetEvidenceError
 from api.server.util import verify_quote, verify_gpu_evidence
-from api.server.util import get_public_key_hash
+from api.server.util import get_public_key_hash, _get_client_certificate
 
 # Define an alias for the Instance model to use in a subquery
 InstanceAlias = aliased(Instance)
@@ -1061,25 +1063,11 @@ async def verify_tee_chute(
     try:
         # Resolve the server. 1-click self-registered servers are linked explicitly by server_id
         # (stamped on the launch config / instance); the legacy path resolves by host + hotkey.
-        server = None
-        if getattr(instance, "server_id", None):
-            server = (
-                await db.execute(select(Server).where(Server.server_id == instance.server_id))
-            ).scalar_one_or_none()
-        if server is None:
-            server_query = select(Server).where(
-                Server.ip == instance.host, Server.miner_hotkey == launch_config.miner_hotkey
-            )
-            try:
-                server = (await db.execute(server_query)).scalar_one_or_none()
-            except MultipleResultsFound:
-                logger.error(
-                    f"Multiple TEE servers share IP {instance.host} for miner {launch_config.miner_hotkey}"
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Multiple TEE servers share the same IP. Each TEE server must have a unique IP. Use GET /miner/servers to review your inventory and remove duplicate servers.",
-                )
+        # Single shared resolver (also used by get_instance_server / evidence collection) so
+        # Model-B co-tenant TDs sharing one L0 host IP always disambiguate by server_id.
+        server = await get_cpu_server_for_host(
+            db, instance.host, launch_config.miner_hotkey, server_id=instance.server_id
+        )
         if not server:
             logger.error(
                 f"Server not found for IP {instance.host} and miner {launch_config.miner_hotkey}"
@@ -1141,6 +1129,76 @@ async def verify_tee_chute(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to verify chute attestation: {str(exc)}",
+        )
+
+
+async def require_attested_client_cert(db, request: Request, instance) -> None:
+    """Bind a secret/code-returning request to the attested TD (self-registered CPU-TEE instances).
+
+    For self-registered CPU-TEE servers verify_tee_chute does no per-chute quote dial (the whole TD
+    is the attested unit), so the launch-config /tee endpoints would otherwise hand the chute code +
+    decrypted secrets to anyone holding the launch JWT -- including the untrusted L0 host, which
+    receives that JWT over the hotkey-authed control channel. Here we require the request to be
+    mTLS-authenticated with the server's attestation-bound cert: its pubkey hash is committed in the
+    registration quote report_data, and only the in-TEE private key can complete the mTLS handshake
+    the validator's terminator verified, so an operator without the in-TEE key cannot pull secrets.
+
+    Fail closed. No-op for GPU-TEE / non-self-registered instances (bound by the verify_tee_chute
+    quote dial), and -- since the binding requires an mTLS terminator -- when the validator is
+    explicitly running without one (require_mtls_client_verify=false, a dev/plaintext validator)."""
+    server = None
+    if getattr(instance, "server_id", None):
+        server = (
+            await db.execute(select(Server).where(Server.server_id == instance.server_id))
+        ).scalar_one_or_none()
+    if (
+        server is None
+        or not getattr(server, "self_registered", False)
+        or server.compute_type != "cpu"
+    ):
+        return
+
+    if not settings.require_mtls_client_verify:
+        logger.warning(
+            f"require_mtls_client_verify is disabled; NOT binding secret delivery for CPU-TEE "
+            f"instance {instance.instance_id} to its attested cert (dev/plaintext validator only)."
+        )
+        return
+
+    attested_cert = getattr(server, "attested_cert", None)
+    if not attested_cert:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "CPU-TEE server has no attestation-bound cert on record; cannot bind secret "
+                "delivery to the attested TD. Re-register the server (POST /servers/cpu/register)."
+            ),
+        )
+    try:
+        client_cert = _get_client_certificate(request)
+        client_hash = get_public_key_hash(client_cert)
+        attested_hash = get_public_key_hash(
+            x509.load_pem_x509_certificate(attested_cert.encode(), default_backend())
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Could not verify the attested client certificate: {exc}",
+        )
+    if client_hash != attested_hash:
+        logger.error(
+            f"Attested client-cert mismatch for instance {instance.instance_id} "
+            f"(server {server.server_id}): got {client_hash[:16]}..., "
+            f"expected {attested_hash[:16]}..."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Client certificate does not match the attested server certificate; refusing to "
+                "release chute code/secrets to an unattested caller."
+            ),
         )
 
 

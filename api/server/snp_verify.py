@@ -204,13 +204,22 @@ def _vcek_tcb_parts(vcek: x509.Certificate) -> dict:
 
 
 def _check_tcb_binding(report: SnpReport, vcek: x509.Certificate) -> None:
-    """The VCEK is issued for a specific TCB; require it to match the report's reported_tcb."""
+    """The VCEK is issued for a specific TCB; require ALL FOUR SPL components to be present in the
+    cert AND equal to the report's reported_tcb. Requiring presence (not merely iterating whatever
+    parsed) prevents a vacuous pass if the VCEK TCB extensions fail to parse to an empty dict."""
     vcek_tcb = _vcek_tcb_parts(vcek)
     report_tcb = report.reported_tcb_parts
-    for comp, value in vcek_tcb.items():
-        if report_tcb.get(comp) != value:
+    expected_components = tuple(_VCEK_TCB_OID.values())  # bootloader, tee, snp, microcode
+    missing = [comp for comp in expected_components if comp not in vcek_tcb]
+    if missing:
+        raise InvalidQuoteError(
+            f"VCEK is missing TCB extension(s) {missing}; cannot bind the report's reported_tcb"
+        )
+    for comp in expected_components:
+        if report_tcb.get(comp) != vcek_tcb.get(comp):
             raise InvalidQuoteError(
-                f"reported_tcb {comp}={report_tcb.get(comp)} does not match VCEK cert ({value})"
+                f"reported_tcb {comp}={report_tcb.get(comp)} does not match VCEK cert "
+                f"({vcek_tcb.get(comp)})"
             )
 
 

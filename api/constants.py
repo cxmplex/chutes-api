@@ -28,6 +28,12 @@ PURPOSE_HEADER = "X-Chutes-Purpose"
 MINER_HEADER = "X-Chutes-Miner"
 VALIDATOR_HEADER = "X-Chutes-Validator"
 ENCRYPTED_HEADER = "X-Chutes-Encrypted"
+# 1-click CPU TEE agents identify which server/host a socket session controls with this header.
+SERVER_ID_HEADER = "X-Chutes-Server-Id"
+
+# Redis pubsub channel for validator -> 1-click agent commands (deploy/stop/delete/upgrade);
+# whichever socket-server replica holds the agent's session forwards each command to it.
+AGENT_COMMAND_CHANNEL = "agent_commands"
 
 # LUKS volume names allowed in GET/POST (extendable)
 SUPPORTED_LUKS_VOLUMES = ("storage", "tdx-cache")

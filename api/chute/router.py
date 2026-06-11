@@ -672,6 +672,7 @@ async def make_public(
     # Safety: skip entirely if kept_public_ids is empty (should never happen due to
     # validation, but NOT IN with empty set matches everything in SQLAlchemy).
     deleted_chutes = []
+    cpu_teardowns = []
     if not kept_public_ids:
         logger.error(
             "make_public: kept_public_ids is empty after processing, skipping stale cleanup"
@@ -700,6 +701,12 @@ async def make_public(
             logger.warning(
                 f"Deleting stale public chute for subnet {subnet_name}: "
                 f"{stale.chute_id} ({stale.name})"
+            )
+            # Capture 1-click CPU instances for post-commit agent teardown (see delete_chute).
+            cpu_teardowns.extend(
+                (stale.chute_id, inst.instance_id, inst.server_id, inst.config_id)
+                for inst in stale.instances
+                if getattr(inst, "server_id", None)
             )
             instance_ids = [inst.instance_id for inst in stale.instances]
             if instance_ids:
@@ -764,6 +771,19 @@ async def make_public(
                 }
             ).decode(),
         )
+
+    # Post-commit: tear down the deleted chutes' 1-click CPU instances (agent command; these
+    # agents do not consume miner_broadcast).
+    if cpu_teardowns:
+        from api.agent_channel import send_instance_teardown
+
+        for td_chute_id, td_instance_id, td_server_id, td_config_id in cpu_teardowns:
+            await send_instance_teardown(
+                td_chute_id,
+                instance_id=td_instance_id,
+                server_id=td_server_id,
+                config_id=td_config_id,
+            )
 
     # Set the daily rate limit after successful completion.
     await settings.redis_client.set(rate_limit_key, "1", ex=86400)
@@ -1489,6 +1509,19 @@ async def delete_chute(
     chute_id = chute.chute_id
     version = chute.version
 
+    # Capture the chute's 1-click CPU instances BEFORE deletion: their teardown is an explicit
+    # agent command (the row delete fires no per-instance notification and CPU agents do not
+    # consume the miner_broadcast chute_deleted event).
+    cpu_instances = (
+        await db.execute(
+            text(
+                "SELECT instance_id, server_id, config_id FROM instances "
+                "WHERE chute_id = :chute_id AND server_id IS NOT NULL"
+            ),
+            {"chute_id": chute.chute_id},
+        )
+    ).all()
+
     # Delete all of the instances first, and mark the deletions as valid so the miners aren't penalized.
     result = await db.execute(
         text("DELETE FROM instances WHERE chute_id = :chute_id RETURNING instance_id"),
@@ -1520,6 +1553,17 @@ async def delete_chute(
             }
         ).decode(),
     )
+
+    # Tear down the 1-click CPU instances captured above (Model A containers / Model B TDs).
+    from api.agent_channel import send_instance_teardown
+
+    for row in cpu_instances:
+        await send_instance_teardown(
+            chute_id,
+            instance_id=row.instance_id,
+            server_id=row.server_id,
+            config_id=row.config_id,
+        )
     return {"chute_id": chute_id, "deleted": True}
 
 

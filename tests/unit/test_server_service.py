@@ -89,6 +89,8 @@ def mock_settings(mock_redis_client):
     settings.redis_client = mock_redis_client
     settings.tee_measurements = _tee_measurements_for_service_tests()
     settings.luks_passphrase = "test_luks_passphrase"
+    # Real string (a Mock breaks semver comparison in process_boot_attestation's version gate).
+    settings.tee_minimum_boot_version = "0.0.0"
 
     with (
         patch("api.server.service.settings", settings),
@@ -459,7 +461,8 @@ async def test_process_boot_attestation_success(
                 TEST_CERT_HASH,
             )
 
-        assert result == "test-boot-token"
+        # Measurement version "1" < 1.3.0 -> legacy boot-token path, no luks nonce.
+        assert result == ("test-boot-token", None)
 
         # Verify database operations
         mock_db_session.add.assert_called_once()
@@ -993,7 +996,8 @@ async def test_full_boot_flow_end_to_end(mock_db_session, mock_settings, mock_ve
                     TEST_CERT_HASH,
                 )
 
-            assert result == "test-boot-token"
+            # Measurement version "1" < 1.3.0 -> legacy boot-token path, no luks nonce.
+            assert result == ("test-boot-token", None)
 
 
 @pytest.mark.asyncio

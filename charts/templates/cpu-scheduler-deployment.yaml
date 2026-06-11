@@ -1,0 +1,41 @@
+{{- if .Values.cpuScheduler.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-scheduler
+  labels:
+    {{- include "cpuScheduler.labels" . | nindent 4 }}
+spec:
+  # The scheduler runs a per-tick redis lock (SET NX), so extra replicas are warm standbys.
+  replicas: {{ .Values.cpuScheduler.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "cpuScheduler.labels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cpuScheduler.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.cpuScheduler.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cpuScheduler.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.cpuScheduler.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cpu-scheduler
+          image: "{{ .Values.cpuScheduler.image }}"
+          imagePullPolicy: {{ .Values.cpuScheduler.imagePullPolicy }}
+          command: ["poetry", "run", "python", "-m", "api.cpu_scheduler"]
+          env:
+            {{- include "chutes.sensitiveEnv" . | nindent 12 }}
+            {{- include "chutes.commonEnv" . | nindent 12 }}
+          resources:
+            {{- toYaml .Values.cpuScheduler.resources | nindent 12 }}
+{{- end }}

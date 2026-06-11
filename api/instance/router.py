@@ -69,6 +69,7 @@ from api.instance.util import (
     load_launch_config_from_jwt,
     invalidate_instance_cache,
     verify_tee_chute,
+    require_attested_client_cert,
 )
 from api.server.service import (
     validate_request_nonce,
@@ -957,6 +958,28 @@ async def get_instance_compute_history_csv(
     )
 
 
+def _require_non_cpu_tee_claim_fields(chute: Chute, args: LaunchConfigArgs) -> None:
+    """`gpus` and `env` were schema-required before CPU-TEE made them Optional. Only CPU-TEE
+    chutes (no aegis envdump, no GPU nodes) may omit them; every other claim must still provide
+    both, otherwise omitting `env` silently skips envdump verification and omitting `gpus`
+    crashes node validation. Reject with the same 422 the old pydantic contract produced
+    (no failed_at: the miner may re-claim with a corrected payload, exactly as before)."""
+    cpu_tee = bool(chute.tee) and (
+        str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
+    )
+    if cpu_tee:
+        return
+    missing = [field for field in ("gpus", "env") if getattr(args, field) is None]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Missing required field(s) for a non-CPU-TEE launch config claim: "
+                f"{', '.join(missing)}"
+            ),
+        )
+
+
 async def _validate_launch_config_env(
     db: AsyncSession,
     launch_config: LaunchConfig,
@@ -1786,6 +1809,8 @@ async def _validate_graval_launch_config_instance(
             detail="Can not claim a graval launch config for a TEE chute.",
         )
 
+    _require_non_cpu_tee_claim_fields(chute, args)
+
     # This does change order from previous graval only implementation
     # If want to preserve order need to split up final shared config check
     await _validate_launch_config_env(db, launch_config, chute, args, log_prefix)
@@ -1820,6 +1845,8 @@ async def _validate_tee_launch_config_instance(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Can not claim a TEE launch config for a non-TEE chute.",
         )
+
+    _require_non_cpu_tee_claim_fields(chute, args)
 
     # Deny launches on servers in TEE maintenance mode before creating any instance/node records.
     # CPU (GPU-less) chutes have no GPU nodes, so the server is resolved by host + miner_hotkey.
@@ -1926,6 +1953,15 @@ async def get_launch_config(
 
     # Load the chute and check if it's scalable.
     chute = await _load_chute(db, chute_id)
+
+    # CPU chutes are validator-scheduled: the cpu_scheduler mints their launch configs directly
+    # (stamped with the target server_id). A miner-minted config could never claim (no attested
+    # cert / server linkage) but WOULD sit pending and distort scheduling -- reject up front.
+    if str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CPU chutes are scheduled by the validator; miners cannot request launch configs for them.",
+        )
 
     # Check if chute is disabled
     if chute.disabled:
@@ -2132,6 +2168,11 @@ async def claim_tee_launch_config(
     )
 
     _validate_launch_config_not_expired(launch_config)
+
+    # CPU-TEE: bind the symmetric-key handout to the attested TD. Only the in-TEE key can complete
+    # the mTLS handshake against the pinned attested_cert, so an operator holding only the launch
+    # JWT cannot claim the instance and obtain its key. Fail closed (no-op for GPU-TEE).
+    await require_attested_client_cert(db, request, instance)
 
     # Store the launch config
     await db.commit()
@@ -2950,6 +2991,11 @@ async def verify_tee_launch_config_instance(
     # Cache GPU info while nodes are eagerly loaded (before any commit/refresh expires them).
     _gpu_count = len(instance.nodes) if instance.nodes else None
     _gpu_type = instance.nodes[0].gpu_identifier if instance.nodes else None
+
+    # CPU-TEE: this response carries the chute code + decrypted secrets, so bind it to the attested
+    # TD. Only the in-TEE key completes the mTLS handshake against the pinned attested_cert; an
+    # operator with just the launch JWT cannot pull them. Fail closed (no-op for GPU-TEE).
+    await require_attested_client_cert(db, request, instance)
 
     # TEE instances skip PoVW checks - they were verified during claim via attestation
     # Just verify the symmetric key via port checks

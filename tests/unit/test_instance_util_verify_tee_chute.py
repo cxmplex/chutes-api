@@ -8,7 +8,9 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import HTTPException
 
-from api.instance.util import verify_tee_chute
+from api.config import settings
+from api.instance.util import verify_tee_chute, require_attested_client_cert
+from api.server.exceptions import NoClientCertError
 from api.server.quote import BootTdxQuote
 from tests.fixtures.gpus import TEST_GPU_NONCE
 
@@ -23,6 +25,9 @@ def _make_instance(chutes_version: str | None, extra: dict | None = None):
     instance.host = "192.168.1.1"
     instance.chutes_version = chutes_version
     instance.extra = extra
+    # Explicit None: a MagicMock auto-attribute is truthy, which would take the
+    # server_id resolution branch instead of the legacy host+hotkey fallback.
+    instance.server_id = None
     return instance
 
 
@@ -38,6 +43,9 @@ def _make_server():
     server = MagicMock()
     server.ip = "192.168.1.1"
     server.miner_hotkey = "miner_hotkey_123"
+    # Explicit False: a truthy auto-attribute would short-circuit verify_tee_chute
+    # down the self-registered (no proxy dial) path, skipping the assertions under test.
+    server.self_registered = False
     return server
 
 
@@ -210,3 +218,107 @@ async def test_verify_tee_chute_chutes_060_extra_none_raises_400(mock_db, sample
             await verify_tee_chute(mock_db, instance, launch_config, "deploy-123", EXPECTED_NONCE)
 
         assert exc_info.value.status_code == 400
+
+
+# --------------------------------------------------------------------------------------------------
+# require_attested_client_cert (C-1: bind /tee secret delivery to the attested TD)
+# --------------------------------------------------------------------------------------------------
+
+_ATTESTED_PEM = "-----BEGIN CERTIFICATE-----\nMIIBdummy\n-----END CERTIFICATE-----\n"
+
+
+def _cpu_tee_instance(server_id: str = "srv-1"):
+    instance = MagicMock()
+    instance.instance_id = "inst-1"
+    instance.server_id = server_id
+    return instance
+
+
+def _cpu_server(attested_cert: str | None = _ATTESTED_PEM):
+    server = MagicMock()
+    server.self_registered = True
+    server.compute_type = "cpu"
+    server.attested_cert = attested_cert
+    return server
+
+
+def _db_returning(server):
+    db = AsyncMock()
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = server
+    db.execute = AsyncMock(return_value=result)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_require_attested_client_cert_match_passes():
+    """Matching client-cert pubkey hash == pinned attested cert -> allowed."""
+    db = _db_returning(_cpu_server())
+    with (
+        patch.object(settings, "require_mtls_client_verify", True),
+        patch("api.instance.util._get_client_certificate", return_value=MagicMock()),
+        patch("api.instance.util.get_public_key_hash", return_value="samehash"),
+        patch("api.instance.util.x509.load_pem_x509_certificate", return_value=MagicMock()),
+    ):
+        await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
+
+
+@pytest.mark.asyncio
+async def test_require_attested_client_cert_mismatch_403():
+    """A client cert whose pubkey hash != the pinned attested cert is rejected."""
+    db = _db_returning(_cpu_server())
+    with (
+        patch.object(settings, "require_mtls_client_verify", True),
+        patch("api.instance.util._get_client_certificate", return_value=MagicMock()),
+        patch(
+            "api.instance.util.get_public_key_hash",
+            side_effect=["client_hash", "attested_hash"],
+        ),
+        patch("api.instance.util.x509.load_pem_x509_certificate", return_value=MagicMock()),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
+        assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_require_attested_client_cert_jwt_only_rejected():
+    """JWT-only caller (no verified mTLS client cert) is rejected -- the C-1 secret-exfil block."""
+    db = _db_returning(_cpu_server())
+    with (
+        patch.object(settings, "require_mtls_client_verify", True),
+        patch("api.instance.util._get_client_certificate", side_effect=NoClientCertError()),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
+        assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_require_attested_client_cert_no_attested_cert_403():
+    """A CPU-TEE server with no attested cert on record fails closed (cannot bind)."""
+    db = _db_returning(_cpu_server(attested_cert=None))
+    with patch.object(settings, "require_mtls_client_verify", True):
+        with pytest.raises(HTTPException) as exc_info:
+            await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
+        assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_require_attested_client_cert_gpu_is_noop():
+    """GPU / non-self-registered instances are bound by the quote dial, not this check -> no-op."""
+    server = MagicMock()
+    server.self_registered = False
+    server.compute_type = "gpu"
+    db = _db_returning(server)
+    # Even with mTLS required and no client cert presented, the GPU path returns without raising.
+    with patch.object(settings, "require_mtls_client_verify", True):
+        await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
+
+
+@pytest.mark.asyncio
+async def test_require_attested_client_cert_dev_noop_when_mtls_disabled():
+    """A dev/plaintext validator (require_mtls_client_verify=false) cannot enforce mTLS -> no-op."""
+    db = _db_returning(_cpu_server())
+    with patch.object(settings, "require_mtls_client_verify", False):
+        await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())

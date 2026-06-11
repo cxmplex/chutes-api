@@ -7,7 +7,6 @@ import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
 import secrets
-import time
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
@@ -85,7 +84,7 @@ from api.node.schemas import Node
 from sqlalchemy.orm import joinedload
 from api.server.schemas import TeeInstanceEvidence
 from api.node.schemas import NodeArgs
-from api.util import extract_ip, semcomp
+from api.util import extract_ip, get_signing_message, semcomp
 
 
 async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
@@ -600,7 +599,9 @@ async def register_cpu_server(
             raise ServerRegistrationError(
                 f"Miner hotkey {miner_hotkey} is not registered on netuid {settings.netuid}"
             )
-    signing_message = f"{miner_hotkey}:{nonce}:{NoncePurpose.CPU_REGISTER.value}"
+    signing_message = get_signing_message(
+        miner_hotkey, nonce, payload_str=None, purpose=NoncePurpose.CPU_REGISTER.value
+    )
     try:
         if not Keypair(ss58_address=miner_hotkey).verify(
             signing_message, bytes.fromhex(signature)
@@ -745,41 +746,24 @@ async def register_cpu_server(
     }
 
 
-# Accept a host-register timestamp nonce within this many seconds of now (replay bound). The host
-# uses a client unix-timestamp nonce (it is not yet known to the validator, so there is no
-# server-issued nonce); the signature + this freshness window authenticate the registration.
-HOST_REGISTER_NONCE_WINDOW_SECONDS = 300
-
-
 async def register_host(
     db: AsyncSession,
     args: HostRegistrationArgs,
     miner_hotkey: str,
-    nonce: str,
-    signature: str,
 ) -> Dict[str, Any]:
     """Model B: register (or refresh) a bare-metal L0 launcher host.
 
-    The host is NOT attested -- it is a launcher only. Trust is established by the owning miner's
-    signature over "{hotkey}:{nonce}:host_register" (with a recent unix-timestamp nonce) plus, in
-    production, metagraph membership. The validator records the host + its capacity so the CPU
+    The host is NOT attested -- it is a launcher only. Authentication (signature over
+    "{hotkey}:{nonce}:host_register" with a fresh unix-timestamp nonce + production metagraph
+    membership) is enforced by the router's `get_current_user` dependency; this service only
+    owns the host-specific logic. The validator records the host + its capacity so the CPU
     scheduler can dispatch per-chute TD launches to it; every launched TD attests itself.
     """
-    if not miner_hotkey or not signature:
-        raise ServerRegistrationError("Missing miner hotkey/signature for host registration")
+    if not miner_hotkey:
+        raise ServerRegistrationError("Missing miner hotkey for host registration")
 
-    # Freshness: the nonce is a client unix timestamp; reject stale/skewed values to bound replay.
-    try:
-        nonce_ts = int(str(nonce))
-    except (TypeError, ValueError):
-        raise ServerRegistrationError("Host registration nonce must be a unix timestamp")
-    skew = abs(int(time.time()) - nonce_ts)
-    if skew > HOST_REGISTER_NONCE_WINDOW_SECONDS:
-        raise ServerRegistrationError(
-            f"Host registration nonce is stale ({skew}s skew > {HOST_REGISTER_NONCE_WINDOW_SECONDS}s)"
-        )
-
-    # Metagraph membership (dev: auto-create the row; the signature is verified in both cases).
+    # Dev (skip_metagraph_check): auto-create the metagraph row so downstream FK references
+    # (self-registered server rows) are satisfied. Prod membership is enforced by the router auth.
     if settings.skip_metagraph_check:
         if await db.get(MetagraphNode, (miner_hotkey, settings.netuid)) is None:
             db.add(
@@ -789,29 +773,6 @@ async def register_host(
                 )
             )
             await db.commit()
-    else:
-        is_registered = (
-            await db.execute(
-                select(
-                    exists()
-                    .where(MetagraphNode.hotkey == miner_hotkey)
-                    .where(MetagraphNode.netuid == settings.netuid)
-                )
-            )
-        ).scalar()
-        if not is_registered:
-            raise ServerRegistrationError(
-                f"Miner hotkey {miner_hotkey} is not registered on netuid {settings.netuid}"
-            )
-
-    signing_message = f"{miner_hotkey}:{nonce}:{NoncePurpose.HOST_REGISTER.value}"
-    try:
-        if not Keypair(ss58_address=miner_hotkey).verify(signing_message, bytes.fromhex(signature)):
-            raise ServerRegistrationError("Invalid miner signature for host registration")
-    except ServerRegistrationError:
-        raise
-    except Exception as exc:
-        raise ServerRegistrationError(f"Invalid miner signature: {exc}")
 
     # Upsert the host (idempotent across reboots by host_id; ownership pinned to the first miner).
     host = await db.get(Host, args.host_id)
@@ -848,38 +809,20 @@ async def register_host(
 
 
 async def request_host_image_upgrade(
-    db: AsyncSession, host_id: str, miner_hotkey: str, nonce: str, signature: str
+    db: AsyncSession, host_id: str, miner_hotkey: str
 ) -> Dict[str, Any]:
     """Model B: tell an online L0 host to refresh its chute guest image (control-channel upgrade_image).
 
-    Owning-miner auth: signature over "{hotkey}:{nonce}:host_upgrade" with a recent unix-timestamp
-    nonce (same scheme as registration). The host re-fetches the published guest image and tears down
+    Authentication (signature over "{hotkey}:{nonce}:host_upgrade", same scheme as registration)
+    is enforced by the router's `get_current_user` dependency; this service owns ownership +
+    online checks and the dispatch. The host re-fetches the published guest image and tears down
     its running per-chute TDs so the scheduler re-places their chutes onto fresh TDs from the new image.
     Remember to pin the new image's measurement on the validator in lockstep, or the new TDs fail attest.
     """
     from api.agent_channel import is_agent_online, send_agent_command
 
-    if not miner_hotkey or not signature:
-        raise ServerRegistrationError("Missing miner hotkey/signature for host upgrade")
-
-    try:
-        nonce_ts = int(str(nonce))
-    except (TypeError, ValueError):
-        raise ServerRegistrationError("Host upgrade nonce must be a unix timestamp")
-    skew = abs(int(time.time()) - nonce_ts)
-    if skew > HOST_REGISTER_NONCE_WINDOW_SECONDS:
-        raise ServerRegistrationError(
-            f"Host upgrade nonce is stale ({skew}s skew > {HOST_REGISTER_NONCE_WINDOW_SECONDS}s)"
-        )
-
-    signing_message = f"{miner_hotkey}:{nonce}:{NoncePurpose.HOST_UPGRADE.value}"
-    try:
-        if not Keypair(ss58_address=miner_hotkey).verify(signing_message, bytes.fromhex(signature)):
-            raise ServerRegistrationError("Invalid miner signature for host upgrade")
-    except ServerRegistrationError:
-        raise
-    except Exception as exc:
-        raise ServerRegistrationError(f"Invalid miner signature: {exc}")
+    if not miner_hotkey:
+        raise ServerRegistrationError("Missing miner hotkey for host upgrade")
 
     host = await db.get(Host, host_id)
     if host is None:
@@ -1493,19 +1436,17 @@ async def get_instance_server(db: AsyncSession, instance_id: str) -> tuple[Serve
     if not instance.chute.tee:
         raise ChuteNotTeeError(instance.chute.chute_id)
 
-    # GPU chutes link to their server via GPU nodes. CPU (GPU-less) chutes have no Node rows,
-    # so the instance<->server linkage is by host + miner_hotkey.
+    # GPU chutes link to their server via GPU nodes. CPU (GPU-less) chutes resolve by the
+    # scheduler-stamped instance.server_id first (required for Model-B co-tenant TDs sharing
+    # one L0 host IP), falling back to host + miner_hotkey for single-tenant servers.
     if instance.nodes:
         server = instance.nodes[0].server
     else:
-        server = (
-            await db.execute(
-                select(Server).where(
-                    Server.ip == instance.host,
-                    Server.miner_hotkey == instance.miner_hotkey,
-                )
-            )
-        ).scalar_one_or_none()
+        from api.instance.util import get_cpu_server_for_host
+
+        server = await get_cpu_server_for_host(
+            db, instance.host, instance.miner_hotkey, server_id=instance.server_id
+        )
         if server is None:
             raise ServerNotFoundError(f"server for instance {instance_id}")
 
@@ -1621,22 +1562,28 @@ async def get_chute_instances_evidence(
     instances = instances_result.unique().scalars().all()
 
     # Resolve each instance's server sequentially (DB access is not safe under gather):
-    # GPU chutes via their GPU nodes, CPU (GPU-less) chutes via host + miner_hotkey.
+    # GPU chutes via their GPU nodes, CPU (GPU-less) chutes via the scheduler-stamped
+    # instance.server_id (required for Model-B co-tenant TDs sharing one L0 host IP), with a
+    # host + miner_hotkey fallback. An unresolvable/ambiguous server fails only that instance
+    # (it lands in failed_instance_ids), not the whole evidence collection.
+    from api.instance.util import get_cpu_server_for_host
+
     servers: list[Optional[Server]] = []
     for inst in instances:
         if inst.nodes:
             servers.append(inst.nodes[0].server)
         else:
-            servers.append(
-                (
-                    await db.execute(
-                        select(Server).where(
-                            Server.ip == inst.host,
-                            Server.miner_hotkey == inst.miner_hotkey,
-                        )
+            try:
+                servers.append(
+                    await get_cpu_server_for_host(
+                        db, inst.host, inst.miner_hotkey, server_id=inst.server_id
                     )
-                ).scalar_one_or_none()
-            )
+                )
+            except HTTPException as exc:
+                logger.error(
+                    f"Could not resolve server for instance {inst.instance_id}: {exc.detail}"
+                )
+                servers.append(None)
 
     results = await asyncio.gather(
         *[_fetch_instance_evidence(inst, server, nonce) for inst, server in zip(instances, servers)]

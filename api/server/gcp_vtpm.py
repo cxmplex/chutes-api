@@ -19,6 +19,7 @@ Verified end-to-end in pure Python against a real GCE AK quote (tests/assets/snp
 import hashlib
 import struct
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from cryptography import x509
@@ -28,6 +29,32 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from loguru import logger
 
 from api.server.exceptions import InvalidQuoteError
+
+
+def _check_cert_time_valid(cert: x509.Certificate, what: str) -> None:
+    """Reject a cert outside its validity window (expired or not-yet-valid)."""
+    now = datetime.now(timezone.utc)
+    try:
+        not_before = cert.not_valid_before_utc
+        not_after = cert.not_valid_after_utc
+    except AttributeError:  # cryptography < 42: naive UTC datetimes
+        not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    if now < not_before or now > not_after:
+        raise InvalidQuoteError(
+            f"{what} certificate is outside its validity period "
+            f"({not_before.isoformat()} .. {not_after.isoformat()})"
+        )
+
+
+def _check_cert_is_ca(cert: x509.Certificate, what: str) -> None:
+    """Require basicConstraints CA=true on a certificate used as an issuer (intermediate / root)."""
+    try:
+        basic_constraints = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+    except x509.ExtensionNotFound:
+        raise InvalidQuoteError(f"{what} certificate has no basicConstraints (expected a CA)")
+    if not basic_constraints.ca:
+        raise InvalidQuoteError(f"{what} certificate is not a CA (basicConstraints CA=false)")
 
 # Pinned Google EK/AK CA Root (self-signed, valid to 2122). The GCE AK leaf chains to this via the
 # per-CA EK/AK CA Intermediate (fetched from the leaf's AIA + cached). This is the trust anchor for
@@ -215,6 +242,14 @@ async def verify_vtpm_quote(
         )
         if inter is None:
             raise InvalidQuoteError("could not obtain the EK/AK CA Intermediate for the AK")
+
+        # Reject expired/not-yet-valid certs, and require the issuers to actually be CAs (a
+        # signature chain alone would accept an in-window leaf misused as an issuer).
+        _check_cert_time_valid(ak, "GCE AK")
+        _check_cert_time_valid(inter, "EK/AK CA Intermediate")
+        _check_cert_time_valid(root, "Google EK/AK CA Root")
+        _check_cert_is_ca(inter, "EK/AK CA Intermediate")
+        _check_cert_is_ca(root, "Google EK/AK CA Root")
 
         # Chain: AK <- intermediate <- pinned root (root self-signed). Any break => not valid.
         try:
