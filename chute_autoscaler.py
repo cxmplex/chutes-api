@@ -3207,6 +3207,13 @@ async def execute_downsizing(to_downsize: List[Tuple[str, int, Set[str]]], db_no
             if not chute:
                 continue
 
+            # CPU chutes are validator-placed (api/cpu_scheduler.py) on single-tenant TEE
+            # servers and have no Node rows: the gpu_count-based node-count check below would
+            # misclassify every CPU instance as broken (0 nodes vs `0 or 1`), and downsizing
+            # them here just fights the scheduler's own target/retire logic.
+            if (chute.node_selector or {}).get("compute_type") == "cpu":
+                continue
+
             active_instances = [
                 inst
                 for inst in chute.instances

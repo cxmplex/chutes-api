@@ -94,6 +94,15 @@ async def handle_agent_command_ack(server_id: str, ack: dict) -> None:
         if not raw:
             return
         context = json.loads(raw)
+        # Bind the ack to the channel the command was dispatched to (the agent's server_id for
+        # Model A, the host channel for Model B): only that session may consume the correlation
+        # and fail the config.
+        if server_id != context.get("server_id"):
+            logger.warning(
+                f"Ignoring ack for command {command_id} from {server_id}; it was "
+                f"dispatched to {context.get('server_id')}"
+            )
+            return
         await settings.redis_client.delete(key)
         status = str((ack or {}).get("status") or "").lower()
         if status not in FAILED_ACK_STATUSES:
@@ -399,9 +408,11 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
 async def send_job_instance_teardown(instance_id: Optional[str]) -> Optional[str]:
     """Dispatch a teardown for a job's instance, resolving the (possibly already purged) row.
 
-    Used on job deletion. When the instance row is already gone, the instance purge path
-    (notify_deleted) has already dispatched the teardown, so a missing row is a no-op -- this
-    is what keeps the purge() -> notify_job_deleted flow from double-dispatching.
+    Used on job deletion. A missing instance row is a no-op (the instance purge path already
+    dispatched its teardown). When a purge and a job deletion overlap -- purge() notifies
+    before committing its instance DELETE, so this helper's fresh session can still see the
+    row -- both paths may dispatch; that is harmless by design, because the agents treat
+    stop/delete for an absent workload as a no-op ack.
     """
     if not instance_id:
         return None

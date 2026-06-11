@@ -7,8 +7,11 @@ comes from each launched per-chute TD attesting itself, never from the host.
 
 Auth: the standard `get_current_user` hotkey dependency (signature over
 "{hotkey}:{nonce}:<purpose>" with a recent unix-timestamp nonce + metagraph membership in
-production). Dev (skip_metagraph_check) drops only the membership requirement; signatures are
-verified either way.
+production). Dev (skip_metagraph_check) drops the membership requirement, and with it the
+hard signature requirement: a signed request is still verified, but an unsigned one falls
+through to "no user" and the endpoint trusts the bare hotkey header. Dev-only by
+construction -- settings fail closed if skip_metagraph_check is combined with the
+production mTLS posture.
 """
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -29,7 +32,8 @@ from api.user.service import get_current_user
 router = APIRouter()
 
 # Dev (skip_metagraph_check): drop the metagraph-membership requirement from the auth dependency;
-# register_host auto-creates a dev metagraph row instead. Signatures are verified either way.
+# register_host auto-creates a dev metagraph row instead. Signed requests are still verified, but
+# dev does not REQUIRE a signature (see module docstring); production (netuid) does.
 _REGISTERED_TO = None if settings.skip_metagraph_check else settings.netuid
 
 

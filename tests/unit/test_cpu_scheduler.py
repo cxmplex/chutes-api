@@ -292,7 +292,11 @@ class TestExpireStaleLaunchConfigs:
         assert session.committed
         key, params = session.executed[0]
         assert key == "text:update_launch_configs"
-        assert params == {"ttl": cs.LAUNCH_CONFIG_EXPIRY_SECONDS}
+        # Claimed (retrieved) configs get a doubled window before being declared dead.
+        assert params == {
+            "ttl": cs.LAUNCH_CONFIG_EXPIRY_SECONDS,
+            "claimed_ttl": cs.LAUNCH_CONFIG_EXPIRY_SECONDS * 2,
+        }
 
     @pytest.mark.asyncio
     async def test_expiry_no_rows_is_noop(self, mock_settings):
@@ -565,7 +569,10 @@ class TestDispatchDeploy:
 
     async def _dispatch(self, chute, server, miner, digest="sha256:abc", job=None):
         session = FakeSession(
-            {"MetagraphNode.MetagraphNode": FakeResult(items=[miner] if miner else [])}
+            {
+                "MetagraphNode.MetagraphNode": FakeResult(items=[miner] if miner else []),
+                "text:update_launch_configs": FakeResult(rowcount=1),
+            }
         )
         send = AsyncMock(return_value="cmd-1")
         digest_mock = AsyncMock(return_value=digest)
@@ -586,13 +593,18 @@ class TestDispatchDeploy:
         assert session.added == []
 
     @pytest.mark.asyncio
-    async def test_tee_without_digest_refuses_dispatch(self, mock_settings, metagraph_node):
+    async def test_tee_without_digest_refuses_and_fails_config(
+        self, mock_settings, metagraph_node
+    ):
         session, send = await self._dispatch(
             _chute(tee=True), _server(), metagraph_node, digest=RuntimeError("registry down")
         )
         send.assert_not_awaited()
-        # The launch config row was minted before the digest check; the expiry sweep reaps it.
+        # The launch config row was minted before the digest check and must be failed
+        # immediately so it doesn't occupy the server / count as pending until expiry.
         assert len(session.added) == 1
+        fail_updates = [p for k, p in session.executed if k == "text:update_launch_configs"]
+        assert fail_updates and fail_updates[0]["config_id"] == session.added[0].config_id
 
     @pytest.mark.asyncio
     async def test_happy_path_payload(self, mock_settings, metagraph_node):

@@ -135,6 +135,19 @@ class TestHandleAgentCommandAck:
         assert session.executed == []
 
     @pytest.mark.asyncio
+    async def test_ack_from_wrong_session_ignored(self, mock_settings, fake_redis):
+        """Only the channel the command was dispatched to may consume its correlation."""
+        self._store_context(fake_redis)
+        session = FakeSession({})
+        with patch("api.database.get_session", _session_ctx(session)):
+            await ac.handle_agent_command_ack(
+                "srv-EVIL", {"command_id": "cmd-1", "status": "error"}
+            )
+        assert session.executed == []
+        # Correlation key NOT consumed: the rightful agent's ack can still land.
+        assert "agent:cmd:cmd-1" in fake_redis.store
+
+    @pytest.mark.asyncio
     async def test_missing_command_id_is_noop(self, mock_settings):
         await ac.handle_agent_command_ack("srv-1", {"status": "error"})
         await ac.handle_agent_command_ack("srv-1", {})

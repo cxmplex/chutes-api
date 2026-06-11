@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime, timezone
 
 from loguru import logger
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, select, text
 from sqlalchemy.orm import joinedload
 
 import api.database.orms  # noqa
@@ -161,13 +161,23 @@ async def _dispatch_deploy(session, chute: Chute, server: Server, job: "Job" = N
 
     # TEE chutes MUST be digest-pinned: confidentiality relies on running exactly the measured/signed
     # image, so refuse to dispatch a TEE deploy we cannot pin (the agent also rejects an unpinned TEE
-    # image, runner.py). The orphan launch_config simply expires; the next scheduler tick retries.
+    # image, runner.py). Fail the just-minted launch config immediately -- left pending it would
+    # occupy the server and count toward the chute's target for the whole expiry window.
     if chute.tee and not image_digest:
         logger.error(
             f"Refusing to deploy TEE chute {chute.chute_id} on {server.server_id}: could not "
             f"resolve an image_digest to pin (image {_chute_image_ref(chute)} not signed/pushed to "
             "the chutes registry?). Fix the image publish so the digest resolves, then retry."
         )
+        await session.execute(
+            text(
+                "UPDATE launch_configs SET failed_at = NOW(), "
+                "verification_error = 'TEE deploy refused: image digest could not be resolved' "
+                "WHERE config_id = :config_id"
+            ),
+            {"config_id": config_id},
+        )
+        await session.commit()
         return
 
     await send_agent_command(
@@ -301,9 +311,14 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
 
 
 async def expire_stale_launch_configs() -> None:
-    """Fail scheduler-minted (server_id-stamped) launch configs that were never claimed/verified
-    within LAUNCH_CONFIG_EXPIRY_SECONDS. Scoped to server_id IS NOT NULL so the GPU launch-config
-    flow (miner-side bookkeeping, its own JWT expiry) is untouched."""
+    """Fail scheduler-minted (server_id-stamped) launch configs that never verified.
+
+    Never-claimed configs (agent vanished between dispatch and claim) expire after the base
+    window; claimed-but-unverified configs (retrieved_at set: the TD is actively pulling/booting,
+    possibly a multi-GB cold pull) get a doubled window before being declared dead so an
+    in-flight verification isn't yanked out from under the agent. Scoped to server_id IS NOT
+    NULL so the GPU launch-config flow (miner-side bookkeeping, its own JWT expiry) is untouched.
+    """
     async with get_session() as session:
         result = await session.execute(
             text(
@@ -311,16 +326,21 @@ async def expire_stale_launch_configs() -> None:
                 "verification_error = 'expired: never verified within the scheduler window' "
                 "WHERE server_id IS NOT NULL AND verified_at IS NULL AND failed_at IS NULL "
                 "AND created_at < NOW() - make_interval(secs => :ttl) "
+                "AND (retrieved_at IS NULL "
+                "     OR created_at < NOW() - make_interval(secs => :claimed_ttl)) "
                 "RETURNING config_id, chute_id, server_id"
             ),
-            {"ttl": LAUNCH_CONFIG_EXPIRY_SECONDS},
+            {
+                "ttl": LAUNCH_CONFIG_EXPIRY_SECONDS,
+                "claimed_ttl": LAUNCH_CONFIG_EXPIRY_SECONDS * 2,
+            },
         )
         expired = result.all()
         await session.commit()
     for row in expired:
         logger.warning(
             f"Expired stale launch config {row.config_id} (chute={row.chute_id}, "
-            f"server={row.server_id}): never verified within {LAUNCH_CONFIG_EXPIRY_SECONDS}s"
+            f"server={row.server_id}): never verified within the scheduler window"
         )
 
 
@@ -331,7 +351,13 @@ async def schedule_once() -> None:
                 await session.execute(
                     select(Chute)
                     .options(joinedload(Chute.image))
-                    .where(Chute.node_selector["compute_type"].astext == "cpu")
+                    .where(
+                        Chute.node_selector["compute_type"].astext == "cpu",
+                        # The 1-click path only runs confidential workloads: every config is
+                        # minted env_type="tee" and the claim handler rejects a non-TEE chute
+                        # (400), so placing one would just churn deploy -> reject -> expire.
+                        Chute.tee.is_(True),
+                    )
                 )
             )
             .unique()
@@ -503,7 +529,17 @@ async def schedule_once() -> None:
             (
                 await session.execute(
                     select(Job)
-                    .outerjoin(LaunchConfig, LaunchConfig.job_id == Job.job_id)
+                    # Only LIVE (non-failed) configs block a job: a config the ack handler /
+                    # expiry sweep / TD reap marked failed must NOT strand the job forever --
+                    # the scheduler is the only config minter for CPU jobs (no other miner can
+                    # retry it, unlike the GPU launch-config flow), so failed attempts retry here.
+                    .outerjoin(
+                        LaunchConfig,
+                        and_(
+                            LaunchConfig.job_id == Job.job_id,
+                            LaunchConfig.failed_at.is_(None),
+                        ),
+                    )
                     .where(
                         Job.chute_id.in_(list(chute_map.keys())),
                         Job.miner_hotkey.is_(None),

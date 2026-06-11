@@ -96,6 +96,9 @@ services:
       VALIDATOR_SS58: 5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4
       VALIDATOR_SEED: 971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20
       SKIP_METAGRAPH_CHECK: "true"
+      # Same dev posture as the api service: SKIP_METAGRAPH_CHECK with the mTLS marker required
+      # fails closed at settings init, so the scheduler would crash-loop without this.
+      REQUIRE_MTLS_CLIENT_VERIFY: "false"
       LAUNCH_CONFIG_PRIVATE_KEY_PATH: /etc/config/launch_config_private_key.pem
       DB_SSL: disable
       CHUTES_VERSION: "0.6.10"
