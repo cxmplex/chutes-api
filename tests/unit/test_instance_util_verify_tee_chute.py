@@ -317,8 +317,42 @@ async def test_require_attested_client_cert_gpu_is_noop():
 
 
 @pytest.mark.asyncio
-async def test_require_attested_client_cert_dev_noop_when_mtls_disabled():
-    """A dev/plaintext validator (require_mtls_client_verify=false) cannot enforce mTLS -> no-op."""
+async def test_require_attested_client_cert_hard_fails_when_mtls_disabled():
+    """Without an mTLS terminator (require_mtls_client_verify=false) the binding cannot be proven,
+    so CPU-TEE secret endpoints must HARD-FAIL -- never warn-and-skip into unbound secret delivery."""
     db = _db_returning(_cpu_server())
     with patch.object(settings, "require_mtls_client_verify", False):
-        await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
+        with pytest.raises(HTTPException) as exc_info:
+            await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
+        assert exc_info.value.status_code == 403
+
+
+# --------------------------------------------------------------------------------------------------
+# create_provision_jwt: every token must carry a unique jti (single-use marker for the in-TEE
+# chutes-provision service's replay registry).
+# --------------------------------------------------------------------------------------------------
+
+
+def test_create_provision_jwt_mints_unique_jti(tmp_path, monkeypatch):
+    import subprocess
+
+    import jwt as pyjwt
+
+    from api.instance.util import create_provision_jwt
+
+    key_path = tmp_path / "launch_key.pem"
+    subprocess.run(
+        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(key_path)],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(settings, "launch_config_private_key_bytes", key_path.read_bytes())
+
+    first = pyjwt.decode(create_provision_jwt("chute-x"), options={"verify_signature": False})
+    second = pyjwt.decode(create_provision_jwt("chute-x"), options={"verify_signature": False})
+
+    assert first["purpose"] == "provision"
+    assert first["server_id"] == "chute-x"
+    assert isinstance(first["jti"], str) and len(first["jti"]) == 32
+    # Replay protection only works if every mint is unique.
+    assert first["jti"] != second["jti"]

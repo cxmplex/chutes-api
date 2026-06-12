@@ -229,7 +229,9 @@ class TdxVerificationResult:
         if not self.td_attributes:
             return True  # treat missing as unsafe
         try:
-            value = int(self.td_attributes, 16)
+            # dcap-qvl serializes td_attributes in little-endian memory order (byte[0] first),
+            # so decode as LE bytes; int(x, 16) would parse big-endian and test the wrong end.
+            value = int.from_bytes(bytes.fromhex(self.td_attributes), "little")
             return bool(value & (1 << TDX_ATTR_DEBUG_BIT))
         except (ValueError, TypeError):
             return True  # treat unparseable as unsafe

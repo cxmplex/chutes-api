@@ -7,6 +7,7 @@ import secrets
 import base64
 import json
 import tempfile
+import time
 from typing import Dict, List, Optional
 from sqlalchemy import select
 from sqlalchemy.sql import func
@@ -16,8 +17,9 @@ from aiohttp import ClientResponse
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request
 from loguru import logger
-from dcap_qvl import get_collateral_and_verify
+from dcap_qvl import PHALA_PCCS_URL, get_collateral, verify_with_root_ca
 from api.config import settings, TeeMeasurementConfig
+from api.server.intel_root import INTEL_SGX_ROOT_CA_DER
 from cryptography import x509
 from cryptography.x509 import Certificate
 from cryptography.hazmat.primitives import serialization
@@ -256,19 +258,26 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
     """
     Verify the cryptographic signature of a TDX quote using dcap-qvl.
 
+    The quote's PCK chain is verified against the explicitly pinned Intel SGX Root CA
+    (intel_root.py) via ``verify_with_root_ca`` -- never the library's built-in root -- matching
+    the deliberate AMD ARK pin in snp_verify. The PCCS only serves collateral (TCB info / QE
+    identity / CRLs), whose signatures chain to the same pinned root, so it is not a trust anchor.
+
     Args:
-        quote_bytes: Raw TDX quote bytes
-        verify_collateral: Whether to verify against Intel's collateral (requires PCCS)
+        quote: Parsed TDX quote (raw_bytes are verified)
 
     Returns:
-        True if signature is valid, False otherwise
+        TdxVerificationResult derived from the dcap-qvl verified report
     """
 
-    logger.info("Verifying TDX quote signature using dcap-qvl")
+    logger.info("Verifying TDX quote signature using dcap-qvl (pinned Intel root)")
 
     try:
-        # Perform quote verification
-        verified_report = await get_collateral_and_verify(quote.raw_bytes)
+        # Perform quote verification against the pinned Intel root.
+        collateral = await get_collateral(PHALA_PCCS_URL, quote.raw_bytes)
+        verified_report = verify_with_root_ca(
+            quote.raw_bytes, collateral, INTEL_SGX_ROOT_CA_DER, int(time.time())
+        )
 
         result = TdxVerificationResult.from_report(verified_report)
 
@@ -387,8 +396,14 @@ async def _verify_snp_vtpm(quote: SnpReport, config, expected_nonce: str) -> Non
     """Verify the GCE vTPM measured-boot quote attached to a GCP SNP report against pinned PCRs.
 
     The vTPM quote (AK cert + TPMS_ATTEST + signature + PCRs) is verified by gcp_vtpm (AK chains to
-    the pinned Google EK/AK CA Root, RSASSA/SHA256 signature, extraData == the registration nonce,
-    pcrDigest == sha256(PCRs)); then the verified PCRs must equal the config's pinned ``vtpm_pcrs``.
+    the pinned Google EK/AK CA Root, RSASSA/SHA256 signature, pcrDigest == sha256(PCRs)); then the
+    verified PCRs must equal the config's pinned ``vtpm_pcrs``.
+
+    Channel binding: the quote's qualifying data must equal sha256(nonce || cert_pubkey_hash),
+    where cert_pubkey_hash is taken from the SNP report's report_data -- which verify_quote has
+    already proven equal to the actual mTLS client cert. This cross-binds the (Google-rooted)
+    vTPM image identity to the SAME TLS key the (AMD-rooted) SNP report attests, so an attacker
+    cannot relay a victim image's good-PCR vTPM quote alongside their own SNP report.
     """
     from api.server.gcp_vtpm import verify_vtpm_quote
 
@@ -406,9 +421,12 @@ async def _verify_snp_vtpm(quote: SnpReport, config, expected_nonce: str) -> Non
     except (KeyError, ValueError, TypeError) as exc:
         raise InvalidQuoteError(f"Malformed vTPM quote: {exc}")
 
+    expected_qualifying_data = hashlib.sha256(
+        bytes.fromhex(expected_nonce) + bytes.fromhex(extract_cert_hash(quote))
+    ).digest()
     vres = await verify_vtpm_quote(
         ak, msg, sig, pcrs,
-        bytes.fromhex(expected_nonce),
+        expected_qualifying_data,
         intermediate_der=intermediate,
         redis=settings.redis_client,
     )

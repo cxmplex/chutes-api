@@ -8,7 +8,7 @@ import pytest
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch, Mock
+from unittest.mock import patch, AsyncMock, Mock
 
 from api.config import TeeMeasurementConfig
 from api.server.util import (
@@ -241,6 +241,52 @@ def test_tdx_verification_result_to_dict():
     assert dict_result["parsed_at"] == now
     assert "rtmrs" in dict_result
     assert dict_result["rtmrs"]["rtmr0"] == "b" * 96
+
+
+def _result_with_td_attributes(td_attributes):
+    return TdxVerificationResult(
+        mrtd="a" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
+        user_data="test",
+        parsed_at=datetime.now(timezone.utc),
+        status="UpToDate",
+        advisory_ids=[],
+        td_attributes=td_attributes,
+    )
+
+
+def test_debug_td_rejected():
+    """A debug-mode TD (DEBUG bit 0 set; td_attributes is little-endian hex) must be rejected.
+
+    dcap-qvl serializes td_attributes in memory order (byte[0] first), so the DEBUG bit lives
+    in the FIRST hex byte. '0100000000000000' is a debug TD.
+    """
+    result = _result_with_td_attributes("0100000000000000")
+    assert result.debug_enabled is True
+    assert result.is_valid is False
+
+
+def test_non_debug_td_accepted():
+    """The normal GCP value (SEPT_VE_DISABLE, bit 28) must NOT be flagged as debug."""
+    result = _result_with_td_attributes("0000001000000000")
+    assert result.debug_enabled is False
+    assert result.is_valid is True
+
+
+def test_debug_bit_endianness_no_false_positive():
+    """A high bit in the LAST byte (bit 56+) is not DEBUG; big-endian parsing would misread it."""
+    result = _result_with_td_attributes("0000000000000001")
+    assert result.debug_enabled is False
+
+
+def test_missing_or_invalid_td_attributes_treated_as_debug():
+    """Missing/unparseable td_attributes must fail closed (treated as debug)."""
+    assert _result_with_td_attributes("").debug_enabled is True
+    assert _result_with_td_attributes("zz").debug_enabled is True
+    assert _result_with_td_attributes("0100000000000000").is_valid is False
 
 
 # Utility function tests
@@ -501,7 +547,9 @@ def test_verify_result_raises_when_rtmr_differs_from_dcap_result(sample_boot_quo
 # Quote signature verification tests
 @pytest.mark.asyncio
 async def test_verify_quote_signature_success(sample_boot_quote):
-    """Test successful quote signature verification."""
+    """Test successful quote signature verification (collateral fetch + pinned-root verify)."""
+    from api.server.intel_root import INTEL_SGX_ROOT_CA_DER
+
     mock_verified_report = Mock()
     mock_verified_report.status = "UpToDate"
     mock_verified_report.to_json.return_value = (
@@ -509,15 +557,26 @@ async def test_verify_quote_signature_success(sample_boot_quote):
         '"report": {"TD10": {"mr_td": "a", "rt_mr0": "b", "rt_mr1": "c", "rt_mr2": "d", '
         '"rt_mr3": "e", "report_data": "test", "td_attributes": "0000001000000000"}}}'
     )
+    mock_collateral = Mock()
 
-    with patch(
-        "api.server.util.get_collateral_and_verify", return_value=mock_verified_report
-    ) as mock_verify:
+    with (
+        patch(
+            "api.server.util.get_collateral", new_callable=AsyncMock, return_value=mock_collateral
+        ) as mock_get_collateral,
+        patch(
+            "api.server.util.verify_with_root_ca", return_value=mock_verified_report
+        ) as mock_verify,
+    ):
         result = await verify_quote_signature(sample_boot_quote)
 
         assert isinstance(result, TdxVerificationResult)
         assert result.is_valid is True
-        mock_verify.assert_called_once_with(sample_boot_quote.raw_bytes)
+        mock_get_collateral.assert_awaited_once()
+        # The verify call must pin the embedded Intel SGX Root CA, not the library default.
+        args = mock_verify.call_args.args
+        assert args[0] == sample_boot_quote.raw_bytes
+        assert args[1] is mock_collateral
+        assert args[2] == INTEL_SGX_ROOT_CA_DER
 
 
 @pytest.mark.asyncio
@@ -530,7 +589,10 @@ async def test_verify_quote_signature_failure(sample_boot_quote):
         '"rt_mr3": "e", "report_data": "test", "td_attributes": "0000001000000000"}}}'
     )
 
-    with patch("api.server.util.get_collateral_and_verify", return_value=mock_verified_report):
+    with (
+        patch("api.server.util.get_collateral", new_callable=AsyncMock, return_value=Mock()),
+        patch("api.server.util.verify_with_root_ca", return_value=mock_verified_report),
+    ):
         with pytest.raises(InvalidQuoteError, match="Unable to parse provided quote"):
             await verify_quote_signature(sample_boot_quote)
 

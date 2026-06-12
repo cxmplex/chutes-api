@@ -32,9 +32,12 @@ services:
       SKIP_METAGRAPH_CHECK: "true"
       # Dev: this stack is reached directly over plaintext HTTP with no mTLS-terminating nginx, so
       # the agent forwards its attestation cert via X-Client-Cert (CHUTES_SEND_CLIENT_CERT_HEADER)
-      # with no X-Client-Verify marker. Disable the marker requirement + the CPU-TEE attested-cert
-      # /tee binding for this dev validator only. NEVER set false in production (it removes the
-      # channel binding that stops the untrusted host pulling chute code/secrets with the launch JWT).
+      # with no X-Client-Verify marker. Disable the marker requirement for this dev validator only.
+      # NOTE: in this posture the CPU-TEE secret-returning /tee endpoints HARD-FAIL (403): without
+      # a verifying terminator the attested-cert binding cannot be proven, and the validator now
+      # refuses (rather than skips) unbound secret delivery. Front the stack with an mTLS
+      # terminator to exercise the secret flow. A non-dev validator (SKIP_METAGRAPH_CHECK unset)
+      # refuses to start with this false. NEVER set false in production.
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
       # Dev: ES256 key for signing launch-config JWTs (CPU scheduler -> agent deploy).
       LAUNCH_CONFIG_PRIVATE_KEY_PATH: /etc/config/launch_config_private_key.pem

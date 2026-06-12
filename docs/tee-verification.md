@@ -603,6 +603,32 @@ Chutes instances are ephemeral -- they scale up and down based on demand. This h
 | NVIDIA GPU attestation                        | The GPUs are genuine NVIDIA hardware, isolated from the host (the host cannot access GPU memory).                                       |
 
 
+## Deployment Requirement: the mTLS Client-Cert Terminator (CPU-TEE)
+
+For self-registered CPU-TEE servers, the validator binds secret-returning `/tee` endpoints to the
+server's attestation-bound certificate via mTLS headers (`api/server/util.py:_get_client_certificate`,
+`api/instance/util.py:require_attested_client_cert`). The validator TRUSTS those headers from a
+verifying terminator that is deployed OUTSIDE this repository (the infra/ingress configuration), so
+the following contract is load-bearing and MUST be verified operationally on every production
+deployment — none of it can be checked from this codebase:
+
+1. The ingress terminates agent mTLS with `ssl_verify_client` (optional or on) against the agent
+   client-cert CA, and proxies to chutes-api with:
+   - `proxy_set_header X-Client-Verify $ssl_client_verify;`
+   - `proxy_set_header X-Client-Cert $ssl_client_escaped_cert;`
+2. Inbound (client-supplied) `X-Client-Verify` / `X-Client-Cert` headers are ALWAYS overwritten or
+   stripped by the terminator — `proxy_set_header` on both names satisfies this; any path that
+   forwards request headers verbatim does not.
+3. chutes-api is NOT reachable except through that terminator (network policy / firewall): a direct
+   request could otherwise forge `X-Client-Verify: SUCCESS` with an arbitrary cert.
+4. `REQUIRE_MTLS_CLIENT_VERIFY` must be `true` in production. This is now enforced in code: the
+   validator refuses to start with it `false` unless the full dev posture
+   (`SKIP_METAGRAPH_CHECK=true`) is set, and with it `false` the CPU-TEE secret endpoints hard-fail
+   (403) rather than skip the attested-cert binding.
+
+Items 1–3 are properties of the ingress repo/deployment and must be re-checked when the ingress
+configuration changes.
+
 ## Dependencies
 
 The following Python packages are needed for independent verification:

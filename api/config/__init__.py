@@ -93,6 +93,19 @@ class Settings(BaseSettings):
                 "posture (REQUIRE_MTLS_CLIENT_VERIFY=true). Set SKIP_METAGRAPH_CHECK=false, or run a "
                 "full dev validator (REQUIRE_MTLS_CLIENT_VERIFY=false) for local bring-up."
             )
+        # The inverse direction must also fail closed: REQUIRE_MTLS_CLIENT_VERIFY=false disables the
+        # X-Client-Verify gate AND the CPU-TEE attested-cert binding on secret-returning endpoints,
+        # so flipping it alone on an otherwise-production validator would silently drop the sole
+        # Model-B secret guard. Only the full dev posture (SKIP_METAGRAPH_CHECK=true, the dev-only
+        # marker) may run without mTLS client verification; a non-dev validator refuses to start.
+        if not self.skip_metagraph_check and not self.require_mtls_client_verify:
+            raise ValueError(
+                "REQUIRE_MTLS_CLIENT_VERIFY=false is a dev-only posture (no mTLS terminator) and "
+                "must not be set on a non-dev validator: it would disable the attested-client-cert "
+                "binding that keeps CPU-TEE chute code/secrets from unattested callers. Set "
+                "REQUIRE_MTLS_CLIENT_VERIFY=true, or run the full dev posture "
+                "(SKIP_METAGRAPH_CHECK=true) for local bring-up."
+            )
 
     @cached_property
     def validator_keypair(self) -> Optional[Keypair]:
@@ -450,27 +463,41 @@ class Settings(BaseSettings):
             # --- AMD SEV-SNP: single launch measurement + policy + min-TCB; no MRTD/RTMRs ---
             if tee_type in ("sev-snp", "snp", "amd-snp"):
                 measurement_hex = _require_hex96(measurement_config.get("measurement"), "measurement")
+                # policy is REQUIRED, not optional: the SNP launch measurement does not cover the
+                # policy field, so an unpinned policy lets a host flip non-DEBUG bits (SMT,
+                # MIGRATE_MA, ...) that the measurement match would never catch.
                 raw_policy = measurement_config.get("policy")
-                policy = None
-                if raw_policy is not None:
-                    # Accept either an int or a hex string like "0x30000".
-                    policy = int(str(raw_policy), 0) if isinstance(raw_policy, str) else int(raw_policy)
-                    if policy & (1 << 19):
-                        raise ValueError(
-                            f"SNP measurement config '{config_name}' sets the guest policy DEBUG "
-                            "bit (0x80000); a debuggable guest offers no confidentiality. Refusing."
-                        )
+                if raw_policy is None:
+                    raise ValueError(
+                        f"Missing 'policy' for SNP measurement config '{config_name}'. SNP configs "
+                        "must pin the full guest policy (the launch measurement does not cover it)."
+                    )
+                # Accept either an int or a hex string like "0x30000".
+                policy = int(str(raw_policy), 0) if isinstance(raw_policy, str) else int(raw_policy)
+                if policy & (1 << 19):
+                    raise ValueError(
+                        f"SNP measurement config '{config_name}' sets the guest policy DEBUG "
+                        "bit (0x80000); a debuggable guest offers no confidentiality. Refusing."
+                    )
+                # min_tcb is REQUIRED, not optional: without a minimum reported TCB there is no
+                # anti-rollback -- a host could run firmware with known-vulnerable SPL levels and
+                # still match the config.
                 raw_min_tcb = measurement_config.get("min_tcb")
-                min_tcb = (
-                    {str(k).lower(): int(v) for k, v in dict(raw_min_tcb).items()}
-                    if raw_min_tcb
-                    else None
-                )
+                if not raw_min_tcb:
+                    raise ValueError(
+                        f"Missing 'min_tcb' for SNP measurement config '{config_name}'. SNP configs "
+                        "must pin minimum TCB levels ({{bootloader,tee,snp,microcode}}) for "
+                        "anti-rollback."
+                    )
+                min_tcb = {str(k).lower(): int(v) for k, v in dict(raw_min_tcb).items()}
                 id_key_digest = measurement_config.get("id_key_digest")
                 if id_key_digest:
                     id_key_digest = _require_hex96(id_key_digest, "id_key_digest")
                 processor_model = (str(measurement_config.get("processor_model") or "Genoa")).strip()
-                # GCP image identity: optional pinned GCE vTPM PCRs (sha256, 64 hex each).
+                # GCP image identity: pinned GCE vTPM PCRs (sha256, 64 hex each). REQUIRED for
+                # provider 'gcp': there the SNP launch measurement is Google firmware only, so a
+                # config without vtpm_pcrs would match on firmware alone and never check WHICH
+                # image is running.
                 raw_vtpm = measurement_config.get("vtpm_pcrs")
                 vtpm_pcrs = None
                 if raw_vtpm:
@@ -483,6 +510,12 @@ class Settings(BaseSettings):
                                 f"expected 64 hex chars (sha256), got {len(val)}."
                             )
                         vtpm_pcrs[str(k)] = val
+                if provider == "gcp" and not vtpm_pcrs:
+                    raise ValueError(
+                        f"SNP measurement config '{config_name}' has provider 'gcp' but no "
+                        "'vtpm_pcrs'. On GCP the SNP measurement attests only Google firmware, so "
+                        "image identity MUST be pinned via the GCE vTPM PCRs (PCR8/PCR9)."
+                    )
                 measurements.append(
                     TeeMeasurementConfig(
                         version=str(version).strip(),
@@ -512,6 +545,14 @@ class Settings(BaseSettings):
             # so a partially-specified config silently leaves the unlisted RTMRs
             # unconstrained -- a measurement-bypass footgun (e.g. omitting RTMR3 would
             # drop all runtime guest-stack enforcement). Reject it at load time.
+            #
+            # RTMR1/RTMR2 are LOAD-BEARING for the CPU-TEE integrity story, not optional
+            # hardening: /boot (kernel, initramfs, grub.cfg) lives OUTSIDE the dm-verity
+            # root, and the verity-roothash -> RTMR3 binding is performed by the initramfs
+            # rtmr3-measure/verity-open scripts measured into RTMR1 (initramfs+kernel) with
+            # the cmdline/grub.cfg in RTMR2. Without those pins a host could boot a tampered
+            # initramfs that extends RTMR3 with the expected value WITHOUT opening the
+            # verified root, voiding the agent/cosign integrity chain.
             if not isinstance(measurement_config.get("boot_rtmrs"), dict) or not isinstance(
                 measurement_config.get("runtime_rtmrs"), dict
             ):

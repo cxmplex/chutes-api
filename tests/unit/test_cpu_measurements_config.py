@@ -158,3 +158,80 @@ def test_invalid_rtmr0_length_still_raises(tmp_path):
     settings = _settings_for_yaml(tmp_path, yaml_text)
     with pytest.raises(ValueError, match="Invalid boot_rtmrs.rtmr0"):
         settings._load_tee_measurements()
+
+
+# --------------------------------------------------------------------------------------------------
+# AMD SEV-SNP configs must fail closed: policy + min_tcb always; vtpm_pcrs for provider gcp.
+# --------------------------------------------------------------------------------------------------
+
+HEX96_SNP = "F" * 96
+HEX64_PCR = "1" * 64
+
+
+def _snp_yaml(*, policy='policy: "0x30000"', min_tcb=True, provider="baremetal", vtpm=False):
+    min_tcb_block = (
+        """
+        min_tcb:
+          bootloader: 7
+          tee: 0
+          snp: 23
+          microcode: 72"""
+        if min_tcb
+        else ""
+    )
+    vtpm_block = (
+        f"""
+        vtpm_pcrs:
+          "8": "{HEX64_PCR}"
+          "9": "{HEX64_PCR}" """
+        if vtpm
+        else ""
+    )
+    return f"""
+    measurements:
+      - version: "1"
+        name: "cpu-snp"
+        provider: "{provider}"
+        tee_type: "sev-snp"
+        measurement: "{HEX96_SNP}"
+        {policy}{min_tcb_block}{vtpm_block}
+        expected_gpus: []
+        gpu_count: 0
+    """
+
+
+def test_snp_config_complete_loads(tmp_path):
+    settings = _settings_for_yaml(tmp_path, _snp_yaml())
+    (config,) = settings._load_tee_measurements()
+    assert config.tee_type == "sev-snp"
+    assert config.policy == 0x30000
+    assert config.min_tcb == {"bootloader": 7, "tee": 0, "snp": 23, "microcode": 72}
+
+
+def test_snp_config_missing_policy_rejected(tmp_path):
+    """The SNP launch measurement does not cover the policy field, so an unpinned policy lets a
+    host flip non-DEBUG policy bits undetected -- the config must hard-fail at load."""
+    settings = _settings_for_yaml(tmp_path, _snp_yaml(policy=""))
+    with pytest.raises(ValueError, match="Missing 'policy'"):
+        settings._load_tee_measurements()
+
+
+def test_snp_config_missing_min_tcb_rejected(tmp_path):
+    """Without a minimum reported TCB there is no anti-rollback; must hard-fail at load."""
+    settings = _settings_for_yaml(tmp_path, _snp_yaml(min_tcb=False))
+    with pytest.raises(ValueError, match="Missing 'min_tcb'"):
+        settings._load_tee_measurements()
+
+
+def test_gcp_snp_config_without_vtpm_pcrs_rejected(tmp_path):
+    """A provider-gcp SNP config without vtpm_pcrs would match on Google firmware alone and never
+    check image identity; must hard-fail at load."""
+    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="gcp", vtpm=False))
+    with pytest.raises(ValueError, match="provider 'gcp' but no\\s+'vtpm_pcrs'"):
+        settings._load_tee_measurements()
+
+
+def test_gcp_snp_config_with_vtpm_pcrs_loads(tmp_path):
+    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="gcp", vtpm=True))
+    (config,) = settings._load_tee_measurements()
+    assert config.vtpm_pcrs == {"8": HEX64_PCR, "9": HEX64_PCR}

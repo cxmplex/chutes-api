@@ -215,7 +215,7 @@ async def verify_vtpm_quote(
     quote_msg: bytes,
     quote_sig: bytes,
     pcrs: Dict[int, bytes],
-    expected_nonce: bytes,
+    expected_qualifying_data: bytes,
     *,
     intermediate_der: Optional[bytes] = None,
     redis=None,
@@ -224,9 +224,11 @@ async def verify_vtpm_quote(
 
     Checks: the AK leaf chains to the pinned Google EK/AK CA Root (via the per-CA intermediate,
     supplied or fetched from the leaf AIA); the quote signature (RSASSA/SHA256) verifies against the
-    AK; the quote's extraData equals ``expected_nonce`` (freshness/binding); and the quoted pcrDigest
-    equals sha256(concat of the provided PCR values, ascending index). Returns the verified PCRs;
-    the caller compares them to the pinned per-image expected PCRs.
+    AK; the quote's extraData equals ``expected_qualifying_data`` (freshness + channel binding --
+    callers pass sha256(nonce || cert_pubkey_hash) so the vTPM evidence is bound to the same TLS
+    identity as the SNP report, not just the nonce); and the quoted pcrDigest equals sha256(concat
+    of the provided PCR values, ascending index). Returns the verified PCRs; the caller compares
+    them to the pinned per-image expected PCRs.
     """
     result = GcpVtpmResult(pcrs={str(i): v.hex().upper() for i, v in pcrs.items()}, status="INVALID")
     try:
@@ -267,8 +269,11 @@ async def verify_vtpm_quote(
             raise InvalidQuoteError("vTPM quote signature is invalid (AK did not sign it)")
 
         extra, pcr_digest = parse_tpms_attest(quote_msg)
-        if extra != expected_nonce:
-            raise InvalidQuoteError("vTPM quote nonce mismatch (stale/replayed quote)")
+        if extra != expected_qualifying_data:
+            raise InvalidQuoteError(
+                "vTPM quote qualifying-data mismatch (stale/replayed quote, or evidence "
+                "bound to a different nonce/TLS identity)"
+            )
 
         concat = b"".join(pcrs[i] for i in sorted(pcrs))
         if hashlib.sha256(concat).digest() != pcr_digest:

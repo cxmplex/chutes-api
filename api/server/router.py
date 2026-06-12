@@ -280,6 +280,13 @@ async def get_cpu_server_connection(
     `chutes ssh/connect <server_id>` needs no flags. This is discovery + authorization ONLY: the
     trust decision is the client verifying the TDX quote itself (Intel + the manifest), NOT this
     response, and the connection goes directly to the instance, never through this API.
+
+    Provisioning authority (D M-3, confirmed): under the current model the self-registered CPU TEE
+    instance's OWNER is the miner hotkey that registered it (check_server_ownership), and that
+    owner is the intended provisioner -- each call here mints a fresh SINGLE-USE token (random jti,
+    consumed by the in-TEE chutes-provision service on first authorization, so a captured token
+    cannot be replayed). If instances are ever assigned/rented to third-party users, token issuance
+    must move behind that user's authorization instead of miner-ownership.
     """
     from api.instance.util import create_provision_jwt
 

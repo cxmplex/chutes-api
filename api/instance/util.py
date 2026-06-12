@@ -856,9 +856,11 @@ def create_provision_jwt(server_id: str, ttl_minutes: int = 30) -> str:
     The in-TEE chutes-provision service verifies it (ES256, iss "chutes", purpose "provision",
     server_id bound, not expired) against the validator's launch PUBLIC key baked + measured into
     the user-instance image, so only the holder of a validator-issued token can push their SSH key
-    or secrets. This is an authorization gate only -- confidentiality comes from TDX + the attested
-    channel, so the user does not have to trust the validator for confidentiality, only for who is
-    allowed to provision the instance they were given.
+    or secrets. The random ``jti`` makes each token SINGLE-USE: the in-TEE service records consumed
+    jti values and rejects replays, so a captured/leaked token cannot be reused within its TTL.
+    This is an authorization gate only -- confidentiality comes from TDX + the attested channel, so
+    the user does not have to trust the validator for confidentiality, only for who is allowed to
+    provision the instance they were given.
     """
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(minutes=ttl_minutes)
@@ -868,6 +870,9 @@ def create_provision_jwt(server_id: str, ttl_minutes: int = 30) -> str:
         "exp": int(expires_at.timestamp()),
         "purpose": "provision",
         "server_id": server_id,
+        # Single-use marker: the in-TEE service consumes each jti on first successful
+        # authorization, so this token cannot be replayed.
+        "jti": uuid.uuid4().hex,
     }
     return jwt.encode(payload, settings.launch_config_private_key_bytes, algorithm="ES256")
 
@@ -1144,8 +1149,11 @@ async def require_attested_client_cert(db, request: Request, instance) -> None:
     the validator's terminator verified, so an operator without the in-TEE key cannot pull secrets.
 
     Fail closed. No-op for GPU-TEE / non-self-registered instances (bound by the verify_tee_chute
-    quote dial), and -- since the binding requires an mTLS terminator -- when the validator is
-    explicitly running without one (require_mtls_client_verify=false, a dev/plaintext validator)."""
+    quote dial). A validator running without an mTLS terminator (require_mtls_client_verify=false,
+    the dev/plaintext posture) cannot prove the caller holds the attested key at all, so it must
+    HARD-FAIL these secret-returning endpoints rather than skip the binding -- a warn-and-return
+    here would hand chute code + decrypted secrets to anyone with the launch JWT, including the
+    untrusted L0 host."""
     server = None
     if getattr(instance, "server_id", None):
         server = (
@@ -1159,11 +1167,18 @@ async def require_attested_client_cert(db, request: Request, instance) -> None:
         return
 
     if not settings.require_mtls_client_verify:
-        logger.warning(
-            f"require_mtls_client_verify is disabled; NOT binding secret delivery for CPU-TEE "
-            f"instance {instance.instance_id} to its attested cert (dev/plaintext validator only)."
+        logger.error(
+            f"require_mtls_client_verify is disabled; cannot bind secret delivery for CPU-TEE "
+            f"instance {instance.instance_id} to its attested cert -- refusing to serve secrets."
         )
-        return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "This validator runs without an mTLS terminator (REQUIRE_MTLS_CLIENT_VERIFY=false) "
+                "and cannot bind secret delivery to the attested TD; refusing to release CPU-TEE "
+                "chute code/secrets. Front the validator with a verifying mTLS terminator."
+            ),
+        )
 
     attested_cert = getattr(server, "attested_cert", None)
     if not attested_cert:
