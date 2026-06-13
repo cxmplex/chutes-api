@@ -72,6 +72,25 @@ async def _target_count(chute_id: str) -> int:
     return max(target, 1)
 
 
+def _server_fits(server: Server, req_cores: int, req_ram: int) -> bool:
+    """Whether a CPU server satisfies a chute's cores/RAM request.
+
+    Host-launched per-chute TDs (Model B, ``server.host_id`` set) are sized to the chute at launch,
+    so require an EXACT vCPU match -- a small chute must not grab a larger chute's right-sized TD
+    (which both wastes the big TD and starves the big chute). Standalone servers (Model A, e.g. a
+    GCP Confidential VM whose vCPU count is fixed/miner-chosen) use ``>=`` so a chute requesting N
+    cores can land on an idle >=N-core VM instead of being stranded forever waiting for an exact
+    match that never appears (the in-VM benchmark reports the VM's real os.cpu_count()).
+    """
+    cores = server.cpu_cores or 0
+    if server.host_id is not None:
+        if cores != req_cores:
+            return False
+    elif cores < req_cores:
+        return False
+    return (server.ram_gb or 0) >= req_ram
+
+
 def _job_ports(chute: Chute, method: str) -> list[dict]:
     """Ports a job declares (`@chute.job(ports=[...])`), as {port, proto}. The agent publishes each on
     the TD AND advertises it to the chute harness (CHUTES_PORT_<PROTO>_<port>) so the harness reports
@@ -479,11 +498,10 @@ async def schedule_once() -> None:
                     continue
                 if (server.benchmark_score or 0) < min_score:
                     continue
-                # Model B runs one chute per right-sized per-chute TD: require an EXACT vCPU match (a
-                # TD is launched with vcpus == the chute's req cores) so a small chute cannot grab a
-                # larger chute's TD (e.g. nginx 1-vCPU stealing jupyter's 4-vCPU TD), which both wastes
-                # the big TD and starves the big chute/job.
-                if (server.cpu_cores or 0) != req_cores or (server.ram_gb or 0) < req_ram:
+                # Exact vCPU match for host-launched per-chute TDs (Model B), >= for standalone
+                # servers (Model A / GCP) -- see _server_fits. This keeps a small chute from stealing
+                # a larger right-sized TD while not stranding a chute on an idle larger GCP VM.
+                if not _server_fits(server, req_cores, req_ram):
                     continue
                 if not await is_agent_online(server.server_id):
                     continue
@@ -566,11 +584,10 @@ async def schedule_once() -> None:
                     continue
                 if (server.benchmark_score or 0) < min_score:
                     continue
-                # Model B runs one chute per right-sized per-chute TD: require an EXACT vCPU match (a
-                # TD is launched with vcpus == the chute's req cores) so a small chute cannot grab a
-                # larger chute's TD (e.g. nginx 1-vCPU stealing jupyter's 4-vCPU TD), which both wastes
-                # the big TD and starves the big chute/job.
-                if (server.cpu_cores or 0) != req_cores or (server.ram_gb or 0) < req_ram:
+                # Exact vCPU match for host-launched per-chute TDs (Model B), >= for standalone
+                # servers (Model A / GCP) -- see _server_fits. This keeps a small chute from stealing
+                # a larger right-sized TD while not stranding a chute on an idle larger GCP VM.
+                if not _server_fits(server, req_cores, req_ram):
                     continue
                 if not await is_agent_online(server.server_id):
                     continue

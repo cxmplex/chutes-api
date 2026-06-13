@@ -24,6 +24,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from loguru import logger
 
+from api.server.cert_validity import check_cert_time_valid
 from api.server.exceptions import InvalidQuoteError
 from api.server.snp_quote import SnpReport
 
@@ -76,26 +77,6 @@ def _spki_sha384(cert: x509.Certificate) -> str:
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
     return hashlib.sha384(spki).hexdigest()
-
-
-def _check_cert_time_valid(cert: x509.Certificate, what: str) -> None:
-    """Reject a chain cert outside its validity window (expired or not-yet-valid).
-
-    Parity with the GCE vTPM path (gcp_vtpm._check_cert_time_valid): a signature chain alone
-    would accept an expired VCEK/ASK/ARK, silently extending trust past AMD's validity period.
-    """
-    now = datetime.now(timezone.utc)
-    try:
-        not_before = cert.not_valid_before_utc
-        not_after = cert.not_valid_after_utc
-    except AttributeError:  # cryptography < 42: naive UTC datetimes
-        not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
-        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
-    if now < not_before or now > not_after:
-        raise InvalidQuoteError(
-            f"{what} certificate is outside its validity period "
-            f"({not_before.isoformat()} .. {not_after.isoformat()})"
-        )
 
 
 def _verify_cert_signed_by(child: x509.Certificate, issuer_pubkey, what: str) -> None:
@@ -159,9 +140,9 @@ def _verify_chain(
     """ARK pinned + self-signed; ASK signed by ARK; VCEK signed by ASK; all within their validity
     windows. Returns the matched model."""
     matched = _pin_ark(ark, model)
-    _check_cert_time_valid(ark, "ARK")
-    _check_cert_time_valid(ask, "ASK")
-    _check_cert_time_valid(vcek, "VCEK")
+    check_cert_time_valid(ark, "ARK")
+    check_cert_time_valid(ask, "ASK")
+    check_cert_time_valid(vcek, "VCEK")
     _verify_cert_signed_by(ark, ark.public_key(), "ARK (self-signed)")
     _verify_cert_signed_by(ask, ark.public_key(), "ASK<-ARK")
     _verify_cert_signed_by(vcek, ask.public_key(), "VCEK<-ASK")

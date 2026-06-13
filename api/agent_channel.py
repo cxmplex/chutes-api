@@ -13,7 +13,7 @@ from typing import Optional
 
 import orjson as json
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from api.config import settings
 from api.constants import AGENT_COMMAND_CHANNEL
@@ -109,8 +109,6 @@ async def handle_agent_command_ack(server_id: str, ack: dict) -> None:
             return
         config_id = context.get("config_id")
         detail = (ack or {}).get("detail") or f"agent ack status={status}"
-        from sqlalchemy import text
-
         from api.database import get_session
 
         async with get_session() as session:
@@ -236,8 +234,6 @@ def _older_than(created_at, seconds: int) -> bool:
 
 async def _reconcile_server_containers(server_id: str, containers: list) -> None:
     """Model A: reconcile a standalone VM's running chute containers against validator state."""
-    from sqlalchemy import select as sa_select
-
     from api.database import get_session
     from api.instance.schemas import Instance, LaunchConfig
     from api.instance.util import purge_and_notify
@@ -247,7 +243,7 @@ async def _reconcile_server_containers(server_id: str, containers: list) -> None
         instances = (
             (
                 await session.execute(
-                    sa_select(Instance).where(Instance.server_id == server_id)
+                    select(Instance).where(Instance.server_id == server_id)
                 )
             )
             .unique()
@@ -257,7 +253,7 @@ async def _reconcile_server_containers(server_id: str, containers: list) -> None
         pending_config_ids = set(
             (
                 await session.execute(
-                    sa_select(LaunchConfig.config_id).where(
+                    select(LaunchConfig.config_id).where(
                         LaunchConfig.server_id == server_id,
                         LaunchConfig.verified_at.is_(None),
                         LaunchConfig.failed_at.is_(None),
@@ -295,8 +291,6 @@ async def _reconcile_server_containers(server_id: str, containers: list) -> None
 
 async def _reconcile_host_slots(host_id: str, slots: list) -> None:
     """Model B: reconcile an L0 host's active TD slots against validator state."""
-    from sqlalchemy import select as sa_select, text as sa_text
-
     from api.chute.schemas import Chute
     from api.database import get_session
     from api.instance.schemas import Instance
@@ -313,7 +307,7 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
         servers = (
             (
                 await session.execute(
-                    sa_select(Server).where(
+                    select(Server).where(
                         Server.host_id == host_id, Server.self_registered.is_(True)
                     )
                 )
@@ -337,7 +331,7 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
             instances = (
                 (
                     await session.execute(
-                        sa_select(Instance).where(Instance.server_id == server.server_id)
+                        select(Instance).where(Instance.server_id == server.server_id)
                     )
                 )
                 .unique()
@@ -350,7 +344,7 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
             )
         async with get_session() as session:
             await session.execute(
-                sa_text(
+                text(
                     "UPDATE launch_configs SET failed_at = NOW(), "
                     "verification_error = 'reconcile: backing TD no longer exists' "
                     "WHERE server_id = :server_id AND verified_at IS NULL AND failed_at IS NULL"
@@ -358,7 +352,7 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
                 {"server_id": server.server_id},
             )
             await session.execute(
-                sa_text("DELETE FROM servers WHERE server_id = :server_id"),
+                text("DELETE FROM servers WHERE server_id = :server_id"),
                 {"server_id": server.server_id},
             )
             await session.commit()
@@ -369,13 +363,13 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
         async with get_session() as session:
             server_exists = (
                 await session.execute(
-                    sa_select(Server.server_id).where(Server.server_id == slot_server_id)
+                    select(Server.server_id).where(Server.server_id == slot_server_id)
                 )
             ).scalar_one_or_none()
             chute_exists = (
                 (
                     await session.execute(
-                        sa_select(Chute.chute_id).where(Chute.chute_id == slot_chute_id)
+                        select(Chute.chute_id).where(Chute.chute_id == slot_chute_id)
                     )
                 ).scalar_one_or_none()
                 if slot_chute_id

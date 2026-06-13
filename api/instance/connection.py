@@ -104,6 +104,45 @@ def get_instance_url(instance, port: int | None = None) -> str:
     return f"http://{instance.host}:{p}"
 
 
+def build_pinned_client(
+    cacert_pem: str,
+    host: str,
+    port: int,
+    *,
+    connect_timeout: float = 10.0,
+    read_timeout: float | None = 10.0,
+    write_timeout: float = 30.0,
+) -> httpx.AsyncClient:
+    """Build an ephemeral httpx client pinned to a TEE instance's cert for an ARBITRARY port.
+
+    Mirrors get_instance_client's TLS posture (verify against the pinned instance cert/CA, SNI =
+    cert CN, TCP -> the instance IP via the CN->IP backend) but targets a caller-chosen port (e.g.
+    the DNAT'd logging port 8001) and is server-auth only (no mTLS client cert). Used by the log
+    capture + prober so the validator reads chute logs over TLS pinned to the attested cert -- the
+    untrusted host that routes the port cannot read or tamper log content on the wire. Caller closes.
+    """
+    # Pin ONLY the attested cert: passing cadata to create_default_context means the system trust
+    # store is NOT loaded, so a host-presented, system-trusted cert cannot satisfy verification --
+    # only the exact attested cert (committed in the registration quote) is trusted.
+    ctx = ssl.create_default_context(cadata=cacert_pem)
+    cert = x509.load_pem_x509_certificate(cacert_pem.encode())
+    cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+    pool = httpcore.AsyncConnectionPool(
+        ssl_context=ctx,
+        http2=False,
+        network_backend=_InstanceNetworkBackend(hostname=cn, ip=host),
+        socket_options=_KEEPALIVE_SOCK_OPTS,
+        keepalive_expiry=75,
+    )
+    return httpx.AsyncClient(
+        transport=_CoreTransport(pool),
+        base_url=f"https://{cn}:{port}",
+        timeout=httpx.Timeout(
+            connect=connect_timeout, read=read_timeout, write=write_timeout, pool=10.0
+        ),
+    )
+
+
 class _InstanceNetworkBackend(httpcore.AsyncNetworkBackend):
     """Resolves cert CN hostnames to instance IPs without external DNS lookups.
 

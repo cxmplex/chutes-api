@@ -356,8 +356,7 @@ class TestScheduleOncePlacement:
         "server_kwargs",
         [
             {"benchmark_score": 10.0},  # below the chute's min_benchmark_score
-            {"cpu_cores": 4},  # exact-vCPU match required (right-sized Model-B TDs)
-            {"cpu_cores": 1},  # too small
+            {"cpu_cores": 1},  # too few cores (< req for both Model A >= and Model B exact)
             {"ram_gb": 2},  # insufficient RAM
         ],
     )
@@ -373,6 +372,29 @@ class TestScheduleOncePlacement:
         # _launch_on_host(session, chute, req_cores, req_ram)
         assert launch.await_args.args[1] is chute
         assert launch.await_args.args[2:] == (2, 4)
+
+    @pytest.mark.asyncio
+    async def test_model_a_larger_server_is_placed(self, mock_settings):
+        """Model A (standalone, host_id=None): a chute requesting fewer cores than the VM has is
+        PLACED on it (>=), not stranded waiting for an exact match that never appears."""
+        chute = _chute(cpu_cores=2, ram_gb=4, min_benchmark_score=50.0)
+        server = _server(server_id="srv-big", cpu_cores=8, ram_gb=16)  # host_id=None => Model A
+        handlers = _schedule_handlers([chute], [server])
+        _, dispatch, launch, _ = await self._run(handlers)
+        dispatch.assert_awaited_once()
+        launch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_model_b_inexact_cores_fall_through(self, mock_settings):
+        """Model B (host-launched, host_id set): a right-sized TD must match the chute's cores
+        EXACTLY, so a larger TD is not reused for a smaller chute -- it falls through to a fresh
+        per-chute TD launch."""
+        chute = _chute(cpu_cores=2, ram_gb=4, min_benchmark_score=50.0)
+        server = _server(server_id="td-big", cpu_cores=8, ram_gb=16, host_id="host-1")
+        handlers = _schedule_handlers([chute], [server])
+        _, dispatch, launch, _ = await self._run(handlers)
+        dispatch.assert_not_awaited()
+        launch.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_offline_agent_skipped(self, mock_settings):

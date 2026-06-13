@@ -225,9 +225,9 @@ def test_snp_config_missing_min_tcb_rejected(tmp_path):
 
 def test_gcp_snp_config_without_vtpm_pcrs_rejected(tmp_path):
     """A provider-gcp SNP config without vtpm_pcrs would match on Google firmware alone and never
-    check image identity; must hard-fail at load."""
+    check image identity; must hard-fail at load (requiring PCR8 and PCR9 specifically)."""
     settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="gcp", vtpm=False))
-    with pytest.raises(ValueError, match="provider 'gcp' but no\\s+'vtpm_pcrs'"):
+    with pytest.raises(ValueError, match="must pin vtpm_pcrs including PCR8 and PCR9"):
         settings._load_tee_measurements()
 
 
@@ -235,3 +235,94 @@ def test_gcp_snp_config_with_vtpm_pcrs_loads(tmp_path):
     settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="gcp", vtpm=True))
     (config,) = settings._load_tee_measurements()
     assert config.vtpm_pcrs == {"8": HEX64_PCR, "9": HEX64_PCR}
+
+
+def test_debug_measurement_rejected_without_switch(tmp_path):
+    """A measurement config tagged debug: true is refused at load unless ALLOW_DEBUG_MEASUREMENTS
+    is set -- a debug image forwards user logs to the host console and must not pass as production."""
+    yaml = f"""
+    measurements:
+      - version: "1"
+        name: "cpu-snp-dbg"
+        provider: "bare-metal"
+        tee_type: "sev-snp"
+        debug: true
+        measurement: "{HEX96_SNP}"
+        policy: "0x30000"
+        min_tcb:
+          bootloader: 7
+          tee: 0
+          snp: 23
+          microcode: 72
+        expected_gpus: []
+        gpu_count: 0
+    """
+    settings = _settings_for_yaml(tmp_path, yaml)
+    with pytest.raises(ValueError, match="ALLOW_DEBUG_MEASUREMENTS"):
+        settings._load_tee_measurements()
+
+
+def test_debug_measurement_allowed_with_switch(tmp_path, monkeypatch):
+    """With ALLOW_DEBUG_MEASUREMENTS set (dev), a debug-tagged config loads."""
+    yaml = f"""
+    measurements:
+      - version: "1"
+        name: "cpu-snp-dbg"
+        provider: "bare-metal"
+        tee_type: "sev-snp"
+        debug: true
+        measurement: "{HEX96_SNP}"
+        policy: "0x30000"
+        min_tcb:
+          bootloader: 7
+          tee: 0
+          snp: 23
+          microcode: 72
+        expected_gpus: []
+        gpu_count: 0
+    """
+    settings = _settings_for_yaml(tmp_path, yaml)
+    monkeypatch.setattr(settings, "allow_debug_measurements", True)
+    (config,) = settings._load_tee_measurements()
+    assert config.name == "cpu-snp-dbg"
+
+
+def test_snp_config_missing_provider_rejected(tmp_path):
+    """SNP image identity is verified differently per provider; an unset/unknown provider would
+    default the GCP vTPM image-identity check off, so it must fail closed at load."""
+    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="", vtpm=False))
+    with pytest.raises(ValueError, match="must set provider to 'gcp' or 'bare-metal'"):
+        settings._load_tee_measurements()
+
+
+def test_snp_config_baremetal_alias_normalized(tmp_path):
+    """'baremetal' is accepted and normalized to 'bare-metal' (no vtpm_pcrs required there)."""
+    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="baremetal", vtpm=False))
+    (config,) = settings._load_tee_measurements()
+    assert config.provider == "bare-metal"
+
+
+def test_gcp_snp_config_with_only_pcr8_rejected(tmp_path):
+    """A GCP SNP config that pins some PCRs but is missing PCR9 leaves the image unpinned (the
+    listed PCR alone may be image-invariant); must fail closed."""
+    yaml = f"""
+    measurements:
+      - version: "1"
+        name: "cpu-snp"
+        provider: "gcp"
+        tee_type: "sev-snp"
+        measurement: "{HEX96_SNP}"
+        policy: "0x30000"
+        min_tcb:
+          bootloader: 7
+          tee: 0
+          snp: 23
+          microcode: 72
+        vtpm_pcrs:
+          "8": "{HEX64_PCR}"
+        expected_gpus: []
+        gpu_count: 0
+    """
+    settings = _settings_for_yaml(tmp_path, yaml)
+    with pytest.raises(ValueError, match="must pin vtpm_pcrs including PCR8 and PCR9"):
+        settings._load_tee_measurements()

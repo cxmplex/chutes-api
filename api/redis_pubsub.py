@@ -125,9 +125,9 @@ class AgentCommandListener(RedisListener):
 
     Unlike the miner ``miner_broadcast`` channel (fan-out filtered by hotkey via ``reverse_map``),
     agent commands target a single server. Each message carries a ``server_id``; this listener
-    looks up the connected agent session in ``sio.agent_sessions`` and emits an ``agent_command``
-    event only to that session. Other socket-server replicas (which do not hold the session)
-    simply find no mapping and skip it.
+    looks up the connected agent session in ``sio.agent_sessions`` and emits an event named after
+    the channel (``agent_commands``, like the base listener emits ``self.channel``) only to that
+    session. Other socket-server replicas (which do not hold the session) find no mapping and skip.
     """
 
     async def _listen(self):
@@ -142,7 +142,7 @@ class AgentCommandListener(RedisListener):
                 agent_sessions = getattr(self.sio, "agent_sessions", {})
                 session_id = agent_sessions.get(server_id) if server_id else None
                 if session_id is not None:
-                    await self.sio.emit("agent_command", data, room=session_id)
+                    await self.sio.emit(self.channel, data, room=session_id)
                     logger.info(
                         f"Dispatched agent command to server_id={server_id}: "
                         f"{data.get('command')} ({data.get('command_id')})"

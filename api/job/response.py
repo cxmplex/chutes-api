@@ -31,6 +31,10 @@ class JobResponse(BaseModel):
 
     host: Optional[str] = None
     port_mappings: Optional[list[dict[str, Any]]] = []
+    # The attested CPU-TEE server the job's instance landed on. The owner passes this to
+    # `chutes connect`/`chutes ssh` (GET /servers/cpu/{server_id}/connection) to attest + reach the
+    # rental over the WireGuard overlay. None until the job is scheduled onto a server.
+    server_id: Optional[str] = None
 
     chute: MinimalChuteResponse
     instance: Optional[MinimalInstanceResponse] = None

@@ -16,7 +16,7 @@ production mTLS posture.
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
@@ -125,22 +125,29 @@ async def list_hosts(
     hosts = (
         (await db.execute(select(Host).where(Host.miner_hotkey == hotkey))).scalars().all()
     )
+    # Per-host TD usage in one grouped query (mirrors api/cpu_scheduler.py _launch_on_host) rather
+    # than a COUNT per host.
+    used_rows = (
+        await db.execute(
+            select(Server.host_id, func.count(Server.server_id))
+            .where(
+                Server.host_id.isnot(None),
+                Server.self_registered.is_(True),
+                Server.miner_hotkey == hotkey,
+            )
+            .group_by(Server.host_id)
+        )
+    ).all()
+    used_by_host = {host_id: count for host_id, count in used_rows}
     out = []
     for h in hosts:
-        used = (
-            await db.execute(
-                select(Server.server_id).where(
-                    Server.host_id == h.host_id, Server.self_registered.is_(True)
-                )
-            )
-        ).scalars().all()
         out.append(
             {
                 "host_id": h.host_id,
                 "name": h.name,
                 "tee_type": h.tee_type,
                 "capacity": h.capacity,
-                "used": len(used),
+                "used": used_by_host.get(h.host_id, 0),
                 "external_host": h.external_host,
                 "cpu_cores": h.cpu_cores,
                 "ram_gb": h.ram_gb,

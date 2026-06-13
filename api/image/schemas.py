@@ -36,7 +36,8 @@ class Image(Base):
     inspecto = Column(String, nullable=True)
     package_hashes = Column(JSONB, nullable=True)
     # CPU-only chutes skip the GPU-oriented filesystem-verification (cfsv) + inspecto build stage.
-    cpu = Column(Boolean, default=False)
+    # nullable=False matches the migration (NOT NULL DEFAULT false), so the ORM and schema agree.
+    cpu = Column(Boolean, default=False, nullable=False)
 
     chutes = relationship("Chute", back_populates="image")
     logo = relationship("Logo", back_populates="images", lazy="joined")

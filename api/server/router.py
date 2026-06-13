@@ -264,16 +264,70 @@ def _manifest_for_version(version: str | None) -> dict | None:
     return None
 
 
+async def _caller_owns_server_workload(db: AsyncSession, server_id: str, user: User | None) -> bool:
+    """True if ``user`` owns the chute or job whose instance is running on this CPU server.
+
+    This authorizes the RENTER (the user who deployed the ssh/jupyter rental the scheduler placed on
+    a miner's server) to discover + provision their own instance, resolving
+    server_id -> Instance -> (Chute.user_id | Job.user_id). The miner who registered the server is
+    NOT this user, so miner-ownership alone cannot gate a rental's owner-connect.
+    """
+    if user is None:
+        return False
+    from api.chute.schemas import Chute
+    from api.instance.schemas import Instance
+    from api.job.schemas import Job
+
+    rows = (
+        await db.execute(
+            select(Instance.instance_id, Instance.chute_id).where(Instance.server_id == server_id)
+        )
+    ).all()
+    if not rows:
+        return False
+    instance_ids = {r.instance_id for r in rows if r.instance_id}
+
+    # A JOB instance's true owner is the JOB's user, NOT the chute author -- a job can run on a
+    # PUBLIC chute someone else authored, so authorizing by chute ownership would let the chute
+    # author owner-connect to another user's running rental. So: job instance -> job owner only;
+    # cord (job-less) instance -> chute author.
+    job_owner_by_instance: dict = {}
+    if instance_ids:
+        for iid, juid in (
+            await db.execute(
+                select(Job.instance_id, Job.user_id).where(Job.instance_id.in_(instance_ids))
+            )
+        ).all():
+            job_owner_by_instance[iid] = juid
+    cord_chute_ids = {
+        r.chute_id for r in rows if r.chute_id and r.instance_id not in job_owner_by_instance
+    }
+    chute_owner_by_id: dict = {}
+    if cord_chute_ids:
+        for cid, cuid in (
+            await db.execute(
+                select(Chute.chute_id, Chute.user_id).where(Chute.chute_id.in_(cord_chute_ids))
+            )
+        ).all():
+            chute_owner_by_id[cid] = cuid
+    for r in rows:
+        owner = (
+            job_owner_by_instance.get(r.instance_id)
+            if r.instance_id in job_owner_by_instance
+            else chute_owner_by_id.get(r.chute_id)
+        )
+        if owner is not None and owner == user.user_id:
+            return True
+    return False
+
+
 @router.get("/cpu/{server_id}/connection")
 async def get_cpu_server_connection(
     server_id: str,
     db: AsyncSession = Depends(get_db_session),
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
-    ),
+    current_user: User | None = Depends(get_current_user(purpose="tee", raise_not_found=False)),
 ):
-    """Owner-authenticated DISCOVERY for a user-attestable CPU TEE instance.
+    """Authorized DISCOVERY for a user-attestable CPU TEE instance (miner owner OR the renter).
 
     Returns where the instance is (the host + attest/provision/ssh/wg ports its in-TEE agent
     advertised), a short-lived provisioning token, and the expected-measurements manifest -- so
@@ -281,17 +335,37 @@ async def get_cpu_server_connection(
     trust decision is the client verifying the TDX quote itself (Intel + the manifest), NOT this
     response, and the connection goes directly to the instance, never through this API.
 
-    Provisioning authority (D M-3, confirmed): under the current model the self-registered CPU TEE
-    instance's OWNER is the miner hotkey that registered it (check_server_ownership), and that
-    owner is the intended provisioner -- each call here mints a fresh SINGLE-USE token (random jti,
-    consumed by the in-TEE chutes-provision service on first authorization, so a captured token
-    cannot be replayed). If instances are ever assigned/rented to third-party users, token issuance
-    must move behind that user's authorization instead of miner-ownership.
+    Authorization (two roles): the miner hotkey that registered the server (ops/debug), OR the
+    RENTER -- the user who owns the chute/job whose instance the scheduler placed on this server.
+    Both are derived from the AUTHENTICATED principal (current_user): a raw X-Chutes-Hotkey header
+    must NEVER gate this, because get_current_user returns None for an unsigned request while the
+    header is still attacker-supplied -- trusting it would let anyone who knows the (public) miner
+    hotkey mint a provisioning token for someone else's rental. Each call mints a fresh SINGLE-USE
+    provisioning token (random jti, server-bound), so a renter only gets one for a server running
+    their own workload.
     """
     from api.instance.util import create_provision_jwt
 
-    server = await check_server_ownership(db, server_id, hotkey)
-    if not getattr(server, "self_registered", False) or server.compute_type != "cpu":
+    # Fail closed on an unauthenticated caller (no valid signature / API key). Without this, an
+    # unsigned request carrying only X-Chutes-Hotkey would otherwise reach the authz check.
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required (sign the request with your hotkey or use an API key).",
+        )
+    server = (
+        await db.execute(select(Server).where(Server.server_id == server_id))
+    ).scalar_one_or_none()
+    if not server or not getattr(server, "self_registered", False) or server.compute_type != "cpu":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Not a self-registered CPU TEE instance.",
+        )
+    # Miner-owner check uses the AUTHENTICATED user's hotkey, never a raw header.
+    is_miner_owner = bool(current_user.hotkey) and server.miner_hotkey == current_user.hotkey
+    if not is_miner_owner and not await _caller_owns_server_workload(db, server_id, current_user):
+        # Neither the registering miner nor the workload's owner -> not authorized to discover or
+        # provision this instance. 404 (not 403) so a server's existence/ownership isn't probeable.
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Not a self-registered CPU TEE instance.",

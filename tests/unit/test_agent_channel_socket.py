@@ -18,7 +18,7 @@ import pytest
 
 import api.agent_channel as ac
 import api.socket_server as ss
-from api.constants import AGENT_COMMAND_CHANNEL, SERVER_ID_HEADER
+from api.constants import ATTEST_SIGNATURE_HEADER, AGENT_COMMAND_CHANNEL, SERVER_ID_HEADER
 from tests.unit.test_cpu_scheduler import FakeRedis, FakeResult, FakeSession, _session_ctx
 
 NOW = datetime.now(timezone.utc)
@@ -153,13 +153,48 @@ class TestHandleAgentCommandAck:
         await ac.handle_agent_command_ack("srv-1", {})
 
 
-def _server_row(server_id="srv-1", host_id=None, self_registered=True, created_at=OLD):
+def _server_row(
+    server_id="srv-1", host_id=None, self_registered=True, created_at=OLD, attested_cert=None
+):
     return SimpleNamespace(
         server_id=server_id,
         host_id=host_id,
         self_registered=self_registered,
         created_at=created_at,
+        attested_cert=attested_cert,
     )
+
+
+def _attested_keypair_and_cert(cn="attestation-service"):
+    """Generate an RSA keypair + self-signed cert standing in for the in-TEE attested serving cert."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .sign(key, hashes.SHA256())
+    )
+    return key, cert.public_bytes(serialization.Encoding.PEM).decode()
+
+
+def _sign_attest(key, message: str) -> str:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    return key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256()).hex()
 
 
 class TestSendInstanceTeardown:
@@ -537,18 +572,63 @@ def _auth_session(server=None, host=None):
 class TestAgentAuthenticate:
     @pytest.mark.asyncio
     async def test_model_a_server_session_bound(self, clean_sio, pass_auth):
-        session = _auth_session(server=_server_row())
+        # A self-registered CPU-TEE server must prove possession of its in-TEE attested key.
+        key, cert_pem = _attested_keypair_and_cert()
+        headers = dict(AGENT_HEADERS)
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(key, "srv-1:12345:sockets-attest")
+        session = _auth_session(server=_server_row(attested_cert=cert_pem))
         online = AsyncMock()
         with (
             patch.object(ss, "get_session", _session_ctx(session)),
             patch.object(ss, "mark_agent_online", online),
         ):
-            assert await ss.agent_authenticate("sess-1", dict(AGENT_HEADERS)) is True
+            assert await ss.agent_authenticate("sess-1", headers) is True
         assert ss.sio.agent_sessions == {"srv-1": "sess-1"}
         assert ss.sio.agent_meta == {"sess-1": {"hotkey": "hk-miner", "server_id": "srv-1"}}
         online.assert_awaited_once_with("srv-1")
         assert clean_sio.emit.await_args.args[0] == "auth_success"
         clean_sio.disconnect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_registered_missing_attested_sig_rejected(self, clean_sio, pass_auth):
+        """The miner-hotkey signature alone (which the untrusted L0 host also has) must NOT bind a
+        self-registered TD's channel -- without the attested-key signature, auth fails closed."""
+        _key, cert_pem = _attested_keypair_and_cert()
+        session = _auth_session(server=_server_row(attested_cert=cert_pem))
+        with (
+            patch.object(ss, "get_session", _session_ctx(session)),
+            patch.object(ss, "mark_agent_online", AsyncMock()),
+        ):
+            assert await ss.agent_authenticate("sess-1", dict(AGENT_HEADERS)) is False
+        assert ss.sio.agent_sessions == {}
+        clean_sio.disconnect.assert_awaited_once_with("sess-1")
+
+    @pytest.mark.asyncio
+    async def test_self_registered_wrong_attested_sig_rejected(self, clean_sio, pass_auth):
+        """A signature from a DIFFERENT key (e.g. an attacker's, not the registration-bound one) is
+        rejected -- only the in-TEE key whose pubkey is in the stored attested cert is accepted."""
+        _key, cert_pem = _attested_keypair_and_cert()
+        attacker_key, _ = _attested_keypair_and_cert()
+        headers = dict(AGENT_HEADERS)
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(attacker_key, "srv-1:12345:sockets-attest")
+        session = _auth_session(server=_server_row(attested_cert=cert_pem))
+        with (
+            patch.object(ss, "get_session", _session_ctx(session)),
+            patch.object(ss, "mark_agent_online", AsyncMock()),
+        ):
+            assert await ss.agent_authenticate("sess-1", headers) is False
+        assert ss.sio.agent_sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_self_registered_no_attested_cert_on_record_rejected(self, clean_sio, pass_auth):
+        """A self-registered server with no stored attested cert cannot have its channel bound; reject."""
+        session = _auth_session(server=_server_row(attested_cert=None))
+        with (
+            patch.object(ss, "get_session", _session_ctx(session)),
+            patch.object(ss, "mark_agent_online", AsyncMock()),
+        ):
+            assert await ss.agent_authenticate("sess-1", dict(AGENT_HEADERS)) is False
+        assert ss.sio.agent_sessions == {}
 
     @pytest.mark.asyncio
     async def test_model_b_host_fallback(self, clean_sio, pass_auth):

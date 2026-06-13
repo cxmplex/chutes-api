@@ -1,5 +1,7 @@
 # Local dev overrides for the CPU-only validator bring-up (Phase 1).
-# Auto-merged by `docker compose`. NOT for production.
+# OPT-IN ONLY (NOT auto-merged): run with
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# so a plain `docker compose up` keeps the production posture. NOT for production.
 #
 # Fixes / additions vs the base docker-compose.yml:
 #   1. Redis wiring: the API reads PRIMARY_REDIS_HOST/PRIMARY_REDIS_PORT/REDIS_PASSWORD

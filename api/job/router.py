@@ -425,10 +425,14 @@ async def complete_job(
 async def get_job(
     job_id: str,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(purpose="jobs")),
 ):
     """
     Get a job.
+
+    Auth uses purpose "jobs" so the SDK can sign the (body-less) GET with the user's hotkey
+    (`chutes jobs get`); API-key callers are unaffected. Surfaces the instance host + the attested
+    server_id so the owner can `chutes connect`/`chutes ssh` to a scheduled rental.
     """
     job = (
         (
@@ -447,7 +451,8 @@ async def get_job(
     job_response = JobResponse.from_orm(job)
     if job.instance:
         job_response.host = job.instance.host
-    return job
+        job_response.server_id = job.instance.server_id
+    return job_response
 
 
 @router.get("/{job_id}/download/{file_id}", response_model=JobResponse)

@@ -141,23 +141,23 @@ async def validate_and_consume_nonce(
     # Parse the stored value
     try:
         stored_data = json.loads(redis_value.decode())
-
-        # Handle legacy format (just server_ip as string) for backward compatibility
-        if isinstance(stored_data, str):
-            stored_server = stored_data
-            stored_purpose = None
-        else:
-            stored_server = stored_data.get("server_ip")
-            stored_purpose = stored_data.get("purpose")
     except (ValueError, AttributeError, json.JSONDecodeError):
         raise NonceError("Invalid nonce format")
+
+    # Every nonce writer (create_nonce) stores a JSON object {server_ip, purpose}. Fail closed on a
+    # bare-string (legacy) value or a missing purpose: a purpose-less nonce would skip the
+    # purpose check below and could be replayed across different operations.
+    if not isinstance(stored_data, dict):
+        raise NonceError("Invalid nonce format (missing purpose)")
+    stored_server = stored_data.get("server_ip")
+    stored_purpose = stored_data.get("purpose")
 
     # Validate server IP
     if stored_server != server_ip:
         raise NonceError(f"Nonce server mismatch: expected {server_ip}, got {stored_server}")
 
-    # Validate purpose (if stored nonce has a purpose, it must match)
-    if stored_purpose and stored_purpose != purpose.value:
+    # Validate purpose: nonces are purpose-specific and cannot be reused across operations.
+    if not stored_purpose or stored_purpose != purpose.value:
         raise NonceError(
             f"Nonce purpose mismatch: expected {purpose.value}, got {stored_purpose}. "
             f"Nonces are purpose-specific and cannot be reused across different operations."

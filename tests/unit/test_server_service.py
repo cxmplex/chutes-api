@@ -906,7 +906,9 @@ async def test_register_server_general_exception(mock_db_session, server_args, s
     [
         (None, "Nonce not found or expired"),
         (TEST_SERVER_IP, "Invalid nonce format"),
-        (json.dumps("192.168.0.1").encode(), "Nonce server mismatch"),
+        # A legacy bare-string nonce value (no purpose) is now rejected fail-closed rather than
+        # interpreted as a server IP -- a purpose-less nonce could otherwise be replayed cross-purpose.
+        (json.dumps("192.168.0.1").encode(), "Invalid nonce format \\(missing purpose\\)"),
     ],
 )
 @pytest.mark.asyncio

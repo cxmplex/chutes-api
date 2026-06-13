@@ -19,7 +19,6 @@ Verified end-to-end in pure Python against a real GCE AK quote (tests/assets/snp
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from cryptography import x509
@@ -28,23 +27,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from loguru import logger
 
+from api.server.cert_validity import check_cert_time_valid
 from api.server.exceptions import InvalidQuoteError
-
-
-def _check_cert_time_valid(cert: x509.Certificate, what: str) -> None:
-    """Reject a cert outside its validity window (expired or not-yet-valid)."""
-    now = datetime.now(timezone.utc)
-    try:
-        not_before = cert.not_valid_before_utc
-        not_after = cert.not_valid_after_utc
-    except AttributeError:  # cryptography < 42: naive UTC datetimes
-        not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
-        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
-    if now < not_before or now > not_after:
-        raise InvalidQuoteError(
-            f"{what} certificate is outside its validity period "
-            f"({not_before.isoformat()} .. {not_after.isoformat()})"
-        )
 
 
 def _check_cert_is_ca(cert: x509.Certificate, what: str) -> None:
@@ -247,9 +231,9 @@ async def verify_vtpm_quote(
 
         # Reject expired/not-yet-valid certs, and require the issuers to actually be CAs (a
         # signature chain alone would accept an in-window leaf misused as an issuer).
-        _check_cert_time_valid(ak, "GCE AK")
-        _check_cert_time_valid(inter, "EK/AK CA Intermediate")
-        _check_cert_time_valid(root, "Google EK/AK CA Root")
+        check_cert_time_valid(ak, "GCE AK")
+        check_cert_time_valid(inter, "EK/AK CA Intermediate")
+        check_cert_time_valid(root, "Google EK/AK CA Root")
         _check_cert_is_ca(inter, "EK/AK CA Intermediate")
         _check_cert_is_ca(root, "Google EK/AK CA Root")
 

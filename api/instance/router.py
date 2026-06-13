@@ -150,6 +150,9 @@ async def _maybe_start_log_capture(instance, config_id: str):
                 host=instance.host,
                 log_port=log_port,
                 miner_hotkey=instance.miner_hotkey,
+                # TEE instances serve the logging port over TLS with the attested cert; pin to it so
+                # the host-routed (DNAT'd) log stream cannot be read/tampered in transit.
+                cacert=instance.cacert,
             )
         )
     except Exception as exc:
@@ -2209,6 +2212,24 @@ async def claim_tee_launch_config(
     return response
 
 
+def _reject_cpu_tee_on_legacy_endpoint(instance) -> None:
+    """The /attest and /graval launch-config endpoints build the verified response (chute code +
+    fs_key) and are the GPU/graval path. CPU-TEE (self-registered) instances MUST verify via
+    POST/PUT /launch_config/{config_id}/tee, which binds the secret response to the in-TEE attested
+    client cert (require_attested_client_cert). Reject a CPU-TEE instance here (defense-in-depth):
+    today these endpoints also crash on the missing GPU nodes, but this makes the exclusion
+    explicit + fail-closed so a future refactor cannot hand a CPU-TEE chute's code/secrets out
+    without the attested-cert binding. Only CPU-TEE instances carry a server_id."""
+    if getattr(instance, "server_id", None) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "CPU-TEE instances must verify via /instances/launch_config/{config_id}/tee "
+                "(attested-cert bound); the graval/attest endpoints are GPU-only."
+            ),
+        )
+
+
 @router.post("/launch_config/{config_id}/attest")
 async def validate_tee_launch_config_instance(
     config_id: str,
@@ -2223,6 +2244,7 @@ async def validate_tee_launch_config_instance(
     launch_config, nodes, instance, validator_pubkey = await _validate_tee_launch_config_instance(
         config_id, args, request, db, authorization
     )
+    _reject_cpu_tee_on_legacy_endpoint(instance)
 
     _validate_launch_config_not_expired(launch_config)
 
@@ -2316,6 +2338,7 @@ async def claim_graval_launch_config(
         instance,
         validator_pubkey,
     ) = await _validate_graval_launch_config_instance(config_id, args, request, db, authorization)
+    _reject_cpu_tee_on_legacy_endpoint(instance)
 
     # Generate a ciphertext for this instance to decrypt.
     node = random.choice(nodes)
@@ -2852,6 +2875,7 @@ async def verify_graval_launch_config_instance(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Instance disappeared (did you update gepetto reconcile?)",
         )
+    _reject_cpu_tee_on_legacy_endpoint(instance)
     # Cache GPU info while nodes are eagerly loaded (before any commit/refresh expires them).
     _gpu_count = len(instance.nodes) if instance.nodes else None
     _gpu_type = instance.nodes[0].gpu_identifier if instance.nodes else None

@@ -30,6 +30,11 @@ VALIDATOR_HEADER = "X-Chutes-Validator"
 ENCRYPTED_HEADER = "X-Chutes-Encrypted"
 # 1-click CPU TEE agents identify which server/host a socket session controls with this header.
 SERVER_ID_HEADER = "X-Chutes-Server-Id"
+# Self-registered CPU-TEE agents additionally sign the socket-auth challenge with their in-TEE
+# attestation-bound key (the one whose pubkey is committed in the registration quote), proving the
+# session is held by the attested TD itself -- not merely by a holder of the miner hotkey (which the
+# untrusted L0 host also has, and could otherwise use to hijack a co-tenant TD's command channel).
+ATTEST_SIGNATURE_HEADER = "X-Chutes-Attest-Signature"
 
 # Redis pubsub channel for validator -> 1-click agent commands (deploy/stop/delete/upgrade);
 # whichever socket-server replica holds the agent's session forwards each command to it.

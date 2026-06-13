@@ -314,6 +314,15 @@ class Settings(BaseSettings):
     # exists on the metagraph. When set, a metagraph_nodes row is auto-created on registration to
     # satisfy the servers FK. NEVER enable in production.
     skip_metagraph_check: bool = os.getenv("SKIP_METAGRAPH_CHECK", "false").lower() == "true"
+    # Debug TEE guest images (debug_logging: chute output forwarded to the host-readable serial
+    # console) produce a DISTINCT measurement, but a validator cannot otherwise tell a debug
+    # measurement from a hardened one -- so a debug config shipped in a production ConfigMap would
+    # let a miner boot the debug image, pass attestation, and stream user logs to the host. A
+    # measurement config tagged `debug: true` is therefore REFUSED at load unless this dev-only
+    # switch is set, so debug measurements cannot silently enter a production deployment.
+    allow_debug_measurements: bool = (
+        os.getenv("ALLOW_DEBUG_MEASUREMENTS", "false").lower() == "true"
+    )
     graval_url: str = os.getenv("GRAVAL_URL", "https://graval.chutes.ai:11443")
 
     # mTLS client-cert trust posture. The X-Client-Cert header is only honored when the mTLS-
@@ -433,6 +442,19 @@ class Settings(BaseSettings):
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
+            # A measurement for a debug guest image (e.g. debug_logging -> chute output on the
+            # host-readable serial console) must never be accepted in production: tag it `debug: true`
+            # and the loader refuses it unless ALLOW_DEBUG_MEASUREMENTS is explicitly set (dev only),
+            # so a debug image cannot pass attestation as a production measurement.
+            if bool(measurement_config.get("debug", False)) and not self.allow_debug_measurements:
+                raise ValueError(
+                    f"Measurement config '{config_name}' is tagged debug: true but "
+                    "ALLOW_DEBUG_MEASUREMENTS is not set. Debug images forward user logs to the "
+                    "host-readable serial console and must not be accepted in production. Remove the "
+                    "config from the production ConfigMap, or set ALLOW_DEBUG_MEASUREMENTS=true for a "
+                    "dev validator."
+                )
+
             def _require_hex96(value: object, field: str) -> str:
                 text = str(value if value is not None else "").upper().strip()
                 if len(text) != 96 or any(c not in "0123456789ABCDEF" for c in text):
@@ -498,6 +520,20 @@ class Settings(BaseSettings):
                 # provider 'gcp': there the SNP launch measurement is Google firmware only, so a
                 # config without vtpm_pcrs would match on firmware alone and never check WHICH
                 # image is running.
+                # Image identity on SNP is provider-specific and MUST fail closed. On GCP the SNP
+                # launch measurement is ONLY Google firmware (identical for every GCP SNP VM), so
+                # image identity hangs entirely on the GCE vTPM PCRs; on bare-metal the dm-verity
+                # roothash is folded into the SNP launch measurement, so the measurement IS the image
+                # identity. A missing/unknown provider previously defaulted vtpm_pcrs off, which would
+                # register an attacker-controlled image on real GCP SNP -- so provider is REQUIRED.
+                snp_provider = "bare-metal" if provider == "baremetal" else provider
+                if snp_provider not in ("gcp", "bare-metal"):
+                    raise ValueError(
+                        f"SNP measurement config '{config_name}' must set provider to 'gcp' or "
+                        f"'bare-metal' (got {provider!r}); image identity is verified differently per "
+                        "provider, so an unset/unknown provider is rejected (fail closed)."
+                    )
+                provider = snp_provider
                 raw_vtpm = measurement_config.get("vtpm_pcrs")
                 vtpm_pcrs = None
                 if raw_vtpm:
@@ -510,12 +546,19 @@ class Settings(BaseSettings):
                                 f"expected 64 hex chars (sha256), got {len(val)}."
                             )
                         vtpm_pcrs[str(k)] = val
-                if provider == "gcp" and not vtpm_pcrs:
-                    raise ValueError(
-                        f"SNP measurement config '{config_name}' has provider 'gcp' but no "
-                        "'vtpm_pcrs'. On GCP the SNP measurement attests only Google firmware, so "
-                        "image identity MUST be pinned via the GCE vTPM PCRs (PCR8/PCR9)."
-                    )
+                if provider == "gcp":
+                    # GCP SNP: require the vTPM PCRs, and require PCR8 (grub cmdline carrying
+                    # verity.roothash) AND PCR9 (kernel/initrd) specifically. Without these exact two,
+                    # the image is unpinned even if other (image-invariant) PCR indices are listed --
+                    # so accepting "some PCRs" would not actually constrain WHICH image runs.
+                    missing_pcrs = [p for p in ("8", "9") if not (vtpm_pcrs or {}).get(p)]
+                    if missing_pcrs:
+                        raise ValueError(
+                            f"GCP SNP measurement config '{config_name}' must pin vtpm_pcrs including "
+                            f"PCR8 and PCR9 (missing {missing_pcrs}). On GCP the SNP measurement "
+                            "attests only Google firmware, so image identity MUST be pinned via the "
+                            "GCE vTPM PCR8 (grub cmdline w/ verity.roothash) + PCR9 (kernel/initrd)."
+                        )
                 measurements.append(
                     TeeMeasurementConfig(
                         version=str(version).strip(),

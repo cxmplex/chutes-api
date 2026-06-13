@@ -65,10 +65,16 @@ async def start_encrypted_log_capture(
     host: str,
     log_port: int,
     miner_hotkey: str,
+    cacert: str | None = None,
 ):
     """
     Start a background task to capture and encrypt startup logs for a private
     chute instance. Captures from creation through activation only.
+
+    ``cacert`` is the instance's attested/CA cert (PEM): when set (every TEE instance), the log
+    stream is fetched over https pinned to it (CN->IP), so the untrusted host that routes the
+    DNAT'd logging port cannot read or tamper the log content on the wire. None => plaintext http
+    (non-TEE / dev only).
 
     Should be called as: asyncio.create_task(start_encrypted_log_capture(...))
     """
@@ -111,6 +117,7 @@ async def start_encrypted_log_capture(
             user_pubkey=user_pubkey,
             ephemeral_scalar=ephemeral_scalar,
             ephemeral_pubkey=ephemeral_pubkey,
+            cacert=cacert,
         )
     except asyncio.CancelledError:
         pass
@@ -162,6 +169,7 @@ async def _capture_startup_logs(
     user_pubkey: bytes,
     ephemeral_scalar: bytes,
     ephemeral_pubkey: bytes,
+    cacert: str | None = None,
 ):
     """
     Stream startup logs from the instance, encrypt, and store in Redis stream.
@@ -177,10 +185,18 @@ async def _capture_startup_logs(
     deadline = time.monotonic() + MAX_CAPTURE_SECONDS
 
     headers, _ = miner_client.sign_request(miner_hotkey, purpose="chutes")
-    client = httpx.AsyncClient(
-        base_url=f"http://{host}:{log_port}",
-        timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
-    )
+    if cacert:
+        # TEE instance: the in-TD logging server serves TLS with the attested cert, and the logging
+        # port is DNAT'd through the untrusted host -- pin to the cert (CN->IP) so the host cannot
+        # read/tamper the log content in transit.
+        from api.instance.connection import build_pinned_client
+
+        client = build_pinned_client(cacert, host, log_port, read_timeout=None)
+    else:
+        client = httpx.AsyncClient(
+            base_url=f"http://{host}:{log_port}",
+            timeout=httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0),
+        )
 
     try:
         batch = []

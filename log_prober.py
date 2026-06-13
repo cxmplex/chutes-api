@@ -26,10 +26,21 @@ async def check_instance_logging_server(instance: Instance) -> bool:
             "external_port"
         ]
 
-        client = _httpx.AsyncClient(
-            base_url=f"http://{instance.host}:{log_port}",
-            timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
-        )
+        # TEE instances serve the logging port over TLS with the attested cert (the logging port is
+        # DNAT'd through the untrusted host), so pin the probe to that cert (CN->IP). Without this,
+        # the plaintext probe would always fail post-TLS and the 3-strikes rule would delete every
+        # TEE instance. Non-TEE instances keep the plain-http probe.
+        if instance.cacert:
+            from api.instance.connection import build_pinned_client
+
+            client = build_pinned_client(
+                instance.cacert, instance.host, log_port, read_timeout=10.0
+            )
+        else:
+            client = _httpx.AsyncClient(
+                base_url=f"http://{instance.host}:{log_port}",
+                timeout=_httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0),
+            )
 
         try:
             headers, _ = miner_client.sign_request(instance.miner_hotkey, purpose="chutes")
@@ -43,7 +54,7 @@ async def check_instance_logging_server(instance: Instance) -> bool:
             )
             if not has_required_log:
                 raise ValueError("No log entry with path '/tmp/_chute.log' found")
-            proto = "http"
+            proto = "https" if instance.cacert else "http"
             logger.success(
                 f"✅ logging server running for {instance.instance_id=} of {instance.miner_hotkey=} for {instance.chute_id=} on {proto}://{instance.host}:{log_port}"
             )

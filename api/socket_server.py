@@ -125,6 +125,37 @@ async def miner_message(session_id, data):
     logger.debug(f"Received message from miner {hotkey=}: {data=}")
 
 
+def _verify_attested_socket_signature(
+    attested_cert_pem: str, message: str, signature_hex: str
+) -> bool:
+    """Verify an attested-key socket-auth signature against the server's registration-bound cert.
+
+    The cert's pubkey hash is committed in the server's registration quote report_data, and the
+    matching private key lives only inside the attested TD (generated in-TEE at boot, never
+    host-supplied), so a valid signature here proves the socket session is held by the TD itself,
+    not merely by a holder of the miner hotkey. RSA today (the in-TEE cert is RSA-4096); EC is
+    tolerated for forward-compat. Fail closed on any error.
+    """
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+
+        cert = x509.load_pem_x509_certificate(attested_cert_pem.encode())
+        pub = cert.public_key()
+        sig = bytes.fromhex(signature_hex)
+        data = message.encode()
+        if isinstance(pub, rsa.RSAPublicKey):
+            pub.verify(sig, data, padding.PKCS1v15(), hashes.SHA256())
+            return True
+        if isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(sig, data, ec.ECDSA(hashes.SHA256()))
+            return True
+        return False
+    except Exception:  # noqa: BLE001 - any failure => signature not valid (fail closed)
+        return False
+
+
 @sio.event
 async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
     """
@@ -146,6 +177,7 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
         )
         hotkey = headers.get(cst.HOTKEY_HEADER)
         server_id = headers.get(cst.SERVER_ID_HEADER)
+        nonce = headers.get(cst.NONCE_HEADER)
         if not server_id:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST, detail="Missing server id header"
@@ -179,6 +211,34 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"{server_id} is not a self-registered server or registered L0 host for {hotkey}",
             )
+        if server is not None:
+            # Self-registered CPU-TEE server: the miner-hotkey signature alone does NOT bind this
+            # command channel to the TD, because the untrusted L0 host also holds the miner key and
+            # could authenticate as a co-tenant TD's server_id to capture its deploy JWT (and DoS the
+            # real TD by overwriting the session). Require a signature from the in-TEE
+            # attestation-bound key (committed in the registration quote) over the nonce-bound
+            # challenge, verified against the stored attested cert. Because only the in-TEE key can
+            # produce it, no non-key-holder (incl. the host) can take over the session. Fail closed:
+            # no stored cert, or a missing/invalid attested signature, is rejected.
+            attest_sig = headers.get(cst.ATTEST_SIGNATURE_HEADER)
+            if not server.attested_cert:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        f"Server {server_id} has no attestation-bound cert on record; cannot bind "
+                        "its command channel to the attested TD. Re-register (POST /servers/cpu/register)."
+                    ),
+                )
+            if not attest_sig or not _verify_attested_socket_signature(
+                server.attested_cert, f"{server_id}:{nonce}:sockets-attest", attest_sig
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "Missing or invalid attestation-bound socket signature for self-registered "
+                        f"server {server_id}; only the in-TEE attested key may hold its command channel."
+                    ),
+                )
         sio.agent_sessions[server_id] = session_id
         sio.agent_meta[session_id] = {"hotkey": hotkey, "server_id": server_id}
         await mark_agent_online(server_id)

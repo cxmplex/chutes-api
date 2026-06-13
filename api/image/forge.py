@@ -300,14 +300,15 @@ USER chutes
         if process.returncode != 0:
             raise BuildFailure("Failed to install chutes library into image!")
 
-        # cfsv filesystem-index + inspecto are GPU-chute integrity features; a CPU-only TEE chute does
-        # not need them, so the verification stage + extraction is skipped for CPU (is_cpu set above;
-        # aegis's bytecode-manifest was already generated in the chutes-inject stage for CPU).
-
-        # Build filesystem verification image.
-        verification_tag = f"{short_tag}-fsv-{uuid.uuid4().hex[:8]}"
-        logger.info(f"Building filesystem verification image as {verification_tag}")
-        fsv_dockerfile_content = f"""FROM {chutes_tag}
+        # cfsv filesystem-index + inspecto are GPU-chute integrity features; a CPU-only TEE chute
+        # does not need them, so the ENTIRE filesystem-verification stage (compose + build + extract)
+        # is skipped for CPU. The TD attestation (dm-verity + RTMR) is the integrity proof instead.
+        bytecode_manifest_path = bytecode_manifest_json_path = None
+        if not is_cpu:
+            # Build filesystem verification image.
+            verification_tag = f"{short_tag}-fsv-{uuid.uuid4().hex[:8]}"
+            logger.info(f"Building filesystem verification image as {verification_tag}")
+            fsv_dockerfile_content = f"""FROM {chutes_tag}
 USER chutes
 ARG CFSV_OP
 ARG PS_OP
@@ -326,17 +327,17 @@ USER chutes
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv collect / /etc/chutesfs.index /tmp/chutesfs.data
 """
 
-        # Generate bytecode manifest (V2) for chutes >= 0.5.5.
-        build_bcm_path = os.path.join(build_dir, "chutes-bcm.so")
-        build_driver_path = os.path.join(build_dir, "generate_manifest_driver.py")
-        if (
-            semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0
-            and os.path.exists(BCM_SO_PATH)
-            and os.path.exists(MANIFEST_DRIVER_PATH)
-        ):
-            shutil.copy2(BCM_SO_PATH, build_bcm_path)
-            shutil.copy2(MANIFEST_DRIVER_PATH, build_driver_path)
-            fsv_dockerfile_content += """COPY chutes-bcm.so /tmp/chutes-bcm.so
+            # Generate bytecode manifest (V2) for chutes >= 0.5.5.
+            build_bcm_path = os.path.join(build_dir, "chutes-bcm.so")
+            build_driver_path = os.path.join(build_dir, "generate_manifest_driver.py")
+            if (
+                semcomp(image.chutes_version or "0.0.0", "0.5.5") >= 0
+                and os.path.exists(BCM_SO_PATH)
+                and os.path.exists(MANIFEST_DRIVER_PATH)
+            ):
+                shutil.copy2(BCM_SO_PATH, build_bcm_path)
+                shutil.copy2(MANIFEST_DRIVER_PATH, build_driver_path)
+                fsv_dockerfile_content += """COPY chutes-bcm.so /tmp/chutes-bcm.so
 COPY generate_manifest_driver.py /tmp/generate_manifest_driver.py
 RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --output /tmp/bytecode.manifest \
@@ -344,46 +345,44 @@ RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --lib /tmp/chutes-bcm.so \
     --extra-dirs /usr/local/lib/python3.12/site-packages
 """
-        if semcomp(image.chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
-            from api.user.service import chutes_user_id
+            if semcomp(image.chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
+                from api.user.service import chutes_user_id
 
-            if image.user_id == await chutes_user_id():
-                fsv_dockerfile_content += """
+                if image.user_id == await chutes_user_id():
+                    fsv_dockerfile_content += """
 USER root
 RUN cp -f /tmp/bytecode.manifest /etc/bytecode.manifest || true
 USER chutes
 RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 """
 
-        fsv_dockerfile_path = os.path.join(build_dir, "Dockerfile.fsv")
-        with open(fsv_dockerfile_path, "w") as f:
-            f.write(fsv_dockerfile_content)
+            fsv_dockerfile_path = os.path.join(build_dir, "Dockerfile.fsv")
+            with open(fsv_dockerfile_path, "w") as f:
+                f.write(fsv_dockerfile_content)
 
-        build_cmd = [
-            "buildah",
-            "build",
-            "--isolation",
-            "rootless",
-            "--network",
-            "slirp4netns",
-            "--build-arg",
-            f"CFSV_OP={os.getenv('CFSV_OP', str(uuid.uuid4()))}",
-            "--build-arg",
-            f"PS_OP={os.getenv('PS_OP', str(uuid.uuid4()))}",
-            "--layers=false",
-            "--storage-opt",
-            "overlay.mountopt=metacopy=on",
-            "--tag",
-            verification_tag,
-            "-f",
-            fsv_dockerfile_path,
-        ]
-        if settings.registry_insecure:
-            build_cmd.extend(["--tls-verify=false"])
-        build_cmd.append(build_dir)
+            build_cmd = [
+                "buildah",
+                "build",
+                "--isolation",
+                "rootless",
+                "--network",
+                "slirp4netns",
+                "--build-arg",
+                f"CFSV_OP={os.getenv('CFSV_OP', str(uuid.uuid4()))}",
+                "--build-arg",
+                f"PS_OP={os.getenv('PS_OP', str(uuid.uuid4()))}",
+                "--layers=false",
+                "--storage-opt",
+                "overlay.mountopt=metacopy=on",
+                "--tag",
+                verification_tag,
+                "-f",
+                fsv_dockerfile_path,
+            ]
+            if settings.registry_insecure:
+                build_cmd.extend(["--tls-verify=false"])
+            build_cmd.append(build_dir)
 
-        bytecode_manifest_path = bytecode_manifest_json_path = None
-        if not is_cpu:
             process = await asyncio.create_subprocess_exec(
                 *build_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -1115,10 +1114,14 @@ async def update_chutes_lib(image_id: str, chutes_version: str, force: bool = Fa
             updated_tag = f"{target_tag}-updated-{uuid.uuid4().hex[:8]}"
             logger.info(f"Stage 1: Building updated image as {updated_tag}")
 
+            # CPU-only chutes skip the GPU confidential-runtime layer (no aegis/cfsv/graval) and the
+            # GPU verification stage; resolved once here and reused for every CPU/GPU branch below.
+            is_cpu = bool(getattr(image, "cpu", False))
+
             # graval is a GPU-only extra; CPU chutes install base chutes (no CUDA/torch).
             _upd_install = (
                 f"RUN pip install chutes=={chutes_version}"
-                if bool(getattr(image, "cpu", False))
+                if is_cpu
                 else f"RUN pip install 'chutes[gpu]=={chutes_version}'"
             )
             dockerfile_content = f"""FROM {full_source_tag}
@@ -1137,7 +1140,7 @@ RUN uv cache clean --force
 """
             # Confidential-runtime .so injection (GPU + GPU-TEE only). CPU-TEE ships none, so LD_PRELOAD
             # stays "" and the image carries no aegis/netnanny/cfsv .so (the TD is the boundary).
-            if bool(getattr(image, "cpu", False)):
+            if is_cpu:
                 pass
             elif semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
                 dockerfile_content += """RUN cp -f $(python -c 'import chutes; import os; print(os.path.join(os.path.dirname(chutes.__file__), "chutes-aegis.so"))') /usr/local/lib/chutes-aegis.so
@@ -1192,14 +1195,15 @@ ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-loginterc
                 raise BuildFailure("Failed to build updated image!")
 
             # cfsv (filesystem verification) + inspecto are GPU-chute integrity features; CPU-only
-            # chutes don't need them, so the verification stage + extraction is skipped for CPU.
-            is_cpu = bool(getattr(image, "cpu", False))
+            # chutes don't need them, so the ENTIRE stage-2 verification stage (compose + build +
+            # extract) is skipped for CPU. The TD attestation (dm-verity + RTMR) is the proof instead.
+            bytecode_manifest_path = bytecode_manifest_json_path = None
+            if not is_cpu:
+                # Stage 2: Build filesystem verification image from the updated image
+                verification_tag = f"{target_tag}-fsv-{uuid.uuid4().hex[:8]}"
+                logger.info(f"Stage 2: Building filesystem verification image as {verification_tag}")
 
-            # Stage 2: Build filesystem verification image from the updated image
-            verification_tag = f"{target_tag}-fsv-{uuid.uuid4().hex[:8]}"
-            logger.info(f"Stage 2: Building filesystem verification image as {verification_tag}")
-
-            fsv_dockerfile_content = f"""FROM {updated_tag}
+                fsv_dockerfile_content = f"""FROM {updated_tag}
 ARG CFSV_OP
 ARG PS_OP
 USER chutes
@@ -1218,17 +1222,17 @@ USER chutes
 RUN CFSV_OP="${{CFSV_OP}}" /cfsv collect / /etc/chutesfs.index /tmp/chutesfs.data
 """
 
-            # Generate bytecode manifest (V2) for chutes >= 0.5.5.
-            build_bcm_path = os.path.join(build_dir, "chutes-bcm.so")
-            build_driver_path = os.path.join(build_dir, "generate_manifest_driver.py")
-            if (
-                semcomp(chutes_version or "0.0.0", "0.5.5") >= 0
-                and os.path.exists(BCM_SO_PATH)
-                and os.path.exists(MANIFEST_DRIVER_PATH)
-            ):
-                shutil.copy2(BCM_SO_PATH, build_bcm_path)
-                shutil.copy2(MANIFEST_DRIVER_PATH, build_driver_path)
-                fsv_dockerfile_content += """COPY chutes-bcm.so /tmp/chutes-bcm.so
+                # Generate bytecode manifest (V2) for chutes >= 0.5.5.
+                build_bcm_path = os.path.join(build_dir, "chutes-bcm.so")
+                build_driver_path = os.path.join(build_dir, "generate_manifest_driver.py")
+                if (
+                    semcomp(chutes_version or "0.0.0", "0.5.5") >= 0
+                    and os.path.exists(BCM_SO_PATH)
+                    and os.path.exists(MANIFEST_DRIVER_PATH)
+                ):
+                    shutil.copy2(BCM_SO_PATH, build_bcm_path)
+                    shutil.copy2(MANIFEST_DRIVER_PATH, build_driver_path)
+                    fsv_dockerfile_content += """COPY chutes-bcm.so /tmp/chutes-bcm.so
 COPY generate_manifest_driver.py /tmp/generate_manifest_driver.py
 RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --output /tmp/bytecode.manifest \
@@ -1237,46 +1241,44 @@ RUN CFSV_OP="${CFSV_OP}" python /tmp/generate_manifest_driver.py \
     --extra-dirs /usr/local/lib/python3.12/site-packages
 """
 
-            if semcomp(chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
-                from api.user.service import chutes_user_id
+                if semcomp(chutes_version, "0.5.3") >= 0 and image.name in ("sglang", "vllm"):
+                    from api.user.service import chutes_user_id
 
-                if image.user_id == await chutes_user_id():
-                    fsv_dockerfile_content += """
+                    if image.user_id == await chutes_user_id():
+                        fsv_dockerfile_content += """
 USER root
 RUN cp -f /tmp/bytecode.manifest /etc/bytecode.manifest || true
 USER chutes
 RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 """
 
-            fsv_dockerfile_path = os.path.join(build_dir, "Dockerfile.fsv")
-            with open(fsv_dockerfile_path, "w") as f:
-                f.write(fsv_dockerfile_content)
+                fsv_dockerfile_path = os.path.join(build_dir, "Dockerfile.fsv")
+                with open(fsv_dockerfile_path, "w") as f:
+                    f.write(fsv_dockerfile_content)
 
-            build_cmd = [
-                "buildah",
-                "build",
-                "--isolation",
-                "rootless",
-                "--network",
-                "slirp4netns",
-                "--build-arg",
-                f"CFSV_OP={os.getenv('CFSV_OP', str(uuid.uuid4()))}",
-                "--build-arg",
-                f"PS_OP={os.getenv('PS_OP', str(uuid.uuid4()))}",
-                "--layers=false",
-                "--storage-opt",
-                "overlay.mountopt=metacopy=on",
-                "--tag",
-                verification_tag,
-                "-f",
-                fsv_dockerfile_path,
-            ]
-            if settings.registry_insecure:
-                build_cmd.extend(["--tls-verify=false"])
-            build_cmd.append(build_dir)
+                build_cmd = [
+                    "buildah",
+                    "build",
+                    "--isolation",
+                    "rootless",
+                    "--network",
+                    "slirp4netns",
+                    "--build-arg",
+                    f"CFSV_OP={os.getenv('CFSV_OP', str(uuid.uuid4()))}",
+                    "--build-arg",
+                    f"PS_OP={os.getenv('PS_OP', str(uuid.uuid4()))}",
+                    "--layers=false",
+                    "--storage-opt",
+                    "overlay.mountopt=metacopy=on",
+                    "--tag",
+                    verification_tag,
+                    "-f",
+                    fsv_dockerfile_path,
+                ]
+                if settings.registry_insecure:
+                    build_cmd.extend(["--tls-verify=false"])
+                build_cmd.append(build_dir)
 
-            bytecode_manifest_path = bytecode_manifest_json_path = None
-            if not is_cpu:
                 process = await asyncio.create_subprocess_exec(
                     *build_cmd,
                     stdout=asyncio.subprocess.PIPE,
