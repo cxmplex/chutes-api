@@ -230,7 +230,7 @@ RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 ENV PYTHONDONTWRITEBYTECODE=1
 {chutes_install}
-RUN uv cache clean --force
+RUN command -v uv >/dev/null 2>&1 && uv cache clean --force || true
 """
         # Confidential-runtime .so injection (GPU + GPU-TEE only). CPU-TEE ships none, so LD_PRELOAD
         # stays "" (cleared above) and the image carries no aegis/netnanny/cfsv .so.
@@ -1136,7 +1136,7 @@ RUN find / -xdev -type d -name __pycache__ -exec rm -rf {{}} \\; || true
 USER chutes
 ENV PYTHONDONTWRITEBYTECODE=1
 {_upd_install}
-RUN uv cache clean --force
+RUN command -v uv >/dev/null 2>&1 && uv cache clean --force || true
 """
             # Confidential-runtime .so injection (GPU + GPU-TEE only). CPU-TEE ships none, so LD_PRELOAD
             # stays "" and the image carries no aegis/netnanny/cfsv .so (the TD is the boundary).

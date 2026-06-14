@@ -203,7 +203,11 @@ async def register_cpu_server_endpoint(
         return await register_cpu_server(
             db, server_ip, args, hotkey, nonce, signature, expected_cert_hash, expected_cert_pem
         )
-    except (AttestationError, ServerRegistrationError):
+    except (AttestationError, ServerRegistrationError) as e:
+        logger.warning(
+            f"CPU server registration rejected: server_id={args.server_id} "
+            f"miner_hotkey={hotkey} detail={getattr(e, 'detail', str(e))}"
+        )
         raise
     except HTTPException:
         raise

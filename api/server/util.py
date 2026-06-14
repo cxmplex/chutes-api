@@ -60,7 +60,10 @@ def get_nonce_expiry_seconds(minutes: int = 10) -> int:
 def extract_client_cert_hash():
     async def _extract_request_client_cert(request: Request):
         try:
-            cert = _get_client_certificate(request)
+            # Attestation/registration: the cert pubkey is bound into the hardware quote, so accept
+            # the proxy-forwarded header cert without requiring a live mTLS handshake (the in-guest
+            # agent posts it via header). The quote check downstream is the actual trust anchor.
+            cert = _get_client_certificate(request, require_proxy_verified=False)
             return get_public_key_hash(cert)
         except HTTPException:
             raise
@@ -81,7 +84,9 @@ def extract_client_cert_pem():
 
     async def _extract_request_client_cert_pem(request: Request):
         try:
-            cert = _get_client_certificate(request)
+            # Attestation/registration: cert is quote-bound; accept the header cert (the in-guest
+            # agent posts it via header, not mTLS). The quote check is the trust anchor.
+            cert = _get_client_certificate(request, require_proxy_verified=False)
             return cert.public_bytes(serialization.Encoding.PEM).decode()
         except HTTPException:
             raise
@@ -199,18 +204,27 @@ def cert_to_base64_der(cert: Certificate) -> str:
 CLIENT_CERT_VERIFY_SUCCESS = "SUCCESS"
 
 
-def _get_client_certificate(request: Request) -> Certificate:
-    """Extract the client certificate the mTLS-terminating proxy verified for this request.
+def _get_client_certificate(request: Request, require_proxy_verified: bool = True) -> Certificate:
+    """Extract the client certificate the mTLS-terminating proxy forwarded for this request.
 
     The proxy performs the TLS client-auth handshake (proving the peer holds the cert's private
-    key), then forwards the verified peer cert as X-Client-Cert (URL-encoded PEM) and its result as
-    X-Client-Verify. We only trust X-Client-Cert when X-Client-Verify == "SUCCESS" (unless
-    REQUIRE_MTLS_CLIENT_VERIFY is disabled for a direct, plaintext dev validator with no mTLS
-    terminator), so a direct caller cannot forge the header without completing mTLS at the verifying
-    proxy. The proxy MUST overwrite any client-supplied X-Client-* headers and the backend MUST NOT
-    be directly reachable.
+    key), then forwards the peer cert as X-Client-Cert (URL-encoded PEM) and its result as
+    X-Client-Verify.
+
+    require_proxy_verified=True (secret-returning endpoints, e.g. /tee): only trust X-Client-Cert
+    when X-Client-Verify == "SUCCESS" -- a LIVE mTLS handshake the terminator verified, proving the
+    caller holds the in-TEE private key NOW. A direct caller cannot forge that header.
+
+    require_proxy_verified=False (attestation/registration endpoints): the cert's public key is bound
+    into the hardware attestation quote (report_data == nonce || sha256(cert pubkey)), so the cert is
+    trusted via that hardware binding rather than a live handshake. This lets the in-guest agent post
+    its attested cert over the X-Client-Cert header (its httpx client does not present a client cert
+    to the optional mTLS edge) while the quote -- not the transport -- establishes trust.
+
+    The SUCCESS gate is also skipped entirely when REQUIRE_MTLS_CLIENT_VERIFY is disabled (the
+    plaintext dev posture). The proxy MUST overwrite any client-supplied X-Client-* headers.
     """
-    if settings.require_mtls_client_verify:
+    if settings.require_mtls_client_verify and require_proxy_verified:
         verify = (request.headers.get("X-Client-Verify") or "").strip().upper()
         if verify != CLIENT_CERT_VERIFY_SUCCESS:
             raise NoClientCertError(

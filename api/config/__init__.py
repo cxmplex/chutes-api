@@ -88,10 +88,17 @@ class Settings(BaseSettings):
         # identified by the secure mTLS-client-verify default. Fail closed on the unsafe combination;
         # the full dev posture (REQUIRE_MTLS_CLIENT_VERIFY=false) is still allowed for local bring-up.
         if self.skip_metagraph_check and self.require_mtls_client_verify:
-            raise ValueError(
-                "SKIP_METAGRAPH_CHECK is a dev-only bypass and must not be enabled in a production "
-                "posture (REQUIRE_MTLS_CLIENT_VERIFY=true). Set SKIP_METAGRAPH_CHECK=false, or run a "
-                "full dev validator (REQUIRE_MTLS_CLIENT_VERIFY=false) for local bring-up."
+            if not self.allow_dev_attested_mtls:
+                raise ValueError(
+                    "SKIP_METAGRAPH_CHECK is a dev-only bypass and must not be enabled in a production "
+                    "posture (REQUIRE_MTLS_CLIENT_VERIFY=true). Set SKIP_METAGRAPH_CHECK=false, run a "
+                    "full dev validator (REQUIRE_MTLS_CLIENT_VERIFY=false), or set ALLOW_DEV_ATTESTED_MTLS=true "
+                    "to intentionally run a dev box with the metagraph bypass AND real attestation mTLS."
+                )
+            logger.warning(
+                "Dev-attested-mTLS posture: SKIP_METAGRAPH_CHECK=true + REQUIRE_MTLS_CLIENT_VERIFY=true "
+                "(ALLOW_DEV_ATTESTED_MTLS=true) -- dev metagraph with a REAL verifying mTLS terminator. "
+                "This must NEVER be used on a production validator."
             )
         # The inverse direction must also fail closed: REQUIRE_MTLS_CLIENT_VERIFY=false disables the
         # X-Client-Verify gate AND the CPU-TEE attested-cert binding on secret-returning endpoints,
@@ -314,6 +321,11 @@ class Settings(BaseSettings):
     # exists on the metagraph. When set, a metagraph_nodes row is auto-created on registration to
     # satisfy the servers FK. NEVER enable in production.
     skip_metagraph_check: bool = os.getenv("SKIP_METAGRAPH_CHECK", "false").lower() == "true"
+    # Opt-in for a dev box that runs the metagraph bypass (SKIP_METAGRAPH_CHECK=true) AND fronts a
+    # REAL verifying mTLS terminator (REQUIRE_MTLS_CLIENT_VERIFY=true) -- i.e. dev metagraph with real
+    # attestation mTLS, needed to exercise CPU-TEE secret delivery without a live chain. Never set in
+    # production (production uses a real metagraph, so SKIP_METAGRAPH_CHECK is false there anyway).
+    allow_dev_attested_mtls: bool = os.getenv("ALLOW_DEV_ATTESTED_MTLS", "false").lower() == "true"
     # Debug TEE guest images (debug_logging: chute output forwarded to the host-readable serial
     # console) produce a DISTINCT measurement, but a validator cannot otherwise tell a debug
     # measurement from a hardened one -- so a debug config shipped in a production ConfigMap would
