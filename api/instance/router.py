@@ -310,6 +310,46 @@ def _verify_rint_commitment(commitment_hex: str, expected_nonce: str) -> bool:
         return False
 
 
+def _verify_e2e_pubkey_sig(
+    attested_cert_pem: str, e2e_pubkey: str, sig_hex: str, config_id: str
+) -> bool:
+    """Verify a CPU-TEE chute's e2e_pubkey is attestation-bound.
+
+    The chute signs ``f"{e2e_pubkey}:{config_id}"`` with the in-TD attested cert key (whose public-key
+    hash is committed in the server's registration quote report_data). We verify that signature with
+    the server's persisted attested cert, proving the ML-KEM public key was generated inside the
+    attested TD -- so neither the untrusted host nor the validator can substitute it before it is
+    published via /e2e/instances (the CPU-TEE analog of the GPU report_data e2e_pubkey binding).
+    Returns True iff the signature is valid.
+    """
+    from cryptography import x509
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
+
+    try:
+        cert = x509.load_pem_x509_certificate(attested_cert_pem.encode())
+        pub = cert.public_key()
+        sig = bytes.fromhex(sig_hex)
+        data = f"{e2e_pubkey}:{config_id}".encode()
+        if isinstance(pub, ed25519.Ed25519PublicKey):
+            pub.verify(sig, data)
+        elif isinstance(pub, ec.EllipticCurvePublicKey):
+            pub.verify(sig, data, ec.ECDSA(hashes.SHA256()))
+        elif isinstance(pub, rsa.RSAPublicKey):
+            pub.verify(sig, data, padding.PKCS1v15(), hashes.SHA256())
+        else:
+            logger.error(f"e2e_pubkey sig: unsupported attested cert key type {type(pub).__name__}")
+            return False
+        return True
+    except InvalidSignature:
+        logger.error("e2e_pubkey signature does not match the attested cert")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"e2e_pubkey signature verification error: {exc}")
+        return False
+
+
 def _validate_tls_cert(
     tls_cert_pem: str, tls_cert_sig_hex: str, rint_commitment_hex: str, nonce: str | None = None
 ) -> bool:
@@ -1488,6 +1528,30 @@ async def _validate_launch_config_instance(
                 detail=launch_config.verification_error,
             )
         validated_cacert = attested_cert
+
+        # Attestation-bind the e2e public key: a CPU-TEE chute that advertises an ML-KEM e2e_pubkey
+        # must prove it was generated inside the attested TD by signing it with the attested cert key
+        # (verified against the cert just pinned above). Without this, the host/validator could publish
+        # a substituted key via /e2e/instances and break the validator-blind e2e guarantee. Fail closed
+        # on a present-but-unsigned or mis-signed key; an absent key just opts this chute out of e2e
+        # (it will not be returned by /e2e/instances).
+        cpu_e2e_pubkey = getattr(args, "e2e_pubkey", None)
+        if cpu_e2e_pubkey:
+            cpu_e2e_pubkey_sig = getattr(args, "e2e_pubkey_sig", None)
+            if not cpu_e2e_pubkey_sig or not _verify_e2e_pubkey_sig(
+                attested_cert, cpu_e2e_pubkey, cpu_e2e_pubkey_sig, launch_config.config_id
+            ):
+                logger.error(f"{log_prefix} CPU-TEE e2e_pubkey attestation-binding failed")
+                launch_config.failed_at = func.now()
+                launch_config.verification_error = (
+                    "CPU-TEE e2e_pubkey is not attestation-bound (missing or invalid signature by the "
+                    "server's attested cert key)"
+                )
+                await db.commit()
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=launch_config.verification_error,
+                )
 
     # Create the instance now that we've verified the envdump/k8s env.
     node_selector = NodeSelector(**chute.node_selector)

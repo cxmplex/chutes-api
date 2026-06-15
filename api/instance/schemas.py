@@ -72,6 +72,10 @@ class LaunchConfigArgs(BaseModel):
     tls_client_key: Optional[str] = None
     tls_client_key_password: Optional[str] = None
     e2e_pubkey: Optional[str] = None
+    # CPU-TEE only: signature over f"{e2e_pubkey}:{config_id}" by the attested in-TD cert key, proving
+    # the ML-KEM e2e key was generated inside the attested TD (GPU-TEE binds e2e_pubkey via the quote
+    # report_data instead). Verified against the server's attested cert before the key is published.
+    e2e_pubkey_sig: Optional[str] = None
     cllmv_session_init: Optional[str] = None
     # The aegis-backed envdump. CPU-TEE chutes ship no aegis and send no envdump; TD attestation
     # (dm-verity + RTMR) + cosign image verification anchor integrity instead.

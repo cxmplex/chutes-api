@@ -68,7 +68,10 @@ Base = declarative_base()
 
 @asynccontextmanager
 async def get_session(readonly=False) -> AsyncGenerator[AsyncSession, None]:
-    session_maker = SessionLocalRead if readonly else SessionLocal
+    # Fall back to the primary session when no read replica is configured (settings.postgres_ro
+    # unset -> SessionLocalRead is None). Without this, any readonly query (e.g. the invocation
+    # path's get_manual_boost) raises "'NoneType' object is not callable" on a single-DB validator.
+    session_maker = (SessionLocalRead or SessionLocal) if readonly else SessionLocal
     async with session_maker() as session:
         try:
             yield session
