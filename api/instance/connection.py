@@ -45,6 +45,9 @@ def _get_ssl_and_cn(instance) -> tuple[ssl.SSLContext, str]:
     # Use CA cert for chain verification when available, fall back to server cert.
     ca_pem = extra.get("ca_cert") or instance.cacert
     ctx.load_verify_locations(cadata=ca_pem)
+    # The attested cert is now CA-signed by the chutes attestation CA (not self-signed), so allow the
+    # pinned cert to act as a trust anchor without requiring a full chain to a self-signed root.
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
 
     # Load mTLS client cert if available.
     # Client key is sent unencrypted (no passphrase) from the miner.
@@ -125,6 +128,9 @@ def build_pinned_client(
     # store is NOT loaded, so a host-presented, system-trusted cert cannot satisfy verification --
     # only the exact attested cert (committed in the registration quote) is trusted.
     ctx = ssl.create_default_context(cadata=cacert_pem)
+    # Attested certs may be CA-signed by the chutes attestation CA; allow the pinned cert to be a
+    # trust anchor without a full chain to a self-signed root.
+    ctx.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN
     cert = x509.load_pem_x509_certificate(cacert_pem.encode())
     cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
     pool = httpcore.AsyncConnectionPool(
