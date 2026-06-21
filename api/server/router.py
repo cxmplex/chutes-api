@@ -24,6 +24,7 @@ from api.server.schemas import (
     CpuServerRegistrationArgs,
     CpuServerRegistrationResponse,
     Server,
+    Host,
     NonceResponse,
     BootAttestationResponse,
     RuntimeAttestationResponse,
@@ -375,6 +376,16 @@ async def get_cpu_server_connection(
             detail="Not a self-registered CPU TEE instance.",
         )
     endpoints = server.tee_endpoints or {}
+    # Informational hardware telemetry: a TD runs on its L0 host's physical CPU, so surface that host's
+    # CPU (model/freq/cache/flags from the node-agent inventory) plus this TD's vCPU/RAM slice. Not
+    # attested (the node-agent is a launcher), purely for the renter's visibility.
+    host_cpu = None
+    if server.host_id:
+        host = (
+            await db.execute(select(Host).where(Host.host_id == server.host_id))
+        ).scalar_one_or_none()
+        if host and host.specs:
+            host_cpu = host.specs.get("cpu")
     return {
         "server_id": server.server_id,
         "host": endpoints.get("host") or server.ip,
@@ -384,6 +395,7 @@ async def get_cpu_server_connection(
         "wg_port": endpoints.get("wg_port", 51820),
         "provision_token": create_provision_jwt(server.server_id),
         "manifest": _manifest_for_version(server.version),
+        "specs": {"cpu": host_cpu, "vcpus": server.cpu_cores, "ram_gb": server.ram_gb},
     }
 
 

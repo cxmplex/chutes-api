@@ -489,7 +489,14 @@ async def schedule_once() -> None:
                     )
                 )
             ).scalar() or 0
-            if current + pending >= await _target_count(chute.chute_id):
+            # Model B in-flight TD launches (host told to boot a TD, but it hasn't self-registered
+            # yet so no LaunchConfig exists) must also count toward target — otherwise the scheduler
+            # keeps launching TDs on every host during the boot window (multiple ticks fire before
+            # the first TD registers). The keys are mb:launch:{chute_id}:{host_id} with a TTL.
+            mb_inflight = len(
+                await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*")
+            )
+            if current + pending + mb_inflight >= await _target_count(chute.chute_id):
                 continue
 
             placed = False
@@ -596,7 +603,14 @@ async def schedule_once() -> None:
                 placed = True
                 break
             if not placed:
-                await _launch_on_host(session, chute, req_cores, req_ram)
+                # Only launch a TD if there isn't one already booting for this chute (any host).
+                # Jobs need exactly one TD; without this guard the scheduler launches on every host
+                # during the boot window (same over-launch bug as the cord pass).
+                mb_inflight = len(
+                    await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*")
+                )
+                if mb_inflight == 0:
+                    await _launch_on_host(session, chute, req_cores, req_ram)
 
 
 async def _tick_with_lock() -> None:
