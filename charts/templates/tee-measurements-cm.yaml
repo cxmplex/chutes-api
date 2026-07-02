@@ -72,3 +72,38 @@ data:
           microcode: 0
         expected_gpus: []
         gpu_count: 0
+      # ChuteFS storage-TD measurements (distinct image: storage-node + persistent-LUKS units baked
+      # in; guest VERSION 1.6.0). Fill from the storage image build (rtmr3-measure / snp-measure).
+      # The storage TD self-registers as a CPU server, so gpu_count MUST be 0.
+      - version: "1.6.0"
+        mrtd: "PLACEHOLDER_STORAGE_TDX_MRTD_96_HEX_CHARS"
+        name: "storage-baremetal-tdx-1.6.0-4c8g"
+        description: "ChuteFS storage TD (Intel TDX, bare-metal, 4c/8g)"
+        provider: "bare-metal"
+        boot_rtmrs:
+          rtmr0: "PLACEHOLDER_STORAGE_TDX_RTMR0_96_HEX_CHARS"
+          rtmr1: "PLACEHOLDER_STORAGE_TDX_RTMR1_96_HEX_CHARS"
+          rtmr2: "PLACEHOLDER_STORAGE_TDX_RTMR2_96_HEX_CHARS"
+          rtmr3: "PLACEHOLDER_STORAGE_TDX_RTMR3_96_HEX_CHARS"
+        runtime_rtmrs:
+          rtmr0: "PLACEHOLDER_STORAGE_TDX_RTMR0_96_HEX_CHARS"
+          rtmr1: "PLACEHOLDER_STORAGE_TDX_RTMR1_96_HEX_CHARS"
+          rtmr2: "PLACEHOLDER_STORAGE_TDX_RTMR2_96_HEX_CHARS"
+          rtmr3: "PLACEHOLDER_STORAGE_TDX_RTMR3_96_HEX_CHARS"
+        expected_gpus: []
+        gpu_count: 0
+      - version: "1.6.0-snp"
+        name: "storage-baremetal-snp-genoa-1.6.0"
+        description: "ChuteFS storage TD (AMD SEV-SNP, bare-metal Genoa)"
+        provider: "baremetal"
+        tee_type: "sev-snp"
+        processor_model: "Genoa"
+        measurement: "PLACEHOLDER_STORAGE_SNP_MEASUREMENT_96_HEX_CHARS"
+        policy: "0x30000"
+        min_tcb:
+          bootloader: 0
+          tee: 0
+          snp: 0
+          microcode: 0
+        expected_gpus: []
+        gpu_count: 0

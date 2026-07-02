@@ -308,7 +308,12 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
             (
                 await session.execute(
                     select(Server).where(
-                        Server.host_id == host_id, Server.self_registered.is_(True)
+                        Server.host_id == host_id,
+                        Server.self_registered.is_(True),
+                        # ChuteFS: the always-on storage TD is launched by the node-agent at boot and
+                        # is NOT a scheduled chute slot, so it never appears in the slot heartbeat.
+                        # Exempt it from reaping or the reconcile loop would tear it down every tick.
+                        Server.storage_role.is_(False),
                     )
                 )
             )

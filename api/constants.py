@@ -17,6 +17,15 @@ class NoncePurpose(str, Enum):
     # Owning-miner signature over "{hotkey}:{nonce}:host_upgrade"; sends the node-agent upgrade_image.
     HOST_UPGRADE = "host_upgrade"
 
+    # ChuteFS: an attested storage TD requesting a confidential per-user-volume application-layer key.
+    # The single-use nonce is bound into a fresh quote whose report_data also commits the TD's
+    # attested serving-cert pubkey; key release verifies that quote against the pinned storage-TD
+    # measurement, requires the presented mTLS cert to match the registered one, and requires the TD
+    # to hold a replica of the volume. The cert+quote are the auth anchor (an operator holding only
+    # the miner hotkey can neither present the cert nor produce the quote); the hotkey header only
+    # scopes the storage-server lookup.
+    STORAGE_KEY = "storage_key"
+
 
 ZERO_ADDRESS_HOTKEY = "5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM"  # Public key is 0x00000...
 HOTKEY_HEADER = "X-Chutes-Hotkey"
@@ -41,11 +50,20 @@ ATTEST_SIGNATURE_HEADER = "X-Chutes-Attest-Signature"
 AGENT_COMMAND_CHANNEL = "agent_commands"
 
 # LUKS volume names allowed in GET/POST (extendable)
-SUPPORTED_LUKS_VOLUMES = ("storage", "tdx-cache")
+#
+# "chutefs-data" is the always-on ChuteFS storage TD's PERSISTENT data volume (attached via the
+# `chutes-cache` virtio serial). Unlike the GPU image's "storage"/"tdx-cache" volumes (block devices
+# the GPU VM owns), this is a per-host durable disk that the storage TD opens with an
+# attestation-released key on every boot and NEVER reformats once initialised.
+SUPPORTED_LUKS_VOLUMES = ("storage", "tdx-cache", "chutefs-data")
 
 # The storage volume's first-boot state determines whether a new k3s encryption
 # key must be generated (luksFormat on a raw device vs. luksOpen on existing LUKS).
 LUKS_STORAGE_VOLUME = "storage"
+
+# The ChuteFS storage TD's persistent, attestation-keyed data volume name (a member of
+# SUPPORTED_LUKS_VOLUMES). The storage TD requests this volume's passphrase via POST /luks/attest.
+CHUTEFS_DATA_VOLUME = "chutefs-data"
 
 # Min balance to register via the CLI (tao units)
 MIN_REG_BALANCE = 0.25

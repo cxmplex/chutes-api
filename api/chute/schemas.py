@@ -363,8 +363,13 @@ class Chute(Base):
     def validate_standard_template(self, _, template):
         """
         Basic validation on standard templates, which for now requires either None or vllm.
+
+        "storage" is the ChuteFS confidential-volume front-end (build_storage_chute): a non-passthrough
+        chute serving put/get/list/delete cords. It intentionally falls through to generic per-request
+        billing + needs egress (to reach the storage TDs), so it is NOT added to the vllm/tei
+        passthrough or the vllm/embedding egress-restriction branches.
         """
-        if template not in (None, "vllm", "diffusion", "tei", "embedding"):
+        if template not in (None, "vllm", "diffusion", "tei", "embedding", "storage"):
             raise ValueError(f"Invalid standard template: {template}")
         return template
 

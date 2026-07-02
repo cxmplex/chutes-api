@@ -291,7 +291,14 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
     used_rows = (
         await session.execute(
             select(Server.host_id, func.count(Server.server_id))
-            .where(Server.host_id.isnot(None), Server.self_registered.is_(True))
+            .where(
+                Server.host_id.isnot(None),
+                Server.self_registered.is_(True),
+                # ChuteFS: the always-on storage TD is not a user-chute slot. The node-agent already
+                # reserves its slot out of advertised host capacity, so counting it here too would
+                # double-charge the host and lose an extra user-chute slot.
+                Server.storage_role.is_(False),
+            )
             .group_by(Server.host_id)
         )
     ).all()
@@ -393,6 +400,9 @@ async def schedule_once() -> None:
                         Server.compute_type == "cpu",
                         Server.self_registered.is_(True),
                         Server.is_tee.is_(True),
+                        # ChuteFS: the always-on storage TD is NOT a user-chute slot; never schedule
+                        # user chutes onto it (it serves the decentralized storage network instead).
+                        Server.storage_role.is_(False),
                         # Maintenance-mode servers (in_maintenance == pending window set) reject
                         # claims at the launch-config handler -- dispatching to them only
                         # manufactures failed configs.

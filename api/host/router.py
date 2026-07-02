@@ -133,6 +133,8 @@ async def list_hosts(
             .where(
                 Server.host_id.isnot(None),
                 Server.self_registered.is_(True),
+                # ChuteFS storage TDs are not user-chute slots (reserved out of capacity already).
+                Server.storage_role.is_(False),
                 Server.miner_hotkey == hotkey,
             )
             .group_by(Server.host_id)

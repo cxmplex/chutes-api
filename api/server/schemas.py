@@ -8,6 +8,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy import (
     Column,
     Integer,
+    BigInteger,
     Float,
     String,
     DateTime,
@@ -125,7 +126,23 @@ class LuksPassphraseRequest(BaseModel):
 class LuksAttestRequest(BaseModel):
     """Request model for POST /luks/attest (new VMs, version >= 1.3.0)."""
 
-    quote: str = Field(..., description="Base64-encoded TDX quote (runtime type, RTMR3 extended)")
+    quote: str = Field(
+        ...,
+        description="Base64-encoded runtime attestation (Intel TDX quote with RTMR3 extended, or an "
+        "AMD SEV-SNP report), bound to the luks_quote_nonce + serving-cert pubkey hash.",
+    )
+    tee_type: str = Field(
+        "tdx",
+        description="TEE provider of the quote: 'tdx' (default) or 'sev-snp'. Selects the verifier so "
+        "an SEV-SNP storage TD can obtain its persistent-volume key alongside Intel TDX VMs.",
+    )
+    snp_cert_chain: Optional[str] = Field(
+        None,
+        description="Base64 SEV-SNP VCEK->ASK->ARK chain (GCP inline auxblob); absent on bare-metal.",
+    )
+    vtpm_quote: Optional[Dict[str, Any]] = Field(
+        None, description="GCE vTPM quote for GCP SNP image identity (absent on bare-metal/TDX)."
+    )
     volumes: List[str] = Field(..., description="Volume names to rotate passphrases for")
 
     @field_validator("volumes")
@@ -247,6 +264,17 @@ class CpuServerRegistrationArgs(BaseModel):
         description="User-attestable reach info advertised by the in-TEE agent: "
         "{host, attest_port, provision_port, ssh_port, wg_port}. Discovery convenience only.",
     )
+    storage_role: bool = Field(
+        False,
+        description="ChuteFS: True when this TD is the always-on storage node (excluded from the CPU "
+        "scheduler and from host-slot reaping; serves the decentralized storage network).",
+    )
+    disk_total_gb: Optional[int] = Field(
+        None, description="ChuteFS storage TD: total durable disk capacity (GB) of its data volume."
+    )
+    disk_free_gb: Optional[int] = Field(
+        None, description="ChuteFS storage TD: currently free disk (GB) on its data volume."
+    )
 
 
 class CpuServerRegistrationResponse(BaseModel):
@@ -257,6 +285,10 @@ class CpuServerRegistrationResponse(BaseModel):
     benchmark_score: float
     verified_at: str
     status: str = "registered"
+    # ChuteFS: the single-use nonce a self-registering storage TD must embed in its next quote to
+    # call POST /{vm_name}/luks/attest for its persistent data-volume key. Minted (and returned) only
+    # for storage_role registrations whose measurement version supports the attest flow (>= 1.3.0).
+    luks_quote_nonce: Optional[str] = None
 
 
 class HostRegistrationArgs(BaseModel):
@@ -278,6 +310,12 @@ class HostRegistrationArgs(BaseModel):
     specs: Optional[dict] = Field(
         None,
         description="Host hardware inventory reported by the agent: cpu/memory/baseboard/system/bios",
+    )
+    disk_total_gb: Optional[int] = Field(
+        None, description="Physical disk capacity (GB) the host can back ChuteFS storage with."
+    )
+    disk_free_gb: Optional[int] = Field(
+        None, description="Currently free physical disk (GB) on the host."
     )
 
 
@@ -532,6 +570,20 @@ class Server(Base):
     # Pure discovery convenience -- trust still comes from the client-side attestation, not this.
     tee_endpoints = Column(JSONB, nullable=True)
 
+    # sha256 of the attestation-bound serving-cert pubkey (DER SPKI), == the report_data cert hash
+    # verified at registration. Indexed so a peer presenting its attested mTLS cert maps to its row
+    # (ChuteFS peer directory / cert authority / attested-caller auth).
+    attested_cert_pubkey_hash = Column(String, nullable=True)
+    # ChuteFS: True for the always-on attested "storage TD" that runs on every bare-metal L0 host
+    # and serves the decentralized storage network. A storage-role server is NEVER a candidate for
+    # the CPU scheduler (it is not a user-chute slot) and is exempt from the host-slot reconcile
+    # reaping; it advertises durable disk capacity below.
+    storage_role = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Durable disk capacity (GB) of the storage TD's persistent ChuteFS data volume. disk_free_gb is
+    # refreshed on announce/heartbeat so the tracker can place replicas on TDs with room.
+    disk_total_gb = Column(Integer, nullable=True)
+    disk_free_gb = Column(Integer, nullable=True)
+
     @property
     def in_maintenance(self) -> bool:
         return self.maintenance_pending_window_id is not None
@@ -593,6 +645,10 @@ class Host(Base):
     cpu_cores = Column(Integer, nullable=True)
     ram_gb = Column(Integer, nullable=True)
     specs = Column(JSONB, nullable=True)
+    # Physical disk inventory (GB) reported by the node-agent (informational; the host is not
+    # attested). Tells the validator how much durable storage this host can back for ChuteFS.
+    disk_total_gb = Column(Integer, nullable=True)
+    disk_free_gb = Column(Integer, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -639,4 +695,130 @@ class VmCacheConfig(Base):
     __table_args__ = (
         Index("idx_vm_cache_miner", "miner_hotkey"),
         Index("idx_vm_cache_last_boot", "last_boot_at"),
+    )
+
+
+class ContentHolding(Base):
+    """ChuteFS: a public model repo@revision currently held by a storage-role TD (integrity-only).
+
+    The model-distribution registry. A chute TD queries it to find attested peers that already hold
+    the weights it needs (avoiding a slow HuggingFace cold-pull); a storage TD inserts/updates a row
+    after it has fetched + verified a repo against the /misc/hf_repo_info manifest.
+    """
+
+    __tablename__ = "content_holdings"
+
+    holding_id = Column(String, primary_key=True, default=generate_uuid)
+    server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
+    repo_id = Column(String, nullable=False)
+    revision = Column(String, nullable=False, default="main", server_default="main")
+    bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    status = Column(String, nullable=False, default="present", server_default="present")
+    announced_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("server_id", "repo_id", "revision", name="uq_content_holding"),
+        Index("idx_content_holdings_repo", "repo_id", "revision"),
+        Index("idx_content_holdings_server", "server_id"),
+    )
+
+
+class StorageVolume(Base):
+    """ChuteFS: a user-owned confidential storage volume (objects replicated across attested TDs)."""
+
+    __tablename__ = "storage_volumes"
+
+    volume_id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    replication_factor = Column(Integer, nullable=False, default=3, server_default="3")
+    quota_bytes = Column(BigInteger, nullable=False, default=10737418240, server_default="10737418240")
+    used_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    deleted = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    objects = relationship("StorageObject", back_populates="volume", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        # Name uniqueness scoped to non-deleted volumes (a soft-deleted name can be reused).
+        Index(
+            "uq_storage_volume_user_name",
+            "user_id",
+            "name",
+            unique=True,
+            postgresql_where=deleted.is_(False),
+        ),
+        Index("idx_storage_volumes_user", "user_id", postgresql_where=deleted.is_(False)),
+    )
+
+
+class StorageVolumeKey(Base):
+    """ChuteFS: the Fernet-encrypted per-volume application-layer encryption key.
+
+    Generated when the volume is created; released ONLY to an attested storage TD that passes a fresh
+    quote verification AND holds a replica of the volume (so a replica on an untrusted host is still
+    host-blind). Encrypted at rest with CACHE_PASSPHRASE_KEY (same primitive as LUKS passphrases).
+    """
+
+    __tablename__ = "storage_volume_keys"
+
+    volume_id = Column(
+        String, ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"), primary_key=True
+    )
+    encrypted_key = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class StorageObject(Base):
+    """ChuteFS: an object (key -> ciphertext bytes) inside a confidential volume.
+
+    The validator tracks only metadata + the ciphertext integrity hash; the bytes themselves live
+    on the storage TDs. size_bytes is the plaintext size, used for per-volume byte accounting.
+    """
+
+    __tablename__ = "storage_objects"
+
+    object_id = Column(String, primary_key=True, default=generate_uuid)
+    volume_id = Column(
+        String, ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"), nullable=False
+    )
+    object_key = Column(String, nullable=False)
+    size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    sha256 = Column(String, nullable=True)
+    deleted = Column(Boolean, nullable=False, default=False, server_default="false")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    volume = relationship("StorageVolume", back_populates="objects")
+    replicas = relationship(
+        "ReplicaPlacement", back_populates="object", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("volume_id", "object_key", name="uq_storage_object_key"),
+        Index("idx_storage_objects_volume", "volume_id", postgresql_where=deleted.is_(False)),
+    )
+
+
+class ReplicaPlacement(Base):
+    """ChuteFS: which storage TDs hold a replica of a given object (replication + peer lookup)."""
+
+    __tablename__ = "replica_placement"
+
+    placement_id = Column(String, primary_key=True, default=generate_uuid)
+    object_id = Column(
+        String, ForeignKey("storage_objects.object_id", ondelete="CASCADE"), nullable=False
+    )
+    server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
+    status = Column(String, nullable=False, default="present", server_default="present")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    confirmed_at = Column(DateTime(timezone=True), nullable=True)
+
+    object = relationship("StorageObject", back_populates="replicas")
+
+    __table_args__ = (
+        UniqueConstraint("object_id", "server_id", name="uq_replica_object_server"),
+        Index("idx_replica_placement_object", "object_id"),
+        Index("idx_replica_placement_server", "server_id"),
     )

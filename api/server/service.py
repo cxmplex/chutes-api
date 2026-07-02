@@ -698,11 +698,31 @@ async def register_cpu_server(
     server.benchmark_score = float(benchmark["composite_score"])
     server.benchmark = benchmark
     server.version = measurement_config.version
+    # ChuteFS: the always-on storage TD self-registers with storage_role=True so the CPU scheduler
+    # never places user chutes on it and the reconcile loop never reaps it; it advertises durable
+    # disk capacity for replica placement. A storage TD is a normal attested CPU server otherwise.
+    storage_role = bool(getattr(args, "storage_role", False))
+    # storage_role is asserted by the (untrusted) host config volume, so bind it to the dedicated,
+    # pinned storage-TD measurement (name 'storage-*'): only the genuine storage image -- whose code
+    # is trusted to use the released per-volume key solely for at-rest encryption -- may be a storage
+    # node. This prevents a malicious operator from marking an arbitrary CPU-TEE image storage_role to
+    # have replicas + per-volume keys released to code that could exfiltrate them.
+    if storage_role and not (measurement_config.name or "").startswith("storage"):
+        raise MeasurementMismatchError(
+            "storage_role registration requires the pinned storage-TD measurement (name 'storage-*'); "
+            f"matched '{measurement_config.name}'."
+        )
+    server.storage_role = storage_role
+    server.disk_total_gb = getattr(args, "disk_total_gb", None)
+    server.disk_free_gb = getattr(args, "disk_free_gb", None)
     # Persist the attestation-bound serving cert. Its pubkey hash was just verified against the
     # quote report_data (verify_quote above), so this PEM is the attested TLS identity of the TD.
     # The validator pins it as the instance cacert so the validator<->chute transport is TLS
     # terminated inside the attested TD (the untrusted host cannot MITM/read/tamper it).
     server.attested_cert = cert_pem
+    # The pubkey hash was verified against the quote report_data above (expected_cert_hash); persist
+    # it so ChuteFS peers presenting this attested mTLS cert map to this server row in O(1).
+    server.attested_cert_pubkey_hash = expected_cert_hash
     # Advertised user-attestable reach info (host + attest/provision/ssh/wg ports) for discovery via
     # GET /servers/cpu/{id}/connection. Optional; pure convenience (trust is the client attestation).
     if args.endpoints:
@@ -727,10 +747,19 @@ async def register_cpu_server(
         except Exception:  # noqa: BLE001 - inflight counter is a best-effort hint
             pass
 
+    # ChuteFS: a storage TD then calls POST /{vm_name}/luks/attest to obtain its persistent
+    # data-volume passphrase. That endpoint is gated on a single-use luks_quote_nonce which, for the
+    # validator-dialed GPU flow, is minted in boot attestation. The self-registering storage TD has
+    # no boot-attestation step, so mint + return one here (same >= 1.3.0 attest-flow version gate).
+    luks_quote_nonce: Optional[str] = None
+    if storage_role and semcomp(measurement_config.version, "1.3.0") >= 0:
+        luks_quote_nonce = await generate_luks_quote_nonce(miner_hotkey, name)
+
     logger.success(
         f"CPU server self-registered: server_id={args.server_id} ip={server_ip} "
         f"miner={miner_hotkey} score={server.benchmark_score} version={measurement_config.version}"
         + (f" host_id={server.host_id}" if server.host_id else "")
+        + (" storage_role=True" if storage_role else "")
     )
     verified_at = attestation.verified_at
     return {
@@ -743,7 +772,22 @@ async def register_cpu_server(
             else datetime.now(timezone.utc).isoformat()
         ),
         "status": "registered",
+        "luks_quote_nonce": luks_quote_nonce,
     }
+
+
+def _sum_disk_gb(disks: Any) -> Optional[int]:
+    """Sum the size_gb of a node-agent specs.disk_info() list (non-rotational + rotational), or None.
+
+    specs["disks"] is a list of {name,size_gb,model,rotational,type} dicts (sek8s specs.disk_info()).
+    """
+    if not isinstance(disks, list):
+        return None
+    total = 0
+    for disk in disks:
+        if isinstance(disk, dict) and isinstance(disk.get("size_gb"), (int, float)):
+            total += int(disk["size_gb"])
+    return total or None
 
 
 async def register_host(
@@ -798,6 +842,10 @@ async def register_host(
     mem = specs.get("memory") or {}
     host.cpu_cores = cpu.get("physical_cores") or cpu.get("logical_cpus")
     host.ram_gb = mem.get("total_gb")
+    # ChuteFS: physical disk inventory so the validator knows how much durable storage this host can
+    # back. Reported explicitly by the agent (preferred) or denormalized from the specs disk list.
+    host.disk_total_gb = args.disk_total_gb or _sum_disk_gb(specs.get("disks"))
+    host.disk_free_gb = args.disk_free_gb
     await db.commit()
     await db.refresh(host)
 
@@ -1325,10 +1373,18 @@ async def process_luks_attest_request(
     Process POST /luks/attest for new-format VMs (version >= 1.3.0).
 
     The quote nonce has already been validated and consumed by require_luks_quote_nonce.
-    Verifies the TDX quote (signature + all RTMR measurements including RTMR3), rotates
-    passphrases, manages the k3s encryption key, and issues a confirm nonce.
+    Verifies the attestation (Intel TDX quote signature + all RTMRs including RTMR3, or an AMD
+    SEV-SNP report's VCEK chain + launch measurement), rotates passphrases, manages the k3s
+    encryption key, and issues a confirm nonce. Provider-aware so an SEV-SNP storage TD can obtain
+    its persistent ChuteFS data-volume passphrase, not just Intel TDX GPU VMs.
     """
-    quote = RuntimeTdxQuote.from_base64(body.quote)
+    tee_type = (getattr(body, "tee_type", None) or "tdx").strip().lower()
+    quote = build_runtime_quote(
+        body.quote,
+        tee_type,
+        getattr(body, "snp_cert_chain", None),
+        getattr(body, "vtpm_quote", None),
+    )
     await verify_quote(quote, quote_nonce, expected_cert_hash)
 
     volumes_data, vm_config = await rotate_luks_passphrases(db, hotkey, vm_name, body.volumes)

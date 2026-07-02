@@ -95,3 +95,43 @@ measurements:
     # id_key_digest: "..."   # optional: pin an owner id-block digest (launch-time enforcement)
     expected_gpus: []
     gpu_count: 0
+
+  # --- ChuteFS storage-TD measurements (the always-on storage node image) -----------------------
+  # The storage-TD image (inventory.storage*.yml, guest VERSION 1.6.0) is a DISTINCT image from the
+  # per-chute image (it bakes the storage-node + persistent-LUKS units), so it has its OWN
+  # measurement, pinned here per provider + size class. Fill MRTD/RTMRs (TDX) or measurement (SNP)
+  # from the storage image build output (rtmr3-measure / snp-measure), exactly like the cpu-* entries.
+  # gpu_count MUST be 0 (CPU self-registration requires it). Version 1.6.0 matches ansible/guest/VERSION.
+  - version: "1.6.0"
+    name: "storage-baremetal-tdx-1.6.0-4c8g"
+    description: "ChuteFS storage TD (Intel TDX, bare-metal, 4c/8g)"
+    provider: "bare-metal"
+    mrtd: "REPLACE_WITH_STORAGE_TDX_MRTD_96HEX"
+    boot_rtmrs:
+      rtmr0: "REPLACE_WITH_STORAGE_TDX_RTMR0"
+      rtmr1: "REPLACE_WITH_STORAGE_TDX_RTMR1"
+      rtmr2: "REPLACE_WITH_STORAGE_TDX_RTMR2"
+      rtmr3: "REPLACE_WITH_STORAGE_TDX_RTMR3"
+    runtime_rtmrs:
+      rtmr0: "REPLACE_WITH_STORAGE_TDX_RTMR0"
+      rtmr1: "REPLACE_WITH_STORAGE_TDX_RTMR1"
+      rtmr2: "REPLACE_WITH_STORAGE_TDX_RTMR2"
+      rtmr3: "REPLACE_WITH_STORAGE_TDX_RTMR3"
+    expected_gpus: []
+    gpu_count: 0
+
+  - version: "1.6.0-snp"
+    name: "storage-baremetal-snp-genoa-1.6.0"
+    description: "ChuteFS storage TD (AMD SEV-SNP, bare-metal Genoa)"
+    provider: "bare-metal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "REPLACE_WITH_STORAGE_SNP_LAUNCH_MEASUREMENT_96HEX"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_gpus: []
+    gpu_count: 0
