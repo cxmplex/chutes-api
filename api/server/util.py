@@ -232,10 +232,17 @@ def _get_client_certificate(request: Request, require_proxy_verified: bool = Tru
     """
     if settings.require_mtls_client_verify and require_proxy_verified:
         verify = (request.headers.get("X-Client-Verify") or "").strip().upper()
-        if verify != CLIENT_CERT_VERIFY_SUCCESS:
+        # SUCCESS = presented + CA-chain verified. FAILED:<reason> = the cert WAS presented in the
+        # live TLS handshake (possession proven via CertificateVerify) but did not chain to a CA --
+        # the expected verdict for attestation-bound SELF-SIGNED TEE certs (nginx runs
+        # ssl_verify_client optional_no_ca; trust comes from the quote binding / attested-cert
+        # registry, not a CA). NONE/missing = no live handshake at all, so the header PEM alone
+        # proves nothing (the M4 forgery) -- reject. nginx overwrites client-supplied X-Client-*.
+        presented = verify == CLIENT_CERT_VERIFY_SUCCESS or verify.startswith("FAILED")
+        if not presented:
             raise NoClientCertError(
                 detail=(
-                    "Client certificate was not verified by the mTLS terminator "
+                    "Client certificate was not presented in the mTLS handshake "
                     f"(X-Client-Verify={verify or 'missing'}); refusing to trust X-Client-Cert."
                 )
             )
