@@ -160,6 +160,54 @@ def get_signing_message(
         )
 
 
+def nonce_timestamp(nonce: str) -> int:
+    """Parse the leading unix-seconds timestamp from a v1 (bare int) or v2 (``ts.rand``) nonce."""
+    return int(nonce.split(".", 1)[0])
+
+
+def nonce_is_valid_v2(nonce: str) -> bool:
+    """v2 nonce freshness: same 600s window as nonce_is_valid, tolerant of the ``ts.rand`` suffix."""
+    try:
+        return abs(time.time() - nonce_timestamp(nonce)) < 600
+    except (ValueError, TypeError):
+        return False
+
+
+def build_v2_signing_message(
+    signer: str, method: str, target: str, nonce: str, body_sha256: str | None
+) -> str:
+    """3-part v2 signed message binding method + path (see the sek8s backend fix plan, Phase 2)."""
+    return f"v2:{signer}:{method.upper()}:{target}:{nonce}:{body_sha256 or ''}"
+
+
+def build_v2_signing_message_mgmt(
+    miner: str, validator: str, method: str, target: str, nonce: str, body_sha256: str | None
+) -> str:
+    """4-part v2 signed message (management: miner acting toward a validator)."""
+    return f"v2:{miner}:{validator}:{method.upper()}:{target}:{nonce}:{body_sha256 or ''}"
+
+
+def request_target(request: Request) -> str:
+    """The signed request target: path plus ``?query`` when a query string is present."""
+    query = request.url.query
+    return f"{request.url.path}?{query}" if query else request.url.path
+
+
+async def consume_sig_nonce(signer: str, nonce: str, ttl_seconds: int = 600) -> bool:
+    """Single-use guard for a v2 nonce via Redis SET NX EX. Returns False if already consumed.
+
+    Multi-process safe (unlike sek8s's in-memory registry): the first request for a given
+    (signer, nonce) wins; a replay within the acceptance window collides and is rejected.
+    """
+    key = f"sig:{signer}:{nonce}"
+    try:
+        was_set = await settings.redis_client.set(key, "1", nx=True, ex=ttl_seconds)
+    except Exception as exc:  # noqa: BLE001 - fail closed: if we cannot dedupe, reject replays
+        logger.warning(f"sig-nonce cache unavailable, rejecting v2 request: {exc}")
+        return False
+    return bool(was_set)
+
+
 def is_invalid_ip(ip: IPv4Address | IPv6Address) -> bool:
     """
     Check if IP address is private/local network.

@@ -90,6 +90,8 @@ async def announce(
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User | None = Depends(
+        # Accept v1+v2 (not require_v2): already-deployed storage TDs on the fleet sign v1 until they
+        # are re-imaged with the v2 tracker; a re-imaged TD's v2 announce binds method+path+body.
         get_current_user(purpose="tee", registered_to=_REGISTERED_TO, raise_not_found=False)
     ),
 ):
@@ -111,6 +113,7 @@ async def announce_replicas(
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User | None = Depends(
+        # Accept v1+v2 (not require_v2): see announce -- deployed storage TDs sign v1 until re-imaged.
         get_current_user(purpose="tee", registered_to=_REGISTERED_TO, raise_not_found=False)
     ),
 ):
@@ -167,7 +170,7 @@ async def peer_cert(
 async def create_volume(
     body: CreateVolumeRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service.create_volume(
         db, current_user.user_id, body.name, body.replication_factor, body.quota_bytes
@@ -178,7 +181,7 @@ async def create_volume(
 @router.get("/volumes", response_model=VolumeListResponse)
 async def list_volumes(
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user(purpose="storage")),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volumes = await service.list_volumes(db, current_user.user_id)
     return VolumeListResponse(volumes=[VolumeResponse(**service._volume_response(v)) for v in volumes])
@@ -188,7 +191,7 @@ async def list_volumes(
 async def get_volume(
     volume_id: str,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user(purpose="storage")),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
     return VolumeResponse(**service._volume_response(volume))
@@ -198,7 +201,7 @@ async def get_volume(
 async def delete_volume(
     volume_id: str,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user(purpose="storage")),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     await service.delete_volume(db, volume_id, current_user.user_id)
     return {"deleted": True}
@@ -212,7 +215,7 @@ async def plan_placement(
     volume_id: str,
     body: PlacementRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     """Quota-check + return the target replica set (N attested TDs on distinct hosts) for an object."""
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
@@ -227,7 +230,7 @@ async def commit_object(
     volume_id: str,
     body: CommitObjectRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     """Finalize an object after its ciphertext has been pushed to the holder TDs (byte accounting)."""
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
@@ -244,7 +247,7 @@ async def locate_object(
     volume_id: str,
     body: LocateObjectRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
     obj, peers = await service.locate_object(db, volume, body.key)
@@ -262,7 +265,7 @@ async def list_objects(
     volume_id: str,
     body: ListObjectsRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
     objects = await service.list_objects(db, volume, body.prefix, body.limit)
@@ -285,7 +288,7 @@ async def delete_object(
     volume_id: str,
     body: DeleteObjectRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
     used = await service.delete_object(db, volume, body.key)
@@ -299,7 +302,7 @@ async def delete_object(
 async def issue_grant(
     body: GrantRequest,
     db: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(get_current_user()),
+    current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     """A volume owner mints a short-lived grant the storage TDs verify to authorize its object ops."""
     grant = await service.issue_grant(db, current_user.user_id, body.volume_id, body.ops)

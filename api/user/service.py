@@ -15,8 +15,15 @@ from api.api_key.util import get_and_check_api_key
 from api.user.tokens import get_user_from_token
 from fastapi.security import APIKeyHeader
 from api.constants import HOTKEY_HEADER, SIGNATURE_HEADER, AUTHORIZATION_HEADER
-from api.constants import NONCE_HEADER, INTEGRATED_SUBNETS
-from api.util import nonce_is_valid, get_signing_message
+from api.constants import NONCE_HEADER, INTEGRATED_SUBNETS, SIG_VERSION_HEADER, SIG_VERSION_V2
+from api.util import (
+    nonce_is_valid,
+    nonce_is_valid_v2,
+    get_signing_message,
+    build_v2_signing_message,
+    request_target,
+    consume_sig_nonce,
+)
 from api.permissions import Permissioning
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,9 +36,15 @@ def get_current_user(
     registered_to: int = None,
     raise_not_found: bool = True,
     allow_api_key=False,
+    require_v2: bool = False,
 ):
     """
     Authentication dependency builder.
+
+    When a request carries ``X-Chutes-Sig-Version: 2`` the signature is verified against the v2
+    message (binding HTTP method + path) and its nonce is consumed single-use, closing the replay
+    where a captured read signature is replayed to a same-purpose destructive endpoint. Legacy v1
+    signatures are still accepted unless ``require_v2`` is set (Stage-3 opt-in for new endpoints).
     """
 
     async def _authenticate(
@@ -41,6 +54,7 @@ def get_current_user(
         signature: str | None = Header(None, alias=SIGNATURE_HEADER),
         nonce: str | None = Header(None, alias=NONCE_HEADER),
         authorization: str | None = Header(None, alias=AUTHORIZATION_HEADER),
+        sig_version: str | None = Header(None, alias=SIG_VERSION_HEADER),
     ):
         """
         Helper to authenticate requests.
@@ -89,7 +103,20 @@ def get_current_user(
 
         # Otherwise we are using hotkey auth, so need to check the nonce
         # and check the message was signed correctly
-        if not nonce_is_valid(nonce):
+        is_v2 = sig_version == SIG_VERSION_V2
+        if require_v2 and not is_v2:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="This endpoint requires a v2 request signature.",
+            )
+        # A v2 nonce MUST carry the random suffix (`{ts}.{rand}`) so two same-second requests do not
+        # collide in the single-use cache; reject a bare-int nonce presented as v2.
+        if is_v2 and "." not in (nonce or ""):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="v2 nonce must be '{ts}.{random}'.",
+            )
+        if not (nonce_is_valid_v2(nonce) if is_v2 else nonce_is_valid(nonce)):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid nonce!",
@@ -114,13 +141,18 @@ def get_current_user(
         # Now get the Signing message
         body_sha256 = getattr(request.state, "body_sha256", None)
 
-        signing_message = get_signing_message(
-            hotkey=hotkey,
-            nonce=nonce,
-            payload_hash=body_sha256,
-            purpose=purpose,
-            payload_str=None,
-        )
+        if is_v2:
+            signing_message = build_v2_signing_message(
+                hotkey, request.method, request_target(request), nonce, body_sha256
+            )
+        else:
+            signing_message = get_signing_message(
+                hotkey=hotkey,
+                nonce=nonce,
+                payload_hash=body_sha256,
+                purpose=purpose,
+                payload_str=None,
+            )
 
         if not signing_message:
             raise HTTPException(
@@ -148,6 +180,14 @@ def get_current_user(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Invalid request signature for hotkey {hotkey}. Message: {signing_message}",
             ) from e
+
+        # v2 nonces are single-use: consume only AFTER the signature verifies, so an unauthenticated
+        # caller cannot burn a legitimate signer's nonce.
+        if is_v2 and not await consume_sig_nonce(hotkey, nonce):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Nonce already used (replay); request a fresh signature.",
+            )
 
         # Requires a hotkey registered to a netuid?
         if registered_to is not None:

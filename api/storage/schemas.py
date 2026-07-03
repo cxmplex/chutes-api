@@ -199,14 +199,36 @@ class ReplicaAnnounceRequest(BaseModel):
 # --- object-op grants (storage-node authorization for confidential object ops) -----------------
 
 
+VALID_GRANT_OPS = ("put", "get", "list", "delete")
+
+
 class GrantRequest(BaseModel):
-    """A volume owner mints a short-lived grant authorizing storage TDs to serve object ops."""
+    """A volume owner mints a short-lived grant authorizing storage TDs to serve object ops.
+
+    Callers should request the MINIMAL op set: a put grant is forwarded to replica peers, so a broad
+    (get/delete) grant would over-privilege every peer for the grant TTL. Ops are constrained to the
+    known operations and de-duplicated.
+    """
 
     volume_id: str
     ops: List[str] = Field(
-        default_factory=lambda: ["put", "get", "list", "delete"],
-        description="Allowed object operations for the grant bearer.",
+        ...,
+        min_length=1,
+        description="Allowed object operations for the grant bearer (subset of put/get/list/delete). "
+        "Required and explicit: callers request the minimal set (e.g. put-only for the replica-forwarded "
+        "grant) so no request silently mints an all-ops bearer credential.",
     )
+
+    @field_validator("ops")
+    @classmethod
+    def validate_ops(cls, v: List[str]) -> List[str]:
+        unknown = [op for op in v if op not in VALID_GRANT_OPS]
+        if unknown:
+            raise ValueError(f"Unknown grant ops: {unknown}; allowed: {list(VALID_GRANT_OPS)}")
+        if not v:
+            raise ValueError("Grant must authorize at least one op.")
+        # Preserve order, drop duplicates.
+        return list(dict.fromkeys(v))
 
 
 class GrantResponse(BaseModel):

@@ -32,6 +32,10 @@ HOTKEY_HEADER = "X-Chutes-Hotkey"
 COLDKEY_HEADER = "X-Chutes-Coldkey"
 SIGNATURE_HEADER = "X-Chutes-Signature"
 NONCE_HEADER = "X-Chutes-Nonce"
+# Request-signature format version. "2" binds HTTP method + path into the signed message and makes
+# the nonce single-use (see api.util.verify_request_signature); absent/"1" == legacy v1.
+SIG_VERSION_HEADER = "X-Chutes-Sig-Version"
+SIG_VERSION_V2 = "2"
 AUTHORIZATION_HEADER = "Authorization"
 PURPOSE_HEADER = "X-Chutes-Purpose"
 MINER_HEADER = "X-Chutes-Miner"
