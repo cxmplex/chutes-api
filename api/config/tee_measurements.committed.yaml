@@ -14,6 +14,26 @@
 # and per-volume key release on that prefix) and MUST set `gpu_count: 0`. The loader validates each
 # value strictly (96 hex chars for measurement/mrtd/rtmrs), so leave a real entry out entirely
 # rather than committing a placeholder that would fail load. See tee_measurements.yaml.example and
-# charts/templates/tee-measurements-cm.yaml for the full schema and the expected storage entries
-# (`storage-baremetal-tdx-1.6.0-4c8g`, `storage-baremetal-snp-genoa-1.6.0`).
-measurements: []
+# charts/templates/tee-measurements-cm.yaml for the full schema.
+measurements:
+  # 1.6.1 ChuteFS storage-TD, AMD SEV-SNP bare-metal EPYC Genoa, 4 vCPU direct-kernel boot.
+  # Offline launch digest from the 2026-07-03 build (sev-snp-measure --vcpus 4 --vcpu-type EPYC-v4);
+  # verified end-to-end on the live chi/fra/lax fleet (registration + LUKS key release + v3 rf=3
+  # round-trip). expected_vmpl: 0 -- the fleet's guests request attestation at VMPL 0 (verified from
+  # live registration quotes; a VMPL-1 pin was rejected by all three boxes).
+  - version: "1.6.1-storage-snp"
+    name: "storage-baremetal-snp-genoa-1.6.1-4vcpu"
+    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image (TEE remediation: v3 at-rest AEAD + tracker-anchored salt, anti-rollback epoch, H2 reformat guard, replication enforcement); bare-metal EPYC Genoa, 4 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "40D9E24D9A3B5A378BDCA090A56739BF219DF589FEF6A6FF89C5FEFD9730872FF96B49B75F92E2286E481FCE7D898FDF"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
