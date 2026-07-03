@@ -16,7 +16,7 @@ from huggingface_hub.utils import (
     HfHubHTTPError,
 )
 from urllib.parse import urlparse
-from fastapi import APIRouter, Request, Response, HTTPException, status, Query
+from fastapi import APIRouter, Header, Request, Response, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from typing import AsyncIterator
 from sqlalchemy import select
@@ -286,6 +286,9 @@ def _fetch_repo_info_sync(repo_id: str, repo_type: str, revision: str, hf_token:
     Load huggingface repo info for cache validation.
     """
     api = HfApi(token=hf_token)
+    # Resolve the revision (branch/tag/sha) to its concrete commit hash so a peer-first fetcher can
+    # materialize the canonical HF cache layout (snapshots/<commit>/ + refs/<revision>) offline.
+    commit_hash = api.repo_info(repo_id=repo_id, revision=revision, repo_type=repo_type).sha
     repo_items = api.list_repo_tree(
         repo_id=repo_id,
         revision=revision,
@@ -315,6 +318,7 @@ def _fetch_repo_info_sync(repo_id: str, repo_type: str, revision: str, hf_token:
         "repo_id": repo_id,
         "repo_type": repo_type,
         "revision": revision,
+        "commit_hash": commit_hash,
         "files": files,
         "directories": directories,
     }
@@ -326,10 +330,14 @@ async def get_hf_repo_info(
     repo_type: str = Query("model"),
     revision: str = Query("main"),
     hf_token: Optional[str] = Query(None),
+    x_hf_token: Optional[str] = Header(None),
 ):
     """
     Proxy endpoint for HF repo file info.
     """
+    # L13: prefer the HF token from the X-HF-Token header (kept out of URLs/access logs); the query
+    # param remains for already-deployed clients that still pass it.
+    hf_token = x_hf_token or hf_token
     uid = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{repo_id=},{repo_type=},{revision=},{hf_token=}"))
     cache_key = f"hf_repo_info:{uid}"
     cached = await settings.redis_client.get(cache_key)
@@ -386,5 +394,7 @@ async def get_hf_repo_info(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    await settings.redis_client.set(cache_key, json.dumps(result).decode())
+    # TTL the cache so entries written before commit_hash existed (C1/L20) expire and get refreshed,
+    # rather than serving a commit_hash-less manifest forever.
+    await settings.redis_client.set(cache_key, json.dumps(result).decode(), ex=3600)
     return result

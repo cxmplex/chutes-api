@@ -707,7 +707,7 @@ async def register_cpu_server(
     # is trusted to use the released per-volume key solely for at-rest encryption -- may be a storage
     # node. This prevents a malicious operator from marking an arbitrary CPU-TEE image storage_role to
     # have replicas + per-volume keys released to code that could exfiltrate them.
-    if storage_role and not (measurement_config.name or "").startswith("storage"):
+    if storage_role and not (measurement_config.name or "").startswith("storage-"):
         raise MeasurementMismatchError(
             "storage_role registration requires the pinned storage-TD measurement (name 'storage-*'); "
             f"matched '{measurement_config.name}'."
@@ -1404,10 +1404,17 @@ async def process_luks_attest_request(
 
     confirm_nonce = await generate_confirm_nonce(hotkey, vm_name)
 
+    # M16: hand the TD the last-confirmed freshness epoch per volume (0 if never confirmed). The TD
+    # refuses to serve a volume whose in-encrypted-fs epoch is older than this (rollback), then writes
+    # epoch+1 and reports it on confirm.
+    stored_epochs = dict(vm_config.volume_epochs or {})
+    volume_epochs = {vol: int(stored_epochs.get(vol, 0)) for vol in volumes_data}
+
     return LuksAttestResult(
         volumes=volumes_data,
         confirm_nonce=confirm_nonce,
         k3s_encryption_key=k3s_b64,
+        volume_epochs=volume_epochs,
     )
 
 
@@ -1432,6 +1439,7 @@ async def process_luks_confirm(
         )
 
     stored: Dict[str, str] = dict(vm_config.volume_passphrases or {})
+    epochs: Dict[str, int] = dict(vm_config.volume_epochs or {})
     confirmed_volumes: Dict[str, dict] = {}
 
     for vol, vol_status in body.volumes.items():
@@ -1454,8 +1462,16 @@ async def process_luks_confirm(
             logger.info(
                 f"LUKS confirm: discarded pending passphrase for volume {vol} (VM: {vm_name})"
             )
+        # M16: advance the anti-rollback floor to the epoch the TD wrote inside the encrypted volume
+        # on this open. Monotonic (never regress), so a lost confirm just leaves disk ahead of the
+        # validator floor (still safe -- disk_epoch >= floor holds next boot).
+        if vol_status.epoch is not None:
+            new_epoch = int(vol_status.epoch)
+            if new_epoch > int(epochs.get(vol, 0)):
+                epochs[vol] = new_epoch
 
     vm_config.volume_passphrases = stored
+    vm_config.volume_epochs = epochs
     await db.commit()
 
     return LuksConfirmResult(volumes=confirmed_volumes)

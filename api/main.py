@@ -143,6 +143,12 @@ async def lifespan(_: FastAPI):
         yield
         return
 
+    # ChuteFS durability reconcile (M7): re-replicate under-target objects + GC dead placements.
+    # Single-process (leader worker) so the fleet isn't reconciled N times in parallel.
+    from api.storage.reconcile import storage_reconcile_loop
+
+    asyncio.create_task(storage_reconcile_loop())
+
     ## Run the migrations.
     # process = await asyncio.create_subprocess_exec(
     #    "dbmate",
@@ -376,6 +382,12 @@ async def host_router_middleware(request: Request, call_next):
                     request.state.auth_object_type = "account"
                 else:
                     request.state.auth_object_type = "account"
+                request.state.auth_object_id = "__self__"
+            elif request.url.path.startswith("/storage/"):
+                # ChuteFS ops (H5): a single "storage" scope object so a storage-scoped API key can be
+                # minted for a deployed storage chute. The deeper /storage/... paths don't fit the
+                # 2-segment object-id regex below, so map them explicitly.
+                request.state.auth_object_type = "storage"
                 request.state.auth_object_id = "__self__"
             else:
                 request.state.auth_object_type = request.url.path.split("/")[-1]

@@ -65,6 +65,10 @@ class TeeMeasurementConfig:
     min_tcb: Optional[Dict[str, int]] = None  # {bootloader,tee,snp,microcode} minimums
     id_key_digest: Optional[str] = None  # 96 hex; optional owner id-block pin
     processor_model: Optional[str] = None  # Genoa | Milan | Turin (selects KDS/ARK)
+    # Optional pinned SNP report VMPL (privilege level the guest attests at). Platform-specific:
+    # bare-metal guests here attest at VMPL 1, GCP at VMPL 0 -- so it is pinned per measurement config
+    # rather than hard-coded. None = not enforced (verify still checks chain/signature/TCB/debug).
+    expected_vmpl: Optional[int] = None
     # GCP-only image identity: pinned GCE vTPM PCR values {pcr_index(str): sha256 hex}. On GCP the
     # SNP launch measurement is Google firmware only (no RTMR3 analog), so image identity (our
     # dm-verity rootfs) is bound via the Google-managed vTPM measured boot -- PCR8 (grub cmdline w/
@@ -79,8 +83,9 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context) -> None:
         """Validate configuration after initialization."""
-        # Eagerly validate TEE measurement configuration only when the config file is mounted
-        if self.tee_measurement_config_path.exists():
+        # Eagerly validate TEE measurement configuration when any source (committed artifact or the
+        # mounted ConfigMap) is present.
+        if self._measurement_source_paths():
             _ = self.tee_measurements
 
         # SKIP_METAGRAPH_CHECK is a dev-only bypass (it auto-creates a metagraph row so an unregistered
@@ -423,6 +428,21 @@ class Settings(BaseSettings):
 
     # TDX Attestation settings - Measurement configuration loaded from ConfigMap
     tee_measurement_config_path: Path = Path("/etc/config/tee_measurements.yaml")
+    # A versioned (git-tracked, shipped-in-image) measurements artifact loaded ALONGSIDE the mounted
+    # ConfigMap. The mounted file is environment/hardware specific and (in dev) gitignored, which
+    # left the ChuteFS storage-* measurements as live-only hand-appended state -- so a from-repo
+    # rebuild had no storage measurements and storage registration failed (H9). Committing the
+    # storage-role measurements here makes them reproducible; the mounted file still overrides by
+    # name for env-specific values.
+    tee_committed_measurement_config_path: Path = Path(__file__).resolve().parent / "tee_measurements.committed.yaml"
+
+    def _measurement_source_paths(self) -> List[Path]:
+        """Existing measurement sources, committed base first then the (overriding) mounted file."""
+        return [
+            p
+            for p in (self.tee_committed_measurement_config_path, self.tee_measurement_config_path)
+            if p and Path(p).exists()
+        ]
 
     @property
     def tee_measurements(self) -> List[TeeMeasurementConfig]:
@@ -434,17 +454,31 @@ class Settings(BaseSettings):
         return self._load_tee_measurements()
 
     def _load_tee_measurements(self) -> List[TeeMeasurementConfig]:
-        """Parse and validate TEE measurement configurations from the YAML file."""
-        try:
-            with open(self.tee_measurement_config_path) as f:
-                config = yaml.safe_load(f)
-        except Exception as e:
-            logger.error(f"Failed to load TEE measurement config: {e}")
-            return []
+        """Parse and validate TEE measurement configurations.
+
+        Merges the committed (versioned) artifact with the mounted ConfigMap: entries are keyed by
+        ``name`` and a mounted-file entry overrides a committed one of the same name, so
+        environment-specific values win while the committed storage-role measurements stay a
+        reproducible baseline.
+        """
+        raw_by_name: Dict[str, dict] = {}
+        ordered_names: List[str] = []
+        for path in self._measurement_source_paths():
+            try:
+                with open(path) as f:
+                    doc = yaml.safe_load(f) or {}
+            except Exception as e:
+                logger.error(f"Failed to load TEE measurement config {path}: {e}")
+                continue
+            for measurement_config in doc.get("measurements") or []:
+                name = measurement_config.get("name", "unnamed")
+                if name not in raw_by_name:
+                    ordered_names.append(name)
+                raw_by_name[name] = measurement_config
 
         measurements: List[TeeMeasurementConfig] = []
-        for measurement_config in config.get("measurements", []):
-            config_name = measurement_config.get("name", "unnamed")
+        for config_name in ordered_names:
+            measurement_config = raw_by_name[config_name]
             version = measurement_config.get("version")
             if not version or not str(version).strip():
                 error_msg = (
@@ -571,6 +605,8 @@ class Settings(BaseSettings):
                             "attests only Google firmware, so image identity MUST be pinned via the "
                             "GCE vTPM PCR8 (grub cmdline w/ verity.roothash) + PCR9 (kernel/initrd)."
                         )
+                raw_vmpl = measurement_config.get("expected_vmpl")
+                expected_vmpl = int(raw_vmpl) if raw_vmpl is not None else None
                 measurements.append(
                     TeeMeasurementConfig(
                         version=str(version).strip(),
@@ -587,6 +623,7 @@ class Settings(BaseSettings):
                         min_tcb=min_tcb,
                         id_key_digest=id_key_digest or None,
                         processor_model=processor_model,
+                        expected_vmpl=expected_vmpl,
                         vtpm_pcrs=vtpm_pcrs,
                     )
                 )
@@ -666,7 +703,7 @@ class Settings(BaseSettings):
         """
         if pinned := os.getenv("TEE_MINIMUM_BOOT_VERSION"):
             return pinned
-        if not self.tee_measurement_config_path.exists():
+        if not self._measurement_source_paths():
             return "0.0.0"
         versions = [m.version for m in self.tee_measurements if m.version]
         if not versions:

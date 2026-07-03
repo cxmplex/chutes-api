@@ -106,8 +106,22 @@ def _verify_rsa(child_pub, signed: bytes, signature: bytes, hash_alg) -> None:
     child_pub.verify(signature, signed, padding.PKCS1v15(), hash_alg)
 
 
-def parse_tpms_attest(quote_msg: bytes) -> tuple[bytes, bytes]:
-    """Parse a TPMS_ATTEST quote: validate magic + ATTEST_QUOTE type; return (extraData, pcrDigest).
+def _decode_pcr_select(pcr_select: bytes) -> set[int]:
+    """Decode a TPMS_PCR_SELECTION bitmap into the set of selected PCR indices (LSB-first per byte)."""
+    indices: set[int] = set()
+    for byte_index, byte in enumerate(pcr_select):
+        for bit in range(8):
+            if byte & (1 << bit):
+                indices.add(byte_index * 8 + bit)
+    return indices
+
+
+def parse_tpms_attest(quote_msg: bytes) -> tuple[bytes, bytes, Dict[int, set]]:
+    """Parse a TPMS_ATTEST quote: validate magic + ATTEST_QUOTE type.
+
+    Returns (extraData, pcrDigest, selections) where selections maps each quoted bank's TPM hash alg
+    id -> the set of PCR indices it covers (L3: the caller asserts the pinned indices/bank are the
+    ones actually quoted, so the signed pcrDigest cannot be over a different bank/index set).
 
     Layout (big-endian): magic u32 | type u16 | qualifiedSigner TPM2B | extraData TPM2B |
     clockInfo(17) | firmwareVersion(8) | [TPMS_QUOTE_INFO: TPML_PCR_SELECTION | pcrDigest TPM2B].
@@ -131,14 +145,19 @@ def parse_tpms_attest(quote_msg: bytes) -> tuple[bytes, bytes]:
         off += 17 + 8  # clockInfo + firmwareVersion
         count = struct.unpack_from(">I", quote_msg, off)[0]
         off += 4
+        selections: Dict[int, set] = {}
         for _ in range(count):
-            off += 2  # hashAlg
+            hash_alg = struct.unpack_from(">H", quote_msg, off)[0]
+            off += 2
             sob = quote_msg[off]
-            off += 1 + sob
+            off += 1
+            pcr_select = quote_msg[off : off + sob]
+            off += sob
+            selections.setdefault(hash_alg, set()).update(_decode_pcr_select(pcr_select))
         pd_len = struct.unpack_from(">H", quote_msg, off)[0]
         off += 2
         pcr_digest = quote_msg[off : off + pd_len]
-        return extra, pcr_digest
+        return extra, pcr_digest, selections
     except (struct.error, IndexError) as exc:
         raise InvalidQuoteError(f"malformed TPMS_ATTEST: {exc}")
 
@@ -252,13 +271,25 @@ async def verify_vtpm_quote(
         except InvalidSignature:
             raise InvalidQuoteError("vTPM quote signature is invalid (AK did not sign it)")
 
-        extra, pcr_digest = parse_tpms_attest(quote_msg)
+        extra, pcr_digest, selections = parse_tpms_attest(quote_msg)
         if extra != expected_qualifying_data:
             raise InvalidQuoteError(
                 "vTPM quote qualifying-data mismatch (stale/replayed quote, or evidence "
                 "bound to a different nonce/TLS identity)"
             )
 
+        # L3: assert the quote's TPML_PCR_SELECTION actually covers EXACTLY the provided PCR indices
+        # in the SHA256 bank, so the signed pcrDigest is over the pinned indices/bank and not some
+        # other selection whose digest happens to be reproduced. (The digest check below + the
+        # caller's per-index pin already compensate; this makes the binding explicit + fail-closed.)
+        sha256_selection = selections.get(_TPM_ALG_SHA256, set())
+        if sha256_selection != set(pcrs):
+            raise InvalidQuoteError(
+                "vTPM quote SHA256 PCR selection "
+                f"{sorted(sha256_selection)} does not match the provided PCR indices {sorted(pcrs)}"
+            )
+
+        # TPM computes pcrDigest over the selected PCRs in ascending index order (single SHA256 bank).
         concat = b"".join(pcrs[i] for i in sorted(pcrs))
         if hashlib.sha256(concat).digest() != pcr_digest:
             raise InvalidQuoteError("vTPM quote pcrDigest does not match the provided PCR values")

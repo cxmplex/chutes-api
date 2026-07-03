@@ -252,9 +252,17 @@ async def get_resolved_ips(host: str) -> Set[IPv4Address | IPv6Address]:
 
 
 def extract_ip(request: Request) -> str:
+    # M5: use the RIGHTMOST X-Forwarded-For entry (the value appended by our trusted mTLS/proxy edge),
+    # not the leftmost. The proxy APPENDS rather than overwrites, so the leftmost hop is fully
+    # client-controlled -- an attacker could set X-Forwarded-For to spoof the "attestation must
+    # originate from the registered IP" + per-host nonce checks. The rightmost hop is the peer our
+    # own edge actually observed; fall back to the real socket peer when the header is absent.
     x_forwarded_for = request.headers.get("X-Forwarded-For")
-    actual_ip = x_forwarded_for.split(",")[0] if x_forwarded_for else request.client.host
-    return actual_ip
+    if x_forwarded_for:
+        hops = [p.strip() for p in x_forwarded_for.split(",") if p.strip()]
+        if hops:
+            return hops[-1]
+    return request.client.host
 
 
 async def is_valid_host(host: str) -> bool:

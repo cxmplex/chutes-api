@@ -111,6 +111,10 @@ class CommitObjectRequest(BaseModel):
     key: str = Field(..., min_length=1, max_length=1024)
     size_bytes: int = Field(..., ge=0)
     sha256: Optional[str] = Field(None, description="Ciphertext content hash (integrity across replicas)")
+    # H1: the v3 at-rest salt is anchored in the tracker (not the host file), and the plaintext hash
+    # lets get() verify the decrypted bytes end-to-end.
+    salt: Optional[str] = Field(None, description="Base64 HKDF salt for the v3 at-rest container")
+    plaintext_sha256: Optional[str] = Field(None, description="sha256 of the object plaintext")
     holder_server_ids: List[str] = Field(
         ..., min_length=1, description="Storage TDs that confirmed they stored the ciphertext"
     )
@@ -120,6 +124,11 @@ class CommitObjectResponse(BaseModel):
     object_id: str
     used_bytes: int
     quota_bytes: int
+    # H3: report the ACTUAL durability so a commit is never silently accepted at rf=1. The reconcile
+    # loop re-replicates under-target objects; until then the client knows the true replica count.
+    replicas_confirmed: int = 1
+    replication_factor: int = 1
+    under_replicated: bool = False
 
 
 class LocateObjectRequest(BaseModel):
@@ -131,12 +140,18 @@ class LocateObjectResponse(BaseModel):
     key: str
     size_bytes: int
     sha256: Optional[str] = None
+    # H1: salt to decrypt the v3 container + plaintext hash for end-to-end verification (NULL for
+    # legacy v1/v2 objects whose salt is still carried in the file).
+    salt: Optional[str] = None
+    plaintext_sha256: Optional[str] = None
     peers: List[StoragePeer] = Field(default_factory=list)
 
 
 class ListObjectsRequest(BaseModel):
     prefix: Optional[str] = Field(None, max_length=1024)
     limit: int = Field(1000, ge=1, le=10000)
+    # L4: keyset cursor -- pass the previous page's next_cursor to page through > limit objects.
+    after: Optional[str] = Field(None, max_length=1024, description="Return keys after this one")
 
 
 class ObjectInfo(BaseModel):
@@ -149,6 +164,8 @@ class ObjectInfo(BaseModel):
 
 class ListObjectsResponse(BaseModel):
     objects: List[ObjectInfo] = Field(default_factory=list)
+    # L4: the key to pass as `after` for the next page, or null when this is the last page.
+    next_cursor: Optional[str] = None
 
 
 class DeleteObjectRequest(BaseModel):
@@ -184,6 +201,19 @@ class VolumeKeyRequest(BaseModel):
 class VolumeKeyResponse(BaseModel):
     volume_id: str
     key: str = Field(..., description="The per-volume application-layer key (base64, 32 bytes)")
+
+
+class RepairTask(BaseModel):
+    """One re-replication task for a storage TD (M7): push a held object to newly-assigned peers."""
+
+    object_id: str
+    volume_id: str
+    grant: str = Field(..., description="Short-lived system put-grant forwarded to each peer /replicate")
+    peers: List[StoragePeer] = Field(default_factory=list)
+
+
+class RepairTasksResponse(BaseModel):
+    tasks: List[RepairTask] = Field(default_factory=list)
 
 
 class ReplicaPlacementUpdate(BaseModel):

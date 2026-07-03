@@ -15,6 +15,7 @@ from api.config import settings
 from api.constants import HOTKEY_HEADER, NoncePurpose
 from api.database import get_db_session
 from api.server.exceptions import AttestationError
+from api.server.schemas import Server
 from api.server.service import create_nonce, validate_request_nonce
 from api.server.util import extract_client_cert_hash
 from api.user.schemas import User
@@ -43,6 +44,8 @@ from api.storage.schemas import (
     PeerListResponse,
     PlacementRequest,
     PlacementResponse,
+    RepairTask,
+    RepairTasksResponse,
     ReplicaAnnounceRequest,
     VolumeKeyRequest,
     VolumeKeyResponse,
@@ -57,7 +60,10 @@ _REGISTERED_TO = None if settings.skip_metagraph_check else settings.netuid
 
 async def require_attested_caller(
     db: AsyncSession = Depends(get_db_session),
-    cert_hash: str = Depends(extract_client_cert_hash()),
+    # M4: require a LIVE mTLS handshake (X-Client-Verify==SUCCESS), not just a header-supplied PEM --
+    # the attested certs are handed out publicly (peers/cert), so a header match alone is not proof
+    # the caller holds the in-TEE key. (The gate is a no-op in the plaintext dev posture.)
+    cert_hash: str = Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """Authenticate that a request comes from inside SOME attested TD (its attested mTLS cert).
 
@@ -151,6 +157,20 @@ async def peers_local(
     return PeerListResponse(peers=[peer] if peer else [])
 
 
+@router.get("/peers/attested")
+async def peers_attested(
+    cert_hash: str,
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Whether a cert pubkey-hash belongs to a registered attested server (M15).
+
+    Public + read-only (attested certs are already handed out via /peers/cert): a storage TD uses it
+    to gate the otherwise-unauthenticated /storage/model/ensure so only an attested TD triggers a
+    peer/HF fetch. Leaks nothing beyond membership of a public cert hash.
+    """
+    return {"attested": await service.is_attested_server_cert(db, cert_hash)}
+
+
 @router.get("/peers/cert/{server_id}", response_model=PeerCertResponse)
 async def peer_cert(
     server_id: str,
@@ -161,6 +181,29 @@ async def peer_cert(
     can pin/verify it for mutually-attested TLS (the per-TD certs are self-issued, no shared CA)."""
     pem, pubkey_hash = await service.peer_cert(db, server_id)
     return PeerCertResponse(server_id=server_id, attested_cert=pem, cert_pubkey_hash=pubkey_hash)
+
+
+@router.get("/objects/{object_id}/replicas", response_model=PeerListResponse)
+async def object_replicas(
+    object_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    _=Depends(require_attested_caller),
+):
+    """The validator-assigned replica peers for an object, so the primary storage TD replicates to the
+    tracker's distinct-host placement instead of a client-supplied peer list (M2)."""
+    peers = await service.object_replica_peers(db, object_id)
+    return PeerListResponse(peers=peers)
+
+
+@router.get("/repair/tasks", response_model=RepairTasksResponse)
+async def repair_tasks(
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_attested_caller),
+):
+    """Repair work for the calling storage TD (M7): objects it holds that are under-replicated, each
+    with a short-lived system put-grant + the newly-assigned target peers to push the ciphertext to."""
+    tasks = await service.repair_tasks_for_server(db, caller.server_id)
+    return RepairTasksResponse(tasks=[RepairTask(**t) for t in tasks])
 
 
 # --- confidential volume CRUD (owner) ----------------------------------------------------------
@@ -234,11 +277,24 @@ async def commit_object(
 ):
     """Finalize an object after its ciphertext has been pushed to the holder TDs (byte accounting)."""
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
-    obj = await service.commit_object(
-        db, volume, body.object_id, body.key, body.size_bytes, body.sha256, body.holder_server_ids
+    obj, replicas_confirmed = await service.commit_object(
+        db,
+        volume,
+        body.object_id,
+        body.key,
+        body.size_bytes,
+        body.sha256,
+        body.holder_server_ids,
+        salt=body.salt,
+        plaintext_sha256=body.plaintext_sha256,
     )
     return CommitObjectResponse(
-        object_id=obj.object_id, used_bytes=volume.used_bytes, quota_bytes=volume.quota_bytes
+        object_id=obj.object_id,
+        used_bytes=volume.used_bytes,
+        quota_bytes=volume.quota_bytes,
+        replicas_confirmed=replicas_confirmed,
+        replication_factor=volume.replication_factor,
+        under_replicated=replicas_confirmed < volume.replication_factor,
     )
 
 
@@ -256,6 +312,10 @@ async def locate_object(
         key=obj.object_key,
         size_bytes=obj.size_bytes,
         sha256=obj.sha256,
+        # H1: the SDK needs the tracker-anchored salt to decrypt a v3 object and the plaintext hash
+        # to verify the bytes end-to-end (both NULL for legacy v1/v2 objects).
+        salt=obj.salt,
+        plaintext_sha256=obj.plaintext_sha256,
         peers=peers,
     )
 
@@ -268,7 +328,9 @@ async def list_objects(
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
-    objects = await service.list_objects(db, volume, body.prefix, body.limit)
+    objects = await service.list_objects(db, volume, body.prefix, body.limit, after=body.after)
+    # L4: a full page implies there may be more; hand back the last key as the next cursor.
+    next_cursor = objects[-1].object_key if len(objects) == body.limit else None
     return ListObjectsResponse(
         objects=[
             ObjectInfo(
@@ -279,7 +341,8 @@ async def list_objects(
                 created_at=o.created_at.isoformat() if o.created_at else "",
             )
             for o in objects
-        ]
+        ],
+        next_cursor=next_cursor,
     )
 
 

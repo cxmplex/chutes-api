@@ -1,0 +1,19 @@
+# Versioned, git-tracked TEE-measurement artifact (H9).
+#
+# This file is loaded by api.config.Settings._load_tee_measurements ALONGSIDE the environment-
+# specific ConfigMap mounted at /etc/config/tee_measurements.yaml. Entries are keyed by `name`;
+# an entry in the mounted file OVERRIDES a same-named entry here. It ships inside the api image
+# (under api/config/) and is committed (see the negation in chutes-api/.gitignore), so a validator
+# rebuilt from source has the ChuteFS storage-role measurements without hand-appending live state.
+#
+# Populate the entries below from the storage-image build outputs (sek8s handoff §6.3):
+#   - Intel TDX: `mrtd` + `boot_rtmrs`/`runtime_rtmrs` RTMR0-3 (rtmr3-measure / first-boot quote).
+#   - AMD SEV-SNP: the 48B/96-hex launch `measurement` (sev-snp-measure --vcpus 4), `policy`,
+#     `min_tcb`, `processor_model`.
+# Every storage entry MUST be named `storage-*` (the validator gates the storage_role registration
+# and per-volume key release on that prefix) and MUST set `gpu_count: 0`. The loader validates each
+# value strictly (96 hex chars for measurement/mrtd/rtmrs), so leave a real entry out entirely
+# rather than committing a placeholder that would fail load. See tee_measurements.yaml.example and
+# charts/templates/tee-measurements-cm.yaml for the full schema and the expected storage entries
+# (`storage-baremetal-tdx-1.6.0-4c8g`, `storage-baremetal-snp-genoa-1.6.0`).
+measurements: []

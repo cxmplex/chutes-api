@@ -8,6 +8,7 @@ per-volume bytes. All object bytes flow peer-to-peer over mutually-attested TLS,
 import base64
 import json
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Set
 
 from cryptography import x509
@@ -41,8 +42,15 @@ from api.storage.schemas import StoragePeer
 STORAGE_PEER_TTL_SECONDS = 180
 # Default storage-node DNAT port name the TD advertises in external_ports.
 STORAGE_PORT_KEY = "storage"
-# How long an object-op grant is valid (seconds). Short-lived: a chute mints one per session.
-GRANT_TTL_SECONDS = 900
+# L5: how long a reserved-but-never-committed (size-0, no present holder) object lingers before the
+# reconcile loop reaps it. Well beyond the put + grant window so an in-flight large upload is safe.
+_ABANDONED_OBJECT_TTL_SECONDS = 24 * 3600
+# How long an object-op grant is valid (seconds). Must exceed the whole put window: the primary
+# forwards the SAME grant to replica peers only AFTER receiving the full body (SDK put timeout 3600s),
+# and each replicate is itself up to 3600s -- so a shorter TTL made every replica of a >~15min upload
+# 403 with the caller still told "success", silently landing the object at rf=1 (H3). Cover push +
+# replicate; the reconcile loop re-replicates anything still short.
+GRANT_TTL_SECONDS = 7200
 
 
 # --- liveness ----------------------------------------------------------------------------------
@@ -145,6 +153,11 @@ async def find_server_by_attested_cert_hash(db: AsyncSession, cert_hash: str) ->
             select(Server).where(Server.attested_cert_pubkey_hash == cert_hash)
         )
     ).scalar_one_or_none()
+
+
+async def is_attested_server_cert(db: AsyncSession, cert_hash: str) -> bool:
+    """Whether cert_hash belongs to some registered attested server (M15 model-ensure gate)."""
+    return await find_server_by_attested_cert_hash(db, cert_hash) is not None
 
 
 async def _attested_live_peers(
@@ -395,10 +408,26 @@ async def list_volumes(db: AsyncSession, user_id: str) -> List[StorageVolume]:
 async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> None:
     volume = await _get_owned_volume(db, volume_id, user_id)
     volume.deleted = True
-    # Cascade: mark objects deleted + drop replica placements so storage TDs evict on next reconcile.
+    # Soft-delete the objects, and DROP their replica_placement rows now (the ON DELETE CASCADE only
+    # fires on a hard object delete, and objects are soft-deleted). This stops locate from returning
+    # holders for a deleted volume and keeps placement rows from growing unbounded (M7).
+    object_ids = [
+        r[0]
+        for r in (
+            await db.execute(
+                select(StorageObject.object_id).where(StorageObject.volume_id == volume_id)
+            )
+        ).all()
+    ]
     await db.execute(
         update(StorageObject).where(StorageObject.volume_id == volume_id).values(deleted=True)
     )
+    if object_ids:
+        await db.execute(
+            ReplicaPlacement.__table__.delete().where(
+                ReplicaPlacement.object_id.in_(object_ids)
+            )
+        )
     await db.commit()
     logger.info(f"Deleted ChuteFS volume {volume_id} for user {user_id}")
 
@@ -499,14 +528,25 @@ async def commit_object(
     size_bytes: int,
     sha256: Optional[str],
     holder_server_ids: List[str],
-) -> StorageObject:
-    """Finalize an object: record replica placements, update byte accounting (quota-enforced)."""
+    salt: Optional[str] = None,
+    plaintext_sha256: Optional[str] = None,
+) -> tuple[StorageObject, int]:
+    """Finalize an object: record replica placements, update byte accounting (quota-enforced).
+
+    Returns (object, replicas_confirmed). The caller surfaces replicas_confirmed vs the volume's
+    replication_factor so an under-replicated commit is reported truthfully instead of as a plain
+    success; the reconcile loop then re-replicates it up to target (H3/M7).
+    """
     obj = (
         await db.execute(
-            select(StorageObject).where(
+            select(StorageObject)
+            .where(
                 StorageObject.object_id == object_id,
                 StorageObject.volume_id == volume.volume_id,
             )
+            # M3: row-lock the object so two concurrent commits of the SAME object read a consistent
+            # `prior` size and can't double-apply the used_bytes delta.
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if obj is None or obj.object_key != key:
@@ -519,37 +559,318 @@ async def commit_object(
             detail="No valid storage-role holders in holder_server_ids.",
         )
     prior = obj.size_bytes
-    projected = volume.used_bytes - prior + size_bytes
-    if projected > volume.quota_bytes:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"Volume quota exceeded: {projected} > {volume.quota_bytes} bytes.",
-        )
+    delta = size_bytes - prior
     obj.size_bytes = size_bytes
     obj.sha256 = sha256
+    # H1: anchor the v3 salt + plaintext hash in the tracker so decryption binds to (volume, object,
+    # salt) and get() can verify end-to-end. The storage node reports both after sealing.
+    obj.salt = salt
+    obj.plaintext_sha256 = plaintext_sha256
     obj.deleted = False
     # Reconcile replica placements to exactly the confirmed holders.
     existing = (
         await db.execute(select(ReplicaPlacement).where(ReplicaPlacement.object_id == object_id))
     ).scalars().all()
     existing_by_server = {p.server_id: p for p in existing}
+    # Only promote holders that the validator ASSIGNED a placement (pending/present) at plan time.
+    # plan_object_placement created a pending row for every chosen replica (incl. the primary), and
+    # the primary replicates only to the validator-derived peer set, so every genuine holder already
+    # has a row. Refusing to CREATE a present row for an unassigned server (mirrors M1) stops an owner
+    # from faking full replication by naming arbitrary storage servers in holder_server_ids.
+    confirmed = 0
     for sid in valid_holders:
-        if sid in existing_by_server:
-            existing_by_server[sid].status = "present"
-            existing_by_server[sid].confirmed_at = func.now()
-        else:
-            db.add(
-                ReplicaPlacement(
-                    object_id=object_id, server_id=sid, status="present", confirmed_at=func.now()
-                )
+        placement = existing_by_server.get(sid)
+        if placement is None:
+            logger.warning(
+                f"commit_object: ignoring holder {sid} for object {object_id} with no assigned "
+                "placement (unrequested replica claim)."
             )
+            continue
+        placement.status = "present"
+        placement.confirmed_at = func.now()
+        confirmed += 1
+    if confirmed == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No confirmed holders had an assigned placement for this object.",
+        )
+    confirmed_servers = {sid for sid in valid_holders if sid in existing_by_server}
     for sid, placement in existing_by_server.items():
-        if sid not in valid_holders:
+        if sid not in confirmed_servers:
             placement.status = "evicted"
-    volume.used_bytes = projected
+    # M3: atomic byte accounting. A self-referential UPDATE (row-locked in Postgres) instead of a
+    # read-modify-write, so concurrent commits to the same volume can't lose updates and drift the
+    # owner past quota. On growth the quota ceiling is enforced IN the same statement (rowcount==0 =>
+    # would exceed -> 413, and the surrounding transaction rolls back the object/placement changes).
+    if delta > 0:
+        res = await db.execute(
+            update(StorageVolume)
+            .where(
+                StorageVolume.volume_id == volume.volume_id,
+                StorageVolume.used_bytes + delta <= StorageVolume.quota_bytes,
+            )
+            .values(used_bytes=StorageVolume.used_bytes + delta)
+        )
+        if (res.rowcount or 0) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Volume quota exceeded (would exceed {volume.quota_bytes} bytes).",
+            )
+    elif delta < 0:
+        await db.execute(
+            update(StorageVolume)
+            .where(StorageVolume.volume_id == volume.volume_id)
+            .values(used_bytes=func.greatest(0, StorageVolume.used_bytes + delta))
+        )
     await db.commit()
     await db.refresh(obj)
-    return obj
+    await db.refresh(volume)
+    # Report the count that ACTUALLY had an assigned placement (not just what the client named).
+    replicas_confirmed = confirmed
+    if replicas_confirmed < volume.replication_factor:
+        logger.warning(
+            f"ChuteFS object {object_id} committed under-replicated: {replicas_confirmed}/"
+            f"{volume.replication_factor} holders; reconcile will re-replicate."
+        )
+    return obj, replicas_confirmed
+
+
+async def _live_attested_server_ids(db: AsyncSession) -> Set[str]:
+    """server_ids of storage servers that are currently BOTH attested and live (heartbeating)."""
+    all_ids = [
+        s.server_id
+        for s in (
+            await db.execute(select(Server.server_id).where(Server.storage_role.is_(True)))
+        ).all()
+    ]
+    if not all_ids:
+        return set()
+    verified = await _verified_storage_ids(db, all_ids)
+    live = await _live_storage_ids(all_ids)
+    return verified & live
+
+
+async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[str, int]:
+    """Repair pass (M7): GC dead placements, then re-assign replicas for under-target live objects.
+
+    - Drops replica_placement rows for soft-deleted objects and for placements whose server row is
+      gone (a reaped storage TD), so accounting + locate reflect reality.
+    - For each live object whose PRESENT holders on currently attested+live servers are below the
+      volume's replication_factor, assigns fresh PENDING placements on distinct healthy hosts. The
+      actual ciphertext copy is executed by a source storage TD via GET /storage/repair/tasks.
+
+    Returns a summary of counts. Bounded per pass (max_objects) so a large fleet reconciles amortized.
+    """
+    # (Placements for a hard-deleted server cascade-delete via the server_id FK, so no orphan GC.)
+    summary = {
+        "gc_deleted_object_placements": 0,
+        "reaped_abandoned": 0,
+        "reassigned": 0,
+        "under_replicated": 0,
+    }
+
+    # L5: reap ABANDONED placements -- a put that reserved a size-0 object + pending rows but never
+    # committed. After a generous TTL (well beyond the put+grant window) with no present holder and
+    # still size 0, soft-delete the object so it stops showing in list()/locate() as a phantom.
+    abandon_cutoff = datetime.now(timezone.utc) - timedelta(seconds=_ABANDONED_OBJECT_TTL_SECONDS)
+    abandoned = list(
+        (
+            await db.execute(
+                select(StorageObject).where(
+                    StorageObject.deleted.is_(False),
+                    StorageObject.size_bytes == 0,
+                    StorageObject.created_at < abandon_cutoff,
+                    ~select(ReplicaPlacement.placement_id)
+                    .where(
+                        ReplicaPlacement.object_id == StorageObject.object_id,
+                        ReplicaPlacement.status == "present",
+                    )
+                    .exists(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for obj in abandoned:
+        obj.deleted = True
+        summary["reaped_abandoned"] += 1
+
+    # GC placements for soft-deleted objects (soft delete does not fire the ON DELETE CASCADE); this
+    # also sweeps the placements of anything reaped just above once it commits below.
+    if summary["reaped_abandoned"]:
+        await db.flush()
+    deleted_obj_ids = [
+        r[0]
+        for r in (
+            await db.execute(select(StorageObject.object_id).where(StorageObject.deleted.is_(True)))
+        ).all()
+    ]
+    if deleted_obj_ids:
+        res = await db.execute(
+            ReplicaPlacement.__table__.delete().where(
+                ReplicaPlacement.object_id.in_(deleted_obj_ids)
+            )
+        )
+        summary["gc_deleted_object_placements"] = res.rowcount or 0
+
+    live_ids = await _live_attested_server_ids(db)
+    # Map server_id -> host for distinct-host placement, over all storage servers.
+    servers = list(
+        (await db.execute(select(Server).where(Server.storage_role.is_(True)))).scalars().all()
+    )
+    host_by_server = {s.server_id: (s.host_id or s.server_id) for s in servers}
+
+    # Under-replicated live objects: assign fresh pending placements on distinct healthy hosts.
+    # Random ordering (not a stable LIMIT window) so that with more than max_objects live objects, a
+    # persistently under-replicated object beyond the first page is still eventually examined across
+    # passes rather than being starved behind a stable prefix of healthy objects.
+    live_objects = list(
+        (
+            await db.execute(
+                select(StorageObject)
+                .join(StorageVolume, StorageVolume.volume_id == StorageObject.volume_id)
+                .where(StorageObject.deleted.is_(False), StorageVolume.deleted.is_(False))
+                .order_by(func.random())
+                .limit(max_objects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for obj in live_objects:
+        volume = await db.get(StorageVolume, obj.volume_id)
+        if volume is None:
+            continue
+        placements = list(
+            (
+                await db.execute(
+                    select(ReplicaPlacement).where(ReplicaPlacement.object_id == obj.object_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        present_live = [p for p in placements if p.status == "present" and p.server_id in live_ids]
+        pending_live = [p for p in placements if p.status == "pending" and p.server_id in live_ids]
+        # Reap pendings whose target is no longer live: they will never confirm, so they must not
+        # count toward the target (nor pin their host) -- otherwise the gap can never be filled.
+        for p in placements:
+            if p.status == "pending" and p.server_id not in live_ids:
+                p.status = "evicted"
+        # Count already-assigned live pendings toward the target so repeated passes DON'T keep adding
+        # new pendings (which converged rf=3 objects to 4-5+ replicas); only fill the true gap.
+        effective = len(present_live) + len(pending_live)
+        if effective >= volume.replication_factor:
+            continue
+        summary["under_replicated"] += 1
+        # Hosts already covered by a live present/pending placement -- keep replicas on DISTINCT hosts.
+        used_hosts = {
+            host_by_server.get(p.server_id, p.server_id) for p in (present_live + pending_live)
+        }
+        assigned_servers = {p.server_id for p in (present_live + pending_live)}
+        needed = volume.replication_factor - effective
+        candidates = await _attested_live_peers(db, servers)
+        for peer in candidates:
+            if needed <= 0:
+                break
+            host = host_by_server.get(peer.server_id, peer.server_id)
+            if peer.server_id in assigned_servers or host in used_hosts:
+                continue
+            db.add(
+                ReplicaPlacement(object_id=obj.object_id, server_id=peer.server_id, status="pending")
+            )
+            used_hosts.add(host)
+            assigned_servers.add(peer.server_id)
+            needed -= 1
+            summary["reassigned"] += 1
+    await db.commit()
+    if summary["reassigned"] or summary["gc_deleted_object_placements"]:
+        logger.info(f"ChuteFS reconcile: {summary}")
+    return summary
+
+
+async def repair_tasks_for_server(db: AsyncSession, server_id: str, max_tasks: int = 25) -> List[Dict]:
+    """Objects THIS storage TD holds (present) that need copies pushed to newly-assigned peers (M7).
+
+    Returns [{object_id, volume_id, grant, peers:[{server_id,host,port}]}]. The grant is a short-lived
+    system put-grant the source TD forwards to each target's /replicate; peers are the object's
+    pending placements on OTHER servers. Only objects the caller actually holds are returned.
+    """
+    held_object_ids = [
+        r[0]
+        for r in (
+            await db.execute(
+                select(ReplicaPlacement.object_id).where(
+                    ReplicaPlacement.server_id == server_id, ReplicaPlacement.status == "present"
+                )
+            )
+        ).all()
+    ]
+    tasks: List[Dict] = []
+    for object_id in held_object_ids:
+        if len(tasks) >= max_tasks:
+            break
+        obj = await db.get(StorageObject, object_id)
+        if obj is None or obj.deleted:
+            continue
+        volume = await db.get(StorageVolume, obj.volume_id)
+        if volume is None or volume.deleted:
+            continue
+        pending_ids = [
+            p.server_id
+            for p in (
+                await db.execute(
+                    select(ReplicaPlacement).where(
+                        ReplicaPlacement.object_id == object_id,
+                        ReplicaPlacement.status == "pending",
+                        ReplicaPlacement.server_id != server_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        ]
+        if not pending_ids:
+            continue
+        target_servers = await _storage_servers_by_id(db, pending_ids)
+        peers = await _attested_live_peers(db, target_servers)
+        if not peers:
+            continue
+        # TTL must cover the repair push window (the source TD replicates with a 3600s timeout, and a
+        # batch of tasks is pushed sequentially), matching the user put-grant TTL rather than 900s.
+        grant = await _issue_system_grant(obj.volume_id, ["put"], ttl=GRANT_TTL_SECONDS)
+        tasks.append(
+            {
+                "object_id": object_id,
+                "volume_id": obj.volume_id,
+                "grant": grant,
+                "peers": [p.model_dump() for p in peers],
+            }
+        )
+    return tasks
+
+
+async def object_replica_peers(db: AsyncSession, object_id: str) -> List[StoragePeer]:
+    """The storage peers the validator ASSIGNED for an object (pending or present).
+
+    The primary storage TD replicates to THIS set instead of a client-supplied ``X-ChuteFS-Peers``
+    header, so a user cannot pin replicas onto storage nodes of its choosing or collapse them onto
+    correlated hosts (M2) -- the tracker's distinct-host placement stays authoritative.
+    """
+    server_ids = [
+        p.server_id
+        for p in (
+            await db.execute(
+                select(ReplicaPlacement).where(
+                    ReplicaPlacement.object_id == object_id,
+                    ReplicaPlacement.status.in_(("present", "pending")),
+                )
+            )
+        ).scalars().all()
+    ]
+    servers = await _storage_servers_by_id(db, server_ids)
+    return await _attested_live_peers(db, servers)
 
 
 async def locate_object(
@@ -582,13 +903,21 @@ async def locate_object(
 
 
 async def list_objects(
-    db: AsyncSession, volume: StorageVolume, prefix: Optional[str], limit: int
+    db: AsyncSession,
+    volume: StorageVolume,
+    prefix: Optional[str],
+    limit: int,
+    after: Optional[str] = None,
 ) -> List[StorageObject]:
     query = select(StorageObject).where(
         StorageObject.volume_id == volume.volume_id, StorageObject.deleted.is_(False)
     )
     if prefix:
         query = query.where(StorageObject.object_key.like(f"{prefix}%"))
+    # L4: keyset cursor -- return keys strictly AFTER the caller's last-seen key so a volume with more
+    # than `limit` objects can be fully enumerated (page by passing the previous page's last key).
+    if after:
+        query = query.where(StorageObject.object_key > after)
     query = query.order_by(StorageObject.object_key).limit(limit)
     return list((await db.execute(query)).scalars().all())
 
@@ -596,11 +925,15 @@ async def list_objects(
 async def delete_object(db: AsyncSession, volume: StorageVolume, key: str) -> int:
     obj = (
         await db.execute(
-            select(StorageObject).where(
+            select(StorageObject)
+            .where(
                 StorageObject.volume_id == volume.volume_id,
                 StorageObject.object_key == key,
                 StorageObject.deleted.is_(False),
             )
+            # M3: row-lock so a concurrent delete of the same object can't double-decrement used_bytes
+            # (the second waits, then sees deleted=True and 404s below).
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if obj is None:
@@ -611,8 +944,14 @@ async def delete_object(db: AsyncSession, volume: StorageVolume, key: str) -> in
         .where(ReplicaPlacement.object_id == obj.object_id)
         .values(status="evicted")
     )
-    volume.used_bytes = max(0, volume.used_bytes - obj.size_bytes)
+    # M3: atomic decrement (clamped at 0), not a read-modify-write, so it can't lose updates.
+    await db.execute(
+        update(StorageVolume)
+        .where(StorageVolume.volume_id == volume.volume_id)
+        .values(used_bytes=func.greatest(0, StorageVolume.used_bytes - obj.size_bytes))
+    )
     await db.commit()
+    await db.refresh(volume)
     return volume.used_bytes
 
 
@@ -633,15 +972,19 @@ async def announce_replicas(
                 )
             )
         ).scalar_one_or_none()
-        if existing is None and new_status == "present":
-            db.add(
-                ReplicaPlacement(
-                    object_id=object_id, server_id=server_id, status="present", confirmed_at=func.now()
-                )
+        if existing is None:
+            # M1: refuse to forge a placement the validator never assigned. A 'present' claim is only
+            # honored when plan_object_placement already created a (pending/present) row for
+            # (object_id, server_id) -- otherwise a storage-owning miner who learns an object_id could
+            # inflate replication accounting and satisfy the key-release replica gate for a volume it
+            # was never assigned. A non-assigned announce (present or evicted) is a no-op.
+            logger.warning(
+                f"Ignoring unassigned replica announce for object {object_id} from {server_id} "
+                f"(status={new_status}); no prior placement."
             )
-        elif existing is not None:
-            existing.status = new_status
-            existing.confirmed_at = func.now() if new_status == "present" else existing.confirmed_at
+            continue
+        existing.status = new_status
+        existing.confirmed_at = func.now() if new_status == "present" else existing.confirmed_at
         recorded += 1
     await db.commit()
     await mark_storage_online(server_id)
@@ -684,7 +1027,7 @@ async def release_volume_key(
     # The per-volume key is released only to the genuine, pinned storage-TD image (name 'storage-*'),
     # whose code uses it solely for at-rest object encryption -- not to any CPU-only image that merely
     # claims storage_role (which could otherwise run arbitrary code that exfiltrates the key).
-    if not (measurement_config.name or "").startswith("storage"):
+    if not (measurement_config.name or "").startswith("storage-"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Volume key release requires the pinned storage-TD measurement (name 'storage-*').",
@@ -745,6 +1088,19 @@ async def issue_grant(db: AsyncSession, user_id: str, volume_id: str, ops: List[
     token = secrets.token_urlsafe(32)
     payload = json.dumps({"user_id": user_id, "volume_id": volume_id, "ops": list(ops)})
     await settings.redis_client.setex(f"storage:grant:{token}", GRANT_TTL_SECONDS, payload)
+    return token
+
+
+async def _issue_system_grant(volume_id: str, ops: List[str], ttl: int = 900) -> str:
+    """Mint a grant WITHOUT user ownership, for validator-driven repair replication (M7).
+
+    The reconcile loop hands this to a source storage TD so it can push a held object's ciphertext to
+    the newly-assigned replica peers; it is put-scoped and short-lived, and the storage node forwards
+    it to the peer's /replicate exactly like a user's put grant.
+    """
+    token = secrets.token_urlsafe(32)
+    payload = json.dumps({"user_id": "__reconcile__", "volume_id": volume_id, "ops": list(ops)})
+    await settings.redis_client.setex(f"storage:grant:{token}", ttl, payload)
     return token
 
 

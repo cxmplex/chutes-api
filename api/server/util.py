@@ -57,13 +57,19 @@ def get_nonce_expiry_seconds(minutes: int = 10) -> int:
     return minutes * 60
 
 
-def extract_client_cert_hash():
+def extract_client_cert_hash(require_proxy_verified: bool = False):
+    """Dependency: the client cert's pubkey hash.
+
+    require_proxy_verified=False (default; attestation/registration + per-volume key release): the
+    cert pubkey is bound into the hardware quote, so a header-forwarded cert is trusted via that
+    binding. require_proxy_verified=True (peer discovery / grant-verify, which have NO downstream
+    quote check): require a LIVE mTLS handshake (X-Client-Verify==SUCCESS) so a caller cannot pass
+    the gate merely by presenting a public attested-cert PEM in a header (M4).
+    """
+
     async def _extract_request_client_cert(request: Request):
         try:
-            # Attestation/registration: the cert pubkey is bound into the hardware quote, so accept
-            # the proxy-forwarded header cert without requiring a live mTLS handshake (the in-guest
-            # agent posts it via header). The quote check downstream is the actual trust anchor.
-            cert = _get_client_certificate(request, require_proxy_verified=False)
+            cert = _get_client_certificate(request, require_proxy_verified=require_proxy_verified)
             return get_public_key_hash(cert)
         except HTTPException:
             raise
@@ -393,6 +399,14 @@ async def verify_snp_quote(quote: SnpReport, expected_nonce: str) -> SnpVerifica
         raise InvalidSignatureError("SEV-SNP report verification failed")
     # Enforce the pinned measurement + policy + min-TCB (raises MeasurementMismatchError if none).
     config = get_matching_measurement_config(quote)
+
+    # L2: pin the report VMPL when the matched config specifies one (platform-specific: bare-metal
+    # attests at VMPL 1, GCP at VMPL 0). A mismatch means the report came from a different privilege
+    # level than the measured guest, so reject it.
+    expected_vmpl = getattr(config, "expected_vmpl", None)
+    if expected_vmpl is not None and getattr(quote, "vmpl", None) != expected_vmpl:
+        logger.error(f"SEV-SNP report VMPL {getattr(quote, 'vmpl', None)} != expected {expected_vmpl}")
+        raise InvalidSignatureError("SEV-SNP report VMPL does not match the pinned measurement")
 
     # GCP image-identity: when the matched config pins vTPM PCRs, require + verify the vTPM quote.
     vtpm_pcrs = getattr(config, "vtpm_pcrs", None)

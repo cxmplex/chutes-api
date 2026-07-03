@@ -275,6 +275,51 @@ def _load_ca_chain(ca_pem: bytes) -> tuple[x509.Certificate, x509.Certificate]:
     return ask, ark
 
 
+async def _fetch_crl(model: str, redis=None) -> bytes:
+    """Fetch (and cache) the AMD KDS VCEK CRL for a processor model."""
+    import httpx
+
+    crl_key = f"snp:crl:{model}"
+    if redis is not None:
+        cached = await redis.get(crl_key)
+        if cached:
+            return cached
+    async with httpx.AsyncClient() as client:
+        crl_der = await _kds_get(client, f"{KDS_BASE}/vcek/v1/{model}/crl")
+    if redis is not None:
+        # CRLs are reissued periodically; a day-long cache matches the VCEK/CA caching above.
+        await redis.set(crl_key, crl_der, ex=86400)
+    return crl_der
+
+
+async def _check_revocation(
+    vcek: x509.Certificate,
+    ask: x509.Certificate,
+    ark: x509.Certificate,
+    model: str,
+    redis=None,
+) -> None:
+    """Honor the AMD KDS CRL (M6): reject a VCEK whose serial is revoked.
+
+    Fetches + caches the model's VCEK CRL and verifies its signature before honoring it (so a host
+    can't feed a forged empty CRL). Per the AMD KDS spec (doc 57230) the VCEK CRL is issued + signed
+    by the **ARK** (`CN=ARK-<product>`, RSASSA-PSS/sha384); we accept either the ARK or the ASK
+    (both are already-verified AMD CA keys on the pinned chain) so revocation works regardless of
+    which AMD CA signs a given product's CRL. If the CRL cannot be fetched (KDS down, nothing cached),
+    logs and proceeds rather than bricking attestation fleet-wide -- the chain + TCB binding still hold.
+    """
+    try:
+        crl_der = await _fetch_crl(model, redis=redis)
+    except Exception as exc:  # noqa: BLE001 - availability: a KDS CRL outage must not brick attest
+        logger.warning(f"SNP VCEK CRL unavailable for {model} ({exc}); proceeding without CRL check")
+        return
+    crl = x509.load_der_x509_crl(crl_der)
+    if not (crl.is_signature_valid(ark.public_key()) or crl.is_signature_valid(ask.public_key())):
+        raise InvalidQuoteError("AMD VCEK CRL signature is invalid (not signed by the ARK or ASK)")
+    if crl.get_revoked_certificate_by_serial_number(vcek.serial_number) is not None:
+        raise InvalidQuoteError("VCEK certificate is revoked (present in the AMD KDS CRL)")
+
+
 async def verify_snp_report(
     report: SnpReport,
     *,
@@ -316,10 +361,15 @@ async def verify_snp_report(
             vcek = x509.load_der_x509_certificate(vcek_der_b)
             ask, ark = _load_ca_chain(ca_pem)
 
-        _verify_chain(vcek, ask, ark, chain_model)
+        matched_model = _verify_chain(vcek, ask, ark, chain_model)
         _verify_report_signature(report, vcek)
         _check_tcb_binding(report, vcek)
+        await _check_revocation(vcek, ask, ark, matched_model, redis=redis)
 
+        # L2: the report's VMPL (privilege level that requested attestation) is pinned as a POLICY at
+        # measurement-match time (config.expected_vmpl), not here -- it is platform-specific (bare-metal
+        # guests attest at VMPL 1 under the paravisor; GCP at VMPL 0), so a blanket pin would reject a
+        # genuine report. This verifier stays pure crypto (chain + signature + TCB + debug).
         if report.debug_enabled:
             result.errors.append("guest policy has DEBUG enabled (no confidentiality)")
         if not result.errors:

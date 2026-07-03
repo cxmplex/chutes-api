@@ -61,8 +61,12 @@ class APIKeyScope(Base):
         """
         Limit which types of objects we can manipulate with API keys.
         """
-        if type_ not in ("images", "chutes", "invocations"):
-            raise ValueError("Invalid object_type, must be one of images, chutes, invocations")
+        # "storage" lets a key be scoped to ChuteFS confidential-volume ops (H5): a deployed storage
+        # chute is handed a storage-scoped key rather than a full-access one.
+        if type_ not in ("images", "chutes", "invocations", "storage"):
+            raise ValueError(
+                "Invalid object_type, must be one of images, chutes, invocations, storage"
+            )
         return type_
 
 

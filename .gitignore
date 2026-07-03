@@ -177,6 +177,9 @@ tests/integration/keys
 .vscode
 *.code-workspace
 **/config/*.yaml
+# The committed, versioned TEE-measurement artifact (non-secret; loaded alongside the mounted,
+# env-specific ConfigMap) is intentionally tracked so a from-repo validator rebuild is reproducible.
+!api/config/tee_measurements.committed.yaml
 # Private signing keys (launch-config JWT signer, etc.) — must never be committed.
 **/config/*.pem
 *.pem

@@ -498,9 +498,10 @@ async def attest_luks(
         result = await process_luks_attest_request(
             db, hotkey, vm_name, body, validated_nonce, expected_cert_hash
         )
+        epochs = result.volume_epochs or {}
         return LuksAttestResponse(
             volumes={
-                vol: LuksVolumeInfo(current=r.current, next=r.next)
+                vol: LuksVolumeInfo(current=r.current, next=r.next, epoch=int(epochs.get(vol, 0)))
                 for vol, r in result.volumes.items()
             },
             confirm_nonce=result.confirm_nonce,

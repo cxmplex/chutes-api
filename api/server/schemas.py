@@ -101,6 +101,10 @@ class LuksAttestResult:
     volumes: Dict[str, "LuksVolumeRotation"]
     confirm_nonce: str
     k3s_encryption_key: str
+    # M16: last-confirmed monotonic freshness epoch per volume. The TD refuses to serve a volume
+    # whose on-disk epoch is OLDER than this (a host that re-presents an old raw-disk snapshot rolls
+    # the whole volume back in time under the still-valid passphrase); plain LUKS cannot detect it.
+    volume_epochs: Dict[str, int] = None
 
 
 @dataclass
@@ -170,6 +174,11 @@ class LuksVolumeInfo(BaseModel):
     next: str = Field(
         ..., description="New pending passphrase the VM should add as a LUKS key slot"
     )
+    epoch: int = Field(
+        0,
+        description="M16 anti-rollback floor: the last-confirmed freshness epoch for this volume. "
+        "The TD refuses to serve if the epoch stored inside the encrypted volume is older than this.",
+    )
 
 
 class LuksAttestResponse(BaseModel):
@@ -186,6 +195,11 @@ class LuksVolumeConfirmStatus(BaseModel):
     rotated: bool = Field(
         ...,
         description="True if passphrase rotation succeeded for this volume; False to discard pending",
+    )
+    epoch: Optional[int] = Field(
+        None,
+        description="M16: the new freshness epoch the TD wrote inside the encrypted volume on this "
+        "open; the validator advances its stored floor to this so the next boot detects a rollback.",
     )
 
 
@@ -687,6 +701,9 @@ class VmCacheConfig(Base):
     miner_hotkey = Column(String, primary_key=True)
     vm_name = Column(String, primary_key=True)
     volume_passphrases = Column(JSONB, nullable=False, default=dict)
+    # M16: per-volume monotonic freshness epoch {volume_name: int}, advanced on each confirmed open,
+    # so the TD can detect a host re-presenting an older raw-disk snapshot (rollback) of a volume.
+    volume_epochs = Column(JSONB, nullable=False, default=dict, server_default="{}")
     k3s_encryption_key = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -785,7 +802,11 @@ class StorageObject(Base):
     )
     object_key = Column(String, nullable=False)
     size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
-    sha256 = Column(String, nullable=True)
+    sha256 = Column(String, nullable=True)  # ciphertext hash (cross-replica integrity)
+    # H1: the v3 at-rest container's HKDF salt (base64) is anchored here, not in the host-controlled
+    # object file, and plaintext_sha256 lets the SDK verify the decrypted bytes end-to-end on get().
+    salt = Column(String, nullable=True)
+    plaintext_sha256 = Column(String, nullable=True)
     deleted = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -796,7 +817,15 @@ class StorageObject(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("volume_id", "object_key", name="uq_storage_object_key"),
+        # Key uniqueness scoped to non-deleted objects (matches storage_volumes) so a soft-deleted
+        # key can be re-PUT; an unconditional UNIQUE made delete-then-reupload a permanent 500.
+        Index(
+            "uq_storage_object_key",
+            "volume_id",
+            "object_key",
+            unique=True,
+            postgresql_where=deleted.is_(False),
+        ),
         Index("idx_storage_objects_volume", "volume_id", postgresql_where=deleted.is_(False)),
     )
 
