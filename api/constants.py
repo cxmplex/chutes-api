@@ -17,6 +17,11 @@ class NoncePurpose(str, Enum):
     # Owning-miner signature over "{hotkey}:{nonce}:host_upgrade"; sends the node-agent upgrade_image.
     HOST_UPGRADE = "host_upgrade"
 
+    # Fleet image releases: an L0 node-agent polling the active guest-image release manifest for its
+    # tee_type (GET /releases/current). Miner-hotkey signature over "{hotkey}:{nonce}:release_fetch";
+    # the manifest is non-secret (public image URLs + sha256), the signature just scopes it to miners.
+    RELEASE_FETCH = "release_fetch"
+
     # ChuteFS: an attested storage TD requesting a confidential per-user-volume application-layer key.
     # The single-use nonce is bound into a fresh quote whose report_data also commits the TD's
     # attested serving-cert pubkey; key release verifies that quote against the pinned storage-TD

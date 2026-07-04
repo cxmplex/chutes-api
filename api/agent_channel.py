@@ -214,10 +214,28 @@ async def handle_agent_status(server_id: str, data) -> None:
     try:
         if "slots" in data:
             await _reconcile_host_slots(server_id, data.get("slots") or [])
+            # Fleet releases: record the guest-image digests the host reports staged (for the
+            # release convergence status). Best-effort; never let it break the reconcile.
+            if "staged_images" in data:
+                await _persist_host_staged_images(server_id, data.get("staged_images"))
         elif "containers" in data:
             await _reconcile_server_containers(server_id, data.get("containers") or [])
     except Exception as exc:
         logger.error(f"Heartbeat reconcile failed for {server_id}: {exc}")
+
+
+async def _persist_host_staged_images(host_id: str, staged) -> None:
+    """Persist the host's reported staged guest-image digests onto its Host row (release status)."""
+    if not isinstance(staged, dict):
+        return
+    from api.database import get_session
+    from api.server.schemas import Host
+
+    async with get_session() as session:
+        host = await session.get(Host, host_id)
+        if host is not None and host.staged_images != staged:
+            host.staged_images = staged
+            await session.commit()
 
 
 def _older_than(created_at, seconds: int) -> bool:

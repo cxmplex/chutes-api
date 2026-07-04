@@ -339,6 +339,10 @@ class HostRegistrationResponse(BaseModel):
     host_id: str
     capacity: int
     status: str = "registered"
+    # Fleet image releases: the active guest-image manifest for this host's tee_type, so a booting
+    # host converges to the current release immediately (no separate poll on the first boot). None
+    # when no release is active for the host's (channel, tee_type). Shape: api.releases.ReleaseManifest.
+    release: Optional[Dict[str, Any]] = None
 
 
 class ServerArgs(BaseModel):
@@ -663,6 +667,10 @@ class Host(Base):
     # attested). Tells the validator how much durable storage this host can back for ChuteFS.
     disk_total_gb = Column(Integer, nullable=True)
     disk_free_gb = Column(Integer, nullable=True)
+    # Fleet image releases: the guest-image digests this host most recently reported it has staged
+    # (from the node-agent heartbeat), e.g. {"chute": {"sha256": ...}, "storage": {"sha256": ...}}.
+    # Informational (the host is not attested) -- powers GET /releases/{id}/status convergence.
+    staged_images = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

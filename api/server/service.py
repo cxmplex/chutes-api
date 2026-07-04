@@ -853,7 +853,23 @@ async def register_host(
         f"L0 host registered: host_id={host.host_id} miner={miner_hotkey} tee_type={host.tee_type} "
         f"capacity={host.capacity} cpu_cores={host.cpu_cores} ram_gb={host.ram_gb}"
     )
-    return {"host_id": host.host_id, "capacity": host.capacity, "status": "registered"}
+    # Fleet image releases: hand the booting host the active manifest for its tee_type so it converges
+    # to the current release on first boot (no separate poll needed). Best-effort -- a release lookup
+    # failure must never block host registration. Local import avoids an import cycle.
+    release = None
+    try:
+        from api.releases.service import active_manifest_for_host
+
+        manifest = await active_manifest_for_host(db, host.tee_type)
+        release = manifest.model_dump() if manifest else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not attach active release manifest for host {host.host_id}: {exc}")
+    return {
+        "host_id": host.host_id,
+        "capacity": host.capacity,
+        "status": "registered",
+        "release": release,
+    }
 
 
 async def request_host_image_upgrade(

@@ -62,9 +62,16 @@ def test_host_routes_carry_hotkey_auth_dependency(path, method):
 @pytest.mark.asyncio
 async def test_register_host_valid_upserts():
     with patch.object(svc.settings, "skip_metagraph_check", True):
-        db = _mock_db()
-        res = await svc.register_host(db, _args(), HOTKEY)
-        assert res == {"host_id": "l0-unit-1", "capacity": 4, "status": "registered"}
+        # No active release -> registration attaches release=None (the manifest lookup is best-effort).
+        with patch("api.releases.service.active_manifest_for_host", AsyncMock(return_value=None)):
+            db = _mock_db()
+            res = await svc.register_host(db, _args(), HOTKEY)
+        assert res == {
+            "host_id": "l0-unit-1",
+            "capacity": 4,
+            "status": "registered",
+            "release": None,
+        }
         assert db.add.called  # new Host row added
 
 
