@@ -37,3 +37,122 @@ measurements:
     expected_vmpl: 0
     expected_gpus: []
     gpu_count: 0
+  # 1.6.2 per-chute CPU-TEE guest image, AMD SEV-SNP bare-metal EPYC Genoa: one image, one launch
+  # digest per vCPU size class (the count only changes the VMSA). Offline sev-snp-measure matrix from
+  # the 2026-07-05 build; fleet-verified via the release system. The scheduler places a chute at its
+  # node_selector cpu_cores, so all four classes are pinned. expected_vmpl: 0 (bare-metal fleet).
+  - version: "1.6.2-snp-1vcpu"
+    name: "cpu-baremetal-snp-genoa-1.6.2-1vcpu"
+    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 1 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "6526040584B4598423A6FA16736B15190F1256D970EAB3569E9E4C1291E0605AE7E8ED760ABDF8F69DA70F8B65D18A59"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
+  - version: "1.6.2-snp-2vcpu"
+    name: "cpu-baremetal-snp-genoa-1.6.2-2vcpu"
+    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 2 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "F2469732561B6BABDDD0C6982EFCB11C65E6E796DBE1B3145C31F68A568979C06391536215B610B1D04AA5C754E05F4E"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
+  - version: "1.6.2-snp-4vcpu"
+    name: "cpu-baremetal-snp-genoa-1.6.2-4vcpu"
+    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 4 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "092B08A07CE088BAC9A4233AC9719B96B30577DB033AA2843F785D4B69731D5A4B5DB2ABAA415E3E2C7A8A1AFE30FBE8"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
+  - version: "1.6.2-snp-8vcpu"
+    name: "cpu-baremetal-snp-genoa-1.6.2-8vcpu"
+    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 8 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "3F1F54730318E180E14EDD32DA07536BA8C25EF3C58030CB5A0670C0902E31047F7124DE72646A1655530B9161173284"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
+  # 1.6.1 storage-TD size-class matrix (1/2/4/8 vCPU) so the storage-TD size knob
+  # (CHUTES_STORAGE_TD_VCPUS) can select any class. The 4-vCPU entry above is the live default;
+  # these are the other classes from the same 1.6.1 storage build artifacts (no rebuild).
+  - version: "1.6.1-storage-snp-1vcpu"
+    name: "storage-baremetal-snp-genoa-1.6.1-1vcpu"
+    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 1 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "77AA058D07FABAFCA8A71D6D3CD098715D885811BA55C1F37EC09F3F32FB74EAA23B3A7553B2D27528B93D5319B8B726"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
+  - version: "1.6.1-storage-snp-2vcpu"
+    name: "storage-baremetal-snp-genoa-1.6.1-2vcpu"
+    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 2 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "D2B22A7C69576F8582383ABCE127D517D4123C693829D9FEDA9144BFB33C14137454C93964575B1CBDC5D593FC3DDF63"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
+  - version: "1.6.1-storage-snp-8vcpu"
+    name: "storage-baremetal-snp-genoa-1.6.1-8vcpu"
+    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 8 vCPU."
+    provider: "baremetal"
+    tee_type: "sev-snp"
+    processor_model: "Genoa"
+    measurement: "CCB4476CF1144E2C9510958493693276FBE3D196797B0E361001D3895B6B7D2211F82D172BC8208C03CCE019546916C8"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+    expected_vmpl: 0
+    expected_gpus: []
+    gpu_count: 0
