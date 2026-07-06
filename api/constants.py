@@ -17,6 +17,11 @@ class NoncePurpose(str, Enum):
     # Owning-miner signature over "{hotkey}:{nonce}:host_upgrade"; sends the node-agent upgrade_image.
     HOST_UPGRADE = "host_upgrade"
 
+    # Model B: trigger an L0 host REBOOT (POST /hosts/{id}/reboot) so the RAM-root box re-netboots into
+    # the freshly published L0 squashfs (node-agent + host image update). Owning-miner signature over
+    # "{hotkey}:{nonce}:host_reboot"; sends the node-agent the `reboot` control command.
+    HOST_REBOOT = "host_reboot"
+
     # Fleet image releases: an L0 node-agent polling the active guest-image release manifest for its
     # tee_type (GET /releases/current). Miner-hotkey signature over "{hotkey}:{nonce}:release_fetch";
     # the manifest is non-secret (public image URLs + sha256), the signature just scopes it to miners.

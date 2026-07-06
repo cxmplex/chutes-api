@@ -214,27 +214,37 @@ async def handle_agent_status(server_id: str, data) -> None:
     try:
         if "slots" in data:
             await _reconcile_host_slots(server_id, data.get("slots") or [])
-            # Fleet releases: record the guest-image digests the host reports staged (for the
-            # release convergence status). Best-effort; never let it break the reconcile.
-            if "staged_images" in data:
-                await _persist_host_staged_images(server_id, data.get("staged_images"))
+            # Fleet releases: record the guest-image digests + running L0 version the host reports
+            # (for the release convergence status). Best-effort; never let it break the reconcile.
+            if "staged_images" in data or "l0_version" in data:
+                await _persist_host_staged_images(
+                    server_id, data.get("staged_images"), data.get("l0_version")
+                )
         elif "containers" in data:
             await _reconcile_server_containers(server_id, data.get("containers") or [])
     except Exception as exc:
         logger.error(f"Heartbeat reconcile failed for {server_id}: {exc}")
 
 
-async def _persist_host_staged_images(host_id: str, staged) -> None:
-    """Persist the host's reported staged guest-image digests onto its Host row (release status)."""
-    if not isinstance(staged, dict):
+async def _persist_host_staged_images(host_id: str, staged, l0_version=None) -> None:
+    """Persist the host's reported staged guest-image digests + running L0 version (release status)."""
+    if not isinstance(staged, dict) and not l0_version:
         return
     from api.database import get_session
     from api.server.schemas import Host
 
     async with get_session() as session:
         host = await session.get(Host, host_id)
-        if host is not None and host.staged_images != staged:
+        if host is None:
+            return
+        changed = False
+        if isinstance(staged, dict) and host.staged_images != staged:
             host.staged_images = staged
+            changed = True
+        if l0_version and host.l0_version != l0_version:
+            host.l0_version = l0_version
+            changed = True
+        if changed:
             await session.commit()
 
 

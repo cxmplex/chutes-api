@@ -21,6 +21,7 @@ from api.releases.schemas import (
     CreateReleaseRequest,
     GuestRelease,
     ReleaseImage,
+    ReleaseL0,
     ReleaseManifest,
 )
 from api.server.schemas import Host, Server
@@ -72,11 +73,30 @@ def _image_from_manifest(images: dict, key: str) -> Optional[ReleaseImage]:
     )
 
 
+def _l0_to_dict(l0: Optional[ReleaseL0]) -> Optional[dict]:
+    if l0 is None:
+        return None
+    return {"version": l0.version, "squashfs_sha256": l0.squashfs_sha256, "netboot_base_url": l0.netboot_base_url}
+
+
+def _l0_from_manifest(images: dict) -> Optional[ReleaseL0]:
+    raw = (images or {}).get("l0")
+    if not raw:
+        return None
+    return ReleaseL0(
+        version=raw["version"],
+        squashfs_sha256=raw.get("squashfs_sha256"),
+        netboot_base_url=raw.get("netboot_base_url"),
+    )
+
+
 async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRelease:
     """Create a draft release. If req.activate, activate it immediately (subject to the gate)."""
     images: Dict[str, dict] = {"chute": _image_to_dict(req.chute)}
     if req.storage is not None:
         images["storage"] = _image_to_dict(req.storage)
+    if req.l0 is not None:
+        images["l0"] = _l0_to_dict(req.l0)
     release = GuestRelease(
         channel=req.channel,
         tee_type=req.tee_type,
@@ -161,13 +181,14 @@ async def get_active_release(db: AsyncSession, tee_type: str, channel: str = "st
 
 
 def release_manifest(release: GuestRelease) -> ReleaseManifest:
-    """The host-facing manifest (release id + chute/storage image entries)."""
+    """The host-facing manifest (release id + chute/storage image entries + optional L0 set)."""
     return ReleaseManifest(
         release_id=release.release_id,
         channel=release.channel,
         tee_type=release.tee_type,
         chute=_image_from_manifest(release.images, "chute"),
         storage=_image_from_manifest(release.images, "storage"),
+        l0=_l0_from_manifest(release.images),
     )
 
 
@@ -182,13 +203,19 @@ async def active_manifest_for_host(
 
 
 async def rollout_release(
-    db: AsyncSession, release_id: str, host_ids: Optional[List[str]] = None
+    db: AsyncSession,
+    release_id: str,
+    host_ids: Optional[List[str]] = None,
+    reboot_l0: bool = False,
 ) -> Dict:
     """Push the active release to online L0 hosts of its tee_type via the upgrade_image command.
 
     host_ids restricts the rollout to a canary subset. Only hosts of the release's tee_type are
     targeted (a chute/storage image for one TEE is meaningless on the other). Offline hosts are
     skipped here -- they converge on their own via the registration response + periodic poll.
+
+    reboot_l0 ALSO sends a `reboot` to apply the release's L0 slot (re-netboot). This is disruptive
+    (every TD on the host restarts), so it is opt-in and best driven one host at a time via host_ids.
     """
     from api.agent_channel import is_agent_online, send_agent_command
 
@@ -201,6 +228,10 @@ async def rollout_release(
         )
 
     manifest = release_manifest(release).model_dump()
+    l0_spec = (release.images or {}).get("l0") or {}
+    l0_version = l0_spec.get("version")
+    if reboot_l0 and not l0_version:
+        raise ReleaseError("reboot_l0 requested but the release carries no l0 slot.")
     q = select(Host).where(Host.tee_type == release.tee_type)
     if host_ids:
         q = q.where(Host.host_id.in_(host_ids))
@@ -214,13 +245,20 @@ async def rollout_release(
             continue
         try:
             command_id = await send_agent_command(host.host_id, "upgrade_image", {"manifest": manifest})
+            detail = f"upgrade_image dispatched ({command_id})"
+            # Opt-in L0 re-netboot: send reboot AFTER the image nudge so the box comes up on the new
+            # guest images too. target_l0_version makes an already-updated host skip the reboot.
+            if reboot_l0 and (getattr(host, "l0_version", None) != l0_version):
+                rid = await send_agent_command(host.host_id, "reboot", {"target_l0_version": l0_version})
+                detail += f"; reboot dispatched ({rid}) -> l0 {l0_version}"
             dispatched += 1
-            results.append({"host_id": host.host_id, "dispatched": True, "detail": f"upgrade_image dispatched ({command_id})"})
+            results.append({"host_id": host.host_id, "dispatched": True, "detail": detail})
         except Exception as exc:  # noqa: BLE001 - report per-host, keep rolling out the rest
             results.append({"host_id": host.host_id, "dispatched": False, "detail": f"dispatch failed: {exc}"})
     logger.success(
         f"Rollout of release {release_id} ({release.tee_type}): dispatched to {dispatched}/{len(hosts)} host(s)"
         + (f" (canary: {host_ids})" if host_ids else "")
+        + (" +reboot_l0" if reboot_l0 else "")
     )
     return {"release_id": release_id, "dispatched": dispatched, "hosts": results}
 
@@ -235,8 +273,10 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
 
     chute_img = (release.images or {}).get("chute") or {}
     storage_img = (release.images or {}).get("storage") or {}
+    l0_spec = (release.images or {}).get("l0") or {}
     chute_sha = chute_img.get("sha256")
     storage_sha = storage_img.get("sha256")
+    l0_version = l0_spec.get("version")
 
     hosts = (
         await db.execute(select(Host).where(Host.tee_type == release.tee_type))
@@ -248,6 +288,10 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         staged_storage = (staged.get("storage") or {}).get("sha256")
         chute_ok = (not chute_sha) or staged_chute == chute_sha
         storage_ok = (not storage_sha) or staged_storage == storage_sha
+        # L0 convergence: the host reports its running /etc/chutes/l0-version; converged when it
+        # equals the release's L0 version (None when the release carries no L0 slot).
+        running_l0 = getattr(host, "l0_version", None)
+        l0_conv = None if not l0_version else (running_l0 == l0_version)
         host_rows.append(
             {
                 "host_id": host.host_id,
@@ -255,6 +299,8 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 "converged": bool(chute_ok and storage_ok),
                 "staged_chute_sha": staged_chute,
                 "staged_storage_sha": staged_storage,
+                "running_l0_version": running_l0,
+                "l0_converged": l0_conv,
             }
         )
 
@@ -279,6 +325,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         "tee_type": release.tee_type,
         "chute_sha": chute_sha,
         "storage_sha": storage_sha,
+        "l0_version": l0_version,
         "hosts": host_rows,
         "servers_on_release": servers_on_release,
     }

@@ -25,7 +25,7 @@ from api.database import get_db_session
 from api.miner.util import is_miner_blacklisted
 from api.server.exceptions import ServerRegistrationError
 from api.server.schemas import Host, HostRegistrationArgs, HostRegistrationResponse, Server
-from api.server.service import register_host, request_host_image_upgrade
+from api.server.service import register_host, request_host_image_upgrade, request_host_reboot
 from api.user.schemas import User
 from api.user.service import get_current_user
 
@@ -108,6 +108,46 @@ async def upgrade_host_image_endpoint(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Host image upgrade failed due to an unexpected error.",
+        )
+
+
+@router.post("/{host_id}/reboot")
+async def reboot_host_endpoint(
+    host_id: str,
+    target_l0_version: str | None = None,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.HOST_REBOOT.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+        )
+    ),
+):
+    """Tell an online L0 host to reboot so it re-netboots into the current L0 squashfs.
+
+    This is how the node-agent + L0 host image itself are updated: publish a new netboot set, then
+    reboot. The RAM-root box re-fetches it; the data disk (ChuteFS volume + staged guest images)
+    survives (unlike a provider reinstall). Optional target_l0_version makes it idempotent. All the
+    host's TDs go down for the ~2-4 min re-netboot -- reboot one box at a time.
+    """
+    if not hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing miner hotkey header.",
+        )
+    try:
+        return await request_host_reboot(db, host_id, hotkey, target_l0_version=target_l0_version)
+    except ServerRegistrationError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Unexpected error in host reboot: host_id={host_id} error={exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Host reboot failed due to an unexpected error.",
         )
 
 

@@ -331,6 +331,9 @@ class HostRegistrationArgs(BaseModel):
     disk_free_gb: Optional[int] = Field(
         None, description="Currently free physical disk (GB) on the host."
     )
+    l0_version: Optional[str] = Field(
+        None, description="L0 host-image version this box is running (from /etc/chutes/l0-version)."
+    )
 
 
 class HostRegistrationResponse(BaseModel):
@@ -671,6 +674,10 @@ class Host(Base):
     # (from the node-agent heartbeat), e.g. {"chute": {"sha256": ...}, "storage": {"sha256": ...}}.
     # Informational (the host is not attested) -- powers GET /releases/{id}/status convergence.
     staged_images = Column(JSONB, nullable=True)
+    # The L0 host-image version this box is running (from /etc/chutes/l0-version, reported at
+    # registration + heartbeat) -- lets the validator tell which L0 a box booted and drive re-netboot
+    # updates (publish a new squashfs + reboot -> box comes up reporting the new version).
+    l0_version = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

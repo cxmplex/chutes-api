@@ -83,11 +83,15 @@ async def rollout_release_endpoint(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(raise_not_found=False)),
 ):
-    """Dispatch upgrade_image to online hosts of the release's tee_type (host_ids = canary). Admin only."""
+    """Dispatch upgrade_image to online hosts of the release's tee_type (host_ids = canary). Admin only.
+
+    reboot_l0=true also re-netboots the hosts to apply the release's L0 slot (disruptive; opt-in).
+    """
     _require_admin(current_user)
     host_ids = body.host_ids if body else None
+    reboot_l0 = body.reboot_l0 if body else False
     try:
-        result = await service.rollout_release(db, release_id, host_ids=host_ids)
+        result = await service.rollout_release(db, release_id, host_ids=host_ids, reboot_l0=reboot_l0)
     except service.ReleaseError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return result

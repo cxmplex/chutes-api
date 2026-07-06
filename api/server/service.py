@@ -846,6 +846,9 @@ async def register_host(
     # back. Reported explicitly by the agent (preferred) or denormalized from the specs disk list.
     host.disk_total_gb = args.disk_total_gb or _sum_disk_gb(specs.get("disks"))
     host.disk_free_gb = args.disk_free_gb
+    # L0 image identity (re-netboot update tracking); tolerate older agents that don't report it.
+    if getattr(args, "l0_version", None):
+        host.l0_version = args.l0_version
     await db.commit()
     await db.refresh(host)
 
@@ -898,6 +901,40 @@ async def request_host_image_upgrade(
 
     command_id = await send_agent_command(host_id, "upgrade_image", {})
     logger.success(f"Dispatched upgrade_image to host {host_id} (command_id={command_id})")
+    return {"host_id": host_id, "command_id": command_id, "status": "dispatched"}
+
+
+async def request_host_reboot(
+    db: AsyncSession, host_id: str, miner_hotkey: str, target_l0_version: Optional[str] = None
+) -> Dict[str, Any]:
+    """Model B: tell an online L0 host to REBOOT so it re-netboots into the current L0 squashfs.
+
+    The bare-metal L0 is a RAM-root live appliance: a reboot re-fetches the (freshly published)
+    netboot set, so this is how the node-agent + host image itself are updated -- without a provider
+    reinstall, so the data disk (ChuteFS volume + staged guest images) survives. Same owning-miner
+    auth as the image upgrade. ``target_l0_version`` makes it idempotent: the node-agent skips the
+    reboot if it is already running that L0 version. All the host's TDs go down for the ~2-4 min
+    re-netboot, so drive this one box at a time.
+    """
+    from api.agent_channel import is_agent_online, send_agent_command
+
+    if not miner_hotkey:
+        raise ServerRegistrationError("Missing miner hotkey for host reboot")
+
+    host = await db.get(Host, host_id)
+    if host is None:
+        raise ServerRegistrationError(f"Host {host_id} is not registered")
+    if host.miner_hotkey != miner_hotkey:
+        raise ServerRegistrationError(f"Host {host_id} belongs to a different miner")
+    if not await is_agent_online(host_id):
+        raise ServerRegistrationError(f"Host {host_id} is not currently online (no control channel)")
+
+    command_id = await send_agent_command(
+        host_id, "reboot", {"target_l0_version": target_l0_version} if target_l0_version else {}
+    )
+    logger.success(
+        f"Dispatched reboot to host {host_id} (command_id={command_id} target_l0={target_l0_version})"
+    )
     return {"host_id": host_id, "command_id": command_id, "status": "dispatched"}
 
 
