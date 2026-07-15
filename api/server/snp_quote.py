@@ -38,7 +38,9 @@ _OFF_ID_KEY_DIGEST = 0xE0  # 48 bytes
 _OFF_AUTHOR_KEY_DIGEST = 0x110  # 48 bytes
 _OFF_REPORTED_TCB = 0x180  # u64
 _OFF_CHIP_ID = 0x1A0  # 64 bytes
-_OFF_SIGNATURE = 0x2A0  # 512 bytes: R(72) || S(72) || reserved; ECDSA-P384, components little-endian
+_OFF_SIGNATURE = (
+    0x2A0  # 512 bytes: R(72) || S(72) || reserved; ECDSA-P384, components little-endian
+)
 
 # The signature covers report bytes [0x00:0x2A0] (everything before the signature field).
 _SIGNED_END = _OFF_SIGNATURE
@@ -56,7 +58,9 @@ class SnpReport:
     vmpl: int
     current_tcb: int
     reported_tcb: int
-    report_data: str  # 128 hex chars (64 bytes); split [:64]/[64:128] mirrors TDX (extract_report_data)
+    report_data: (
+        str  # 128 hex chars (64 bytes); split [:64]/[64:128] mirrors TDX (extract_report_data)
+    )
     measurement: str  # 96 hex chars (48 bytes), uppercase
     host_data: str
     id_key_digest: str
@@ -174,7 +178,9 @@ class SnpReport:
             measurement=report_bytes[_OFF_MEASUREMENT : _OFF_MEASUREMENT + 48].hex().upper(),
             host_data=report_bytes[_OFF_HOST_DATA : _OFF_HOST_DATA + 32].hex().upper(),
             id_key_digest=report_bytes[_OFF_ID_KEY_DIGEST : _OFF_ID_KEY_DIGEST + 48].hex().upper(),
-            author_key_digest=report_bytes[_OFF_AUTHOR_KEY_DIGEST : _OFF_AUTHOR_KEY_DIGEST + 48].hex().upper(),
+            author_key_digest=report_bytes[_OFF_AUTHOR_KEY_DIGEST : _OFF_AUTHOR_KEY_DIGEST + 48]
+            .hex()
+            .upper(),
             chip_id=report_bytes[_OFF_CHIP_ID : _OFF_CHIP_ID + 64].hex().upper(),
             signature_r=sig[0:72],
             signature_s=sig[72:144],

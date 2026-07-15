@@ -11,32 +11,41 @@ and push to the newly-assigned peers; this loop only maintains the authoritative
 import asyncio
 
 from loguru import logger
+from sqlalchemy import text
 
-from api.config import settings
 from api.database import get_session
 from api.storage.service import reconcile_storage
 
 # How often to run a reconcile pass (seconds). Bounded per pass (max_objects) so a large fleet
 # reconciles amortized rather than in one heavy sweep.
 RECONCILE_INTERVAL_SECONDS = 300
-# Cross-pod leader lock: the per-worker migration-process gate is per POD, so N API pods would each
-# run a reconcile loop and race on the UNIQUE(object_id, server_id) placement rows. A short redis
-# lock (TTL just under the interval) ensures only ONE pod runs a given pass.
-_RECONCILE_LOCK_KEY = "storage:reconcile:leader"
-_RECONCILE_LOCK_TTL = RECONCILE_INTERVAL_SECONDS - 30
+_RECONCILE_LOCK_KEY = "chutefs-storage-reconcile-v1"
 
 
 async def storage_reconcile_loop() -> None:
     """Forever: run a bounded ChuteFS reconcile pass every RECONCILE_INTERVAL_SECONDS (single pod)."""
     while True:
         try:
-            # Only the pod that wins the redis lock runs this pass; others skip until it expires.
-            got_lock = await settings.redis_client.set(
-                _RECONCILE_LOCK_KEY, "1", nx=True, ex=_RECONCILE_LOCK_TTL
-            )
-            if got_lock:
-                async with get_session() as session:
-                    await reconcile_storage(session)
+            # A session-level PostgreSQL advisory lock cannot expire mid-pass. It remains owned by
+            # this exact DB connection across the reconcile function's bounded commits and is
+            # explicitly released before the pooled connection is returned.
+            async with get_session() as session:
+                got_lock = bool(
+                    (
+                        await session.execute(
+                            text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                            {"lock_key": _RECONCILE_LOCK_KEY},
+                        )
+                    ).scalar_one()
+                )
+                if got_lock:
+                    try:
+                        await reconcile_storage(session)
+                    finally:
+                        await session.execute(
+                            text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                            {"lock_key": _RECONCILE_LOCK_KEY},
+                        )
         except Exception as exc:  # noqa: BLE001 - never let a bad pass kill the loop
             logger.warning(f"ChuteFS reconcile pass failed: {exc}")
         await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)

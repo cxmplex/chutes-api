@@ -17,6 +17,9 @@ TEST_WINDOW_ID = "window-abc-123"
 TEST_VERSION_OLD = "0.2.0"
 TEST_VERSION_TARGET = "0.3.1"
 TEST_VERSION_ABOVE = "0.4.0"
+TEST_MEASUREMENT_NAME = "cpu-baremetal-tdx-test-4vcpu"
+TEST_CONFIG_FINGERPRINT = "c" * 64
+TEST_TRUST_SET_FINGERPRINT = "d" * 64
 TEST_WINDOW_START = datetime(2026, 4, 1, tzinfo=timezone.utc)
 TEST_WINDOW_END = datetime(2026, 4, 7, tzinfo=timezone.utc)
 
@@ -60,7 +63,15 @@ async def test_boot_no_server_row_is_noop(mock_get):
     """First boot before registration: no server found, no error."""
     mock_get.side_effect = ServerNotFoundError("not found")
     db = AsyncMock()
-    await _handle_boot_version_update(db, TEST_HOTKEY, TEST_VM_NAME, TEST_VERSION_TARGET)
+    await _handle_boot_version_update(
+        db,
+        TEST_HOTKEY,
+        TEST_VM_NAME,
+        TEST_VERSION_TARGET,
+        TEST_MEASUREMENT_NAME,
+        TEST_CONFIG_FINGERPRINT,
+        TEST_TRUST_SET_FINGERPRINT,
+    )
     db.commit.assert_not_awaited()
 
 
@@ -72,9 +83,20 @@ async def test_boot_updates_version_no_maintenance(mock_get):
     mock_get.return_value = server
     db = AsyncMock()
 
-    await _handle_boot_version_update(db, TEST_HOTKEY, TEST_VM_NAME, TEST_VERSION_TARGET)
+    await _handle_boot_version_update(
+        db,
+        TEST_HOTKEY,
+        TEST_VM_NAME,
+        TEST_VERSION_TARGET,
+        TEST_MEASUREMENT_NAME,
+        TEST_CONFIG_FINGERPRINT,
+        TEST_TRUST_SET_FINGERPRINT,
+    )
 
     assert server.version == TEST_VERSION_TARGET
+    assert server.measurement_name == TEST_MEASUREMENT_NAME
+    assert server.measurement_config_fingerprint == TEST_CONFIG_FINGERPRINT
+    assert server.trust_set_fingerprint == TEST_TRUST_SET_FINGERPRINT
     assert server.maintenance_pending_window_id is None
     db.commit.assert_awaited_once()
 
@@ -90,7 +112,15 @@ async def test_boot_meets_target_clears_maintenance(mock_get):
     db = AsyncMock()
     db.get = AsyncMock(return_value=window)
 
-    await _handle_boot_version_update(db, TEST_HOTKEY, TEST_VM_NAME, TEST_VERSION_TARGET)
+    await _handle_boot_version_update(
+        db,
+        TEST_HOTKEY,
+        TEST_VM_NAME,
+        TEST_VERSION_TARGET,
+        TEST_MEASUREMENT_NAME,
+        TEST_CONFIG_FINGERPRINT,
+        TEST_TRUST_SET_FINGERPRINT,
+    )
 
     assert server.version == TEST_VERSION_TARGET
     assert server.maintenance_pending_window_id is None
@@ -109,7 +139,15 @@ async def test_boot_above_target_clears_maintenance(mock_get):
     db = AsyncMock()
     db.get = AsyncMock(return_value=window)
 
-    await _handle_boot_version_update(db, TEST_HOTKEY, TEST_VM_NAME, TEST_VERSION_ABOVE)
+    await _handle_boot_version_update(
+        db,
+        TEST_HOTKEY,
+        TEST_VM_NAME,
+        TEST_VERSION_ABOVE,
+        TEST_MEASUREMENT_NAME,
+        TEST_CONFIG_FINGERPRINT,
+        TEST_TRUST_SET_FINGERPRINT,
+    )
 
     assert server.version == TEST_VERSION_ABOVE
     assert server.maintenance_pending_window_id is None
@@ -126,7 +164,15 @@ async def test_boot_below_target_keeps_maintenance(mock_get):
     db = AsyncMock()
     db.get = AsyncMock(return_value=window)
 
-    await _handle_boot_version_update(db, TEST_HOTKEY, TEST_VM_NAME, TEST_VERSION_OLD)
+    await _handle_boot_version_update(
+        db,
+        TEST_HOTKEY,
+        TEST_VM_NAME,
+        TEST_VERSION_OLD,
+        TEST_MEASUREMENT_NAME,
+        TEST_CONFIG_FINGERPRINT,
+        TEST_TRUST_SET_FINGERPRINT,
+    )
 
     assert server.version == TEST_VERSION_OLD
     assert server.maintenance_pending_window_id == TEST_WINDOW_ID
@@ -143,7 +189,15 @@ async def test_boot_stale_window_cleared(mock_get):
     db = AsyncMock()
     db.get = AsyncMock(return_value=None)
 
-    await _handle_boot_version_update(db, TEST_HOTKEY, TEST_VM_NAME, TEST_VERSION_TARGET)
+    await _handle_boot_version_update(
+        db,
+        TEST_HOTKEY,
+        TEST_VM_NAME,
+        TEST_VERSION_TARGET,
+        TEST_MEASUREMENT_NAME,
+        TEST_CONFIG_FINGERPRINT,
+        TEST_TRUST_SET_FINGERPRINT,
+    )
 
     assert server.version == TEST_VERSION_TARGET
     assert server.maintenance_pending_window_id is None

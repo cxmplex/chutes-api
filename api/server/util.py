@@ -10,12 +10,13 @@ import tempfile
 import time
 from typing import Dict, List, Optional
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import unquote
 from aiohttp import ClientResponse
 from cryptography.fernet import Fernet
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, status
 from loguru import logger
 from dcap_qvl import PHALA_PCCS_URL, get_collateral, verify_with_root_ca
 from api.config import settings, TeeMeasurementConfig
@@ -43,7 +44,14 @@ from api.server.snp_verify import SnpVerificationResult, verify_snp_report
 import hashlib
 import os
 
-from api.server.schemas import Server, VmCacheConfig, LuksVolumeRotation
+from api.server.schemas import (
+    Server,
+    VmCacheConfig,
+    LuksCapabilityContext,
+    LuksVolumeConfirmStatus,
+    LuksVolumeGenerationLease,
+    LuksVolumeRotation,
+)
 from api.util import semcomp
 
 
@@ -63,8 +71,9 @@ def extract_client_cert_hash(require_proxy_verified: bool = False):
     require_proxy_verified=False (default; attestation/registration + per-volume key release): the
     cert pubkey is bound into the hardware quote, so a header-forwarded cert is trusted via that
     binding. require_proxy_verified=True (peer discovery / grant-verify, which have NO downstream
-    quote check): require a LIVE mTLS handshake (X-Client-Verify==SUCCESS) so a caller cannot pass
-    the gate merely by presenting a public attested-cert PEM in a header (M4).
+    quote check): require a LIVE mTLS handshake. nginx reports SUCCESS for a CA-chained cert and
+    FAILED:<reason> for an expected self-signed TEE cert under optional_no_ca; both prove possession,
+    while NONE/missing does not. A public cert PEM in a header alone cannot pass the gate (M4).
     """
 
     async def _extract_request_client_cert(request: Request):
@@ -150,7 +159,8 @@ def get_public_key_hash(cert: Certificate) -> str:
 
     # Serialize public key to DER format (matching openssl pkey -outform der)
     public_key_der = public_key.public_bytes(
-        encoding=serialization.Encoding.DER, format=serialization.PublicFormat.SubjectPublicKeyInfo
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
     # Compute SHA-256 hash
@@ -218,8 +228,10 @@ def _get_client_certificate(request: Request, require_proxy_verified: bool = Tru
     X-Client-Verify.
 
     require_proxy_verified=True (secret-returning endpoints, e.g. /tee): only trust X-Client-Cert
-    when X-Client-Verify == "SUCCESS" -- a LIVE mTLS handshake the terminator verified, proving the
-    caller holds the in-TEE private key NOW. A direct caller cannot forge that header.
+    when X-Client-Verify proves the cert was presented in a LIVE handshake. Accept SUCCESS or
+    FAILED:<reason>: optional_no_ca reports FAILED for self-signed attested TEE certs even though
+    CertificateVerify proved private-key possession. Reject NONE/missing. A direct caller cannot
+    forge the proxy-owned result header.
 
     require_proxy_verified=False (attestation/registration endpoints): the cert's public key is bound
     into the hardware attestation quote (report_data == nonce || sha256(cert pubkey)), so the cert is
@@ -227,7 +239,7 @@ def _get_client_certificate(request: Request, require_proxy_verified: bool = Tru
     its attested cert over the X-Client-Cert header (its httpx client does not present a client cert
     to the optional mTLS edge) while the quote -- not the transport -- establishes trust.
 
-    The SUCCESS gate is also skipped entirely when REQUIRE_MTLS_CLIENT_VERIFY is disabled (the
+    The presentation gate is skipped entirely when REQUIRE_MTLS_CLIENT_VERIFY is disabled (the
     plaintext dev posture). The proxy MUST overwrite any client-supplied X-Client-* headers.
     """
     if settings.require_mtls_client_verify and require_proxy_verified:
@@ -382,7 +394,26 @@ def get_snp_processor_model() -> str:
     return os.getenv("SNP_PROCESSOR_MODEL", "Genoa")
 
 
-async def verify_snp_quote(quote: SnpReport, expected_nonce: str) -> SnpVerificationResult:
+def verify_snp_measurement_constraints(quote: SnpReport, config) -> None:
+    """Enforce the exact SNP measurement, policy, TCB, ID-key, and VMPL pin."""
+    if not quote.matches_measurement(config):
+        raise MeasurementMismatchError(
+            "SEV-SNP report does not match the exact configured measurement constraints."
+        )
+    expected_vmpl = getattr(config, "expected_vmpl", None)
+    if (
+        not isinstance(expected_vmpl, int)
+        or isinstance(expected_vmpl, bool)
+        or quote.vmpl != expected_vmpl
+    ):
+        raise MeasurementMismatchError("SEV-SNP report VMPL does not match the pinned measurement.")
+
+
+async def verify_snp_quote(
+    quote: SnpReport,
+    expected_nonce: str,
+    expected_gcp_identity: Optional[dict] = None,
+) -> SnpVerificationResult:
     """Verify an AMD SEV-SNP report end-to-end and match it to a configured SNP measurement config.
 
     Cryptographic verification (VCEK->ASK->ARK chain + ARK pin + ECDSA-P384 report signature +
@@ -399,26 +430,27 @@ async def verify_snp_quote(quote: SnpReport, expected_nonce: str) -> SnpVerifica
     # If the report carried an inline cert chain (GCP auxblob), use it; else fetch the VCEK from KDS.
     cert_chain = getattr(quote, "cert_chain", None)
     result = await verify_snp_report(
-        quote, model=model, cert_chain=cert_chain, redis=settings.redis_client
+        quote,
+        model=model,
+        cert_chain=cert_chain,
+        redis=settings.redis_client,
+        crl_outage_grace_seconds=settings.snp_crl_outage_grace_seconds,
     )
     if not result.is_valid:
         logger.error(f"SEV-SNP report verification failed: {result.errors}")
         raise InvalidSignatureError("SEV-SNP report verification failed")
     # Enforce the pinned measurement + policy + min-TCB (raises MeasurementMismatchError if none).
     config = get_matching_measurement_config(quote)
-
-    # L2: pin the report VMPL when the matched config specifies one (platform-specific: bare-metal
-    # attests at VMPL 1, GCP at VMPL 0). A mismatch means the report came from a different privilege
-    # level than the measured guest, so reject it.
-    expected_vmpl = getattr(config, "expected_vmpl", None)
-    if expected_vmpl is not None and getattr(quote, "vmpl", None) != expected_vmpl:
-        logger.error(f"SEV-SNP report VMPL {getattr(quote, 'vmpl', None)} != expected {expected_vmpl}")
-        raise InvalidSignatureError("SEV-SNP report VMPL does not match the pinned measurement")
+    verify_snp_measurement_constraints(quote, config)
 
     # GCP image-identity: when the matched config pins vTPM PCRs, require + verify the vTPM quote.
     vtpm_pcrs = getattr(config, "vtpm_pcrs", None)
     if vtpm_pcrs:
-        await _verify_snp_vtpm(quote, config, expected_nonce)
+        vtpm_result = await _verify_snp_vtpm(
+            quote, config, expected_nonce, expected_gcp_identity=expected_gcp_identity
+        )
+        result.revocation_status.update(vtpm_result.revocation_status)
+        result.warnings.extend(vtpm_result.warnings)
 
     logger.success(
         f"SEV-SNP report verified + measurement matched: measurement={quote.measurement[:16]}..."
@@ -427,7 +459,13 @@ async def verify_snp_quote(quote: SnpReport, expected_nonce: str) -> SnpVerifica
     return result
 
 
-async def _verify_snp_vtpm(quote: SnpReport, config, expected_nonce: str) -> None:
+async def _verify_snp_vtpm(
+    quote: SnpReport,
+    config,
+    expected_nonce: str,
+    *,
+    expected_gcp_identity: Optional[dict] = None,
+):
     """Verify the GCE vTPM measured-boot quote attached to a GCP SNP report against pinned PCRs.
 
     The vTPM quote (AK cert + TPMS_ATTEST + signature + PCRs) is verified by gcp_vtpm (AK chains to
@@ -460,10 +498,21 @@ async def _verify_snp_vtpm(quote: SnpReport, config, expected_nonce: str) -> Non
         bytes.fromhex(expected_nonce) + bytes.fromhex(extract_cert_hash(quote))
     ).digest()
     vres = await verify_vtpm_quote(
-        ak, msg, sig, pcrs,
+        ak,
+        msg,
+        sig,
+        pcrs,
         expected_qualifying_data,
+        expected_security_flags={
+            int(tag): value for tag, value in (config.vtpm_security_flags or {}).items()
+        },
         intermediate_der=intermediate,
         redis=settings.redis_client,
+        expected_zone=(expected_gcp_identity or {}).get("zone"),
+        expected_project_id=(expected_gcp_identity or {}).get("project_id"),
+        expected_project_number=(expected_gcp_identity or {}).get("project_number"),
+        expected_instance_id=(expected_gcp_identity or {}).get("instance_id"),
+        expected_instance_name=(expected_gcp_identity or {}).get("instance_name"),
     )
     if not vres.is_valid:
         logger.error(f"GCE vTPM quote verification failed: {vres.errors}")
@@ -475,13 +524,16 @@ async def _verify_snp_vtpm(quote: SnpReport, config, expected_nonce: str) -> Non
         idx = int(idx_str)
         actual = vres.pcrs.get(str(idx))
         if not actual or actual.upper() != expected_hex.upper():
-            mismatches.append(f"PCR{idx}: expected {expected_hex[:16]}..., got {(actual or '')[:16]}...")
+            mismatches.append(
+                f"PCR{idx}: expected {expected_hex[:16]}..., got {(actual or '')[:16]}..."
+            )
     if mismatches:
         logger.error(f"vTPM PCR mismatch (image identity): {'; '.join(mismatches)}")
         raise MeasurementMismatchError(
             "vTPM PCRs do not match the expected image measurements. "
             "Ensure you are running a supported GCP confidential image."
         )
+    return vres
 
 
 def verify_measurements(quote: TdxQuote) -> bool:
@@ -582,22 +634,6 @@ def _verify_measurements(
         raise AttestationError("Measurement verification failed due to an unexpected error.")
 
 
-def get_luks_passphrase() -> str:
-    """
-    Get the LUKS passphrase for disk decryption.
-
-    Returns:
-        LUKS passphrase string
-    """
-
-    passphrase = settings.luks_passphrase
-    if not passphrase:
-        logger.error("No LUKS passphrase configured")
-        raise InvalidTdxConfiguration("Missing LUKS passphrase configuration")
-
-    return passphrase
-
-
 def generate_cache_passphrase() -> str:
     """
     Generate a new cryptographically secure passphrase for cache volume encryption.
@@ -676,6 +712,8 @@ async def _create_vm_cache_config(
         miner_hotkey=miner_hotkey,
         vm_name=vm_name,
         volume_passphrases={},
+        volume_epochs={},
+        volume_generation_leases={},
         last_boot_at=func.now(),
     )
     db.add(vm_config)
@@ -735,67 +773,325 @@ async def delete_luks_passphrases_for_server(
         logger.info(f"Deleted LUKS config for VM {server_name} (miner: {miner_hotkey})")
 
 
-async def generate_confirm_nonce(miner_hotkey: str, vm_name: str) -> str:
-    """Generate a confirm nonce and store in Redis with 5-minute TTL."""
+async def generate_confirm_nonce(
+    capability: LuksCapabilityContext,
+    issued_volumes: Dict[str, LuksVolumeRotation],
+) -> str:
+    """Store an idempotent confirmation capability for exact durable generation leases."""
     nonce = secrets.token_hex(32)
-    redis_key = f"confirm:{miner_hotkey}:{vm_name}"
-    await settings.redis_client.setex(redis_key, 300, nonce)
-    logger.info(f"Generated confirm nonce for VM {vm_name} (miner: {miner_hotkey})")
+    redis_key = f"luks_confirm_nonce:{nonce}"
+    confirm_context = capability.model_copy(
+        update={
+            "issued_volumes": list(issued_volumes),
+            "issued_generations": {
+                volume: lease.generation for volume, lease in issued_volumes.items()
+            },
+            "issued_lease_ids": {
+                volume: lease.lease_id for volume, lease in issued_volumes.items()
+            },
+        }
+    )
+    await settings.redis_client.setex(redis_key, 300, confirm_context.model_dump_json())
+    logger.info(
+        f"Generated {capability.purpose.value} confirm capability for server "
+        f"{capability.server_id} generations={confirm_context.issued_generations}"
+    )
     return nonce
 
 
-async def generate_luks_quote_nonce(miner_hotkey: str, vm_name: str) -> str:
-    """Generate a LUKS quote nonce and store in Redis with 10-minute TTL."""
+async def generate_luks_quote_nonce(capability: LuksCapabilityContext) -> str:
+    """Store a one-use quote capability with immutable server and key-scope context."""
     nonce = secrets.token_hex(32)
-    redis_key = f"luks_quote_nonce:{miner_hotkey}:{vm_name}"
-    await settings.redis_client.setex(redis_key, 600, nonce)
-    logger.info(f"Generated LUKS quote nonce for VM {vm_name} (miner: {miner_hotkey})")
+    redis_key = f"luks_quote_nonce:{nonce}"
+    await settings.redis_client.setex(redis_key, 600, capability.model_dump_json())
+    logger.info(
+        f"Generated {capability.purpose.value} quote capability for server "
+        f"{capability.server_id} volumes={capability.allowed_volumes}"
+    )
     return nonce
 
 
-async def rotate_luks_passphrases(
+def _generation_conflict(detail: str) -> None:
+    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+
+
+def _confirmed_generation(floors: Dict[str, object], volume: str) -> int:
+    raw = floors.get(volume, 0)
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+        _generation_conflict(f"Stored confirmed generation for volume {volume} is invalid.")
+    return raw
+
+
+def _load_generation_leases(
+    vm_config: VmCacheConfig,
+) -> Dict[str, LuksVolumeGenerationLease]:
+    raw_leases = dict(vm_config.volume_generation_leases or {})
+    leases: Dict[str, LuksVolumeGenerationLease] = {}
+    for volume, raw_lease in raw_leases.items():
+        try:
+            leases[volume] = LuksVolumeGenerationLease.model_validate(raw_lease)
+        except (TypeError, ValueError) as exc:
+            _generation_conflict(f"Stored generation lease for volume {volume} is invalid: {exc}")
+    return leases
+
+
+def _same_stable_lease_identity(
+    lease: LuksVolumeGenerationLease, capability: LuksCapabilityContext
+) -> bool:
+    """Compare the registered identity that survives an ephemeral-certificate reboot."""
+    return (
+        lease.server_id == capability.server_id
+        and lease.miner_hotkey == capability.miner_hotkey
+        and lease.vm_name == capability.vm_name
+        and lease.measurement_name == capability.measurement_name
+        and lease.measurement_version == capability.measurement_version
+        and lease.measurement_config_fingerprint == capability.measurement_config_fingerprint
+        and lease.trust_set_fingerprint == capability.trust_set_fingerprint
+        and lease.tee_type == capability.tee_type
+        and lease.purpose == capability.purpose
+        and lease.storage_role == capability.storage_role
+    )
+
+
+def allocate_luks_generation_leases(
+    vm_config: VmCacheConfig,
+    capability: LuksCapabilityContext,
+    volume_names: List[str],
+) -> Dict[str, LuksVolumeRotation]:
+    """Allocate or idempotently reissue one exclusive generation per volume.
+
+    The caller holds a row lock on ``vm_cache_configs``. An unresolved lease is never replaced:
+    its pending passphrase and generation are returned again only to the same stable registered
+    server, measurement, and role identity. If a real reboot replaces the ephemeral certificate,
+    the already-validated current capability atomically takes ownership and fences the prior cert.
+    """
+    stored: Dict[str, str] = dict(vm_config.volume_passphrases or {})
+    floors: Dict[str, object] = dict(vm_config.volume_epochs or {})
+    leases = _load_generation_leases(vm_config)
+    result: Dict[str, LuksVolumeRotation] = {}
+
+    for volume in volume_names:
+        floor = _confirmed_generation(floors, volume)
+        current_encrypted = stored.get(volume)
+        current = decrypt_passphrase(current_encrypted) if current_encrypted else None
+        pending_name = f"pending_{volume}"
+        pending_encrypted = stored.get(pending_name)
+        lease = leases.get(volume)
+
+        if lease is not None:
+            if not _same_stable_lease_identity(lease, capability):
+                _generation_conflict(
+                    f"Volume {volume} already has an unresolved lease for another "
+                    "registered server or measurement identity."
+                )
+            if lease.generation != floor + 1:
+                _generation_conflict(
+                    f"Volume {volume} lease generation does not exactly follow its "
+                    "confirmed generation."
+                )
+            if not pending_encrypted:
+                _generation_conflict(
+                    f"Volume {volume} has an unresolved generation lease without its "
+                    "pending passphrase."
+                )
+            if lease.promotion_required != (current is None):
+                _generation_conflict(
+                    f"Volume {volume} key-promotion state conflicts with its generation lease."
+                )
+
+            if lease.cert_hash != capability.cert_hash:
+                lease = lease.model_copy(update={"cert_hash": capability.cert_hash})
+                leases[volume] = lease
+            pending = decrypt_passphrase(pending_encrypted)
+            reused = True
+        else:
+            # A pre-migration unresolved pending passphrase has no lease metadata. Preserve it and
+            # adopt it as floor+1 instead of deleting the only key that may already format the disk.
+            if pending_encrypted:
+                pending = decrypt_passphrase(pending_encrypted)
+                reused = True
+            else:
+                pending = generate_cache_passphrase()
+                stored[pending_name] = encrypt_passphrase(pending)
+                reused = False
+            lease = LuksVolumeGenerationLease(
+                generation=floor + 1,
+                lease_id=secrets.token_hex(32),
+                server_id=capability.server_id,
+                miner_hotkey=capability.miner_hotkey,
+                vm_name=capability.vm_name,
+                cert_hash=capability.cert_hash,
+                measurement_name=capability.measurement_name,
+                measurement_version=capability.measurement_version,
+                measurement_config_fingerprint=capability.measurement_config_fingerprint,
+                trust_set_fingerprint=capability.trust_set_fingerprint,
+                tee_type=capability.tee_type,
+                purpose=capability.purpose,
+                storage_role=capability.storage_role,
+                promotion_required=current is None,
+            )
+            leases[volume] = lease
+
+        result[volume] = LuksVolumeRotation(
+            current=current,
+            next=pending,
+            generation=lease.generation,
+            confirmed_generation=floor,
+            lease_id=lease.lease_id,
+            lease_reused=reused,
+        )
+
+    vm_config.volume_passphrases = stored
+    vm_config.volume_epochs = floors
+    vm_config.volume_generation_leases = {
+        volume: lease.model_dump(mode="json") for volume, lease in leases.items()
+    }
+    return result
+
+
+async def _get_vm_cache_config_for_update(
     db: AsyncSession,
     miner_hotkey: str,
     vm_name: str,
+    *,
+    create: bool,
+) -> Optional[VmCacheConfig]:
+    """Get the VM key-custody row under a database lock, creating it race-safely."""
+    if create:
+        await db.execute(
+            pg_insert(VmCacheConfig)
+            .values(
+                miner_hotkey=miner_hotkey,
+                vm_name=vm_name,
+                volume_passphrases={},
+                volume_epochs={},
+                volume_generation_leases={},
+                last_boot_at=func.now(),
+            )
+            .on_conflict_do_nothing(index_elements=["miner_hotkey", "vm_name"])
+        )
+    result = await db.execute(
+        select(VmCacheConfig)
+        .where(
+            VmCacheConfig.miner_hotkey == miner_hotkey,
+            VmCacheConfig.vm_name == vm_name,
+        )
+        .with_for_update()
+    )
+    return result.scalar_one_or_none()
+
+
+async def lease_luks_passphrases(
+    db: AsyncSession,
+    capability: LuksCapabilityContext,
     volume_names: List[str],
-) -> tuple[Dict[str, LuksVolumeRotation], "VmCacheConfig"]:
-    """
-    Rotate LUKS passphrases for the given volumes.
-
-    For each volume:
-    - Reads the current passphrase from DB (None if first boot)
-    - Discards any stale pending passphrase from a prior unconfirmed rotation
-    - Generates a new passphrase stored as pending_{vol} in volume_passphrases
-
-    Returns a tuple of (volume_data, vm_config) where volume_data maps each
-    volume name to a LuksVolumeRotation and vm_config is the updated ORM object
-    (after commit + refresh).
-    """
-    vm_config = await _get_vm_cache_config(db, miner_hotkey, vm_name)
+) -> tuple[Dict[str, LuksVolumeRotation], VmCacheConfig]:
+    """Allocate generation leases while serializing every transition on the VM custody row."""
+    vm_config = await _get_vm_cache_config_for_update(
+        db,
+        capability.miner_hotkey,
+        capability.vm_name,
+        create=True,
+    )
     if vm_config is None:
-        vm_config = await _create_vm_cache_config(db, miner_hotkey, vm_name)
+        raise RuntimeError("Failed to create the VM LUKS key-custody row.")
 
-    stored: Dict[str, str] = dict(vm_config.volume_passphrases or {})
-    result: Dict[str, LuksVolumeRotation] = {}
-
-    for vol in volume_names:
-        current_enc = stored.get(vol)
-        current = decrypt_passphrase(current_enc) if current_enc else None
-
-        # Discard any stale pending from a prior unconfirmed rotation
-        stored.pop(f"pending_{vol}", None)
-
-        new_passphrase = generate_cache_passphrase()
-        stored[f"pending_{vol}"] = encrypt_passphrase(new_passphrase)
-
-        result[vol] = LuksVolumeRotation(current=current, next=new_passphrase)
-
-    vm_config.volume_passphrases = stored
+    result = allocate_luks_generation_leases(vm_config, capability, volume_names)
     vm_config.last_boot_at = func.now()
     await db.commit()
     await db.refresh(vm_config)
-    logger.info(f"LUKS rotation for VM {vm_name}: volumes={volume_names}")
+    logger.info(
+        f"LUKS generation lease for VM {capability.vm_name}: "
+        f"generations={{{', '.join(f'{volume}: {item.generation}' for volume, item in result.items())}}}"
+    )
     return result, vm_config
+
+
+def confirm_luks_generation_leases(
+    vm_config: VmCacheConfig,
+    capability: LuksCapabilityContext,
+    confirmations: Dict[str, LuksVolumeConfirmStatus],
+) -> Dict[str, dict]:
+    """Apply exact, idempotent generation confirmations to one locked custody row."""
+    stored: Dict[str, str] = dict(vm_config.volume_passphrases or {})
+    floors: Dict[str, object] = dict(vm_config.volume_epochs or {})
+    leases = _load_generation_leases(vm_config)
+    outcomes: Dict[str, dict] = {}
+
+    issued_generations = capability.issued_generations or {}
+    issued_lease_ids = capability.issued_lease_ids or {}
+
+    for volume, confirmation in confirmations.items():
+        generation = confirmation.generation
+        expected_generation = issued_generations.get(volume)
+        expected_lease_id = issued_lease_ids.get(volume)
+        if generation != expected_generation or not expected_lease_id:
+            _generation_conflict(
+                f"Confirmation for volume {volume} does not match the issued generation."
+            )
+
+        floor = _confirmed_generation(floors, volume)
+        lease = leases.get(volume)
+
+        if generation < floor:
+            _generation_conflict(
+                f"Confirmation generation {generation} for volume {volume} is stale; "
+                f"the confirmed generation is {floor}."
+            )
+        if generation == floor:
+            # The exact transition already committed (for example, the HTTP response was dropped).
+            # It is queryable and harmless to acknowledge again, but it cannot mutate key state.
+            outcomes[volume] = {
+                "result": "already_confirmed",
+                "generation": generation,
+            }
+            continue
+        if generation != floor + 1:
+            _generation_conflict(
+                f"Confirmation generation {generation} for volume {volume} does not "
+                f"exactly follow confirmed generation {floor}."
+            )
+        if lease is None:
+            _generation_conflict(
+                f"Volume {volume} has no unresolved lease for generation {generation}."
+            )
+        if (
+            lease.generation != generation
+            or lease.lease_id != expected_lease_id
+            or lease.cert_hash != capability.cert_hash
+            or not _same_stable_lease_identity(lease, capability)
+        ):
+            _generation_conflict(
+                f"Confirmation for volume {volume} does not own its active generation lease."
+            )
+
+        pending_name = f"pending_{volume}"
+        if pending_name not in stored:
+            _generation_conflict(
+                f"Volume {volume} generation lease has no pending passphrase to finalize."
+            )
+        if lease.promotion_required and not confirmation.rotated:
+            _generation_conflict(
+                f"Volume {volume} was first-formatted with its pending passphrase and "
+                "requires promotion."
+            )
+
+        if confirmation.rotated:
+            stored[volume] = stored.pop(pending_name)
+            result_name = "promoted"
+        else:
+            stored.pop(pending_name)
+            result_name = "confirmed"
+        floors[volume] = generation
+        leases.pop(volume)
+        outcomes[volume] = {"result": result_name, "generation": generation}
+
+    vm_config.volume_passphrases = stored
+    vm_config.volume_epochs = floors
+    vm_config.volume_generation_leases = {
+        volume: lease.model_dump(mode="json") for volume, lease in leases.items()
+    }
+    return outcomes
 
 
 async def _track_server(
@@ -822,7 +1118,13 @@ async def _track_server(
     return server
 
 
-async def verify_quote(quote, expected_nonce: str, expected_cert_hash: str):
+async def verify_quote(
+    quote,
+    expected_nonce: str,
+    expected_cert_hash: str,
+    *,
+    expected_gcp_identity: Optional[dict] = None,
+):
     """Verify a TEE attestation (Intel TDX quote or AMD SEV-SNP report).
 
     The nonce + client-cert-hash binding (report_data = nonce || sha256(pubkey)) is identical for
@@ -840,7 +1142,9 @@ async def verify_quote(quote, expected_nonce: str, expected_cert_hash: str):
     # AMD SEV-SNP: VCEK chain + report signature + measurement (no DCAP / MRTD / RTMRs).
     # On GCP, image identity is additionally enforced via the GCE vTPM quote (nonce-bound).
     if isinstance(quote, SnpReport):
-        return await verify_snp_quote(quote, expected_nonce)
+        return await verify_snp_quote(
+            quote, expected_nonce, expected_gcp_identity=expected_gcp_identity
+        )
 
     # Intel TDX: dcap-qvl signature verification + DCAP-result cross-check + MRTD/RTMR match.
     result = await verify_quote_signature(quote)
@@ -856,7 +1160,13 @@ async def verify_gpu_evidence(evidence: list[Dict[str, str]], expected_nonce: st
             json.dump(evidence, fp)
             fp.flush()
 
-            verify_gpus_cmd = ["chutes-nvattest", "--nonce", expected_nonce, "--evidence", fp.name]
+            verify_gpus_cmd = [
+                "chutes-nvattest",
+                "--nonce",
+                expected_nonce,
+                "--evidence",
+                fp.name,
+            ]
 
             process = await asyncio.create_subprocess_exec(*verify_gpus_cmd)
 

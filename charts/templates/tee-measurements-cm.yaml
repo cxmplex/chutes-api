@@ -12,12 +12,16 @@ data:
     #
     # Note: Matching is by full MRTD + RTMRs. Multiple configs may share the same RTMR0 (e.g. VM versions).
     # Each config must have a version (stored on attestation for audit trail).
+    # debug is mandatory and must be a YAML boolean. Managed-release pins also require build-derived
+    # image_sha256 + an ordered complete image_measurement_names matrix; production release
+    # activation separately verifies canonical detached-cosign provenance.
     measurements:
       # Example measurement configuration - replace with actual values
       - version: "1"
         mrtd: "PLACEHOLDER_MRTD_96_HEX_CHARS"
         name: "8xh200"
         description: "8x H200 GPU configuration"
+        debug: false
         boot_rtmrs:
           rtmr0: "PLACEHOLDER_RTMR0_96_HEX_CHARS"
           rtmr1: "PLACEHOLDER_RTMR1_96_HEX_CHARS"
@@ -40,6 +44,7 @@ data:
         name: "cpu-gcp"
         description: "CPU-only TEE configuration (no GPU)"
         provider: "gcp"
+        debug: false
         boot_rtmrs:
           rtmr0: "PLACEHOLDER_CPU_RTMR0_96_HEX_CHARS"
           rtmr1: "PLACEHOLDER_CPU_RTMR1_96_HEX_CHARS"
@@ -60,9 +65,10 @@ data:
       - version: "1"
         name: "cpu-snp-genoa"
         description: "CPU-only AMD SEV-SNP configuration (no GPU)"
-        provider: "baremetal"
+        provider: "bare-metal"
         tee_type: "sev-snp"
         processor_model: "Genoa"
+        debug: false
         measurement: "PLACEHOLDER_SNP_MEASUREMENT_96_HEX_CHARS"
         policy: "0x30000"
         min_tcb:
@@ -70,6 +76,10 @@ data:
           tee: 0
           snp: 0
           microcode: 0
+        expected_vmpl: 0
+        # A provider: "gcp" SNP pin must also include real PCR8/PCR9 plus
+        # vtpm_security_flags with exactly numeric tags "2", "3", "4", and "5" and the boolean
+        # values observed in that image's signed Google AK extension.
         expected_gpus: []
         gpu_count: 0
       # ChuteFS storage-TD measurements (distinct image: storage-node + persistent-LUKS units baked
@@ -80,6 +90,7 @@ data:
         name: "storage-baremetal-tdx-1.6.0-4c8g"
         description: "ChuteFS storage TD (Intel TDX, bare-metal, 4c/8g)"
         provider: "bare-metal"
+        debug: false
         boot_rtmrs:
           rtmr0: "PLACEHOLDER_STORAGE_TDX_RTMR0_96_HEX_CHARS"
           rtmr1: "PLACEHOLDER_STORAGE_TDX_RTMR1_96_HEX_CHARS"
@@ -95,9 +106,10 @@ data:
       - version: "1.6.0-snp"
         name: "storage-baremetal-snp-genoa-1.6.0"
         description: "ChuteFS storage TD (AMD SEV-SNP, bare-metal Genoa)"
-        provider: "baremetal"
+        provider: "bare-metal"
         tee_type: "sev-snp"
         processor_model: "Genoa"
+        debug: false
         measurement: "PLACEHOLDER_STORAGE_SNP_MEASUREMENT_96_HEX_CHARS"
         policy: "0x30000"
         min_tcb:
@@ -105,5 +117,6 @@ data:
           tee: 0
           snp: 0
           microcode: 0
+        expected_vmpl: 0
         expected_gpus: []
         gpu_count: 0

@@ -6,8 +6,8 @@ Tests TDX quote parsing, validation, and utility functions.
 import base64
 import pytest
 import secrets
+import struct
 from datetime import datetime, timezone
-from pathlib import Path
 from unittest.mock import patch, AsyncMock, Mock
 
 from api.config import TeeMeasurementConfig
@@ -19,7 +19,6 @@ from api.server.util import (
     verify_result,
     get_matching_measurement_config,
     extract_nonce,
-    get_luks_passphrase,
 )
 from api.server.quote import (
     TdxQuote,
@@ -29,8 +28,15 @@ from api.server.quote import (
 )
 from api.server.exceptions import (
     InvalidQuoteError,
-    InvalidTdxConfiguration,
     MeasurementMismatchError,
+)
+from tests.fixtures.tdx import (
+    EXPECTED_MRTD,
+    EXPECTED_RMTR0,
+    EXPECTED_RMTR1,
+    EXPECTED_RMTR2,
+    EXPECTED_RMTR3,
+    EXPECTED_USER_DATA,
 )
 
 
@@ -48,7 +54,12 @@ def _tee_measurements_for_quotes():
             version="1",
             mrtd="a" * 96,
             name="test-boot",
-            boot_rtmrs={"RTMR0": "b" * 96, "RTMR1": "c" * 96, "RTMR2": "d" * 96, "RTMR3": "e" * 96},
+            boot_rtmrs={
+                "RTMR0": "b" * 96,
+                "RTMR1": "c" * 96,
+                "RTMR2": "d" * 96,
+                "RTMR3": "e" * 96,
+            },
             runtime_rtmrs={
                 "RTMR0": "d" * 96,
                 "RTMR1": "e" * 96,
@@ -66,7 +77,6 @@ def mock_settings():
     """Mock settings for testing."""
     settings = Mock()
     settings.tee_measurements = _tee_measurements_for_quotes()
-    settings.luks_passphrase = "test_luks_passphrase"
     return settings
 
 
@@ -364,6 +374,19 @@ def test_quote_from_bytes(valid_quote_bytes):
     assert boot_quote.mrtd == runtime_quote.mrtd  # Same underlying data
 
 
+def test_synthetic_tdx_v4_fixture_parses_exact_measurements(valid_quote_bytes):
+    quote = RuntimeTdxQuote.from_bytes(valid_quote_bytes)
+    assert quote.version == 4
+    assert quote.att_key_type == 2
+    assert quote.tee_type == 0x81
+    assert quote.mrtd == EXPECTED_MRTD
+    assert quote.rtmr0 == EXPECTED_RMTR0
+    assert quote.rtmr1 == EXPECTED_RMTR1
+    assert quote.rtmr2 == EXPECTED_RMTR2
+    assert quote.rtmr3 == EXPECTED_RMTR3
+    assert quote.report_data == EXPECTED_USER_DATA
+
+
 def test_parse_quote_with_user_data(valid_quote_bytes, test_nonce):
     """Test parsing quote with embedded nonce in user data."""
     # Modify the valid quote to include our test nonce in user data
@@ -415,10 +438,10 @@ def test_parse_invalid_version(valid_quote_bytes):
     quote_bytes = bytearray(valid_quote_bytes)
 
     # Modify version (first 2 bytes, little endian) to an unsupported value
-    quote_bytes[0] = 99  # Invalid version (parser accepts 4 and 5 only)
+    quote_bytes[0] = 99  # Invalid version (the parser deliberately accepts v4 only)
     quote_bytes[1] = 0
 
-    with pytest.raises(InvalidQuoteError, match="Invalid quote version"):
+    with pytest.raises(InvalidQuoteError, match="Unsupported quote version"):
         BootTdxQuote.from_bytes(bytes(quote_bytes))
 
 
@@ -445,6 +468,25 @@ def test_parse_invalid_att_key_type(valid_quote_bytes):
     quote_bytes[3] = 0
 
     with pytest.raises(InvalidQuoteError, match="Invalid attestation key type"):
+        BootTdxQuote.from_bytes(bytes(quote_bytes))
+
+
+def test_parse_truncated_v4_report_body(valid_quote_bytes):
+    with pytest.raises(InvalidQuoteError, match="body is truncated"):
+        BootTdxQuote.from_bytes(valid_quote_bytes[:632])
+
+
+def test_parse_truncated_declared_v4_signature_body(valid_quote_bytes):
+    quote_bytes = bytearray(valid_quote_bytes)
+    struct.pack_into("<I", quote_bytes, 632, len(quote_bytes))
+    with pytest.raises(InvalidQuoteError, match="signature body is malformed or truncated"):
+        BootTdxQuote.from_bytes(bytes(quote_bytes))
+
+
+def test_parse_rejects_zero_length_v4_signature_body(valid_quote_bytes):
+    quote_bytes = bytearray(valid_quote_bytes)
+    struct.pack_into("<I", quote_bytes, 632, 0)
+    with pytest.raises(InvalidQuoteError, match="signature body is malformed"):
         BootTdxQuote.from_bytes(bytes(quote_bytes))
 
 
@@ -561,7 +603,9 @@ async def test_verify_quote_signature_success(sample_boot_quote):
 
     with (
         patch(
-            "api.server.util.get_collateral", new_callable=AsyncMock, return_value=mock_collateral
+            "api.server.util.get_collateral",
+            new_callable=AsyncMock,
+            return_value=mock_collateral,
         ) as mock_get_collateral,
         patch(
             "api.server.util.verify_with_root_ca", return_value=mock_verified_report
@@ -590,7 +634,11 @@ async def test_verify_quote_signature_failure(sample_boot_quote):
     )
 
     with (
-        patch("api.server.util.get_collateral", new_callable=AsyncMock, return_value=Mock()),
+        patch(
+            "api.server.util.get_collateral",
+            new_callable=AsyncMock,
+            return_value=Mock(),
+        ),
         patch("api.server.util.verify_with_root_ca", return_value=mock_verified_report),
     ):
         with pytest.raises(InvalidQuoteError, match="Unable to parse provided quote"):
@@ -624,7 +672,12 @@ def test_verify_measurements_mrtd_mismatch(mock_settings, sample_boot_quote):
             version="1",
             mrtd="different" + "0" * 88,
             name="other",
-            boot_rtmrs={"RTMR0": "b" * 96, "RTMR1": "c" * 96, "RTMR2": "d" * 96, "RTMR3": "e" * 96},
+            boot_rtmrs={
+                "RTMR0": "b" * 96,
+                "RTMR1": "c" * 96,
+                "RTMR2": "d" * 96,
+                "RTMR3": "e" * 96,
+            },
             runtime_rtmrs={
                 "RTMR0": "d" * 96,
                 "RTMR1": "e" * 96,
@@ -762,25 +815,6 @@ def test_tdx_quote_matches_measurement_rtmr_mismatch():
         raw_bytes=b"",
     )
     assert quote_wrong_rtmr.matches_measurement(config) is False
-
-
-# LUKS passphrase tests
-@patch("api.server.util.settings")
-def test_get_luks_passphrase_configured(mock_settings):
-    """Test getting LUKS passphrase when configured."""
-    mock_settings.luks_passphrase = "configured_passphrase"
-
-    passphrase = get_luks_passphrase()
-    assert passphrase == "configured_passphrase"
-
-
-@patch("api.server.util.settings")
-def test_get_luks_passphrase_not_configured(mock_settings):
-    """Test getting LUKS passphrase when not configured raises."""
-    mock_settings.luks_passphrase = None
-
-    with pytest.raises(InvalidTdxConfiguration, match="LUKS passphrase"):
-        get_luks_passphrase()
 
 
 # Test different quote types with different RTMRs
@@ -977,6 +1011,7 @@ def test_large_quote_parsing():
     large_quote_bytes[5] = 0
     large_quote_bytes[6] = 0
     large_quote_bytes[7] = 0
+    struct.pack_into("<I", large_quote_bytes, 632, len(large_quote_bytes) - 636)
 
     # Add some MRTD and RTMR data
     mrtd_offset = 48 + 136
@@ -993,15 +1028,9 @@ def test_large_quote_parsing():
     assert quote.version == 4
 
 
-def test_multiple_quote_parsing():
+def test_multiple_quote_parsing(valid_quote_bytes):
     """Test parsing multiple quotes in sequence."""
-    if not Path("tests/assets/quote.bin").exists():
-        pytest.skip("Quote file not available")
-
-    with open("tests/assets/quote.bin", "rb") as f:
-        quote_bytes = f.read()
-
-    quote_b64 = base64.b64encode(quote_bytes).decode("utf-8")
+    quote_b64 = base64.b64encode(valid_quote_bytes).decode("utf-8")
 
     # Parse multiple times to ensure no state contamination
     quotes = []
@@ -1110,7 +1139,7 @@ def test_all_quote_validation_errors():
     # Invalid version
     invalid_quote = bytearray(1000)
     invalid_quote[0] = 99  # Invalid version
-    with pytest.raises(InvalidQuoteError, match="Invalid quote version"):
+    with pytest.raises(InvalidQuoteError, match="Unsupported quote version"):
         BootTdxQuote.from_bytes(bytes(invalid_quote))
 
     # Invalid TEE type

@@ -48,9 +48,7 @@ async def is_agent_online(server_id: str) -> bool:
     return bool(await settings.redis_client.exists(_online_key(server_id)))
 
 
-async def send_agent_command(
-    server_id: str, command: str, data: Optional[dict] = None
-) -> str:
+async def send_agent_command(server_id: str, command: str, data: Optional[dict] = None) -> str:
     """Publish an explicit command to a connected agent. Returns the generated command_id.
 
     The command is fanned out via redis pubsub; whichever socket-server replica holds the
@@ -269,11 +267,7 @@ async def _reconcile_server_containers(server_id: str, containers: list) -> None
     reported = {str(c) for c in containers if c}
     async with get_session() as session:
         instances = (
-            (
-                await session.execute(
-                    select(Instance).where(Instance.server_id == server_id)
-                )
-            )
+            (await session.execute(select(Instance).where(Instance.server_id == server_id)))
             .unique()
             .scalars()
             .all()
@@ -303,9 +297,7 @@ async def _reconcile_server_containers(server_id: str, containers: list) -> None
             f"Reconcile: agent {server_id} no longer runs container for instance "
             f"{instance.instance_id} (config {instance.config_id}); purging"
         )
-        await purge_and_notify(
-            instance, reason="reconcile - agent reports chute container gone"
-        )
+        await purge_and_notify(instance, reason="reconcile - agent reports chute container gone")
 
     # Agent -> validator drift: a running container with neither an instance nor a live launch
     # config (purged while the agent was offline, or its config expired) is an orphan -- stop it.
@@ -450,9 +442,9 @@ async def send_job_instance_teardown(instance_id: Optional[str]) -> Optional[str
         async with get_session() as session:
             instance = (
                 await session.execute(
-                    select(
-                        Instance.chute_id, Instance.server_id, Instance.config_id
-                    ).where(Instance.instance_id == instance_id)
+                    select(Instance.chute_id, Instance.server_id, Instance.config_id).where(
+                        Instance.instance_id == instance_id
+                    )
                 )
             ).first()
         if instance is None:

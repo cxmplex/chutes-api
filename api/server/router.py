@@ -3,7 +3,6 @@ FastAPI routes for server management and TDX attestation.
 """
 
 from typing import Dict, Any, List
-import orjson as json
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Header, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,15 +10,26 @@ from sqlalchemy.exc import IntegrityError, DatabaseError
 from loguru import logger
 
 from api.database import get_db_session
-from api.config import settings
+from api.config import (
+    measurement_config_fingerprint,
+    measurement_trust_set_fingerprint,
+    settings,
+)
 from api.node.util import check_node_inventory
 from api.user.schemas import User
 from api.user.service import get_current_user
-from api.constants import HOTKEY_HEADER, SIGNATURE_HEADER, NoncePurpose, SUPPORTED_LUKS_VOLUMES
+from api.constants import (
+    HOTKEY_HEADER,
+    NONCE_HEADER,
+    SIGNATURE_HEADER,
+    NoncePurpose,
+    SUPPORTED_LUKS_VOLUMES,
+)
 
 from api.server.schemas import (
     BootAttestationArgs,
     RuntimeAttestationArgs,
+    RuntimeAttestationNonceContext,
     ServerArgs,
     CpuServerRegistrationArgs,
     CpuServerRegistrationResponse,
@@ -44,6 +54,8 @@ from api.server.schemas import (
 )
 from api.server.service import (
     create_nonce,
+    validate_and_consume_nonce,
+    issue_boot_attestation_nonce,
     process_boot_attestation,
     register_server,
     register_cpu_server,
@@ -51,9 +63,11 @@ from api.server.service import (
     get_server_by_name_or_id,
     update_server_name,
     process_runtime_attestation,
+    runtime_attestation_context_for_server,
     get_server_attestation_status,
     delete_server,
     validate_request_nonce,
+    require_boot_attestation_nonce,
     process_luks_passphrase_request,
     require_luks_quote_nonce,
     require_confirm_nonce,
@@ -67,7 +81,6 @@ from api.server.service import (
 from api.server.util import (
     extract_client_cert_hash,
     extract_client_cert_pem,
-    get_luks_passphrase,
 )
 from api.server.exceptions import (
     AttestationError,
@@ -82,26 +95,46 @@ from api.util import extract_ip, is_valid_host, semcomp
 router = APIRouter()
 
 
-# Anonymous Boot Attestation Endpoints (Pre-registration)
+# Registered-server Boot Attestation Endpoints
 
 
 @router.get("/nonce", response_model=NonceResponse)
-async def get_nonce(request: Request):
+async def get_nonce(
+    request: Request,
+    server_id: str = Query(..., description="Registered server authorized for boot attestation"),
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    authorization_nonce: str | None = Header(None, alias=NONCE_HEADER),
+    signature: str | None = Header(None, alias=SIGNATURE_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
     """
-    Generate a nonce for boot attestation.
+    Generate a server-bound nonce for boot attestation.
 
-    This endpoint is called by VMs during boot before any registration.
-    No authentication required as the VM doesn't exist in the system yet.
+    The miner signs ``{hotkey}:{authorization_nonce}:boot_luks_nonce:{server_id}:{cert_hash}``
+    with a fresh ``{timestamp}.{random}`` authorization nonce. Ownership, non-storage role, source
+    address, and live possession of the stored serving certificate are checked before a quote nonce
+    is issued, so a caller cannot name another miner's VM and obtain a capability.
     """
     try:
-        server_ip = extract_ip(request)
-        nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.BOOT)
+        nonce_info = await issue_boot_attestation_nonce(
+            db,
+            extract_ip(request),
+            server_id,
+            hotkey,
+            authorization_nonce,
+            signature,
+            expected_cert_hash,
+        )
 
         return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to generate boot nonce: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate nonce"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate nonce",
         )
 
 
@@ -110,25 +143,24 @@ async def verify_boot_attestation(
     request: Request,
     args: BootAttestationArgs,
     db: AsyncSession = Depends(get_db_session),
-    nonce=Depends(validate_request_nonce(NoncePurpose.BOOT)),
-    expected_cert_hash=Depends(extract_client_cert_hash()),
+    validated_nonce=Depends(require_boot_attestation_nonce),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """
-    Verify boot attestation and return LUKS passphrase.
+    Verify boot attestation and return a scoped follow-up capability.
 
-    This endpoint verifies the TDX quote against expected boot measurements
-    and returns the LUKS passphrase for disk decryption if valid.
-    For VMs running version >= 1.3.0, also returns a luks_quote_nonce for
-    the subsequent POST /luks/attest call.
+    The generic/global LUKS passphrase is never returned. For versions >= 1.3.0, the response
+    contains a one-use boot-LUKS quote capability for ``storage``/``tdx-cache`` only; older
+    versions receive an equivalently scoped legacy boot token.
     """
     try:
         server_ip = extract_ip(request)
+        nonce, nonce_context = validated_nonce
         boot_token, luks_quote_nonce = await process_boot_attestation(
-            db, server_ip, args, nonce, expected_cert_hash
+            db, server_ip, args, nonce, nonce_context, expected_cert_hash
         )
 
         return BootAttestationResponse(
-            key=get_luks_passphrase(),
             boot_token=boot_token,
             luks_quote_nonce=luks_quote_nonce,
         )
@@ -141,7 +173,8 @@ async def verify_boot_attestation(
     except Exception as e:
         logger.error(f"Unexpected error in boot attestation: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Boot attestation failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Boot attestation failed",
         )
 
 
@@ -164,7 +197,8 @@ async def get_cpu_register_nonce(request: Request):
     except Exception as e:
         logger.error(f"Failed to generate CPU register nonce: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate nonce"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate nonce",
         )
 
 
@@ -184,8 +218,9 @@ async def register_cpu_server_endpoint(
 
     The booted server submits its own runtime TDX quote + CPU benchmark. Trust is established by:
     the single-use attestation nonce (X-Chutes-Nonce, bound into the quote report_data), the mTLS
-    client cert (also bound into report_data), the owning miner's signature (X-Chutes-Signature
-    over "{hotkey}:{nonce}:cpu_register"), and the quote measurements matching a CPU config.
+    client cert (also bound into report_data), the owning miner's signature over the registration
+    purpose plus server ID, name, cert hash, requested role, and optional logical rollout token hash,
+    and the quote measurements matching the same CPU/storage role.
     """
     if not hotkey or not signature:
         raise HTTPException(
@@ -202,7 +237,14 @@ async def register_cpu_server_endpoint(
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
         server_ip = extract_ip(request)
         return await register_cpu_server(
-            db, server_ip, args, hotkey, nonce, signature, expected_cert_hash, expected_cert_pem
+            db,
+            server_ip,
+            args,
+            hotkey,
+            nonce,
+            signature,
+            expected_cert_hash,
+            expected_cert_pem,
         )
     except (AttestationError, ServerRegistrationError) as e:
         logger.warning(
@@ -224,49 +266,102 @@ async def register_cpu_server_endpoint(
         )
 
 
-def _manifest_for_version(version: str | None) -> dict | None:
-    """Build a chutes-attest measurement manifest from the pinned (published, reproducible) CPU
-    measurement config for this version. These are the EXPECTED measurements the client verifies the
-    live quote against -- they come from the published config, not from the instance itself."""
-    if not version:
+def _manifest_for_server(server: Server) -> dict | None:
+    """Return the exact active pin persisted by this server's successful attestation."""
+    if (
+        not server.version
+        or not server.measurement_name
+        or not server.measurement_config_fingerprint
+        or not server.trust_set_fingerprint
+    ):
         return None
-    for m in settings.tee_measurements:
-        if m.version != version or (m.gpu_count or 0) != 0:
-            continue
-        tee_type = getattr(m, "tee_type", "tdx")
-        provider = getattr(m, "provider", None) or "bare-metal"
-        if tee_type in ("sev-snp", "snp", "amd-snp"):
-            # AMD SEV-SNP: a single launch measurement + policy + min-TCB (no MRTD/RTMRs).
-            return {
-                "schema_version": 1,
-                "image": f"chutes-cpu-snp-{m.name}",
-                "image_version": version,
-                "provider": provider,
-                "tee_type": "sev-snp",
-                "snp": {
-                    "measurement": m.measurement,
-                    "policy": m.policy,
-                    "processor_model": m.processor_model,
-                    "min_tcb": m.min_tcb,
-                },
-            }
-        # Intel TDX: MRTD + RTMR0-3. The config loader upper-cases RTMR keys (RTMR0..RTMR3).
-        rt = m.runtime_rtmrs or {}
-        return {
-            "schema_version": 1,
-            "image": f"chutes-cpu-tee-{m.name}",
-            "image_version": version,
-            "provider": provider,
-            "tee_type": "tdx",
-            "measurements": {
-                "mrtd": m.mrtd,
-                "rtmr0": rt.get("RTMR0") or rt.get("rtmr0"),
-                "rtmr1": rt.get("RTMR1") or rt.get("rtmr1"),
-                "rtmr2": rt.get("RTMR2") or rt.get("rtmr2"),
-                "rtmr3": rt.get("RTMR3") or rt.get("rtmr3"),
-            },
+    measurements = settings.tee_measurements
+    trust_set_fingerprint = measurement_trust_set_fingerprint(measurements)
+    if server.trust_set_fingerprint != trust_set_fingerprint:
+        return None
+    measurement = next(
+        (
+            config
+            for config in measurements
+            if config.name == server.measurement_name
+            and config.version == server.version
+            and (config.gpu_count or 0) == 0
+        ),
+        None,
+    )
+    if measurement is None:
+        return None
+    config_fingerprint = measurement_config_fingerprint(measurement)
+    if server.measurement_config_fingerprint != config_fingerprint:
+        return None
+
+    tee_type = getattr(measurement, "tee_type", "tdx")
+    provider = getattr(measurement, "provider", None) or "bare-metal"
+    exact_pin = {
+        "version": measurement.version,
+        "name": measurement.name,
+        "tee_type": tee_type,
+        "provider": provider,
+        "mrtd": measurement.mrtd,
+        "boot_rtmrs": measurement.boot_rtmrs,
+        "runtime_rtmrs": measurement.runtime_rtmrs,
+        "expected_gpus": measurement.expected_gpus,
+        "gpu_count": measurement.gpu_count,
+        "measurement": getattr(measurement, "measurement", None),
+        "policy": getattr(measurement, "policy", None),
+        "min_tcb": getattr(measurement, "min_tcb", None),
+        "processor_model": getattr(measurement, "processor_model", None),
+        "expected_vmpl": getattr(measurement, "expected_vmpl", None),
+        "id_key_digest": getattr(measurement, "id_key_digest", None),
+        "vtpm_pcrs": getattr(measurement, "vtpm_pcrs", None),
+        "vtpm_security_flags": getattr(measurement, "vtpm_security_flags", None),
+        "debug": bool(getattr(measurement, "debug", False)),
+        "image_sha256": getattr(measurement, "image_sha256", None),
+        "image_measurement_names": getattr(measurement, "image_measurement_names", None),
+        "config_fingerprint": config_fingerprint,
+        "trust_set_fingerprint": trust_set_fingerprint,
+    }
+    manifest = {
+        "schema_version": 1,
+        "image": (
+            f"chutes-cpu-snp-{measurement.name}"
+            if tee_type in ("sev-snp", "snp", "amd-snp")
+            else f"chutes-cpu-tee-{measurement.name}"
+        ),
+        "image_version": measurement.version,
+        "provider": provider,
+        "tee_type": ("sev-snp" if tee_type in ("sev-snp", "snp", "amd-snp") else "tdx"),
+        "measurement_name": measurement.name,
+        "config_fingerprint": config_fingerprint,
+        "trust_set_fingerprint": trust_set_fingerprint,
+        "debug": exact_pin["debug"],
+        "image_sha256": exact_pin["image_sha256"],
+        "image_measurement_names": exact_pin["image_measurement_names"],
+        "expected_gpus": list(measurement.expected_gpus or []),
+        "gpu_count": measurement.gpu_count,
+        "exact_pin": exact_pin,
+    }
+    if tee_type in ("sev-snp", "snp", "amd-snp"):
+        manifest["snp"] = {
+            "measurement": measurement.measurement,
+            "policy": measurement.policy,
+            "processor_model": measurement.processor_model,
+            "min_tcb": measurement.min_tcb,
+            "expected_vmpl": measurement.expected_vmpl,
+            "id_key_digest": measurement.id_key_digest,
+            "vtpm_pcrs": measurement.vtpm_pcrs,
+            "vtpm_security_flags": measurement.vtpm_security_flags,
         }
-    return None
+    else:
+        runtime = measurement.runtime_rtmrs or {}
+        manifest["measurements"] = {
+            "mrtd": measurement.mrtd,
+            "rtmr0": runtime.get("RTMR0") or runtime.get("rtmr0"),
+            "rtmr1": runtime.get("RTMR1") or runtime.get("rtmr1"),
+            "rtmr2": runtime.get("RTMR2") or runtime.get("rtmr2"),
+            "rtmr3": runtime.get("RTMR3") or runtime.get("rtmr3"),
+        }
+    return manifest
 
 
 async def _caller_owns_server_workload(db: AsyncSession, server_id: str, user: User | None) -> bool:
@@ -335,10 +430,11 @@ async def get_cpu_server_connection(
     """Authorized DISCOVERY for a user-attestable CPU TEE instance (miner owner OR the renter).
 
     Returns where the instance is (the host + attest/provision/ssh/wg ports its in-TEE agent
-    advertised), a short-lived provisioning token, and the expected-measurements manifest -- so
-    `chutes ssh/connect <server_id>` needs no flags. This is discovery + authorization ONLY: the
-    trust decision is the client verifying the TDX quote itself (Intel + the manifest), NOT this
-    response, and the connection goes directly to the instance, never through this API.
+    advertised), a short-lived provisioning token, and an explicitly untrusted transparency view
+    of the matched measurement. This is discovery + authorization ONLY: the trust decision is the
+    client verifying the quote against a separately published cosign-signed manifest and trusted
+    public key, NOT this response. The connection goes directly to the instance, never through this
+    API.
 
     Authorization (two roles): the miner hotkey that registered the server (ops/debug), OR the
     RENTER -- the user who owns the chute/job whose instance the scheduler placed on this server.
@@ -386,6 +482,15 @@ async def get_cpu_server_connection(
         ).scalar_one_or_none()
         if host and host.specs:
             host_cpu = host.specs.get("cpu")
+    manifest = _manifest_for_server(server)
+    if manifest is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This server's exact attested measurement identity is retired, revoked, "
+                "or stale; fresh registration is required."
+            ),
+        )
     return {
         "server_id": server.server_id,
         "host": endpoints.get("host") or server.ip,
@@ -394,7 +499,9 @@ async def get_cpu_server_connection(
         "ssh_port": endpoints.get("ssh_port", 22),
         "wg_port": endpoints.get("wg_port", 51820),
         "provision_token": create_provision_jwt(server.server_id),
-        "manifest": _manifest_for_version(server.version),
+        # Discovery is authenticated, but this unsigned view is not an independent image trust
+        # root. The CLI requires a separately published cosign-signed manifest and trusted key.
+        "untrusted_manifest": manifest,
         "specs": {"cpu": host_cpu, "vcpus": server.cpu_cores, "ram_gb": server.ram_gb},
     }
 
@@ -437,13 +544,14 @@ def _validate_luks_request(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
 
-@router.post("/{vm_name}/luks", response_model=Dict[str, str])
+@router.post("/{server_id}/luks", response_model=Dict[str, str])
 async def sync_luks_passphrases(
-    vm_name: str,
+    server_id: str,
     body: LuksPassphraseRequest,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     boot_token: str | None = Header(None, alias="X-Boot-Token"),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """
     Sync LUKS passphrases for legacy VMs (version < 1.3.0).
@@ -457,8 +565,9 @@ async def sync_luks_passphrases(
         result = await process_luks_passphrase_request(
             db,
             boot_token,
+            server_id,
             hotkey,
-            vm_name,
+            expected_cert_hash,
             body.volumes,
             rekey_volume_names=body.rekey,
         )
@@ -476,32 +585,44 @@ async def sync_luks_passphrases(
         )
 
 
-@router.post("/{vm_name}/luks/attest", response_model=LuksAttestResponse)
+@router.post(
+    "/{server_id}/luks/attest",
+    response_model=LuksAttestResponse,
+    response_model_exclude_none=True,
+)
 async def attest_luks(
-    vm_name: str,
+    server_id: str,
     body: LuksAttestRequest,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    expected_cert_hash=Depends(extract_client_cert_hash()),
-    validated_nonce: str = Depends(require_luks_quote_nonce),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+    validated_capability=Depends(require_luks_quote_nonce),
 ):
     """
     Rotate LUKS passphrases for new-format VMs (version >= 1.3.0).
 
-    The VM embeds the luks_quote_nonce (received in the boot attestation response)
-    in a TDX quote after extending RTMR3 in initramfs. require_luks_quote_nonce
-    validates and consumes the nonce; the handler then calls verify_quote which
-    checks the TDX signature and all RTMR measurements including RTMR3. Returns
-    rotated passphrases, the k3s encryption key, and a confirm nonce.
+    The opaque nonce carries the registered server ID, owner, cert, exact measurement, role, and
+    allowed volume namespace. The handler revalidates all of them before looking up any key.
+    Storage capabilities can release only ``chutefs-data`` and never receive a k3s key.
     """
     try:
         result = await process_luks_attest_request(
-            db, hotkey, vm_name, body, validated_nonce, expected_cert_hash
+            db,
+            server_id,
+            hotkey,
+            body,
+            validated_capability,
+            expected_cert_hash,
         )
-        epochs = result.volume_epochs or {}
         return LuksAttestResponse(
             volumes={
-                vol: LuksVolumeInfo(current=r.current, next=r.next, epoch=int(epochs.get(vol, 0)))
+                vol: LuksVolumeInfo(
+                    current=r.current,
+                    next=r.next,
+                    generation=r.generation,
+                    confirmed_generation=r.confirmed_generation,
+                    lease_reused=r.lease_reused,
+                )
                 for vol, r in result.volumes.items()
             },
             confirm_nonce=result.confirm_nonce,
@@ -520,23 +641,32 @@ async def attest_luks(
         )
 
 
-@router.post("/{vm_name}/luks/confirm", response_model=LuksConfirmResponse)
+@router.post("/{server_id}/luks/confirm", response_model=LuksConfirmResponse)
 async def confirm_luks_rotation(
-    vm_name: str,
+    server_id: str,
     body: LuksConfirmRequest,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _=Depends(require_confirm_nonce),
+    capability=Depends(require_confirm_nonce),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """
-    Confirm or discard pending LUKS passphrase rotation results.
+    Confirm exact LUKS generation leases and finalize their pending passphrases.
 
-    The VM reports per-volume success/failure. require_confirm_nonce validates
-    and consumes the nonce before the handler runs. Volumes with rotated=True
-    have pending passphrases promoted to current; rotated=False discards pending.
+    The VM reports the exact generation durably written for every issued volume.
+    A first-format pending passphrase is promoted only with rotated=True; an existing
+    current key remains active with rotated=False. Exact duplicate confirmations are
+    idempotent, while stale, skipped, or mismatched lease generations are rejected.
     """
     try:
-        result = await process_luks_confirm(db, hotkey, vm_name, body)
+        result = await process_luks_confirm(
+            db,
+            server_id,
+            hotkey,
+            body,
+            capability,
+            expected_cert_hash,
+        )
         return LuksConfirmResponse(status="confirmed", volumes=result.volumes)
     except HTTPException:
         raise
@@ -634,12 +764,9 @@ async def create_server(
             exc_info=True,
         )
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Server registration failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server registration failed",
         )
-
-
-TEE_MEASUREMENTS_CACHE_KEY = "tee_measurements"
-TEE_MEASUREMENTS_CACHE_TTL = 3600  # 60 minutes; measurements only change on new releases
 
 
 @router.get("/tee/measurements", response_model=List[TeeMeasurementResponse])
@@ -652,10 +779,6 @@ async def get_tee_measurements():
     verify that a server is running approved software before trusting it.
     No authentication required — public transparency endpoint.
     """
-    cached = await settings.redis_client.get(TEE_MEASUREMENTS_CACHE_KEY)
-    if cached:
-        return json.loads(cached)
-
     try:
         measurements = settings.tee_measurements
     except Exception as e:
@@ -665,11 +788,13 @@ async def get_tee_measurements():
             detail="Failed to read TEE measurements",
         )
 
-    result = [
+    trust_set_fingerprint = measurement_trust_set_fingerprint(measurements)
+    return [
         TeeMeasurementResponse(
             version=m.version,
             name=m.name,
             tee_type=getattr(m, "tee_type", "tdx"),
+            provider=getattr(m, "provider", None),
             mrtd=m.mrtd,
             boot_rtmrs=m.boot_rtmrs,
             runtime_rtmrs=m.runtime_rtmrs,
@@ -679,15 +804,18 @@ async def get_tee_measurements():
             policy=getattr(m, "policy", None),
             min_tcb=getattr(m, "min_tcb", None),
             processor_model=getattr(m, "processor_model", None),
+            expected_vmpl=getattr(m, "expected_vmpl", None),
+            id_key_digest=getattr(m, "id_key_digest", None),
+            vtpm_pcrs=getattr(m, "vtpm_pcrs", None),
+            vtpm_security_flags=getattr(m, "vtpm_security_flags", None),
+            debug=bool(getattr(m, "debug", False)),
+            image_sha256=getattr(m, "image_sha256", None),
+            image_measurement_names=getattr(m, "image_measurement_names", None),
+            config_fingerprint=measurement_config_fingerprint(m),
+            trust_set_fingerprint=trust_set_fingerprint,
         )
         for m in measurements
     ]
-    await settings.redis_client.set(
-        TEE_MEASUREMENTS_CACHE_KEY,
-        json.dumps([r.model_dump() for r in result]).decode(),
-        ex=TEE_MEASUREMENTS_CACHE_TTL,
-    )
-    return result
 
 
 @router.get("/maintenance/policy", response_model=MaintenancePolicyResponse)
@@ -823,7 +951,8 @@ async def get_server_details(
     except Exception as e:
         logger.error(f"Failed to get server details: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to get server details"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to get server details",
         )
 
 
@@ -880,7 +1009,8 @@ async def remove_server(
     except Exception as e:
         logger.error(f"Failed to remove server: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to remove server"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to remove server",
         )
 
 
@@ -907,18 +1037,26 @@ async def get_runtime_nonce(
         if server.ip != actual_ip:
             raise Exception()
 
-        nonce_info = await create_nonce(server.ip, purpose=NoncePurpose.RUNTIME)
+        context = runtime_attestation_context_for_server(server)
+        nonce_info = await create_nonce(
+            server.ip,
+            purpose=NoncePurpose.RUNTIME,
+            context=context.model_dump(),
+        )
 
         return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
 
     except ServerNotFoundError as e:
+        raise e
+    except AttestationError as e:
         raise e
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to generate runtime nonce: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate nonce"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate nonce",
         )
 
 
@@ -932,8 +1070,8 @@ async def verify_runtime_attestation(
     _: User = Depends(
         get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
     ),
-    nonce=Depends(validate_request_nonce(NoncePurpose.RUNTIME)),
-    expected_cert_hash=Depends(extract_client_cert_hash()),
+    nonce: str | None = Header(None, alias=NONCE_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """
     Verify runtime attestation with full measurement validation.
@@ -941,8 +1079,24 @@ async def verify_runtime_attestation(
     try:
         server = await check_server_ownership(db, server_id, hotkey)
         actual_ip = extract_ip(request)
+        stored_nonce = await validate_and_consume_nonce(nonce, actual_ip, NoncePurpose.RUNTIME)
+        try:
+            nonce_context = RuntimeAttestationNonceContext.model_validate(
+                stored_nonce.get("context")
+            )
+        except (AttributeError, ValueError, TypeError) as exc:
+            raise NonceError(
+                "Runtime nonce is missing its exact registered identity context."
+            ) from exc
         result = await process_runtime_attestation(
-            db, server.server_id, actual_ip, args, hotkey, nonce, expected_cert_hash
+            db,
+            server.server_id,
+            actual_ip,
+            args,
+            hotkey,
+            nonce,
+            expected_cert_hash,
+            nonce_context,
         )
 
         return RuntimeAttestationResponse(
@@ -964,7 +1118,8 @@ async def verify_runtime_attestation(
     except Exception as e:
         logger.error(f"Unexpected error in runtime attestation: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Runtime attestation failed"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Runtime attestation failed",
         )
 
 

@@ -9,6 +9,9 @@
 #
 # Note: Matching is by full MRTD + RTMRs (not just RTMR0). Multiple configs may share the same
 # RTMR0 (e.g. old and new VM versions during transition). Each config must have a unique version.
+# `debug` is mandatory and must be a YAML boolean. Managed-release pins additionally set
+# image_sha256 + the ordered complete image_measurement_names matrix. Production activation also
+# verifies the canonical detached-cosign provenance payload; do not invent any value.
 
 measurements:
   # Example: 8x H200 GPU configuration (version for audit trail; server version = latest attestation)
@@ -16,6 +19,7 @@ measurements:
     mrtd: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
     name: "8xh200"
     description: "8x H200 GPU configuration"
+    debug: false
     boot_rtmrs:
       rtmr0: "B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
       rtmr1: "C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
@@ -35,6 +39,7 @@ measurements:
     mrtd: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
     name: "8xb200"
     description: "8x B200 GPU configuration"
+    debug: false
     boot_rtmrs:
       rtmr0: "X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6"
       rtmr1: "C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
@@ -58,6 +63,7 @@ measurements:
     name: "cpu-gcp"
     description: "CPU-only TEE configuration (no GPU)"
     provider: "gcp"
+    debug: false
     boot_rtmrs:
       rtmr0: "B1C2D3E4F5061728B9CADBECFD0E1F20B1C2D3E4F5061728B9CADBECFD0E1F20B1C2D3E4F5061728B9CADBECFD0E1F20"
       rtmr1: "C1D2E3F405162738C9DAEBFC0D1E2F30C1D2E3F405162738C9DAEBFC0D1E2F30C1D2E3F405162738C9DAEBFC0D1E2F30"
@@ -85,6 +91,7 @@ measurements:
     provider: "bare-metal"
     tee_type: "sev-snp"
     processor_model: "Genoa"
+    debug: false
     measurement: "A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30"
     policy: "0x30000"
     min_tcb:
@@ -92,7 +99,18 @@ measurements:
       tee: 0
       snp: 23
       microcode: 72
+    expected_vmpl: 0
     # id_key_digest: "..."   # optional: pin an owner id-block digest (launch-time enforcement)
+    # A provider: "gcp" SNP entry must additionally pin PCR8/PCR9 and the exact four boolean values
+    # from its real signed Google AK extension. Keep the undocumented flag tags numeric:
+    # vtpm_pcrs:
+    #   "8": "REPLACE_WITH_REAL_PCR8_SHA256"
+    #   "9": "REPLACE_WITH_REAL_PCR9_SHA256"
+    # vtpm_security_flags:
+    #   "2": true
+    #   "3": false
+    #   "4": false
+    #   "5": false
     expected_gpus: []
     gpu_count: 0
 
@@ -106,6 +124,7 @@ measurements:
     name: "storage-baremetal-tdx-1.6.0-4c8g"
     description: "ChuteFS storage TD (Intel TDX, bare-metal, 4c/8g)"
     provider: "bare-metal"
+    debug: false
     mrtd: "REPLACE_WITH_STORAGE_TDX_MRTD_96HEX"
     boot_rtmrs:
       rtmr0: "REPLACE_WITH_STORAGE_TDX_RTMR0"
@@ -126,6 +145,7 @@ measurements:
     provider: "bare-metal"
     tee_type: "sev-snp"
     processor_model: "Genoa"
+    debug: false
     measurement: "REPLACE_WITH_STORAGE_SNP_LAUNCH_MEASUREMENT_96HEX"
     policy: "0x30000"
     min_tcb:
@@ -133,5 +153,6 @@ measurements:
       tee: 0
       snp: 23
       microcode: 72
+    expected_vmpl: 0
     expected_gpus: []
     gpu_count: 0

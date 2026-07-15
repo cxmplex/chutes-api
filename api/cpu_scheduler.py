@@ -16,7 +16,7 @@ Run as its own process (e.g. `python -m api.cpu_scheduler`), like chute_autoscal
 import asyncio
 import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from loguru import logger
 from sqlalchemy import and_, func, select, text
@@ -25,13 +25,17 @@ from sqlalchemy.orm import joinedload
 import api.database.orms  # noqa
 from api.agent_channel import is_agent_online, send_agent_command
 from api.chute.schemas import Chute
-from api.config import settings
+from api.config import (
+    measurement_config_fingerprint,
+    measurement_trust_set_fingerprint,
+    settings,
+)
 from api.database import get_session
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2, purge_and_notify
 from api.job.schemas import Job
 from api.metagraph import MetagraphNode
-from api.server.schemas import Host, Server
+from api.server.schemas import Host, Server, ServerAttestation
 from api.util import semcomp
 
 SCHEDULER_INTERVAL_SECONDS = 15
@@ -89,6 +93,78 @@ def _server_fits(server: Server, req_cores: int, req_ram: int) -> bool:
     elif cores < req_cores:
         return False
     return (server.ram_gb or 0) >= req_ram
+
+
+async def _current_attested_servers(session, servers: list[Server]) -> list[Server]:
+    """Keep only fresh candidates bound to an exact pin in the complete active trust set."""
+    if not servers:
+        return []
+    try:
+        measurements = settings.tee_measurements
+        trust_set_fingerprint = measurement_trust_set_fingerprint(measurements)
+        configs = {
+            config.name: config
+            for config in measurements
+            if config.name
+            and (config.gpu_count or 0) == 0
+            and not config.name.startswith("storage-")
+        }
+    except Exception as exc:  # noqa: BLE001 - scheduler trust failure is fail-closed
+        logger.error(f"CPU scheduler could not load active attestation trust: {exc}")
+        return []
+    if not configs:
+        return []
+
+    latest = (
+        select(
+            ServerAttestation.server_id,
+            ServerAttestation.verification_error,
+            ServerAttestation.measurement_name,
+            ServerAttestation.measurement_version,
+            ServerAttestation.measurement_config_fingerprint,
+            ServerAttestation.trust_set_fingerprint,
+            ServerAttestation.verified_at,
+            func.row_number()
+            .over(
+                partition_by=ServerAttestation.server_id,
+                order_by=(
+                    ServerAttestation.created_at.desc(),
+                    ServerAttestation.attestation_id.desc(),
+                ),
+            )
+            .label("rn"),
+        )
+        .where(ServerAttestation.server_id.in_([server.server_id for server in servers]))
+        .subquery()
+    )
+    rows = (await session.execute(select(latest).where(latest.c.rn == 1))).all()
+    latest_by_server = {row.server_id: row for row in rows}
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=settings.release_attestation_max_age_seconds
+    )
+    eligible = []
+    for server in servers:
+        config = configs.get(server.measurement_name)
+        attestation = latest_by_server.get(server.server_id)
+        if config is None or attestation is None:
+            continue
+        config_fingerprint = measurement_config_fingerprint(config)
+        if (
+            server.version != config.version
+            or server.measurement_config_fingerprint != config_fingerprint
+            or server.trust_set_fingerprint != trust_set_fingerprint
+            or (server.tee_type or "tdx").lower() != config.tee_type.lower()
+            or attestation.verification_error is not None
+            or attestation.verified_at is None
+            or attestation.verified_at < cutoff
+            or attestation.measurement_name != config.name
+            or attestation.measurement_version != config.version
+            or attestation.measurement_config_fingerprint != config_fingerprint
+            or attestation.trust_set_fingerprint != trust_set_fingerprint
+        ):
+            continue
+        eligible.append(server)
+    return eligible
 
 
 def _job_ports(chute: Chute, method: str) -> list[dict]:
@@ -281,9 +357,9 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
     chute can still boot concurrently on a different host. Per-host capacity = host.capacity
     minus the self-registered TDs stamped with that host_id minus its in-flight launches.
     """
-    hosts = (
-        (await session.execute(select(Host))).scalars().all()
-    )
+    # A one-slot ChuteFS appliance legitimately advertises zero schedulable chute capacity.
+    # Exclude it before online/dispatch work; registration rejects zero on non-storage hosts.
+    hosts = (await session.execute(select(Host).where(Host.capacity > 0))).scalars().all()
     if not hosts:
         return False
 
@@ -311,7 +387,9 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
         inflight_key = f"mb:launch:{chute.chute_id}:{host.host_id}"
         if await settings.redis_client.exists(inflight_key):
             continue  # a TD for this chute is already booting on this host
-        host_inflight = int(await settings.redis_client.get(f"mb:host_inflight:{host.host_id}") or 0)
+        host_inflight = int(
+            await settings.redis_client.get(f"mb:host_inflight:{host.host_id}") or 0
+        )
         available = (host.capacity or 0) - used_by_host.get(host.host_id, 0) - host_inflight
         if available <= 0:
             continue
@@ -327,7 +405,9 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
         # Mark the (chute, host) launch + bump the host's in-flight count for the boot window.
         await settings.redis_client.set(inflight_key, host.host_id, ex=MB_LAUNCH_INFLIGHT_TTL)
         await settings.redis_client.incr(f"mb:host_inflight:{host.host_id}")
-        await settings.redis_client.expire(f"mb:host_inflight:{host.host_id}", MB_LAUNCH_INFLIGHT_TTL)
+        await settings.redis_client.expire(
+            f"mb:host_inflight:{host.host_id}", MB_LAUNCH_INFLIGHT_TTL
+        )
         logger.success(
             f"Model B: dispatched per-chute TD launch for {chute.chute_id} to host {host.host_id} "
             f"({mem}/{vcpus}vcpu; host avail was {available})"
@@ -413,6 +493,7 @@ async def schedule_once() -> None:
             .scalars()
             .all()
         )
+        servers = await _current_attested_servers(session, servers)
         # Note: do NOT bail on empty servers -- Model B can still launch per-chute TDs on L0 hosts.
 
         # A server is unavailable if it already runs an instance or has a deploy in flight
@@ -457,11 +538,7 @@ async def schedule_once() -> None:
             # letting the old version serve forever. Stale instances are retired once a
             # current-version instance is live (see below).
             chute_instances = (
-                (
-                    await session.execute(
-                        select(Instance).where(Instance.chute_id == chute.chute_id)
-                    )
-                )
+                (await session.execute(select(Instance).where(Instance.chute_id == chute.chute_id)))
                 .unique()
                 .scalars()
                 .all()
@@ -503,9 +580,7 @@ async def schedule_once() -> None:
             # yet so no LaunchConfig exists) must also count toward target — otherwise the scheduler
             # keeps launching TDs on every host during the boot window (multiple ticks fire before
             # the first TD registers). The keys are mb:launch:{chute_id}:{host_id} with a TTL.
-            mb_inflight = len(
-                await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*")
-            )
+            mb_inflight = len(await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*"))
             if current + pending + mb_inflight >= await _target_count(chute.chute_id):
                 continue
 
@@ -551,7 +626,8 @@ async def schedule_once() -> None:
                     f"stale instance {inst.instance_id} (version {inst.version} -> {chute.version}) in place"
                 )
                 await purge_and_notify(
-                    inst, reason="rolling update - replacing outdated instance (no spare capacity)"
+                    inst,
+                    reason="rolling update - replacing outdated instance (no spare capacity)",
                 )
 
         # --- CPU jobs: validator-scheduled (WE place them onto hosts; miners do NOT choose, unlike
@@ -616,9 +692,7 @@ async def schedule_once() -> None:
                 # Only launch a TD if there isn't one already booting for this chute (any host).
                 # Jobs need exactly one TD; without this guard the scheduler launches on every host
                 # during the boot window (same over-launch bug as the cord pass).
-                mb_inflight = len(
-                    await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*")
-                )
+                mb_inflight = len(await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*"))
                 if mb_inflight == 0:
                     await _launch_on_host(session, chute, req_cores, req_ram)
 

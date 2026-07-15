@@ -18,3 +18,131 @@ jobs:
 
       - name: Run lint
         run: make lint
+
+  attestation-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install cosign
+        run: |
+          curl -fsSLO https://github.com/sigstore/cosign/releases/download/v2.5.3/cosign_2.5.3_amd64.deb
+          sudo dpkg -i cosign_2.5.3_amd64.deb
+          rm cosign_2.5.3_amd64.deb
+          cosign version
+      - name: Install test dependencies
+        run: uv sync --extra dev
+      - name: Run mandatory attestation policy suites
+        run: >-
+          uv run pytest -q
+          tests/unit/test_cpu_measurements_config.py
+          tests/unit/test_runtime_snp_e2e.py
+          tests/unit/test_attestation_hardening.py
+          tests/unit/test_snp.py
+          tests/unit/test_server_utils.py
+          tests/unit/test_server_service.py
+          tests/unit/test_instance_util_verify_tee_chute.py
+          tests/unit/test_storage_attestation_fingerprints.py
+          tests/unit/test_tee_measurements_endpoint.py
+          tests/unit/test_release_provenance.py
+          --junitxml=attestation-policy.xml
+      - name: Reject skipped attestation policy tests
+        run: >-
+          uv run python -c
+          "import xml.etree.ElementTree as E;
+          root=E.parse('attestation-policy.xml').getroot();
+          skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
+          assert skipped == 0, f'{skipped} mandatory attestation policy tests skipped'"
+
+  storage-postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: chutes
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d chutes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://user:password@127.0.0.1:5432/chutes
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      DBMATE_BIN: /usr/local/bin/dbmate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install dbmate
+        run: >-
+          sudo curl -fsSL -o /usr/local/bin/dbmate
+          https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
+          && sudo chmod +x /usr/local/bin/dbmate
+      - name: Install cosign
+        run: |
+          curl -fsSLO https://github.com/sigstore/cosign/releases/download/v2.5.3/cosign_2.5.3_amd64.deb
+          sudo dpkg -i cosign_2.5.3_amd64.deb
+          rm cosign_2.5.3_amd64.deb
+          cosign version
+      - name: Install test dependencies
+        run: uv sync --extra dev
+      - name: Run mandatory release unit tests
+        run: >-
+          uv run pytest -q
+          tests/unit/test_releases_service.py
+          tests/unit/test_release_provenance.py
+          tests/unit/test_model_b.py
+          --junitxml=release-unit.xml
+      - name: Reject skipped release unit tests
+        run: >-
+          uv run python -c
+          "import xml.etree.ElementTree as E;
+          root=E.parse('release-unit.xml').getroot();
+          skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
+          assert skipped == 0, f'{skipped} release unit tests skipped'"
+      - name: Run mandatory real-Postgres release tests
+        run: >-
+          uv run pytest -q
+          tests/integration/test_releases_postgres.py
+          --junitxml=release-postgres.xml
+      - name: Reject skipped real-Postgres release tests
+        run: >-
+          uv run python -c
+          "import xml.etree.ElementTree as E;
+          root=E.parse('release-postgres.xml').getroot();
+          skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
+          assert skipped == 0, f'{skipped} real-Postgres release tests skipped'"
+      - name: Run mandatory real-Postgres storage tests
+        run: >-
+          uv run pytest -q
+          tests/integration/test_storage_reconciliation_postgres.py
+          tests/integration/test_model_access_routes_postgres.py
+          -m "not cross_repo"
+          --junitxml=storage-postgres.xml
+      - name: Reject skipped storage tests
+        run: >-
+          uv run python -c
+          "import xml.etree.ElementTree as E;
+          root=E.parse('storage-postgres.xml').getroot();
+          skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
+          assert skipped == 0, f'{skipped} real-Postgres storage tests skipped'"
+
+  api-runtime-cosign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API runtime and smoke-test cosign verify-blob
+        run: bash tests/docker/smoke_api_runtime_cosign.sh

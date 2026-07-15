@@ -8,7 +8,9 @@ from pathlib import Path
 import aioboto3
 import json
 import yaml
-from dataclasses import dataclass
+from yaml.constructor import ConstructorError
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import datetime, timezone
 from api.safe_redis import SafeRedis
 from functools import cached_property, lru_cache
 import redis.asyncio as redis
@@ -17,7 +19,7 @@ from redis.backoff import ConstantBackoff
 from boto3.session import Config
 from typing import Dict, List, Optional
 from bittensor_wallet.keypair import Keypair
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from contextlib import asynccontextmanager
 from cryptography.hazmat.primitives import serialization
@@ -27,12 +29,70 @@ from loguru import logger
 from api.semver_util import semcomp
 
 
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate mapping keys before values are overwritten."""
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    loader.flatten_mapping(node)
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as exc:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable mapping key",
+                key_node.start_mark,
+            ) from exc
+        if duplicate:
+            raise ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate YAML key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 @lru_cache(maxsize=1)
 def load_launch_config_private_key():
     if (path := os.getenv("LAUNCH_CONFIG_PRIVATE_KEY_PATH")) is not None:
         with open(path, "rb") as infile:
             return infile.read()
     return None
+
+
+_CHUTEFS_FRAME_PLAINTEXT_BYTES = 1024 * 1024
+_CHUTEFS_FIXED_CIPHERTEXT_BYTES = 48
+_CHUTEFS_PER_DATA_FRAME_BYTES = 20
+MAX_SNP_CRL_OUTAGE_GRACE_SECONDS = 3600
+
+
+def _max_plaintext_for_ciphertext_limit(ciphertext_limit: int) -> int:
+    """Largest v4 plaintext whose exact framed ciphertext fits the node limit."""
+    low = 0
+    high = max(0, ciphertext_limit)
+    while low < high:
+        candidate = (low + high + 1) // 2
+        frames = (candidate + _CHUTEFS_FRAME_PLAINTEXT_BYTES - 1) // _CHUTEFS_FRAME_PLAINTEXT_BYTES
+        sealed = (
+            candidate + _CHUTEFS_FIXED_CIPHERTEXT_BYTES + frames * _CHUTEFS_PER_DATA_FRAME_BYTES
+        )
+        if sealed <= ciphertext_limit:
+            low = candidate
+        else:
+            high = candidate - 1
+    return low
 
 
 @dataclass
@@ -65,9 +125,9 @@ class TeeMeasurementConfig:
     min_tcb: Optional[Dict[str, int]] = None  # {bootloader,tee,snp,microcode} minimums
     id_key_digest: Optional[str] = None  # 96 hex; optional owner id-block pin
     processor_model: Optional[str] = None  # Genoa | Milan | Turin (selects KDS/ARK)
-    # Optional pinned SNP report VMPL (privilege level the guest attests at). Platform-specific:
-    # bare-metal guests here attest at VMPL 1, GCP at VMPL 0 -- so it is pinned per measurement config
-    # rather than hard-coded. None = not enforced (verify still checks chain/signature/TCB/debug).
+    # Pinned SNP report VMPL (privilege level the guest attests at). The observed bare-metal and GCP
+    # fleets both attest at VMPL 0; it remains per-measurement so a future platform must be pinned
+    # from a real quote rather than inheriting an assumption. Production SNP entries may not omit it.
     expected_vmpl: Optional[int] = None
     # GCP-only image identity: pinned GCE vTPM PCR values {pcr_index(str): sha256 hex}. On GCP the
     # SNP launch measurement is Google firmware only (no RTMR3 analog), so image identity (our
@@ -75,14 +135,85 @@ class TeeMeasurementConfig:
     # verity.roothash) + PCR9 (kernel/initrd). When set, registration requires a verified vTPM quote
     # whose PCRs equal these. Unset for bare-metal SNP (image identity is in the SNP measurement).
     vtpm_pcrs: Optional[Dict[str, str]] = None
+    # GCP-only policy for the four boolean values signed in the Google AK attestation extension.
+    # Keys are the undocumented ASN.1 context tags, deliberately kept numeric rather than assigned
+    # local semantic names. GCP SNP verification requires exactly tags 2, 3, 4, and 5.
+    vtpm_security_flags: Optional[Dict[str, bool]] = None
+    # Build posture is explicit in YAML. The loader never defaults a missing value to hardened:
+    # debug images retain known credentials/host-visible logging and require a validator opt-in.
+    debug: bool = False
+    # Pin-side image binding. Managed production activation additionally requires canonical detached
+    # cosign provenance and compares these fields plus the cryptographic measurement values to it.
+    # Unsigned bindings are accepted only for explicit debug artifacts on an explicit dev validator.
+    image_sha256: Optional[str] = None
+    image_measurement_names: Optional[List[str]] = None
+    # Canonical identities assigned only after every configured source validates successfully.
+    config_fingerprint: str = ""
+    trust_set_fingerprint: str = ""
+
+
+def measurement_config_fingerprint(config: TeeMeasurementConfig) -> str:
+    """Return the stable SHA-256 identity of every security-relevant config field."""
+    payload = (
+        asdict(config)
+        if is_dataclass(config)
+        else {
+            name: getattr(config, name, None) for name in TeeMeasurementConfig.__dataclass_fields__
+        }
+    )
+    payload.pop("config_fingerprint", None)
+    payload.pop("trust_set_fingerprint", None)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def measurement_trust_set_fingerprint(
+    measurements: List[TeeMeasurementConfig],
+) -> str:
+    """Return the stable identity of the complete active set, independent of source order."""
+    trust_payload = [
+        {
+            "name": measurement.name,
+            "config_fingerprint": (
+                measurement.config_fingerprint or measurement_config_fingerprint(measurement)
+            ),
+        }
+        for measurement in sorted(measurements, key=lambda item: item.name)
+    ]
+    return hashlib.sha256(
+        json.dumps(trust_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(arbitrary_types_allowed=True)
     _validator_keypair: Optional[Keypair] = None
+    _tee_measurements_last_good: Optional[List[TeeMeasurementConfig]] = None
+    _tee_measurements_last_error: Optional[str] = None
+    _tee_measurements_last_source_identity: Optional[tuple] = None
+    _tee_measurements_expected_sources: Optional[tuple[str, ...]] = None
+    _tee_measurements_fingerprint: Optional[str] = None
+    _tee_measurements_last_loaded_at: Optional[str] = None
 
     def model_post_init(self, __context) -> None:
         """Validate configuration after initialization."""
+        # ALLOW_DEBUG_MEASUREMENTS is not a production escape hatch. The metagraph bypass is the
+        # validator's explicit dev marker (including the dev-attested-mTLS posture); without that
+        # marker, reject the opt-in itself before loading any debug pins.
+        if self.allow_debug_measurements and not self.skip_metagraph_check:
+            raise ValueError(
+                "ALLOW_DEBUG_MEASUREMENTS=true is permitted only in the explicit dev posture "
+                "(SKIP_METAGRAPH_CHECK=true). A production validator must use hardened image "
+                "measurements."
+            )
+        if self.release_attestation_max_age_seconds <= 0:
+            raise ValueError("RELEASE_ATTESTATION_MAX_AGE_SECONDS must be positive.")
+        if not 0 <= self.snp_crl_outage_grace_seconds <= MAX_SNP_CRL_OUTAGE_GRACE_SECONDS:
+            raise ValueError(
+                "SNP_CRL_OUTAGE_GRACE_SECONDS must be between 0 and "
+                f"{MAX_SNP_CRL_OUTAGE_GRACE_SECONDS}; longer revocation outages fail closed."
+            )
         # Eagerly validate TEE measurement configuration when any source (committed artifact or the
         # mounted ConfigMap) is present.
         if self._measurement_source_paths():
@@ -117,6 +248,12 @@ class Settings(BaseSettings):
                 "binding that keeps CPU-TEE chute code/secrets from unattested callers. Set "
                 "REQUIRE_MTLS_CLIENT_VERIFY=true, or run the full dev posture "
                 "(SKIP_METAGRAPH_CHECK=true) for local bring-up."
+            )
+        if not self.skip_metagraph_check and not self.tee_measurement_config_required:
+            raise ValueError(
+                "Production validators must set TEE_MEASUREMENT_CONFIG_REQUIRED=true and mount the "
+                "environment-specific TEE measurement source. The committed artifact alone is not "
+                "a production trust set."
             )
 
     @cached_property
@@ -342,12 +479,12 @@ class Settings(BaseSettings):
     )
     graval_url: str = os.getenv("GRAVAL_URL", "https://graval.chutes.ai:11443")
 
-    # mTLS client-cert trust posture. The X-Client-Cert header is only honored when the mTLS-
-    # terminating proxy also sets X-Client-Verify=SUCCESS (proving the proxy verified the peer's
-    # private-key possession and set the header itself; the proxy must strip any client-supplied
-    # X-Client-* and the backend must not be directly reachable). It also gates the CPU-TEE attested-
-    # cert binding on the secret-returning /tee endpoints. Operator-controlled (trusted); set to
-    # false ONLY for a dev validator reached directly over plaintext with no mTLS terminator.
+    # mTLS client-cert trust posture. The X-Client-Cert header is honored only when the terminating
+    # proxy reports that a cert was presented: SUCCESS for a CA-chained cert, or FAILED:<reason> for
+    # the expected self-signed TEE cert under nginx optional_no_ca. Both prove CertificateVerify
+    # possession; NONE/missing does not. The proxy must overwrite client-supplied X-Client-* and the
+    # backend must not be directly reachable. This also gates the CPU-TEE attested-cert binding on
+    # secret-returning /tee endpoints. Set false only for plaintext local development.
     require_mtls_client_verify: bool = (
         os.getenv("REQUIRE_MTLS_CLIENT_VERIFY", "true").lower() == "true"
     )
@@ -403,6 +540,68 @@ class Settings(BaseSettings):
     default_discounts: dict = json.loads(os.getenv("DEFAULT_DISCOUNTS", '{"*": 0.0}'))
     default_job_quotas: dict = json.loads(os.getenv("DEFAULT_JOB_QUOTAS", '{"*": 0}'))
 
+    # ChuteFS account entitlements and bounded control-plane work. Volume owners never submit quota
+    # values: nullable per-user fields override these defaults, and both are capped here.
+    storage_default_volume_quota_bytes: int = int(
+        os.getenv("STORAGE_DEFAULT_VOLUME_QUOTA_BYTES", str(10 * 1024**3))
+    )
+    storage_max_volume_quota_bytes: int = int(
+        os.getenv("STORAGE_MAX_VOLUME_QUOTA_BYTES", str(1024**4))
+    )
+    storage_default_aggregate_quota_bytes: int = int(
+        os.getenv("STORAGE_DEFAULT_AGGREGATE_QUOTA_BYTES", str(100 * 1024**3))
+    )
+    storage_max_aggregate_quota_bytes: int = int(
+        os.getenv("STORAGE_MAX_AGGREGATE_QUOTA_BYTES", str(10 * 1024**4))
+    )
+    storage_max_volumes_per_user: int = int(os.getenv("STORAGE_MAX_VOLUMES_PER_USER", "100"))
+    storage_max_ciphertext_bytes: int = int(
+        os.getenv("STORAGE_MAX_CIPHERTEXT_BYTES", str(64 * 1024**3))
+    )
+    storage_max_object_bytes: int = int(
+        os.getenv(
+            "STORAGE_MAX_OBJECT_BYTES",
+            str(_max_plaintext_for_ciphertext_limit(storage_max_ciphertext_bytes)),
+        )
+    )
+    storage_volume_page_size_max: int = int(os.getenv("STORAGE_VOLUME_PAGE_SIZE_MAX", "200"))
+    storage_inventory_page_size_max: int = int(os.getenv("STORAGE_INVENTORY_PAGE_SIZE_MAX", "250"))
+    storage_reconcile_batch_size: int = int(os.getenv("STORAGE_RECONCILE_BATCH_SIZE", "250"))
+    storage_erase_task_lease_seconds: int = int(
+        os.getenv("STORAGE_ERASE_TASK_LEASE_SECONDS", "300")
+    )
+    storage_erase_retention_seconds: int = int(
+        os.getenv("STORAGE_ERASE_RETENTION_SECONDS", str(30 * 24 * 3600))
+    )
+    # Retiring an unreachable holder without its physical ACK is disabled by default. Enabling this
+    # setting still requires a support/billing administrator to name overdue task ids explicitly.
+    storage_allow_administrative_erase_retirement: bool = (
+        os.getenv("STORAGE_ALLOW_ADMINISTRATIVE_ERASE_RETIREMENT", "false").lower() == "true"
+    )
+    storage_model_holding_freshness_seconds: int = int(
+        os.getenv("STORAGE_MODEL_HOLDING_FRESHNESS_SECONDS", "300")
+    )
+    storage_inventory_snapshot_retention_seconds: int = int(
+        os.getenv("STORAGE_INVENTORY_SNAPSHOT_RETENTION_SECONDS", str(24 * 3600))
+    )
+    storage_erase_audit_retention_seconds: int = int(
+        os.getenv("STORAGE_ERASE_AUDIT_RETENTION_SECONDS", str(90 * 24 * 3600))
+    )
+
+    @model_validator(mode="after")
+    def validate_storage_object_limits(self) -> "Settings":
+        if self.storage_max_ciphertext_bytes < _CHUTEFS_FIXED_CIPHERTEXT_BYTES:
+            raise ValueError("STORAGE_MAX_CIPHERTEXT_BYTES cannot hold an empty v4 container")
+        safe_plaintext_limit = _max_plaintext_for_ciphertext_limit(
+            self.storage_max_ciphertext_bytes
+        )
+        if not 0 <= self.storage_max_object_bytes <= safe_plaintext_limit:
+            raise ValueError(
+                "STORAGE_MAX_OBJECT_BYTES exceeds the configured node ciphertext "
+                "limit after v4 framing overhead"
+            )
+        return self
+
     # Reroll discount (i.e. duplicate prompts for re-roll in RP, or pass@k, etc.)
     reroll_multiplier: float = float(os.getenv("REROLL_MULTIPLIER", "0.1"))
 
@@ -421,6 +620,19 @@ class Settings(BaseSettings):
     # Cosign Settings
     cosign_password: Optional[str] = os.getenv("COSIGN_PASSWORD")
     cosign_key: Optional[Path] = Path(os.getenv("COSIGN_KEY")) if os.getenv("COSIGN_KEY") else None
+    # Managed guest-image releases use a separate provenance signing trust root. The release
+    # service runs cosign verify-blob against this mounted public key on every activation/serve path;
+    # a missing key therefore fails production release management closed.
+    trusted_provenance_public_key_path: Path = Path(
+        os.getenv(
+            "TRUSTED_PROVENANCE_PUBLIC_KEY_PATH",
+            "/etc/chutes/provenance/cosign.pub",
+        )
+    )
+    provenance_cosign_binary: str = os.getenv("PROVENANCE_COSIGN_BINARY", "cosign")
+    release_attestation_max_age_seconds: int = int(
+        os.getenv("RELEASE_ATTESTATION_MAX_AGE_SECONDS", "3600")
+    )
 
     # hCaptcha
     hcaptcha_sitekey: Optional[str] = os.getenv("HCAPTCHA_SITEKEY")
@@ -428,21 +640,36 @@ class Settings(BaseSettings):
 
     # TDX Attestation settings - Measurement configuration loaded from ConfigMap
     tee_measurement_config_path: Path = Path("/etc/config/tee_measurements.yaml")
+    tee_measurement_config_required: bool = (
+        os.getenv("TEE_MEASUREMENT_CONFIG_REQUIRED", "false").lower() == "true"
+    )
+    # A signed CRL that has just crossed nextUpdate may be used only after a real KDS transport
+    # outage, never after a malformed/future/bad-signature response. The extension is disabled by
+    # default and hard-capped at one hour so configuration cannot turn revocation into stale trust.
+    snp_crl_outage_grace_seconds: int = int(os.getenv("SNP_CRL_OUTAGE_GRACE_SECONDS", "0"))
     # A versioned (git-tracked, shipped-in-image) measurements artifact loaded ALONGSIDE the mounted
     # ConfigMap. The mounted file is environment/hardware specific and (in dev) gitignored, which
     # left the ChuteFS storage-* measurements as live-only hand-appended state -- so a from-repo
     # rebuild had no storage measurements and storage registration failed (H9). Committing the
     # storage-role measurements here makes them reproducible; the mounted file still overrides by
     # name for env-specific values.
-    tee_committed_measurement_config_path: Path = Path(__file__).resolve().parent / "tee_measurements.committed.yaml"
+    tee_committed_measurement_config_path: Path = (
+        Path(__file__).resolve().parent / "tee_measurements.committed.yaml"
+    )
 
     def _measurement_source_paths(self) -> List[Path]:
-        """Existing measurement sources, committed base first then the (overriding) mounted file."""
-        return [
-            p
-            for p in (self.tee_committed_measurement_config_path, self.tee_measurement_config_path)
-            if p and Path(p).exists()
-        ]
+        """Measurement sources, failing when an explicitly required mounted source disappears."""
+        sources = []
+        committed = self.tee_committed_measurement_config_path
+        if committed and Path(committed).exists():
+            sources.append(Path(committed))
+        mounted = self.tee_measurement_config_path
+        mounted_explicit = bool(os.getenv("TEE_MEASUREMENT_CONFIG_PATH"))
+        if mounted and Path(mounted).exists():
+            sources.append(Path(mounted))
+        elif mounted and (self.tee_measurement_config_required or mounted_explicit):
+            raise ValueError(f"Required TEE measurement config does not exist: {mounted}")
+        return sources
 
     @property
     def tee_measurements(self) -> List[TeeMeasurementConfig]:
@@ -454,6 +681,92 @@ class Settings(BaseSettings):
         return self._load_tee_measurements()
 
     def _load_tee_measurements(self) -> List[TeeMeasurementConfig]:
+        """Atomically reload the trust set, retaining only a previously validated set on failure."""
+        source_identity = (
+            str(Path(self.tee_committed_measurement_config_path).resolve())
+            if self.tee_committed_measurement_config_path
+            else None,
+            str(Path(self.tee_measurement_config_path).resolve())
+            if self.tee_measurement_config_path
+            else None,
+            bool(self.tee_measurement_config_required),
+        )
+        try:
+            source_paths = self._measurement_source_paths()
+            resolved_sources = tuple(str(Path(path).resolve()) for path in source_paths)
+            if (
+                self._tee_measurements_last_source_identity == source_identity
+                and self._tee_measurements_expected_sources is not None
+            ):
+                missing_sources = sorted(
+                    set(self._tee_measurements_expected_sources) - set(resolved_sources)
+                )
+                if missing_sources:
+                    raise ValueError(
+                        "Previously validated TEE measurement source(s) disappeared: "
+                        f"{missing_sources}"
+                    )
+            measurements = self._parse_tee_measurements(source_paths)
+            for measurement in measurements:
+                measurement.config_fingerprint = measurement_config_fingerprint(measurement)
+            trust_fingerprint = measurement_trust_set_fingerprint(measurements)
+            for measurement in measurements:
+                measurement.trust_set_fingerprint = trust_fingerprint
+        except Exception as exc:
+            self._tee_measurements_last_error = str(exc)
+            if (
+                self._tee_measurements_last_good is not None
+                and self._tee_measurements_last_source_identity == source_identity
+            ):
+                logger.error(
+                    f"TEE measurement reload failed; retaining last-known-good trust set: {exc}"
+                )
+                return list(self._tee_measurements_last_good)
+            raise
+        self._tee_measurements_last_good = list(measurements)
+        self._tee_measurements_last_error = None
+        self._tee_measurements_last_source_identity = source_identity
+        self._tee_measurements_expected_sources = resolved_sources
+        self._tee_measurements_fingerprint = trust_fingerprint
+        self._tee_measurements_last_loaded_at = datetime.now(timezone.utc).isoformat()
+        return measurements
+
+    def tee_measurement_health(self) -> dict:
+        """Reload and report readiness without replacing a valid set with partial input."""
+        try:
+            measurements = self._load_tee_measurements()
+        except Exception as exc:
+            return {
+                "status": "unhealthy",
+                "ready": False,
+                "last_error": str(exc),
+                "fingerprint": None,
+                "measurement_count": 0,
+                "last_loaded_at": self._tee_measurements_last_loaded_at,
+                "expected_sources": list(self._tee_measurements_expected_sources or ()),
+            }
+        degraded = self._tee_measurements_last_error is not None
+        return {
+            "status": "degraded" if degraded else "healthy",
+            "ready": not degraded,
+            "last_error": self._tee_measurements_last_error,
+            "fingerprint": self._tee_measurements_fingerprint,
+            "measurement_count": len(measurements),
+            "last_loaded_at": self._tee_measurements_last_loaded_at,
+            "expected_sources": list(self._tee_measurements_expected_sources or ()),
+        }
+
+    @property
+    def tee_measurements_fingerprint(self) -> str:
+        """Fingerprint of the complete, currently served trust set."""
+        _ = self.tee_measurements
+        if not self._tee_measurements_fingerprint:
+            raise ValueError("TEE measurement trust set has no validated fingerprint")
+        return self._tee_measurements_fingerprint
+
+    def _parse_tee_measurements(
+        self, source_paths: Optional[List[Path]] = None
+    ) -> List[TeeMeasurementConfig]:
         """Parse and validate TEE measurement configurations.
 
         Merges the committed (versioned) artifact with the mounted ConfigMap: entries are keyed by
@@ -463,18 +776,89 @@ class Settings(BaseSettings):
         """
         raw_by_name: Dict[str, dict] = {}
         ordered_names: List[str] = []
-        for path in self._measurement_source_paths():
+        committed_names: set[str] = set()
+        revoked_names: set[str] = set()
+        committed_path = (
+            Path(self.tee_committed_measurement_config_path).resolve()
+            if self.tee_committed_measurement_config_path
+            else None
+        )
+        for path in source_paths if source_paths is not None else self._measurement_source_paths():
+            is_committed = committed_path is not None and Path(path).resolve() == committed_path
+            names_in_source: set[str] = set()
             try:
                 with open(path) as f:
-                    doc = yaml.safe_load(f) or {}
+                    doc = yaml.load(f, Loader=_UniqueKeySafeLoader) or {}
             except Exception as e:
-                logger.error(f"Failed to load TEE measurement config {path}: {e}")
-                continue
-            for measurement_config in doc.get("measurements") or []:
+                error_msg = f"Failed to load TEE measurement config {path}: {e}"
+                logger.error(error_msg)
+                raise ValueError(error_msg) from e
+            if not isinstance(doc, dict):
+                raise ValueError(
+                    f"Invalid TEE measurement config {path}: document root must be a mapping."
+                )
+            raw_measurements = doc.get("measurements") or []
+            if not isinstance(raw_measurements, list):
+                raise ValueError(
+                    f"Invalid TEE measurement config {path}: 'measurements' must be a list."
+                )
+            for measurement_config in raw_measurements:
+                if not isinstance(measurement_config, dict):
+                    raise ValueError(
+                        f"Invalid TEE measurement config {path}: each measurement must be a mapping."
+                    )
                 name = measurement_config.get("name", "unnamed")
+                if name in names_in_source:
+                    raise ValueError(
+                        f"Invalid TEE measurement config {path}: duplicate measurement name "
+                        f"{name!r} in one source."
+                    )
+                names_in_source.add(name)
                 if name not in raw_by_name:
                     ordered_names.append(name)
                 raw_by_name[name] = measurement_config
+                if is_committed:
+                    committed_names.add(name)
+            raw_revocations = doc.get("revoked_measurements") or []
+            if not isinstance(raw_revocations, list) or any(
+                not isinstance(name, str) or not name.strip() for name in raw_revocations
+            ):
+                raise ValueError(
+                    f"Invalid TEE measurement config {path}: "
+                    "'revoked_measurements' must be a list of non-empty names."
+                )
+            revoked_names.update(name.strip() for name in raw_revocations)
+
+        if revoked_names:
+            # A provenance-bound image is one atomic trust object even when it has one launch
+            # measurement per vCPU class.  A tombstone naming any member retires the complete
+            # declared set; otherwise set validation below would reject the partial matrix and a
+            # runtime reload would fall back to an LKG that still trusts the explicitly revoked
+            # member.
+            expanded_revocations = set(revoked_names)
+            changed = True
+            while changed:
+                changed = False
+                for name, config in raw_by_name.items():
+                    raw_image_names = config.get("image_measurement_names")
+                    if not isinstance(raw_image_names, list):
+                        continue
+                    image_names = {
+                        str(image_name).strip()
+                        for image_name in raw_image_names
+                        if isinstance(image_name, str) and image_name.strip()
+                    }
+                    if (
+                        name in expanded_revocations
+                        or image_names.intersection(expanded_revocations)
+                    ) and not image_names.issubset(expanded_revocations):
+                        expanded_revocations.update(image_names)
+                        changed = True
+            revoked_names = expanded_revocations
+            raw_by_name = {
+                name: config for name, config in raw_by_name.items() if name not in revoked_names
+            }
+            ordered_names = [name for name in ordered_names if name not in revoked_names]
 
         measurements: List[TeeMeasurementConfig] = []
         for config_name in ordered_names:
@@ -488,11 +872,18 @@ class Settings(BaseSettings):
                 logger.error(error_msg)
                 raise ValueError(error_msg)
 
-            # A measurement for a debug guest image (e.g. debug_logging -> chute output on the
-            # host-readable serial console) must never be accepted in production: tag it `debug: true`
-            # and the loader refuses it unless ALLOW_DEBUG_MEASUREMENTS is explicitly set (dev only),
-            # so a debug image cannot pass attestation as a production measurement.
-            if bool(measurement_config.get("debug", False)) and not self.allow_debug_measurements:
+            # Never infer "hardened" from an absent or loosely typed value. A YAML string such as
+            # "false" is truthy in Python, so only a real YAML boolean is accepted.
+            if "debug" not in measurement_config or not isinstance(
+                measurement_config["debug"], bool
+            ):
+                raise ValueError(
+                    f"Missing or invalid 'debug' posture for measurement config '{config_name}'. "
+                    "Every measurement must explicitly set debug: true or debug: false using a YAML "
+                    "boolean; an omitted posture must not be treated as hardened."
+                )
+            is_debug = measurement_config["debug"]
+            if is_debug and not self.allow_debug_measurements:
                 raise ValueError(
                     f"Measurement config '{config_name}' is tagged debug: true but "
                     "ALLOW_DEBUG_MEASUREMENTS is not set. Debug images forward user logs to the "
@@ -500,6 +891,56 @@ class Settings(BaseSettings):
                     "config from the production ConfigMap, or set ALLOW_DEBUG_MEASUREMENTS=true for a "
                     "dev validator."
                 )
+
+            # Bind committed pins to the exact qcow2 digest and complete measurement-name set. This
+            # relation is cross-checked against separately signed canonical provenance at managed
+            # production activation; only explicit debug dev releases may use it unsigned.
+            has_image_sha = "image_sha256" in measurement_config
+            has_image_names = "image_measurement_names" in measurement_config
+            if has_image_sha != has_image_names:
+                raise ValueError(
+                    f"Incomplete image provenance for measurement config '{config_name}': "
+                    "image_sha256 and image_measurement_names must be supplied together."
+                )
+            if config_name in committed_names and not has_image_sha:
+                raise ValueError(
+                    f"Missing image provenance for committed measurement config '{config_name}'. "
+                    "Committed pins must bind image_sha256, image_measurement_names, and debug posture."
+                )
+
+            image_sha256 = None
+            image_measurement_names = None
+            if has_image_sha:
+                image_sha256 = str(measurement_config["image_sha256"] or "").strip().lower()
+                if len(image_sha256) != 64 or any(
+                    c not in "0123456789abcdef" for c in image_sha256
+                ):
+                    raise ValueError(
+                        f"Invalid image_sha256 for measurement config '{config_name}': "
+                        "expected 64 hex characters."
+                    )
+                raw_image_names = measurement_config["image_measurement_names"]
+                if not isinstance(raw_image_names, list) or not raw_image_names:
+                    raise ValueError(
+                        f"Invalid image_measurement_names for measurement config '{config_name}': "
+                        "expected a non-empty list."
+                    )
+                if any(not isinstance(name, str) or not name.strip() for name in raw_image_names):
+                    raise ValueError(
+                        f"Invalid image_measurement_names for measurement config '{config_name}': "
+                        "every name must be a non-empty string."
+                    )
+                image_measurement_names = [name.strip() for name in raw_image_names]
+                if len(set(image_measurement_names)) != len(image_measurement_names):
+                    raise ValueError(
+                        f"Invalid image_measurement_names for measurement config '{config_name}': "
+                        "duplicate names are not allowed."
+                    )
+                if config_name not in image_measurement_names:
+                    raise ValueError(
+                        f"Invalid image provenance for measurement config '{config_name}': "
+                        "its own name is absent from image_measurement_names."
+                    )
 
             def _require_hex96(value: object, field: str) -> str:
                 text = str(value if value is not None else "").upper().strip()
@@ -520,7 +961,16 @@ class Settings(BaseSettings):
                     f"Missing 'gpu_count' for measurement config '{config_name}'. "
                     "All TEE measurement configs must specify gpu_count (use 0 for CPU-only configs)."
                 )
-            gpu_count = int(gpu_count)
+            if not isinstance(gpu_count, int) or isinstance(gpu_count, bool):
+                raise ValueError(
+                    f"Invalid 'gpu_count' for measurement config '{config_name}': "
+                    "expected a non-negative YAML integer."
+                )
+            if gpu_count < 0:
+                raise ValueError(
+                    f"Invalid 'gpu_count' for measurement config '{config_name}': "
+                    "expected a non-negative integer."
+                )
             # Optional infrastructure provider hint ("gcp" | "bare-metal").
             provider = measurement_config.get("provider")
             if provider is not None:
@@ -530,7 +980,9 @@ class Settings(BaseSettings):
 
             # --- AMD SEV-SNP: single launch measurement + policy + min-TCB; no MRTD/RTMRs ---
             if tee_type in ("sev-snp", "snp", "amd-snp"):
-                measurement_hex = _require_hex96(measurement_config.get("measurement"), "measurement")
+                measurement_hex = _require_hex96(
+                    measurement_config.get("measurement"), "measurement"
+                )
                 # policy is REQUIRED, not optional: the SNP launch measurement does not cover the
                 # policy field, so an unpinned policy lets a host flip non-DEBUG bits (SMT,
                 # MIGRATE_MA, ...) that the measurement match would never catch.
@@ -557,11 +1009,58 @@ class Settings(BaseSettings):
                         "must pin minimum TCB levels ({{bootloader,tee,snp,microcode}}) for "
                         "anti-rollback."
                     )
-                min_tcb = {str(k).lower(): int(v) for k, v in dict(raw_min_tcb).items()}
+                if not isinstance(raw_min_tcb, dict):
+                    raise ValueError(
+                        f"Invalid 'min_tcb' for SNP measurement config '{config_name}': "
+                        "expected a mapping."
+                    )
+                expected_tcb_keys = {"bootloader", "tee", "snp", "microcode"}
+                actual_tcb_keys = set(raw_min_tcb)
+                normalized_tcb_keys = {
+                    key.lower() for key in actual_tcb_keys if isinstance(key, str)
+                }
+                case_duplicates = sorted(
+                    key
+                    for key in normalized_tcb_keys
+                    if sum(
+                        isinstance(candidate, str) and candidate.lower() == key
+                        for candidate in actual_tcb_keys
+                    )
+                    > 1
+                )
+                if actual_tcb_keys != expected_tcb_keys:
+                    missing = sorted(expected_tcb_keys - normalized_tcb_keys)
+                    unknown = sorted(
+                        repr(key)
+                        for key in actual_tcb_keys
+                        if not isinstance(key, str) or key not in expected_tcb_keys
+                    )
+                    raise ValueError(
+                        f"Invalid 'min_tcb' for SNP measurement config '{config_name}': "
+                        f"keys must be exactly lowercase {sorted(expected_tcb_keys)} "
+                        f"(missing={missing}, unknown_or_wrong_case={unknown}, "
+                        f"case_duplicates={case_duplicates})."
+                    )
+                min_tcb = {}
+                for key, value in raw_min_tcb.items():
+                    if not isinstance(value, int) or isinstance(value, bool):
+                        raise ValueError(
+                            f"Invalid min_tcb.{key} for measurement config '{config_name}': "
+                            "expected an actual YAML integer in 0..255 "
+                            "(not bool, string, or float)."
+                        )
+                    if not 0 <= value <= 255:
+                        raise ValueError(
+                            f"Invalid min_tcb.{key} for measurement config '{config_name}': "
+                            "expected an integer in 0..255."
+                        )
+                    min_tcb[key] = value
                 id_key_digest = measurement_config.get("id_key_digest")
                 if id_key_digest:
                     id_key_digest = _require_hex96(id_key_digest, "id_key_digest")
-                processor_model = (str(measurement_config.get("processor_model") or "Genoa")).strip()
+                processor_model = (
+                    str(measurement_config.get("processor_model") or "Genoa")
+                ).strip()
                 # GCP image identity: pinned GCE vTPM PCRs (sha256, 64 hex each). REQUIRED for
                 # provider 'gcp': there the SNP launch measurement is Google firmware only, so a
                 # config without vtpm_pcrs would match on firmware alone and never check WHICH
@@ -572,14 +1071,12 @@ class Settings(BaseSettings):
                 # roothash is folded into the SNP launch measurement, so the measurement IS the image
                 # identity. A missing/unknown provider previously defaulted vtpm_pcrs off, which would
                 # register an attacker-controlled image on real GCP SNP -- so provider is REQUIRED.
-                snp_provider = "bare-metal" if provider == "baremetal" else provider
-                if snp_provider not in ("gcp", "bare-metal"):
+                if provider not in ("gcp", "bare-metal"):
                     raise ValueError(
                         f"SNP measurement config '{config_name}' must set provider to 'gcp' or "
                         f"'bare-metal' (got {provider!r}); image identity is verified differently per "
                         "provider, so an unset/unknown provider is rejected (fail closed)."
                     )
-                provider = snp_provider
                 raw_vtpm = measurement_config.get("vtpm_pcrs")
                 vtpm_pcrs = None
                 if raw_vtpm:
@@ -605,8 +1102,61 @@ class Settings(BaseSettings):
                             "attests only Google firmware, so image identity MUST be pinned via the "
                             "GCE vTPM PCR8 (grub cmdline w/ verity.roothash) + PCR9 (kernel/initrd)."
                         )
+                raw_vtpm_security_flags = measurement_config.get("vtpm_security_flags")
+                vtpm_security_flags = None
+                if raw_vtpm_security_flags is not None:
+                    if not isinstance(raw_vtpm_security_flags, dict):
+                        raise ValueError(
+                            f"Invalid vtpm_security_flags for SNP config '{config_name}': "
+                            "expected a map containing exactly boolean tags 2, 3, 4, and 5."
+                        )
+                    vtpm_security_flags = {}
+                    for raw_tag, raw_value in raw_vtpm_security_flags.items():
+                        if isinstance(raw_tag, bool) or not isinstance(raw_tag, (str, int)):
+                            raise ValueError(
+                                f"Invalid vtpm_security_flags tag {raw_tag!r} for SNP config "
+                                f"'{config_name}': expected tags 2, 3, 4, and 5."
+                            )
+                        tag = str(raw_tag)
+                        if tag in vtpm_security_flags:
+                            raise ValueError(
+                                f"Duplicate normalized vtpm_security_flags tag {tag!r} for "
+                                f"SNP config '{config_name}'."
+                            )
+                        if not isinstance(raw_value, bool):
+                            raise ValueError(
+                                f"Invalid vtpm_security_flags[{tag}] for SNP config "
+                                f"'{config_name}': expected an actual YAML boolean."
+                            )
+                        vtpm_security_flags[tag] = raw_value
+                    expected_flag_tags = {"2", "3", "4", "5"}
+                    if set(vtpm_security_flags) != expected_flag_tags:
+                        raise ValueError(
+                            f"Invalid vtpm_security_flags for SNP config '{config_name}': "
+                            "keys must be exactly tags 2, 3, 4, and 5."
+                        )
+                if provider == "gcp" and vtpm_security_flags is None:
+                    raise ValueError(
+                        f"GCP SNP measurement config '{config_name}' must pin "
+                        "vtpm_security_flags with exactly boolean tags 2, 3, 4, and 5."
+                    )
+                if provider != "gcp" and raw_vtpm_security_flags is not None:
+                    raise ValueError(
+                        f"vtpm_security_flags is GCP-only for SNP config '{config_name}'."
+                    )
                 raw_vmpl = measurement_config.get("expected_vmpl")
-                expected_vmpl = int(raw_vmpl) if raw_vmpl is not None else None
+                if not isinstance(raw_vmpl, int) or isinstance(raw_vmpl, bool):
+                    raise ValueError(
+                        f"Missing or invalid 'expected_vmpl' for SNP measurement config "
+                        f"'{config_name}'. Pin an actual YAML integer observed in a real "
+                        "registration quote."
+                    )
+                expected_vmpl = raw_vmpl
+                if expected_vmpl not in range(4):
+                    raise ValueError(
+                        f"Invalid expected_vmpl for SNP measurement config '{config_name}': "
+                        "expected an integer in 0..3."
+                    )
                 measurements.append(
                     TeeMeasurementConfig(
                         version=str(version).strip(),
@@ -625,6 +1175,10 @@ class Settings(BaseSettings):
                         processor_model=processor_model,
                         expected_vmpl=expected_vmpl,
                         vtpm_pcrs=vtpm_pcrs,
+                        vtpm_security_flags=vtpm_security_flags,
+                        debug=is_debug,
+                        image_sha256=image_sha256,
+                        image_measurement_names=image_measurement_names,
                     )
                 )
                 continue
@@ -660,7 +1214,10 @@ class Settings(BaseSettings):
                 k.upper(): _require_hex96(v, f"runtime_rtmrs.{k}")
                 for k, v in measurement_config["runtime_rtmrs"].items()
             }
-            for set_name, rtmr_set in (("boot_rtmrs", boot_rtmrs), ("runtime_rtmrs", runtime_rtmrs)):
+            for set_name, rtmr_set in (
+                ("boot_rtmrs", boot_rtmrs),
+                ("runtime_rtmrs", runtime_rtmrs),
+            ):
                 missing = [r for r in ("RTMR0", "RTMR1", "RTMR2", "RTMR3") if r not in rtmr_set]
                 if missing:
                     raise ValueError(
@@ -685,8 +1242,39 @@ class Settings(BaseSettings):
                     gpu_count=gpu_count,
                     provider=provider,
                     tee_type="tdx",
+                    debug=is_debug,
+                    image_sha256=image_sha256,
+                    image_measurement_names=image_measurement_names,
                 )
             )
+
+        # Validate the relation as a set after every source has been merged. This catches a mounted
+        # override that changes one committed entry but omits/changes the rest of its provenance,
+        # unknown names, mixed debug posture, and partial per-vCPU matrices.
+        by_name = {config.name: config for config in measurements}
+        for config in measurements:
+            if not config.image_sha256:
+                continue
+            declared_names = set(config.image_measurement_names or [])
+            for name in declared_names:
+                peer = by_name.get(name)
+                if (
+                    peer is None
+                    or peer.image_sha256 != config.image_sha256
+                    or list(peer.image_measurement_names or [])
+                    != list(config.image_measurement_names or [])
+                    or peer.debug != config.debug
+                    or peer.tee_type != config.tee_type
+                    or peer.provider != config.provider
+                    or peer.gpu_count != config.gpu_count
+                    or peer.expected_gpus != config.expected_gpus
+                ):
+                    raise ValueError(
+                        f"Inconsistent image provenance for measurement set "
+                        f"{sorted(declared_names)}: every declared entry must be loaded and bind "
+                        "the same image_sha256, ordered set, debug posture, TEE, provider, and "
+                        "CPU/GPU inventory."
+                    )
 
         logger.info(f"Loaded {len(measurements)} TEE measurement configurations")
         return measurements

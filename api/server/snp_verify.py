@@ -10,8 +10,9 @@ api/server/util.py (which does the equivalent for TDX via dcap-qvl).
 Verified end-to-end against a real EPYC 9124 "Genoa" report (tests/assets/snp/).
 """
 
-import asyncio
+import base64
 import hashlib
+import json
 import struct
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 from loguru import logger
 
+from api.config import MAX_SNP_CRL_OUTAGE_GRACE_SECONDS
 from api.server.cert_validity import check_cert_time_valid
 from api.server.exceptions import InvalidQuoteError
 from api.server.snp_quote import SnpReport
@@ -63,6 +65,8 @@ class SnpVerificationResult:
     status: str
     advisory_ids: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
+    revocation_status: dict = field(default_factory=dict)
     parsed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
@@ -84,7 +88,9 @@ def _verify_cert_signed_by(child: x509.Certificate, issuer_pubkey, what: str) ->
     try:
         if isinstance(issuer_pubkey, ec.EllipticCurvePublicKey):
             issuer_pubkey.verify(
-                child.signature, child.tbs_certificate_bytes, ec.ECDSA(child.signature_hash_algorithm)
+                child.signature,
+                child.tbs_certificate_bytes,
+                ec.ECDSA(child.signature_hash_algorithm),
             )
             return
         if isinstance(issuer_pubkey, rsa.RSAPublicKey):
@@ -126,7 +132,9 @@ def _pin_ark(ark: x509.Certificate, model: Optional[str] = None) -> str:
         if not pin:
             raise InvalidQuoteError(f"no pinned ARK for SNP model {model!r}")
         if h != pin:
-            raise InvalidQuoteError("ARK public key does not match the pinned AMD root (untrusted root)")
+            raise InvalidQuoteError(
+                "ARK public key does not match the pinned AMD root (untrusted root)"
+            )
         return model
     for known_model, pin in ARK_PUBKEY_SHA384.items():
         if h == pin:
@@ -135,7 +143,10 @@ def _pin_ark(ark: x509.Certificate, model: Optional[str] = None) -> str:
 
 
 def _verify_chain(
-    vcek: x509.Certificate, ask: x509.Certificate, ark: x509.Certificate, model: Optional[str] = None
+    vcek: x509.Certificate,
+    ask: x509.Certificate,
+    ark: x509.Certificate,
+    model: Optional[str] = None,
 ) -> str:
     """ARK pinned + self-signed; ASK signed by ARK; VCEK signed by ASK; all within their validity
     windows. Returns the matched model."""
@@ -149,7 +160,9 @@ def _verify_chain(
     return matched
 
 
-def parse_ghcb_cert_table(aux: bytes) -> tuple[x509.Certificate, x509.Certificate, x509.Certificate]:
+def parse_ghcb_cert_table(
+    aux: bytes,
+) -> tuple[x509.Certificate, x509.Certificate, x509.Certificate]:
     """Parse the GHCB cert table (SNP extended-report auxblob) -> (vcek, ask, ark).
 
     Format: a sequence of entries {GUID(16) || offset(u32 LE) || length(u32 LE)} terminated by a
@@ -165,9 +178,11 @@ def parse_ghcb_cert_table(aux: bytes) -> tuple[x509.Certificate, x509.Certificat
         if guid == b"\x00" * 16 or (coff == 0 and clen == 0):
             break
         try:
-            certs.append(x509.load_der_x509_certificate(aux[coff : coff + clen]))
-        except Exception:  # noqa: BLE001 - skip non-cert table entries
-            pass
+            certificate = x509.load_der_x509_certificate(aux[coff : coff + clen])
+        except ValueError:
+            certificate = None
+        if certificate is not None:
+            certs.append(certificate)
         off += 24
     vcek = ask = ark = None
     for c in certs:
@@ -275,21 +290,170 @@ def _load_ca_chain(ca_pem: bytes) -> tuple[x509.Certificate, x509.Certificate]:
     return ask, ark
 
 
-async def _fetch_crl(model: str, redis=None) -> bytes:
-    """Fetch (and cache) the AMD KDS VCEK CRL for a processor model."""
+def _crl_times(crl: x509.CertificateRevocationList):
+    try:
+        return crl.last_update_utc, crl.next_update_utc
+    except AttributeError:
+        return (
+            crl.last_update.replace(tzinfo=timezone.utc),
+            crl.next_update.replace(tzinfo=timezone.utc) if crl.next_update is not None else None,
+        )
+
+
+def _check_crl_freshness(
+    crl: x509.CertificateRevocationList, *, outage_grace_seconds: int = 0
+) -> None:
+    if (
+        not isinstance(outage_grace_seconds, int)
+        or isinstance(outage_grace_seconds, bool)
+        or not 0 <= outage_grace_seconds <= MAX_SNP_CRL_OUTAGE_GRACE_SECONDS
+    ):
+        raise InvalidQuoteError(
+            "AMD VCEK CRL outage grace exceeds the enforced safe maximum"
+        )
+    now = datetime.now(timezone.utc)
+    last_update, next_update = _crl_times(crl)
+    if last_update > now:
+        raise InvalidQuoteError("AMD VCEK CRL is not yet valid")
+    if next_update is None:
+        raise InvalidQuoteError("AMD VCEK CRL has no nextUpdate freshness bound")
+    if now > next_update and (now - next_update).total_seconds() > outage_grace_seconds:
+        raise InvalidQuoteError("AMD VCEK CRL is expired")
+
+
+async def _fetch_crl(model: str) -> bytes:
+    """Fetch the AMD KDS VCEK CRL for a processor model without caching untrusted bytes."""
     import httpx
 
-    crl_key = f"snp:crl:{model}"
-    if redis is not None:
-        cached = await redis.get(crl_key)
-        if cached:
-            return cached
     async with httpx.AsyncClient() as client:
-        crl_der = await _kds_get(client, f"{KDS_BASE}/vcek/v1/{model}/crl")
-    if redis is not None:
-        # CRLs are reissued periodically; a day-long cache matches the VCEK/CA caching above.
-        await redis.set(crl_key, crl_der, ex=86400)
-    return crl_der
+        return await _kds_get(client, f"{KDS_BASE}/vcek/v1/{model}/crl")
+
+
+def _authenticated_crl(
+    crl_der: bytes,
+    ask: x509.Certificate,
+    ark: x509.Certificate,
+) -> x509.CertificateRevocationList:
+    """Parse a CRL and require its named issuer and signature to match the pinned AMD chain."""
+    try:
+        crl = x509.load_der_x509_crl(crl_der)
+    except ValueError as exc:
+        raise InvalidQuoteError("AMD VCEK CRL is malformed") from exc
+    possible_issuers = [
+        issuer
+        for issuer in (ark, ask)
+        if crl.issuer == issuer.subject and crl.is_signature_valid(issuer.public_key())
+    ]
+    if not possible_issuers:
+        raise InvalidQuoteError(
+            "AMD VCEK CRL signature or issuer is invalid (not authenticated by the ARK/ASK)"
+        )
+    return crl
+
+
+def _crl_signing_issuer(
+    crl: x509.CertificateRevocationList,
+    ask: x509.Certificate,
+    ark: x509.Certificate,
+) -> x509.Certificate:
+    for issuer in (ark, ask):
+        if crl.issuer == issuer.subject and crl.is_signature_valid(issuer.public_key()):
+            return issuer
+    raise InvalidQuoteError(
+        "AMD VCEK CRL signature or issuer is invalid (not authenticated by the ARK/ASK)"
+    )
+
+
+def _crl_cache_payload(
+    crl_der: bytes,
+    crl: x509.CertificateRevocationList,
+    issuer: x509.Certificate,
+) -> str:
+    last_update, next_update = _crl_times(crl)
+    if next_update is None:
+        raise InvalidQuoteError("AMD VCEK CRL has no nextUpdate freshness bound")
+    return json.dumps(
+        {
+            "schema": 1,
+            "der": base64.b64encode(crl_der).decode("ascii"),
+            "sha256": hashlib.sha256(crl_der).hexdigest(),
+            "issuer_spki_sha384": _spki_sha384(issuer),
+            "last_update": last_update.isoformat(),
+            "next_update": next_update.isoformat(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _load_cached_crl(
+    payload: bytes | str,
+    ask: x509.Certificate,
+    ark: x509.Certificate,
+) -> x509.CertificateRevocationList:
+    try:
+        if isinstance(payload, bytes):
+            payload = payload.decode("ascii")
+        document = json.loads(payload)
+        expected_keys = {
+            "schema",
+            "der",
+            "sha256",
+            "issuer_spki_sha384",
+            "last_update",
+            "next_update",
+        }
+        if not isinstance(document, dict) or set(document) != expected_keys:
+            raise ValueError("unexpected cache metadata")
+        if document["schema"] != 1:
+            raise ValueError("unsupported cache schema")
+        crl_der = base64.b64decode(document["der"], validate=True)
+        if hashlib.sha256(crl_der).hexdigest() != document["sha256"]:
+            raise ValueError("CRL digest mismatch")
+        crl = _authenticated_crl(crl_der, ask, ark)
+        issuer = _crl_signing_issuer(crl, ask, ark)
+        last_update, next_update = _crl_times(crl)
+        if next_update is None:
+            raise ValueError("missing nextUpdate")
+        if (
+            document["issuer_spki_sha384"] != _spki_sha384(issuer)
+            or document["last_update"] != last_update.isoformat()
+            or document["next_update"] != next_update.isoformat()
+        ):
+            raise ValueError("CRL cache metadata does not match signed content")
+        return crl
+    except (InvalidQuoteError, ValueError, TypeError, KeyError, UnicodeError) as exc:
+        raise InvalidQuoteError("cached AMD VCEK CRL is unauthenticated or malformed") from exc
+
+
+async def _cache_authenticated_crl(
+    redis,
+    cache_key: str,
+    crl_der: bytes,
+    crl: x509.CertificateRevocationList,
+    issuer: x509.Certificate,
+    *,
+    outage_grace_seconds: int,
+) -> None:
+    _last_update, next_update = _crl_times(crl)
+    if next_update is None:
+        raise InvalidQuoteError("AMD VCEK CRL has no nextUpdate freshness bound")
+    ttl = int(
+        (next_update - datetime.now(timezone.utc)).total_seconds()
+        + outage_grace_seconds
+    )
+    if ttl <= 0:
+        return
+    await redis.set(
+        cache_key,
+        _crl_cache_payload(crl_der, crl, issuer),
+        ex=ttl,
+    )
+
+
+def _reject_revoked_vcek(crl: x509.CertificateRevocationList, vcek: x509.Certificate) -> None:
+    if crl.get_revoked_certificate_by_serial_number(vcek.serial_number) is not None:
+        raise InvalidQuoteError("VCEK certificate is revoked (present in the AMD KDS CRL)")
 
 
 async def _check_revocation(
@@ -298,26 +462,84 @@ async def _check_revocation(
     ark: x509.Certificate,
     model: str,
     redis=None,
-) -> None:
+    *,
+    outage_grace_seconds: int = 0,
+) -> str:
     """Honor the AMD KDS CRL (M6): reject a VCEK whose serial is revoked.
 
     Fetches + caches the model's VCEK CRL and verifies its signature before honoring it (so a host
     can't feed a forged empty CRL). Per the AMD KDS spec (doc 57230) the VCEK CRL is issued + signed
     by the **ARK** (`CN=ARK-<product>`, RSASSA-PSS/sha384); we accept either the ARK or the ASK
     (both are already-verified AMD CA keys on the pinned chain) so revocation works regardless of
-    which AMD CA signs a given product's CRL. If the CRL cannot be fetched (KDS down, nothing cached),
-    logs and proceeds rather than bricking attestation fleet-wide -- the chain + TCB binding still hold.
+    which AMD CA signs a given product's CRL. Registration and key release fail closed when no
+    authenticated CRL remains within its signed nextUpdate window.
     """
+    if (
+        not isinstance(outage_grace_seconds, int)
+        or isinstance(outage_grace_seconds, bool)
+        or not 0 <= outage_grace_seconds <= MAX_SNP_CRL_OUTAGE_GRACE_SECONDS
+    ):
+        raise InvalidQuoteError(
+            "AMD VCEK CRL outage grace exceeds the enforced safe maximum"
+        )
+    cache_key = f"snp:crl:{model}"
+    outage_candidate = None
+    if redis is not None:
+        cached_payload = await redis.get(cache_key)
+        if cached_payload:
+            try:
+                cached_crl = _load_cached_crl(cached_payload, ask, ark)
+            except InvalidQuoteError:
+                await redis.delete(cache_key)
+            else:
+                try:
+                    _check_crl_freshness(cached_crl)
+                except InvalidQuoteError:
+                    try:
+                        _check_crl_freshness(
+                            cached_crl,
+                            outage_grace_seconds=outage_grace_seconds,
+                        )
+                    except InvalidQuoteError:
+                        await redis.delete(cache_key)
+                    else:
+                        outage_candidate = cached_crl
+                else:
+                    _reject_revoked_vcek(cached_crl, vcek)
+                    return "good"
+
     try:
-        crl_der = await _fetch_crl(model, redis=redis)
-    except Exception as exc:  # noqa: BLE001 - availability: a KDS CRL outage must not brick attest
-        logger.warning(f"SNP VCEK CRL unavailable for {model} ({exc}); proceeding without CRL check")
-        return
-    crl = x509.load_der_x509_crl(crl_der)
-    if not (crl.is_signature_valid(ark.public_key()) or crl.is_signature_valid(ask.public_key())):
-        raise InvalidQuoteError("AMD VCEK CRL signature is invalid (not signed by the ARK or ASK)")
-    if crl.get_revoked_certificate_by_serial_number(vcek.serial_number) is not None:
-        raise InvalidQuoteError("VCEK certificate is revoked (present in the AMD KDS CRL)")
+        crl_der = await _fetch_crl(model)
+        crl = _authenticated_crl(crl_der, ask, ark)
+        _check_crl_freshness(crl)
+        if redis is not None:
+            issuer = _crl_signing_issuer(crl, ask, ark)
+            await _cache_authenticated_crl(
+                redis,
+                cache_key,
+                crl_der,
+                crl,
+                issuer,
+                outage_grace_seconds=outage_grace_seconds,
+            )
+        _reject_revoked_vcek(crl, vcek)
+        return "good"
+    except InvalidQuoteError:
+        # A malformed, future, expired, or incorrectly signed response from KDS is not an outage.
+        # Never turn bad authenticated status into availability by falling back to stale state.
+        raise
+    except Exception as exc:
+        if outage_candidate is not None:
+            _reject_revoked_vcek(outage_candidate, vcek)
+            logger.warning(
+                "AMD KDS CRL fetch failed; using an authenticated CRL inside the configured "
+                f"{outage_grace_seconds}s post-nextUpdate outage window: {exc}"
+            )
+            return "authenticated_outage_grace"
+        raise InvalidQuoteError(
+            f"AMD VCEK CRL is unavailable and no authenticated current cached "
+            f"revocation state exists: {exc}"
+        ) from exc
 
 
 async def verify_snp_report(
@@ -329,6 +551,7 @@ async def verify_snp_report(
     ask_pem: Optional[bytes] = None,
     ark_pem: Optional[bytes] = None,
     redis=None,
+    crl_outage_grace_seconds: int = 0,
 ) -> SnpVerificationResult:
     """Verify an SNP report end-to-end.
 
@@ -364,12 +587,24 @@ async def verify_snp_report(
         matched_model = _verify_chain(vcek, ask, ark, chain_model)
         _verify_report_signature(report, vcek)
         _check_tcb_binding(report, vcek)
-        await _check_revocation(vcek, ask, ark, matched_model, redis=redis)
+        revocation_status = await _check_revocation(
+            vcek,
+            ask,
+            ark,
+            matched_model,
+            redis=redis,
+            outage_grace_seconds=crl_outage_grace_seconds,
+        )
+        result.revocation_status["amd_vcek"] = revocation_status
+        if revocation_status == "authenticated_outage_grace":
+            result.warnings.append(
+                "AMD VCEK revocation used an authenticated CRL inside the configured "
+                "post-nextUpdate KDS outage window"
+            )
 
-        # L2: the report's VMPL (privilege level that requested attestation) is pinned as a POLICY at
-        # measurement-match time (config.expected_vmpl), not here -- it is platform-specific (bare-metal
-        # guests attest at VMPL 1 under the paravisor; GCP at VMPL 0), so a blanket pin would reject a
-        # genuine report. This verifier stays pure crypto (chain + signature + TCB + debug).
+        # L2: the report's VMPL is pinned at measurement-match time (config.expected_vmpl), not here.
+        # Both current bare-metal and GCP fleets report VMPL 0; future platforms still need their
+        # observed value pinned explicitly. This verifier stays pure crypto.
         if report.debug_enabled:
             result.errors.append("guest policy has DEBUG enabled (no confidentiality)")
         if not result.errors:

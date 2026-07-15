@@ -1,0 +1,24 @@
+services:
+  api:
+    environment: &validator_dev_trust
+      ALLOW_DEBUG_MEASUREMENTS: "true"
+      ALLOW_DEV_ATTESTED_MTLS: "true"
+      REQUIRE_MTLS_CLIENT_VERIFY: "true"
+      SKIP_METAGRAPH_CHECK: "true"
+      TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
+      TRUSTED_PROVENANCE_PUBLIC_KEY_PATH: /etc/chutes/provenance/cosign.pub
+    volumes: &validator_dev_trust_mounts
+      - /etc/chutes/provenance/cosign.pub:/etc/chutes/provenance/cosign.pub:ro
+      - ./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro
+
+  socket:
+    environment: *validator_dev_trust
+    volumes: *validator_dev_trust_mounts
+
+  events_socket:
+    environment: *validator_dev_trust
+    volumes: *validator_dev_trust_mounts
+
+  forge:
+    environment: *validator_dev_trust
+    volumes: *validator_dev_trust_mounts

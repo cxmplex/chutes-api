@@ -21,8 +21,9 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Literal, Optional
 from dataclasses import dataclass
+from enum import Enum
 from api.database import Base, generate_uuid
 from api.node.schemas import NodeArgs
 
@@ -51,25 +52,54 @@ class NonceResponse(BaseModel):
 
 
 class BootAttestationArgs(BaseModel):
-    """Request model for boot attestation."""
+    """Request model for boot attestation of an already-registered server."""
 
     quote: str = Field(..., description="Base64 encoded TDX quote")
-    miner_hotkey: str = Field(..., description="Miner hotkey that owns this VM")
-    vm_name: str = Field(..., description="VM name/identifier")
+    server_id: str = Field(..., description="Registered server identity authorized by the nonce")
 
 
 class BootAttestationResponse(BaseModel):
-    """Response model for successful boot attestation."""
+    """Capability-only response for successful boot attestation.
 
-    key: str
+    Root/global disk key material is deliberately never returned here. The caller receives exactly
+    one scoped follow-up capability according to the matched image version.
+    """
+
     boot_token: Optional[str] = None
     luks_quote_nonce: Optional[str] = None
 
 
 class RuntimeAttestationArgs(BaseModel):
-    """Request model for runtime attestation."""
+    """Provider-neutral request model for runtime attestation."""
 
-    quote: str = Field(..., description="Base64 encoded TDX quote")
+    quote: str = Field(..., description="Base64 encoded TDX quote or SEV-SNP report")
+    tee_type: str = Field("tdx", description="'tdx' or 'sev-snp'")
+    snp_cert_chain: Optional[str] = Field(
+        None,
+        description="Base64 SEV-SNP VCEK/ASK/ARK auxiliary chain when supplied by the platform",
+    )
+    vtpm_quote: Optional[Dict[str, Any]] = Field(
+        None, description="GCE vTPM quote required by a GCP SNP measurement"
+    )
+
+
+class RuntimeAttestationNonceContext(BaseModel):
+    """Complete registered identity authorized for one runtime quote."""
+
+    server_id: str
+    miner_hotkey: str
+    vm_name: str
+    cert_hash: str
+    role: Literal["compute", "storage"]
+    compute_type: Literal["cpu", "gpu"]
+    tee_type: str
+    provider: Literal["gcp", "bare-metal"]
+    deployment_model: Literal["gcp-model-a", "bare-metal-model-b", "bare-metal-direct"]
+    host_id: Optional[str] = None
+    measurement_name: str
+    measurement_version: str
+    measurement_config_fingerprint: str
+    trust_set_fingerprint: str
 
 
 class RuntimeAttestationResponse(BaseModel):
@@ -78,20 +108,123 @@ class RuntimeAttestationResponse(BaseModel):
     attestation_id: str
     verified_at: str
     status: str
+    revocation_status: Dict[str, str]
+
+
+class LuksCapabilityPurpose(str, Enum):
+    """Distinct key-release capabilities; neither namespace is interchangeable."""
+
+    BOOT = "boot_luks"
+    STORAGE = "storage_luks"
+
+
+class BootAttestationNonceContext(BaseModel):
+    """Identity authorized by the miner before a boot quote nonce is issued."""
+
+    purpose: Literal["boot_attestation"] = "boot_attestation"
+    server_id: str
+    miner_hotkey: str
+    vm_name: str
+    cert_hash: str
+    storage_role: bool
+    allowed_volumes: List[str]
+
+
+class LuksCapabilityContext(BaseModel):
+    """Server-bound context carried by an opaque LUKS capability."""
+
+    purpose: LuksCapabilityPurpose
+    server_id: str
+    miner_hotkey: str
+    vm_name: str
+    cert_hash: str
+    measurement_name: str
+    measurement_version: str
+    measurement_config_fingerprint: str
+    trust_set_fingerprint: str
+    tee_type: str
+    storage_role: bool
+    allowed_volumes: List[str]
+    issued_volumes: Optional[List[str]] = None
+    issued_generations: Optional[Dict[str, int]] = None
+    issued_lease_ids: Optional[Dict[str, str]] = None
+
+    @field_validator("allowed_volumes", "issued_volumes")
+    @classmethod
+    def validate_capability_volumes(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        from api.constants import SUPPORTED_LUKS_VOLUMES
+
+        if not value or len(value) != len(set(value)):
+            raise ValueError("capability volumes must be non-empty and unique")
+        invalid = [volume for volume in value if volume not in SUPPORTED_LUKS_VOLUMES]
+        if invalid:
+            raise ValueError(f"unsupported capability volume(s): {invalid}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_issued_leases(self) -> "LuksCapabilityContext":
+        """Keep quote capabilities and generation-confirm capabilities structurally distinct."""
+        lease_maps = (self.issued_generations, self.issued_lease_ids)
+        if self.issued_volumes is None:
+            if any(value is not None for value in lease_maps):
+                raise ValueError("quote capability cannot contain issued generation leases")
+            return self
+
+        expected = set(self.issued_volumes)
+        if any(value is None for value in lease_maps):
+            raise ValueError("confirm capability requires generation and lease-id maps")
+        if (
+            set(self.issued_generations or {}) != expected
+            or set(self.issued_lease_ids or {}) != expected
+        ):
+            raise ValueError("confirm capability lease maps must match issued volumes")
+        if any(
+            not isinstance(generation, int) or isinstance(generation, bool) or generation < 1
+            for generation in (self.issued_generations or {}).values()
+        ):
+            raise ValueError("issued generations must be positive integers")
+        if any(not lease_id for lease_id in (self.issued_lease_ids or {}).values()):
+            raise ValueError("issued lease ids must be non-empty")
+        return self
+
+
+class LuksVolumeGenerationLease(BaseModel):
+    """Durable exclusive generation lease stored in ``vm_cache_configs`` JSONB."""
+
+    generation: int = Field(..., ge=1)
+    lease_id: str = Field(..., min_length=32, max_length=128)
+    server_id: str
+    miner_hotkey: str
+    vm_name: str
+    cert_hash: str
+    measurement_name: str
+    measurement_version: str
+    measurement_config_fingerprint: str
+    trust_set_fingerprint: str
+    tee_type: str
+    purpose: LuksCapabilityPurpose
+    storage_role: bool
+    promotion_required: bool
 
 
 @dataclass
 class LuksVolumeRotation:
-    """Internal result of rotating a single LUKS volume's passphrase (not an API model)."""
+    """Internal result of leasing one LUKS volume generation (not an API model)."""
 
     current: Optional[str]
-    """Current active passphrase. None on first boot — VM should run luksFormat."""
+    """Current active passphrase; None until the first-format pending key is promoted."""
     next: str
     """New pending passphrase the VM should add as a LUKS key slot."""
-
-    @property
-    def is_first_boot(self) -> bool:
-        return self.current is None
+    generation: int
+    """Exclusive generation allocated to this lease."""
+    confirmed_generation: int
+    """Last durably confirmed generation."""
+    lease_id: str
+    """Opaque lease identity carried only by the confirm capability."""
+    lease_reused: bool
+    """Whether this response reissued an unresolved lease instead of allocating a new one."""
 
 
 @dataclass
@@ -100,11 +233,7 @@ class LuksAttestResult:
 
     volumes: Dict[str, "LuksVolumeRotation"]
     confirm_nonce: str
-    k3s_encryption_key: str
-    # M16: last-confirmed monotonic freshness epoch per volume. The TD refuses to serve a volume
-    # whose on-disk epoch is OLDER than this (a host that re-presents an old raw-disk snapshot rolls
-    # the whole volume back in time under the still-valid passphrase); plain LUKS cannot detect it.
-    volume_epochs: Dict[str, int] = None
+    k3s_encryption_key: Optional[str] = None
 
 
 @dataclass
@@ -112,7 +241,7 @@ class LuksConfirmResult:
     """Internal result of process_luks_confirm (not an API model)."""
 
     volumes: Dict[str, dict]
-    """Per-volume outcome: {"result": "promoted"|"discarded"|"no_pending"}."""
+    """Per-volume outcome: promoted, confirmed, or already_confirmed plus generation."""
 
 
 class LuksPassphraseRequest(BaseModel):
@@ -145,9 +274,12 @@ class LuksAttestRequest(BaseModel):
         description="Base64 SEV-SNP VCEK->ASK->ARK chain (GCP inline auxblob); absent on bare-metal.",
     )
     vtpm_quote: Optional[Dict[str, Any]] = Field(
-        None, description="GCE vTPM quote for GCP SNP image identity (absent on bare-metal/TDX)."
+        None,
+        description="GCE vTPM quote for GCP SNP image identity (absent on bare-metal/TDX).",
     )
-    volumes: List[str] = Field(..., description="Volume names to rotate passphrases for")
+    volumes: List[str] = Field(
+        ..., description="Volume names requiring exclusive generation leases"
+    )
 
     @field_validator("volumes")
     @classmethod
@@ -169,15 +301,27 @@ class LuksVolumeInfo(BaseModel):
 
     current: Optional[str] = Field(
         None,
-        description="Current passphrase (None on first boot — VM must luksFormat before luksOpen)",
+        description="Current passphrase. None while the retained first-format pending key still "
+        "requires promotion; on retry the disk may already open with next.",
     )
     next: str = Field(
         ..., description="New pending passphrase the VM should add as a LUKS key slot"
     )
-    epoch: int = Field(
-        0,
-        description="M16 anti-rollback floor: the last-confirmed freshness epoch for this volume. "
-        "The TD refuses to serve if the epoch stored inside the encrypted volume is older than this.",
+    generation: int = Field(
+        ...,
+        ge=1,
+        description="Exclusive generation allocated to this key-release lease.",
+    )
+    confirmed_generation: int = Field(
+        ...,
+        ge=0,
+        description="Last durably confirmed generation. The mounted disk must match this floor, "
+        "or the issued generation only when this is an unresolved-lease retry.",
+    )
+    lease_reused: bool = Field(
+        ...,
+        description="True when the validator retained and reissued the same unresolved key and "
+        "generation instead of allocating another generation.",
     )
 
 
@@ -185,8 +329,15 @@ class LuksAttestResponse(BaseModel):
     """Response model for POST /luks/attest."""
 
     volumes: Dict[str, LuksVolumeInfo]
-    confirm_nonce: str = Field(..., description="Single-use nonce for the confirm endpoint")
-    k3s_encryption_key: str = Field(..., description="k3s encryption key (base64)")
+    confirm_nonce: str = Field(
+        ...,
+        description="Short-lived generation-bound nonce for exact, idempotent confirmation",
+    )
+    k3s_encryption_key: Optional[str] = Field(
+        None,
+        description="k3s encryption key (base64), returned only for a boot-LUKS capability "
+        "that explicitly authorizes the storage volume",
+    )
 
 
 class LuksVolumeConfirmStatus(BaseModel):
@@ -194,12 +345,13 @@ class LuksVolumeConfirmStatus(BaseModel):
 
     rotated: bool = Field(
         ...,
-        description="True if passphrase rotation succeeded for this volume; False to discard pending",
+        description="True if the pending passphrase now opens the volume and must be promoted; "
+        "False when the existing current passphrase remains active.",
     )
-    epoch: Optional[int] = Field(
-        None,
-        description="M16: the new freshness epoch the TD wrote inside the encrypted volume on this "
-        "open; the validator advances its stored floor to this so the next boot detects a rollback.",
+    generation: int = Field(
+        ...,
+        ge=1,
+        description="Exact leased generation durably written to the encrypted volume.",
     )
 
 
@@ -233,8 +385,10 @@ class CpuServerRegistrationArgs(BaseModel):
 
     The booted server self-submits its own runtime TDX quote + CPU benchmark. The Redis-issued
     attestation nonce travels in the X-Chutes-Nonce header, the owning miner hotkey in
-    X-Chutes-Hotkey, and the miner-hotkey signature over "{hotkey}:{nonce}:cpu_register" in
-    X-Chutes-Signature. The quote's report_data binds nonce || sha256(mTLS client cert pubkey).
+    X-Chutes-Hotkey, and the miner-hotkey signature over
+    "{hotkey}:{nonce}:cpu_register:{server_id}:{name}:{cert_hash}:{storage|compute}" (plus the
+    release-target-token hash when present) in X-Chutes-Signature. The quote's report_data binds
+    nonce || sha256(mTLS client cert pubkey), with the nonce derivation also binding that token.
     """
 
     server_id: str = Field(..., description="Stable server identifier (e.g. VM instance id)")
@@ -249,8 +403,9 @@ class CpuServerRegistrationArgs(BaseModel):
     )
     host_id: Optional[str] = Field(
         None,
-        description="Model B: the L0 launcher host (hosts.host_id) that launched this per-chute TD; "
-        "absent for standalone single-VM self-registrations. Enables per-host capacity accounting.",
+        description="Model B: required enrolled L0 launcher host (hosts.host_id) for every bare-metal "
+        "TD; absent only for hostless GCP Model-A self-registrations. Enables per-host capacity "
+        "accounting.",
     )
     external_host: Optional[str] = Field(
         None,
@@ -283,11 +438,23 @@ class CpuServerRegistrationArgs(BaseModel):
         description="ChuteFS: True when this TD is the always-on storage node (excluded from the CPU "
         "scheduler and from host-slot reaping; serves the decentralized storage network).",
     )
+    release_target_token: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=4096,
+        description=(
+            "Validator-signed one-use generation for same-miner-transferable logical rollout "
+            "telemetry. Its hash is bound into the quote and registration signature; it never "
+            "proves physical placement or pin-pruning safety."
+        ),
+    )
     disk_total_gb: Optional[int] = Field(
-        None, description="ChuteFS storage TD: total durable disk capacity (GB) of its data volume."
+        None,
+        description="ChuteFS storage TD: total durable disk capacity (GB) of its data volume.",
     )
     disk_free_gb: Optional[int] = Field(
-        None, description="ChuteFS storage TD: currently free disk (GB) on its data volume."
+        None,
+        description="ChuteFS storage TD: currently free disk (GB) on its data volume.",
     )
 
 
@@ -296,11 +463,15 @@ class CpuServerRegistrationResponse(BaseModel):
 
     server_id: str
     measurement_version: Optional[str] = None
+    measurement_name: str
+    measurement_config_fingerprint: str
+    trust_set_fingerprint: str
+    revocation_status: Dict[str, str]
     benchmark_score: float
     verified_at: str
     status: str = "registered"
     # ChuteFS: the single-use nonce a self-registering storage TD must embed in its next quote to
-    # call POST /{vm_name}/luks/attest for its persistent data-volume key. Minted (and returned) only
+    # call POST /{server_id}/luks/attest for its persistent data-volume key. Minted (and returned) only
     # for storage_role registrations whose measurement version supports the attest flow (>= 1.3.0).
     luks_quote_nonce: Optional[str] = None
 
@@ -313,27 +484,89 @@ class HostRegistrationArgs(BaseModel):
     with a recent unix-timestamp nonce (the host is not yet known, so there is no server-issued nonce).
     """
 
-    host_id: str = Field(..., description="Stable launcher host id (e.g. hostname / GCP instance id)")
+    host_id: str = Field(
+        ..., description="Stable launcher host id (e.g. hostname / GCP instance id)"
+    )
     name: Optional[str] = Field(None, description="Host name (defaults to host_id)")
-    capacity: int = Field(1, ge=1, description="Max concurrent per-chute TDs (auto-discovered by agent)")
-    default_mem: Optional[str] = Field(None, description="Default per-TD memory size class, e.g. 8G")
-    default_vcpus: Optional[int] = Field(None, description="Default per-TD vCPU size class")
-    external_host: Optional[str] = Field(None, description="Public IP/host advertised for chute TDs")
-    tee_type: str = Field("tdx", description="TEE provider the host launches guests with: tdx|sev-snp")
+    capacity: int = Field(
+        1,
+        ge=0,
+        le=64,
+        description=(
+            "Max concurrent per-chute TDs. Zero is valid only when storage_enabled reserves the "
+            "host's sole TD slot."
+        ),
+    )
+    storage_enabled: bool = Field(
+        False,
+        description="Whether this enrolled L0 runs the dedicated ChuteFS storage TD.",
+    )
+    default_mem: Optional[str] = Field(
+        None,
+        pattern=r"^[1-9][0-9]*(?:G|M)$",
+        max_length=32,
+        description="Default per-TD memory size class, e.g. 8G",
+    )
+    default_vcpus: Optional[int] = Field(
+        None,
+        ge=1,
+        le=4096,
+        description="Default per-TD vCPU size class",
+    )
+    external_host: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=253,
+        pattern=r"^[A-Za-z0-9.:-]+$",
+        description="Public IP/host advertised for chute TDs",
+    )
+    tee_type: str = Field(
+        "tdx", description="TEE provider the host launches guests with: tdx|sev-snp"
+    )
     netuid: Optional[int] = Field(None, description="Subnet netuid (defaults to the validator's)")
     specs: Optional[dict] = Field(
         None,
         description="Host hardware inventory reported by the agent: cpu/memory/baseboard/system/bios",
     )
     disk_total_gb: Optional[int] = Field(
-        None, description="Physical disk capacity (GB) the host can back ChuteFS storage with."
+        None,
+        ge=0,
+        le=8_589_934_591,
+        description="Physical disk capacity (GB) the host can back ChuteFS storage with.",
     )
     disk_free_gb: Optional[int] = Field(
-        None, description="Currently free physical disk (GB) on the host."
+        None,
+        ge=0,
+        le=8_589_934_591,
+        description="Currently free physical disk (GB) on the host.",
     )
     l0_version: Optional[str] = Field(
-        None, description="L0 host-image version this box is running (from /etc/chutes/l0-version)."
+        None,
+        description="L0 host-image version this box is running (from /etc/chutes/l0-version).",
     )
+    release_channel: str = Field(
+        "stable",
+        min_length=1,
+        max_length=32,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        description="Guest-release channel this host follows from its first registration response.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_zero_capacity_storage_enrollment(self):
+        if self.capacity == 0 and not self.storage_enabled:
+            raise ValueError("capacity=0 is valid only for an enrolled ChuteFS storage host")
+        if self.default_mem:
+            multiplier = 1024**3 if self.default_mem.endswith("G") else 1024**2
+            if int(self.default_mem[:-1]) * multiplier > 2**63 - 1:
+                raise ValueError("default_mem exceeds the signed-int64 byte range")
+        if (
+            self.disk_total_gb is not None
+            and self.disk_free_gb is not None
+            and self.disk_free_gb > self.disk_total_gb
+        ):
+            raise ValueError("disk_free_gb cannot exceed disk_total_gb")
+        return self
 
 
 class HostRegistrationResponse(BaseModel):
@@ -463,6 +696,7 @@ class TeeMeasurementResponse(BaseModel):
     version: str
     name: str
     tee_type: str = "tdx"
+    provider: Optional[str] = None
     mrtd: str
     boot_rtmrs: Dict[str, str]
     runtime_rtmrs: Dict[str, str]
@@ -473,10 +707,19 @@ class TeeMeasurementResponse(BaseModel):
     policy: Optional[int] = None
     min_tcb: Optional[Dict[str, int]] = None
     processor_model: Optional[str] = None
+    expected_vmpl: Optional[int] = None
+    id_key_digest: Optional[str] = None
+    vtpm_pcrs: Optional[Dict[str, str]] = None
+    vtpm_security_flags: Optional[Dict[str, bool]] = None
+    debug: bool
+    image_sha256: Optional[str] = None
+    image_measurement_names: Optional[List[str]] = None
+    config_fingerprint: str
+    trust_set_fingerprint: str
 
 
 class BootAttestation(Base):
-    """Track anonymous boot attestations (pre-registration)."""
+    """Track boot attestations whose identity was authorized from a registered server."""
 
     __tablename__ = "boot_attestations"
 
@@ -489,6 +732,12 @@ class BootAttestation(Base):
     measurement_version = Column(
         String, nullable=True
     )  # Matched TEE measurement config version (audit trail); NULL if verification failed
+    measurement_name = Column(
+        String, nullable=True
+    )  # Exact matched pin name; required for release-completion trust decisions.
+    measurement_config_fingerprint = Column(String(64), nullable=True)
+    trust_set_fingerprint = Column(String(64), nullable=True)
+    revocation_status = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     verified_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -521,7 +770,11 @@ class TeeUpgradeWindow(Base):
     __table_args__ = (
         UniqueConstraint("target_measurement_version", name="uq_tee_upgrade_target"),
         CheckConstraint("upgrade_window_end > upgrade_window_start", name="chk_window_bounds"),
-        Index("idx_tee_upgrade_window_bounds", "upgrade_window_start", "upgrade_window_end"),
+        Index(
+            "idx_tee_upgrade_window_bounds",
+            "upgrade_window_start",
+            "upgrade_window_end",
+        ),
     )
 
 
@@ -573,6 +826,16 @@ class Server(Base):
     )
     # Current attested measurement version, updated on every successful boot attestation.
     version = Column(Text, nullable=True)
+    # Exact latest matched pin name. Version alone is not a release identity because multiple
+    # providers, roles, images, and vCPU classes can share a version string.
+    measurement_name = Column(Text, nullable=True)
+    # Canonical identity of every security field in the exact matched pin, and of the full active
+    # trust set at verification time. Legacy rows remain NULL and are never treated as current.
+    measurement_config_fingerprint = Column(String(64), nullable=True)
+    trust_set_fingerprint = Column(String(64), nullable=True)
+    # Latest successful quote's authenticated revocation outcomes. The explicit
+    # revocation_not_advertised value is auditable and never represented as a successful check.
+    attestation_revocation_status = Column(JSONB, nullable=True)
 
     # True for 1-click CPU servers that self-registered via POST /servers/cpu/register
     # (the server attested + checked in itself), vs servers advertised by a miner control plane.
@@ -604,6 +867,17 @@ class Server(Base):
     # refreshed on announce/heartbeat so the tracker can place replicas on TDs with room.
     disk_total_gb = Column(Integer, nullable=True)
     disk_free_gb = Column(Integer, nullable=True)
+    # Generated once and persisted inside the encrypted ChuteFS filesystem. A replacement/wiped disk
+    # therefore gets a new value even when the storage TD reuses the same deterministic server_id.
+    storage_incarnation = Column(String, nullable=True)
+    storage_incarnation_announced_at = Column(DateTime(timezone=True), nullable=True)
+    # Reconciliation alone advances model-directory identity/order. An exact-identity authenticated
+    # inventory heartbeat may refresh freshness without letting a replacement cert or disk inherit it.
+    model_inventory_storage_incarnation = Column(String, nullable=True)
+    model_inventory_cert_pubkey_hash = Column(String, nullable=True)
+    model_inventory_snapshot_started_at = Column(DateTime(timezone=True), nullable=True)
+    model_inventory_snapshot_id = Column(String, nullable=True)
+    model_inventory_fresh_at = Column(DateTime(timezone=True), nullable=True)
 
     @property
     def in_maintenance(self) -> bool:
@@ -625,12 +899,41 @@ class Server(Base):
         Index("idx_server_miner", "miner_hotkey"),
         Index("idx_servers_miner_name", "miner_hotkey", "name", unique=True),
         Index(
+            "uq_servers_attested_pubkey",
+            func.lower(attested_cert_pubkey_hash),
+            unique=True,
+            postgresql_where=attested_cert_pubkey_hash.isnot(None),
+        ),
+        Index(
             "idx_servers_maintenance_pending",
             "miner_hotkey",
             postgresql_where=maintenance_pending_window_id.isnot(None),
         ),
+        Index(
+            "idx_servers_model_inventory_fresh",
+            "model_inventory_fresh_at",
+            "server_id",
+            postgresql_where=storage_role.is_(True),
+        ),
+        CheckConstraint(
+            "("
+            "model_inventory_fresh_at IS NULL "
+            "AND model_inventory_storage_incarnation IS NULL "
+            "AND model_inventory_cert_pubkey_hash IS NULL "
+            "AND model_inventory_snapshot_started_at IS NULL "
+            "AND model_inventory_snapshot_id IS NULL"
+            ") OR ("
+            "model_inventory_fresh_at IS NOT NULL "
+            "AND model_inventory_storage_incarnation IS NOT NULL "
+            "AND model_inventory_cert_pubkey_hash IS NOT NULL "
+            "AND model_inventory_snapshot_started_at IS NOT NULL "
+            "AND model_inventory_snapshot_id IS NOT NULL"
+            ")",
+            name="ck_servers_model_inventory_marker",
+        ),
         ForeignKeyConstraint(
-            ["netuid", "miner_hotkey"], ["metagraph_nodes.netuid", "metagraph_nodes.hotkey"]
+            ["netuid", "miner_hotkey"],
+            ["metagraph_nodes.netuid", "metagraph_nodes.hotkey"],
         ),
     )
 
@@ -655,6 +958,12 @@ class Host(Base):
     tee_type = Column(String, nullable=False, default="tdx", server_default="tdx")
     # Max concurrent per-chute TDs (slot pool size on the node-agent).
     capacity = Column(Integer, nullable=False, default=1, server_default="1")
+    # Signed L0 enrollment state. Allows a one-slot storage appliance to advertise zero schedulable
+    # chute slots without letting ordinary compute hosts misuse capacity=0 registration.
+    storage_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Desired-state channel followed by this logical L0 target. Release activation snapshots only
+    # hosts enrolled in the release's channel.
+    release_channel = Column(String, nullable=False, default="stable", server_default="stable")
     # Default per-TD size class (overridable per launch); must match a pinned per-size-class measurement.
     default_mem = Column(String, nullable=True)
     default_vcpus = Column(Integer, nullable=True)
@@ -672,7 +981,9 @@ class Host(Base):
     disk_free_gb = Column(Integer, nullable=True)
     # Fleet image releases: the guest-image digests this host most recently reported it has staged
     # (from the node-agent heartbeat), e.g. {"chute": {"sha256": ...}, "storage": {"sha256": ...}}.
-    # Informational (the host is not attested) -- powers GET /releases/{id}/status convergence.
+    # Untrusted telemetry only (the host is not attested). Fresh exact ServerAttestation identities
+    # can establish aggregate role/measurement counts, but neither this field nor guest-supplied
+    # Server.host_id proves physical-host convergence or makes prior pins safe to prune.
     staged_images = Column(JSONB, nullable=True)
     # The L0 host-image version this box is running (from /etc/chutes/l0-version, reported at
     # registration + heartbeat) -- lets the validator tell which L0 a box booted and drive re-netboot
@@ -681,7 +992,15 @@ class Host(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
-    __table_args__ = (Index("idx_hosts_miner", "miner_hotkey"),)
+    __table_args__ = (
+        CheckConstraint("capacity >= 0", name="ck_hosts_capacity_nonnegative"),
+        CheckConstraint(
+            "capacity > 0 OR storage_enabled IS TRUE",
+            name="ck_hosts_zero_capacity_storage_only",
+        ),
+        Index("idx_hosts_miner", "miner_hotkey"),
+        Index("idx_hosts_release_targeting", "release_channel", "tee_type"),
+    )
 
 
 class ServerAttestation(Base):
@@ -696,6 +1015,12 @@ class ServerAttestation(Base):
     measurement_version = Column(
         String, nullable=True
     )  # Matched TEE measurement config version (audit trail); NULL if verification failed
+    measurement_name = Column(
+        String, nullable=True
+    )  # Exact matched pin name; NULL when no config matched or verification failed early.
+    measurement_config_fingerprint = Column(String(64), nullable=True)
+    trust_set_fingerprint = Column(String(64), nullable=True)
+    revocation_status = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     verified_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -705,6 +1030,20 @@ class ServerAttestation(Base):
         Index("idx_attestation_server", "server_id"),
         Index("idx_attestation_created", "created_at"),
         Index("idx_attestation_verified", "verified_at"),
+        Index(
+            "idx_server_attestations_release_identity",
+            server_id,
+            created_at.desc(),
+            attestation_id.desc(),
+            postgresql_include=[
+                "measurement_name",
+                "measurement_version",
+                "measurement_config_fingerprint",
+                "trust_set_fingerprint",
+                "verification_error",
+                "verified_at",
+            ],
+        ),
     )
 
 
@@ -716,9 +1055,11 @@ class VmCacheConfig(Base):
     miner_hotkey = Column(String, primary_key=True)
     vm_name = Column(String, primary_key=True)
     volume_passphrases = Column(JSONB, nullable=False, default=dict)
-    # M16: per-volume monotonic freshness epoch {volume_name: int}, advanced on each confirmed open,
-    # so the TD can detect a host re-presenting an older raw-disk snapshot (rollback) of a volume.
+    # Last-confirmed monotonic generation floor {volume_name: int}.
     volume_epochs = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    # Exclusive unresolved generation leases. Each entry binds generation + pending passphrase
+    # custody to the registered server, attested cert capability, and exact measurement.
+    volume_generation_leases = Column(JSONB, nullable=False, default=dict, server_default="{}")
     k3s_encryption_key = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -747,11 +1088,22 @@ class ContentHolding(Base):
     bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
     status = Column(String, nullable=False, default="present", server_default="present")
     announced_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    last_snapshot_id = Column(String, nullable=True)
+    last_snapshot_started_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("server_id", "repo_id", "revision", name="uq_content_holding"),
         Index("idx_content_holdings_repo", "repo_id", "revision"),
         Index("idx_content_holdings_server", "server_id"),
+        Index(
+            "idx_content_holdings_snapshot_omission",
+            "server_id",
+            "holding_id",
+        ),
+        CheckConstraint(
+            "bytes BETWEEN 0 AND 9223372036854775807",
+            name="ck_content_holding_signed_bytes",
+        ),
     )
 
 
@@ -764,9 +1116,14 @@ class StorageVolume(Base):
     user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False)
     name = Column(String, nullable=False)
     replication_factor = Column(Integer, nullable=False, default=3, server_default="3")
-    quota_bytes = Column(BigInteger, nullable=False, default=10737418240, server_default="10737418240")
+    quota_bytes = Column(
+        BigInteger, nullable=False, default=10737418240, server_default="10737418240"
+    )
     used_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
     deleted = Column(Boolean, nullable=False, default=False, server_default="false")
+    delete_requested_at = Column(DateTime(timezone=True), nullable=True)
+    key_shredded_at = Column(DateTime(timezone=True), nullable=True)
+    purged_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -782,6 +1139,12 @@ class StorageVolume(Base):
             postgresql_where=deleted.is_(False),
         ),
         Index("idx_storage_volumes_user", "user_id", postgresql_where=deleted.is_(False)),
+        Index(
+            "idx_storage_volumes_deleted_work",
+            "delete_requested_at",
+            "volume_id",
+            postgresql_where=(deleted.is_(True) & purged_at.is_(None)),
+        ),
     )
 
 
@@ -796,33 +1159,65 @@ class StorageVolumeKey(Base):
     __tablename__ = "storage_volume_keys"
 
     volume_id = Column(
-        String, ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"), primary_key=True
+        String,
+        ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"),
+        primary_key=True,
     )
     encrypted_key = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class StorageObject(Base):
-    """ChuteFS: an object (key -> ciphertext bytes) inside a confidential volume.
+    """One immutable upload generation for a key inside a confidential ChuteFS volume.
 
-    The validator tracks only metadata + the ciphertext integrity hash; the bytes themselves live
-    on the storage TDs. size_bytes is the plaintext size, used for per-volume byte accounting.
+    Placement always creates a fresh pending row.  Commit atomically compare-and-swaps it into the
+    one current committed generation for ``(volume_id, object_key)`` and retires its predecessor.
     """
 
     __tablename__ = "storage_objects"
 
     object_id = Column(String, primary_key=True, default=generate_uuid)
     volume_id = Column(
-        String, ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"), nullable=False
+        String,
+        ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"),
+        nullable=False,
     )
     object_key = Column(String, nullable=False)
+    lifecycle_state = Column(String, nullable=False, default="pending", server_default="pending")
+    placement_request_id = Column(String, nullable=True)
+    expected_predecessor_id = Column(
+        String,
+        ForeignKey("storage_objects.object_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    # Placement-time reservation. Unlike size_bytes, this is populated before commit.
+    projected_size_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    # Exact sealed-container byte count. It is established by target possession receipts and becomes
+    # immutable at commit; replication capabilities bind this value rather than the plaintext quota
+    # size above.
+    ciphertext_size_bytes = Column(BigInteger, nullable=True)
+    # One-time upgrade audit for legacy committed bytes adopted from an intact, currently attested
+    # assigned storage TD. These fields are immutable after their atomic NULL -> populated transition.
+    legacy_adopted_at = Column(DateTime(timezone=True), nullable=True)
+    legacy_adoption_placement_id = Column(String, nullable=True)
+    legacy_adoption_server_id = Column(String, nullable=True)
+    legacy_adoption_cert_pubkey_hash = Column(String, nullable=True)
+    legacy_adoption_storage_incarnation = Column(String, nullable=True)
     sha256 = Column(String, nullable=True)  # ciphertext hash (cross-replica integrity)
     # H1: the v3 at-rest container's HKDF salt (base64) is anchored here, not in the host-controlled
     # object file, and plaintext_sha256 lets the SDK verify the decrypted bytes end-to-end on get().
     salt = Column(String, nullable=True)
     plaintext_sha256 = Column(String, nullable=True)
-    deleted = Column(Boolean, nullable=False, default=False, server_default="false")
+    durability_state = Column(String, nullable=False, default="pending", server_default="pending")
+    durable_replica_count = Column(Integer, nullable=False, default=0, server_default="0")
+    durability_updated_at = Column(DateTime(timezone=True), nullable=True)
+    committed_at = Column(DateTime(timezone=True), nullable=True)
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
+    tombstoned_at = Column(DateTime(timezone=True), nullable=True)
+    erase_enqueued_at = Column(DateTime(timezone=True), nullable=True)
+    detached_predecessor_id = Column(String, nullable=True)
+    predecessor_detached_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -832,16 +1227,136 @@ class StorageObject(Base):
     )
 
     __table_args__ = (
-        # Key uniqueness scoped to non-deleted objects (matches storage_volumes) so a soft-deleted
-        # key can be re-PUT; an unconditional UNIQUE made delete-then-reupload a permanent 500.
+        # A key may have concurrent pending attempts and retired history, but only one current
+        # committed generation.
         Index(
-            "uq_storage_object_key",
+            "uq_storage_object_current",
             "volume_id",
             "object_key",
             unique=True,
-            postgresql_where=deleted.is_(False),
+            postgresql_where=lifecycle_state == "committed",
         ),
-        Index("idx_storage_objects_volume", "volume_id", postgresql_where=deleted.is_(False)),
+        Index(
+            "uq_storage_object_placement_request",
+            "volume_id",
+            "placement_request_id",
+            unique=True,
+            postgresql_where=placement_request_id.isnot(None),
+        ),
+        Index(
+            "idx_storage_objects_current",
+            "volume_id",
+            "object_key",
+            postgresql_where=lifecycle_state == "committed",
+        ),
+        Index(
+            "idx_storage_objects_pending",
+            "created_at",
+            "object_id",
+            postgresql_where=lifecycle_state == "pending",
+        ),
+        Index(
+            "idx_storage_objects_reconcile",
+            "durability_updated_at",
+            "object_id",
+            postgresql_where=lifecycle_state == "committed",
+        ),
+        Index(
+            "idx_storage_objects_gc",
+            "tombstoned_at",
+            "superseded_at",
+            "object_id",
+            postgresql_where=lifecycle_state.in_(("superseded", "tombstoned")),
+        ),
+        Index(
+            "idx_storage_objects_erase_queue",
+            func.coalesce(tombstoned_at, superseded_at, created_at),
+            "object_id",
+            postgresql_where=lifecycle_state.in_(("superseded", "tombstoned")),
+        ),
+        Index(
+            "idx_storage_objects_terminal_erase",
+            func.coalesce(tombstoned_at, superseded_at, created_at),
+            "object_id",
+            postgresql_where=(
+                lifecycle_state.in_(("superseded", "tombstoned")) & erase_enqueued_at.isnot(None)
+            ),
+        ),
+        Index(
+            "idx_storage_objects_expected_predecessor",
+            "expected_predecessor_id",
+            "object_id",
+            postgresql_where=expected_predecessor_id.isnot(None),
+        ),
+        Index(
+            "idx_storage_objects_delete_fence",
+            "volume_id",
+            "object_key",
+            "object_id",
+            "created_at",
+        ),
+        Index(
+            "idx_storage_objects_deleted_volume_retire",
+            "volume_id",
+            "object_id",
+            postgresql_where=lifecycle_state.in_(("pending", "committed", "superseded")),
+        ),
+        Index("idx_storage_objects_volume", "volume_id", "object_id"),
+        CheckConstraint(
+            "lifecycle_state IN ('pending', 'committed', 'superseded', 'tombstoned')",
+            name="ck_storage_object_lifecycle_state",
+        ),
+        CheckConstraint(
+            "durability_state IN "
+            "('pending', 'healthy', 'under_replicated', 'at_risk', 'irrecoverable')",
+            name="ck_storage_object_durability_state",
+        ),
+        CheckConstraint(
+            "durable_replica_count >= 0",
+            name="ck_storage_object_durable_replica_count",
+        ),
+        CheckConstraint(
+            "size_bytes BETWEEN 0 AND 9223372036854775807 "
+            "AND projected_size_bytes BETWEEN 0 AND 9223372036854775807 "
+            "AND (ciphertext_size_bytes IS NULL OR "
+            "ciphertext_size_bytes BETWEEN 0 AND 9223372036854775807)",
+            name="ck_storage_object_signed_sizes",
+        ),
+        CheckConstraint(
+            "(detached_predecessor_id IS NULL AND predecessor_detached_at IS NULL) "
+            "OR (detached_predecessor_id IS NOT NULL "
+            "AND predecessor_detached_at IS NOT NULL "
+            "AND detached_predecessor_id <> object_id)",
+            name="ck_storage_object_detached_predecessor",
+        ),
+    )
+
+
+class StorageObjectDeleteFence(Base):
+    """A bounded owner-delete cutoff for every generation of one object key."""
+
+    __tablename__ = "storage_object_delete_fences"
+
+    fence_id = Column(String, primary_key=True, default=generate_uuid)
+    volume_id = Column(
+        String,
+        ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    object_key = Column(String, nullable=False)
+    cutoff_at = Column(DateTime(timezone=True), nullable=False)
+    scan_cursor = Column(String, nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("volume_id", "object_key", name="uq_storage_object_delete_fence"),
+        Index(
+            "idx_storage_object_delete_fence_work",
+            "cutoff_at",
+            "fence_id",
+            postgresql_where=completed_at.is_(None),
+        ),
     )
 
 
@@ -852,17 +1367,425 @@ class ReplicaPlacement(Base):
 
     placement_id = Column(String, primary_key=True, default=generate_uuid)
     object_id = Column(
-        String, ForeignKey("storage_objects.object_id", ondelete="CASCADE"), nullable=False
+        String,
+        ForeignKey("storage_objects.object_id", ondelete="CASCADE"),
+        nullable=False,
     )
     server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
-    status = Column(String, nullable=False, default="present", server_default="present")
+    status = Column(String, nullable=False, default="pending", server_default="pending")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    storage_incarnation = Column(String, nullable=True)
+    target_cert_pubkey_hash = Column(String, nullable=True)
+    proof_sha256 = Column(String, nullable=True)
+    proof_size_bytes = Column(BigInteger, nullable=True)
+    proof_plaintext_size_bytes = Column(BigInteger, nullable=True)
+    proof_plaintext_sha256 = Column(String, nullable=True)
+    # Set only for a replica received through a consumed one-use validator capability. The initial
+    # direct-upload target has no capability id while its generation remains pending.
+    proof_capability_id = Column(String, nullable=True)
+    proof_mode = Column(String, nullable=True)
+    proof_at = Column(DateTime(timezone=True), nullable=True)
+    legacy_adoption_started_at = Column(DateTime(timezone=True), nullable=True)
+    pending_since = Column(DateTime(timezone=True), nullable=True)
+    pending_deadline = Column(DateTime(timezone=True), nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String, nullable=True)
+    last_inventory_snapshot_id = Column(String, nullable=True)
+    last_inventory_seen_at = Column(DateTime(timezone=True), nullable=True)
 
     object = relationship("StorageObject", back_populates="replicas")
 
     __table_args__ = (
         UniqueConstraint("object_id", "server_id", name="uq_replica_object_server"),
-        Index("idx_replica_placement_object", "object_id"),
+        Index("idx_replica_placement_object", "object_id", "placement_id"),
         Index("idx_replica_placement_server", "server_id"),
+        Index(
+            "idx_replica_pending_deadline",
+            "pending_deadline",
+            postgresql_where=status == "pending",
+        ),
+        Index(
+            "idx_replica_server_incarnation",
+            "server_id",
+            "storage_incarnation",
+        ),
+        Index(
+            "idx_replica_inventory_snapshot",
+            "server_id",
+            "storage_incarnation",
+            "status",
+            "placement_id",
+            "created_at",
+            "proof_at",
+            "last_inventory_seen_at",
+            "last_inventory_snapshot_id",
+            postgresql_where=status == "present",
+        ),
+        Index(
+            "idx_replica_repair_source",
+            "server_id",
+            "placement_id",
+            postgresql_where=status == "present",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'present', 'evicted')",
+            name="ck_replica_placement_status",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_replica_placement_attempt_count",
+        ),
+        CheckConstraint(
+            "proof_mode IS NULL OR proof_mode IN "
+            "('direct_upload', 'replication_capability', 'legacy_adoption')",
+            name="ck_replica_placement_proof_mode",
+        ),
+        CheckConstraint(
+            "proof_size_bytes IS NULL OR proof_size_bytes BETWEEN 0 AND 9223372036854775807",
+            name="ck_replica_ciphertext_size",
+        ),
+        CheckConstraint(
+            "proof_plaintext_size_bytes IS NULL "
+            "OR proof_plaintext_size_bytes BETWEEN 0 AND 9223372036854775807",
+            name="ck_replica_plaintext_size",
+        ),
+        CheckConstraint(
+            "proof_plaintext_sha256 IS NULL OR proof_plaintext_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_replica_plaintext_hash",
+        ),
+    )
+
+
+class StorageReplicationCapability(Base):
+    """One-use, identity- and generation-bound authorization for one replica transfer."""
+
+    __tablename__ = "storage_replication_capabilities"
+
+    capability_id = Column(String, primary_key=True, default=generate_uuid)
+    token_hash = Column(String, nullable=False, unique=True)
+    object_id = Column(
+        String,
+        ForeignKey("storage_objects.object_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    volume_id = Column(
+        String,
+        ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_placement_id = Column(
+        String,
+        ForeignKey("replica_placement.placement_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    source_server_id = Column(
+        String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False
+    )
+    source_cert_pubkey_hash = Column(String, nullable=False)
+    source_storage_incarnation = Column(String, nullable=False)
+    target_placement_id = Column(
+        String,
+        ForeignKey("replica_placement.placement_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_placement_attempt = Column(Integer, nullable=False)
+    target_server_id = Column(
+        String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False
+    )
+    target_cert_pubkey_hash = Column(String, nullable=False)
+    target_storage_incarnation = Column(String, nullable=False)
+    expected_ciphertext_sha256 = Column(String, nullable=False)
+    expected_ciphertext_size_bytes = Column(BigInteger, nullable=False)
+    issued_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    transfer_deadline = Column(DateTime(timezone=True), nullable=False)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    failed_at = Column(DateTime(timezone=True), nullable=True)
+    last_error = Column(String, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "idx_replication_capability_target",
+            "target_server_id",
+            "target_placement_id",
+            "target_placement_attempt",
+        ),
+        Index("idx_replication_capability_source", "source_server_id", "object_id"),
+        Index(
+            "idx_replication_capability_expiry",
+            "expires_at",
+            postgresql_where=(consumed_at.is_(None) & completed_at.is_(None) & failed_at.is_(None)),
+        ),
+        Index(
+            "uq_replication_capability_active_target",
+            "target_placement_id",
+            unique=True,
+            postgresql_where=(completed_at.is_(None) & failed_at.is_(None)),
+        ),
+        CheckConstraint(
+            "expected_ciphertext_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_replication_capability_hash",
+        ),
+        CheckConstraint(
+            "expected_ciphertext_size_bytes BETWEEN 0 AND 9223372036854775807",
+            name="ck_replication_capability_size",
+        ),
+        CheckConstraint(
+            "target_placement_attempt > 0",
+            name="ck_replication_capability_attempt",
+        ),
+        CheckConstraint(
+            "issued_at < expires_at AND expires_at <= transfer_deadline",
+            name="ck_replication_capability_deadlines",
+        ),
+        CheckConstraint(
+            "NOT (completed_at IS NOT NULL AND failed_at IS NOT NULL)",
+            name="ck_replication_capability_terminal",
+        ),
+    )
+
+
+class StorageInventorySnapshot(Base):
+    """A page-wise, attested inventory snapshot for one mounted storage incarnation."""
+
+    __tablename__ = "storage_inventory_snapshots"
+
+    snapshot_id = Column(String, primary_key=True)
+    server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
+    storage_incarnation = Column(String, nullable=False)
+    cert_pubkey_hash = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="scanning", server_default="scanning")
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    eligibility_cutoff_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_page_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    reconcile_cursor = Column(String, nullable=True)
+    reported_entries = Column(BigInteger, nullable=False, default=0, server_default="0")
+    omitted_entries = Column(BigInteger, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index(
+            "idx_storage_inventory_reconcile",
+            "state",
+            "completed_at",
+            "snapshot_id",
+        ),
+        Index(
+            "idx_storage_inventory_server",
+            "server_id",
+            "storage_incarnation",
+            "started_at",
+        ),
+        Index(
+            "idx_storage_inventory_stale",
+            "last_page_at",
+            "snapshot_id",
+            postgresql_where=state.in_(("scanning", "reconciled")),
+        ),
+        CheckConstraint(
+            "state IN ('scanning', 'complete', 'reconciled')",
+            name="ck_storage_inventory_state",
+        ),
+        CheckConstraint(
+            "reported_entries >= 0 AND omitted_entries >= 0",
+            name="ck_storage_inventory_counts",
+        ),
+    )
+
+
+class StorageModelInventorySnapshot(Base):
+    """A staged, page-wise authoritative model-holding inventory."""
+
+    __tablename__ = "storage_model_inventory_snapshots"
+
+    snapshot_id = Column(String, primary_key=True)
+    server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
+    storage_incarnation = Column(String, nullable=False)
+    cert_pubkey_hash = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="scanning", server_default="scanning")
+    started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    eligibility_cutoff_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_page_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    reconciled_at = Column(DateTime(timezone=True), nullable=True)
+    application_started_at = Column(DateTime(timezone=True), nullable=True)
+    last_reconcile_at = Column(DateTime(timezone=True), nullable=True)
+    apply_cursor_repo_id = Column(String, nullable=True)
+    apply_cursor_revision = Column(String, nullable=True)
+    omit_cursor = Column(String, nullable=True)
+    next_page_index = Column(Integer, nullable=False, default=0, server_default="0")
+    reported_entries = Column(BigInteger, nullable=False, default=0, server_default="0")
+    applied_entries = Column(BigInteger, nullable=False, default=0, server_default="0")
+    omitted_entries = Column(BigInteger, nullable=False, default=0, server_default="0")
+
+    __table_args__ = (
+        Index(
+            "idx_storage_model_inventory_reconcile",
+            "state",
+            "last_reconcile_at",
+            started_at.desc(),
+            snapshot_id.desc(),
+            postgresql_where=state.in_(("complete", "applying", "omitting")),
+        ),
+        Index(
+            "uq_storage_model_inventory_active_identity",
+            "server_id",
+            "storage_incarnation",
+            "cert_pubkey_hash",
+            unique=True,
+            postgresql_where=state.in_(("applying", "omitting")),
+        ),
+        Index(
+            "idx_storage_model_inventory_waiting",
+            "server_id",
+            "storage_incarnation",
+            "cert_pubkey_hash",
+            started_at.desc(),
+            snapshot_id.desc(),
+            postgresql_where=state == "complete",
+        ),
+        Index(
+            "idx_storage_model_inventory_stale",
+            "last_page_at",
+            "snapshot_id",
+            postgresql_where=state.in_(("scanning", "reconciled")),
+        ),
+        Index(
+            "idx_storage_model_inventory_server_order",
+            "server_id",
+            "storage_incarnation",
+            "cert_pubkey_hash",
+            "started_at",
+            "snapshot_id",
+        ),
+        CheckConstraint(
+            "state IN ('scanning', 'complete', 'applying', 'omitting', 'reconciled')",
+            name="ck_storage_model_inventory_state",
+        ),
+        CheckConstraint(
+            "next_page_index >= 0 "
+            "AND reported_entries BETWEEN 0 AND 9223372036854775807 "
+            "AND applied_entries BETWEEN 0 AND 9223372036854775807 "
+            "AND omitted_entries BETWEEN 0 AND 9223372036854775807",
+            name="ck_storage_model_inventory_counts",
+        ),
+    )
+
+
+class StorageModelInventoryEntry(Base):
+    """One staged model holding in an authoritative snapshot."""
+
+    __tablename__ = "storage_model_inventory_entries"
+
+    snapshot_id = Column(
+        String,
+        ForeignKey("storage_model_inventory_snapshots.snapshot_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    repo_id = Column(String, primary_key=True)
+    revision = Column(String, primary_key=True)
+    bytes = Column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "bytes BETWEEN 0 AND 9223372036854775807",
+            name="ck_storage_model_inventory_entry_bytes",
+        ),
+    )
+
+
+class StorageEraseTask(Base):
+    """Durable per-holder erasure of one exact immutable object generation."""
+
+    __tablename__ = "storage_erase_tasks"
+
+    task_id = Column(String, primary_key=True, default=generate_uuid)
+    object_id = Column(String, nullable=False)
+    volume_id = Column(String, nullable=False)
+    placement_id = Column(String, nullable=True)
+    server_id = Column(String, nullable=False)
+    storage_incarnation = Column(String, nullable=True)
+    holder_cert_pubkey_hash = Column(String, nullable=True)
+    reason = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="pending", server_default="pending")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    retention_deadline = Column(DateTime(timezone=True), nullable=False)
+    claimed_at = Column(DateTime(timezone=True), nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    claim_cert_pubkey_hash = Column(String, nullable=True)
+    attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    erased_file_was_present = Column(Boolean, nullable=True)
+    retired_by_user_id = Column(String, nullable=True)
+    last_error = Column(String, nullable=True)
+    metadata_purged_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_storage_erase_generation_holder",
+            "object_id",
+            "server_id",
+            func.coalesce(storage_incarnation, ""),
+            unique=True,
+        ),
+        Index(
+            "idx_storage_erase_claim",
+            "server_id",
+            "storage_incarnation",
+            "state",
+            "lease_expires_at",
+            "created_at",
+        ),
+        Index("idx_storage_erase_object", "object_id", "state"),
+        Index("idx_storage_erase_volume", "volume_id", "state"),
+        Index(
+            "idx_storage_erase_retention",
+            "retention_deadline",
+            "task_id",
+            postgresql_where=state.in_(("pending", "claimed")),
+        ),
+        Index(
+            "idx_storage_erase_volume_reason",
+            "volume_id",
+            "reason",
+            "task_id",
+        ),
+        Index(
+            "idx_storage_erase_volume_finalize",
+            "volume_id",
+            "state",
+            "reason",
+            "metadata_purged_at",
+        ),
+        Index(
+            "idx_storage_erase_terminal_unpurged",
+            "object_id",
+            "task_id",
+            postgresql_where=(state.in_(("erased", "retired")) & metadata_purged_at.is_(None)),
+        ),
+        Index(
+            "idx_storage_erase_terminal_audit",
+            "completed_at",
+            "task_id",
+            "volume_id",
+            postgresql_where=(state.in_(("erased", "retired")) & metadata_purged_at.isnot(None)),
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'claimed', 'erased', 'retired')",
+            name="ck_storage_erase_task_state",
+        ),
+        CheckConstraint("attempt_count >= 0", name="ck_storage_erase_task_attempts"),
+        CheckConstraint(
+            "(state IN ('erased', 'retired') AND completed_at IS NOT NULL) "
+            "OR (state IN ('pending', 'claimed') AND completed_at IS NULL)",
+            name="ck_storage_erase_task_terminal",
+        ),
     )

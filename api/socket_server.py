@@ -251,7 +251,9 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
         return True
     except HTTPException as e:
         logger.warning(f"Agent authentication failed: {e.detail}")
-        await sio.emit("auth_failed", {"error": f"Authentication failed: {e.detail}"}, to=session_id)
+        await sio.emit(
+            "auth_failed", {"error": f"Authentication failed: {e.detail}"}, to=session_id
+        )
     except Exception as e:
         logger.error(f"Unexpected error authenticating agent: {e}")
         await sio.emit("auth_failed", {"error": f"Unexpected error: {e}"}, to=session_id)

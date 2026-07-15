@@ -28,6 +28,10 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      volumes:
+        - name: tee-measurements
+          configMap:
+            name: tee-measurements
       containers:
         - name: cpu-scheduler
           image: "{{ .Values.cpuScheduler.image }}"
@@ -36,6 +40,12 @@ spec:
           env:
             {{- include "chutes.sensitiveEnv" . | nindent 12 }}
             {{- include "chutes.commonEnv" . | nindent 12 }}
+            - name: TEE_MEASUREMENT_CONFIG_REQUIRED
+              value: "true"
+          volumeMounts:
+            - name: tee-measurements
+              mountPath: "/etc/config"
+              readOnly: true
           resources:
             {{- toYaml .Values.cpuScheduler.resources | nindent 12 }}
 {{- end }}

@@ -2,43 +2,64 @@
 
 Endpoint groups + auth:
   - storage-TD ops (announce, replica-announce): owning-miner hotkey signature.
-  - peer discovery + cert authority: a verified attested mTLS client cert (request came from inside
-    SOME attested TD) -- this is how a chute TD finds model peers and how storage TDs find each other.
+  - generic peer discovery + cert authority: a verified attested mTLS client cert.
+  - non-CPU/GPU model access: a verified launch JWT bound to one instance/chute/model/commit; this
+    exposes only one storage target plus a one-use ensure capability, never generic peer/object APIs.
   - per-user volume CRUD + object metadata: the volume owner (API key / hotkey user).
   - per-volume key release: attested mTLS cert + a fresh quote bound to a single-use storage_key nonce.
 """
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
-from api.constants import HOTKEY_HEADER, NoncePurpose
+from api.constants import AUTHORIZATION_HEADER, HOTKEY_HEADER, NoncePurpose
 from api.database import get_db_session
 from api.server.exceptions import AttestationError
 from api.server.schemas import Server
 from api.server.service import create_nonce, validate_request_nonce
 from api.server.util import extract_client_cert_hash
+from api.permissions import Permissioning
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.util import extract_ip
 from api.storage import service
 from api.storage.schemas import (
     AnnounceModelHoldingsRequest,
+    AnnounceModelHoldingsResponse,
     AnnounceResponse,
+    AdministrativeEraseRetirementRequest,
+    AdministrativeEraseRetirementResponse,
     CommitObjectRequest,
     CommitObjectResponse,
     CreateVolumeRequest,
+    DeleteVolumeResponse,
     DeleteObjectRequest,
     DeleteObjectResponse,
+    EraseTask,
+    EraseTaskResultRequest,
+    EraseTaskResultResponse,
+    EraseTasksResponse,
     GrantRequest,
     GrantResponse,
     GrantVerifyRequest,
     GrantVerifyResponse,
     KeyNonceResponse,
+    InventoryPageRequest,
+    InventoryPageResponse,
+    LegacyReplicaAdoptionMetadataResponse,
+    LegacyReplicaAdoptionResponse,
+    LegacyReplicaAdoptionRequest,
     ListObjectsRequest,
     ListObjectsResponse,
     LocateObjectRequest,
     LocateObjectResponse,
+    ModelAccessRequest,
+    ModelAccessResponse,
+    ModelEnsureCapabilityBinding,
+    ModelEnsureCapabilityConsumeRequest,
+    ModelEnsureCapabilityIssueRequest,
+    ModelEnsureCapabilityIssueResponse,
     ObjectInfo,
     PeerCertResponse,
     PeerListResponse,
@@ -47,6 +68,14 @@ from api.storage.schemas import (
     RepairTask,
     RepairTasksResponse,
     ReplicaAnnounceRequest,
+    ReplicaAuthorizationResponse,
+    ReplicationCapabilityBinding,
+    ReplicationCapabilityCompleteRequest,
+    ReplicationCapabilityFailureRequest,
+    ReplicationCapabilityIssueRequest,
+    ReplicationCapabilityIssueResponse,
+    ReplicationCapabilityResult,
+    ReplicationCapabilityConsumeRequest,
     VolumeKeyRequest,
     VolumeKeyResponse,
     VolumeListResponse,
@@ -60,9 +89,9 @@ _REGISTERED_TO = None if settings.skip_metagraph_check else settings.netuid
 
 async def require_attested_caller(
     db: AsyncSession = Depends(get_db_session),
-    # M4: require a LIVE mTLS handshake (X-Client-Verify==SUCCESS), not just a header-supplied PEM --
-    # the attested certs are handed out publicly (peers/cert), so a header match alone is not proof
-    # the caller holds the in-TEE key. (The gate is a no-op in the plaintext dev posture.)
+    # M4: require a LIVE mTLS handshake, not just a header-supplied PEM. nginx reports SUCCESS for a
+    # CA-chained cert and FAILED:<reason> for the expected self-signed attested TEE cert under
+    # optional_no_ca; both prove CertificateVerify possession. NONE/missing proves no handshake.
     cert_hash: str = Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """Authenticate that a request comes from inside SOME attested TD (its attested mTLS cert).
@@ -79,10 +108,52 @@ async def require_attested_caller(
     return server
 
 
+async def require_fresh_storage_caller(
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_attested_caller),
+) -> Server:
+    """Require current mTLS cert possession plus a bounded-age accepted storage attestation."""
+    if not settings.require_mtls_client_verify:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Storage liveness and replica receipts are disabled without a verifying "
+                "mTLS terminator."
+            ),
+        )
+    if not caller.storage_role or not await service.is_freshly_attested_storage_server(db, caller):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Storage caller lacks a current successful attestation against an active "
+                "storage measurement."
+            ),
+        )
+    # Only this certificate-authenticated dependency may refresh storage liveness. A miner-hotkey
+    # heartbeat never reaches this call by itself.
+    await service.mark_storage_online(caller.server_id)
+    return caller
+
+
+async def require_storage_administrator(
+    current_user: User = Depends(get_current_user(require_v2=True)),
+) -> User:
+    if not (
+        current_user.has_role(Permissioning.chutes_support)
+        or current_user.has_role(Permissioning.billing_admin)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Storage erase retirement requires a support or billing administrator.",
+        )
+    return current_user
+
+
 def _require_hotkey(hotkey: str | None) -> str:
     if not hotkey:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing miner hotkey header."
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing miner hotkey header.",
         )
     return hotkey
 
@@ -90,7 +161,7 @@ def _require_hotkey(hotkey: str | None) -> str:
 # --- storage-TD ops (owning-miner signature) ---------------------------------------------------
 
 
-@router.post("/announce", response_model=AnnounceResponse)
+@router.post("/announce", response_model=AnnounceModelHoldingsResponse)
 async def announce(
     body: AnnounceModelHoldingsRequest,
     db: AsyncSession = Depends(get_db_session),
@@ -100,17 +171,23 @@ async def announce(
         # are re-imaged with the v2 tracker; a re-imaged TD's v2 announce binds method+path+body.
         get_current_user(purpose="tee", registered_to=_REGISTERED_TO, raise_not_found=False)
     ),
+    caller: Server = Depends(require_fresh_storage_caller),
 ):
     """A storage TD reports the public model repos it holds + refreshes its free disk (heartbeat)."""
     miner_hotkey = _require_hotkey(hotkey)
-    recorded = await service.announce_model_holdings(
+    result = await service.announce_model_holdings(
         db,
         miner_hotkey,
         body.server_id,
+        caller.server_id,
+        body.snapshot_id,
+        body.page_index,
+        body.storage_incarnation,
         body.disk_free_gb,
         [h.model_dump() for h in body.holdings],
+        body.complete,
     )
-    return AnnounceResponse(recorded=recorded)
+    return AnnounceModelHoldingsResponse(**result)
 
 
 @router.post("/replicas/announce", response_model=AnnounceResponse)
@@ -122,13 +199,123 @@ async def announce_replicas(
         # Accept v1+v2 (not require_v2): see announce -- deployed storage TDs sign v1 until re-imaged.
         get_current_user(purpose="tee", registered_to=_REGISTERED_TO, raise_not_found=False)
     ),
+    caller: Server = Depends(require_fresh_storage_caller),
 ):
     """A storage TD reports object replicas it now holds (confirms a replication push)."""
     miner_hotkey = _require_hotkey(hotkey)
     recorded = await service.announce_replicas(
-        db, miner_hotkey, body.server_id, [p.model_dump() for p in body.placements]
+        db,
+        miner_hotkey,
+        body.server_id,
+        caller.server_id,
+        body.storage_incarnation,
+        [p.model_dump() for p in body.placements],
     )
     return AnnounceResponse(recorded=recorded)
+
+
+@router.post("/replicas/adopt-legacy", response_model=LegacyReplicaAdoptionResponse)
+async def adopt_legacy_replicas(
+    body: LegacyReplicaAdoptionRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Adopt one intact pre-secure-replication file through its current attested assignment."""
+    outcomes = await service.adopt_legacy_replicas(
+        db,
+        caller,
+        body.storage_incarnation,
+        [submission.model_dump() for submission in body.objects],
+    )
+    return LegacyReplicaAdoptionResponse(outcomes=outcomes)
+
+
+@router.get(
+    "/replicas/adopt-legacy/{object_id}/metadata",
+    response_model=LegacyReplicaAdoptionMetadataResponse,
+)
+async def legacy_adoption_metadata(
+    object_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Return decryption metadata only for this TD's quarantined legacy assignment."""
+    return LegacyReplicaAdoptionMetadataResponse(
+        **(await service.legacy_adoption_metadata(db, caller, object_id))
+    )
+
+
+@router.post("/inventory", response_model=InventoryPageResponse)
+async def record_inventory(
+    body: InventoryPageRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Record one bounded page of a current incarnation's authoritative finalized-file inventory."""
+    return InventoryPageResponse(
+        **(
+            await service.record_inventory_page(
+                db,
+                caller,
+                body.snapshot_id,
+                body.storage_incarnation,
+                [entry.model_dump() for entry in body.entries],
+                body.complete,
+            )
+        )
+    )
+
+
+@router.get("/erase/tasks", response_model=EraseTasksResponse)
+async def claim_erase_tasks(
+    limit: int = Query(25, ge=1, le=100),
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Lease exact-generation erase work to its current attested holder incarnation."""
+    tasks = await service.claim_erase_tasks(db, caller, limit)
+    return EraseTasksResponse(tasks=[EraseTask(**task) for task in tasks])
+
+
+@router.post("/erase/tasks/{task_id}/result", response_model=EraseTaskResultResponse)
+async def record_erase_result(
+    task_id: str,
+    body: EraseTaskResultRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Acknowledge an fsync-complete deletion, or release a failed lease for retry."""
+    return EraseTaskResultResponse(
+        **(
+            await service.record_erase_task_result(
+                db,
+                caller,
+                task_id,
+                body.status,
+                body.file_was_present,
+                body.error,
+            )
+        )
+    )
+
+
+@router.post(
+    "/admin/erase/retire",
+    response_model=AdministrativeEraseRetirementResponse,
+)
+async def administratively_retire_erase_tasks(
+    body: AdministrativeEraseRetirementRequest,
+    db: AsyncSession = Depends(get_db_session),
+    administrator: User = Depends(require_storage_administrator),
+):
+    """Explicitly retire named overdue tasks under the configured retention policy."""
+    retired = await service.administratively_retire_erase_tasks(
+        db,
+        administrator.user_id,
+        body.task_ids,
+        body.reason,
+    )
+    return AdministrativeEraseRetirementResponse(retired=retired)
 
 
 # --- peer discovery + cert authority (attested caller) -----------------------------------------
@@ -150,25 +337,130 @@ async def peers_model(
 async def peers_local(
     host_id: str,
     db: AsyncSession = Depends(get_db_session),
-    _=Depends(require_attested_caller),
+    caller: Server = Depends(require_attested_caller),
 ):
     """The attested storage TD on host_id (a chute resolves its same-host storage node here)."""
+    if not caller.host_id or caller.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requested local storage host does not match the attested caller.",
+        )
     peer = await service.local_storage_peer(db, host_id)
     return PeerListResponse(peers=[peer] if peer else [])
 
 
-@router.get("/peers/attested")
-async def peers_attested(
-    cert_hash: str,
+@router.get("/peers/model-target", response_model=PeerListResponse)
+async def model_target(
+    repo_id: str,
+    revision: str,
     db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_attested_caller),
 ):
-    """Whether a cert pubkey-hash belongs to a registered attested server (M15).
+    """Choose a live storage target even when no peer holds this cold immutable commit yet."""
+    peer = await service.model_ensure_target(
+        db,
+        repo_id,
+        revision,
+        preferred_host_id=caller.host_id,
+    )
+    return PeerListResponse(peers=[peer] if peer else [])
 
-    Public + read-only (attested certs are already handed out via /peers/cert): a storage TD uses it
-    to gate the otherwise-unauthenticated /storage/model/ensure so only an attested TD triggers a
-    peer/HF fetch. Leaks nothing beyond membership of a public cert hash.
-    """
-    return {"attested": await service.is_attested_server_cert(db, cert_hash)}
+
+@router.post(
+    "/model/capabilities",
+    response_model=ModelEnsureCapabilityIssueResponse,
+)
+async def issue_model_ensure_capability(
+    body: ModelEnsureCapabilityIssueRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_attested_caller),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    """Authorize one launch/instance/model target after real requester mTLS possession."""
+    requester = await service.authorize_launch_model_request(
+        db,
+        authorization,
+        body.repo_id,
+        body.revision,
+        body.requested_revision,
+        expected_server_id=caller.server_id,
+    )
+    requester["requester_cert_pubkey_hash"] = (
+        (caller.attested_cert_pubkey_hash or "").strip().lower()
+    )
+    if not requester["requester_cert_pubkey_hash"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Attested requester has no certificate binding.",
+        )
+    return ModelEnsureCapabilityIssueResponse(
+        **(
+            await service.issue_model_ensure_capability(
+                db,
+                requester,
+                body.request_id,
+                body.target_server_id,
+                body.repo_id,
+                body.revision,
+                body.requested_revision,
+            )
+        )
+    )
+
+
+@router.post("/model/access", response_model=ModelAccessResponse)
+async def issue_launch_model_access(
+    body: ModelAccessRequest,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    """Authorize non-CPU/GPU launch instances for public model discovery and one ensure only."""
+    requester = await service.authorize_launch_model_request(
+        db,
+        authorization,
+        body.repo_id,
+        body.revision,
+        body.requested_revision,
+    )
+    peer = await service.model_ensure_target(db, body.repo_id, body.revision)
+    if peer is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No live attested storage target is available.",
+        )
+    issued = await service.issue_model_ensure_capability(
+        db,
+        requester,
+        body.request_id,
+        peer.server_id,
+        body.repo_id,
+        body.revision,
+        body.requested_revision,
+    )
+    return ModelAccessResponse(peer=peer, **issued)
+
+
+@router.post(
+    "/model/capabilities/consume",
+    response_model=ModelEnsureCapabilityBinding,
+)
+async def consume_model_ensure_capability(
+    body: ModelEnsureCapabilityConsumeRequest,
+    target: Server = Depends(require_fresh_storage_caller),
+):
+    """Consume an exact capability over the selected target's own attested mTLS."""
+    return ModelEnsureCapabilityBinding(
+        **(
+            await service.consume_model_ensure_capability(
+                target,
+                body.capability,
+                body.request_id,
+                body.repo_id,
+                body.revision,
+                body.requested_revision,
+            )
+        )
+    )
 
 
 @router.get("/peers/cert/{server_id}", response_model=PeerCertResponse)
@@ -187,7 +479,7 @@ async def peer_cert(
 async def object_replicas(
     object_id: str,
     db: AsyncSession = Depends(get_db_session),
-    _=Depends(require_attested_caller),
+    _=Depends(require_fresh_storage_caller),
 ):
     """The validator-assigned replica peers for an object, so the primary storage TD replicates to the
     tracker's distinct-host placement instead of a client-supplied peer list (M2)."""
@@ -195,15 +487,110 @@ async def object_replicas(
     return PeerListResponse(peers=peers)
 
 
+@router.get(
+    "/objects/{object_id}/replica-authorization",
+    response_model=ReplicaAuthorizationResponse,
+)
+async def replica_authorization(
+    object_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Return only the calling target TD's current, incarnation-bound assignment."""
+    return ReplicaAuthorizationResponse(
+        **(await service.replica_authorization(db, object_id, caller))
+    )
+
+
 @router.get("/repair/tasks", response_model=RepairTasksResponse)
 async def repair_tasks(
     db: AsyncSession = Depends(get_db_session),
-    caller: Server = Depends(require_attested_caller),
+    caller: Server = Depends(require_fresh_storage_caller),
 ):
-    """Repair work for the calling storage TD (M7): objects it holds that are under-replicated, each
-    with a short-lived system put-grant + the newly-assigned target peers to push the ciphertext to."""
+    """Capability-free repair descriptors; each target is leased only when transfer begins."""
     tasks = await service.repair_tasks_for_server(db, caller.server_id)
     return RepairTasksResponse(tasks=[RepairTask(**t) for t in tasks])
+
+
+@router.post(
+    "/replication/capabilities",
+    response_model=ReplicationCapabilityIssueResponse,
+)
+async def issue_replication_capability(
+    body: ReplicationCapabilityIssueRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Lease one exact target transfer to a source with a current possession receipt."""
+    return ReplicationCapabilityIssueResponse(
+        **(
+            await service.issue_replication_capability(
+                db,
+                caller,
+                body.object_id,
+                body.target_server_id,
+                body.ciphertext_sha256,
+                body.ciphertext_size_bytes,
+            )
+        )
+    )
+
+
+@router.post(
+    "/replication/capabilities/consume",
+    response_model=ReplicationCapabilityBinding,
+)
+async def consume_replication_capability(
+    body: ReplicationCapabilityConsumeRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Atomically consume a one-use capability as its exact current target before body read."""
+    return ReplicationCapabilityBinding(
+        **(
+            await service.consume_replication_capability(
+                db, caller, body.capability, body.source_signature
+            )
+        )
+    )
+
+
+@router.post(
+    "/replication/capabilities/complete",
+    response_model=ReplicationCapabilityResult,
+)
+async def complete_replication_capability(
+    body: ReplicationCapabilityCompleteRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Record target possession only after durable no-replace publication of exact bytes."""
+    return ReplicationCapabilityResult(
+        **(
+            await service.complete_replication_capability(
+                db,
+                caller,
+                body.capability,
+                body.ciphertext_sha256,
+                body.ciphertext_size_bytes,
+            )
+        )
+    )
+
+
+@router.post(
+    "/replication/capabilities/fail",
+    response_model=ReplicationCapabilityResult,
+)
+async def fail_replication_capability(
+    body: ReplicationCapabilityFailureRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Record one bounded transfer failure without manufacturing a possession receipt."""
+    return ReplicationCapabilityResult(
+        **(await service.fail_replication_capability(db, caller, body.capability, body.error))
+    )
 
 
 # --- confidential volume CRUD (owner) ----------------------------------------------------------
@@ -215,19 +602,30 @@ async def create_volume(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
-    volume = await service.create_volume(
-        db, current_user.user_id, body.name, body.replication_factor, body.quota_bytes
+    volume, aggregate_quota = await service.create_volume(
+        db, current_user.user_id, body.name, body.replication_factor
     )
-    return VolumeResponse(**service._volume_response(volume))
+    return VolumeResponse(**service._volume_response(volume, aggregate_quota))
 
 
 @router.get("/volumes", response_model=VolumeListResponse)
 async def list_volumes(
+    limit: int = Query(100, ge=1, le=200),
+    after: str | None = Query(None, max_length=128),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
-    volumes = await service.list_volumes(db, current_user.user_id)
-    return VolumeListResponse(volumes=[VolumeResponse(**service._volume_response(v)) for v in volumes])
+    effective_limit = min(limit, settings.storage_volume_page_size_max)
+    volumes, aggregate_quota = await service.list_volumes(
+        db, current_user.user_id, effective_limit, after
+    )
+    return VolumeListResponse(
+        volumes=[
+            VolumeResponse(**service._volume_response(volume, aggregate_quota))
+            for volume in volumes
+        ],
+        next_cursor=volumes[-1].volume_id if len(volumes) == effective_limit else None,
+    )
 
 
 @router.get("/volumes/{volume_id}", response_model=VolumeResponse)
@@ -237,17 +635,19 @@ async def get_volume(
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
-    return VolumeResponse(**service._volume_response(volume))
+    aggregate_quota = await service.storage_aggregate_quota(db, current_user.user_id)
+    return VolumeResponse(**service._volume_response(volume, aggregate_quota))
 
 
-@router.delete("/volumes/{volume_id}")
+@router.delete("/volumes/{volume_id}", response_model=DeleteVolumeResponse)
 async def delete_volume(
     volume_id: str,
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
-    await service.delete_volume(db, volume_id, current_user.user_id)
-    return {"deleted": True}
+    return DeleteVolumeResponse(
+        **(await service.delete_volume(db, volume_id, current_user.user_id))
+    )
 
 
 # --- object metadata: placement / commit / locate / list / delete (owner) ----------------------
@@ -262,9 +662,19 @@ async def plan_placement(
 ):
     """Quota-check + return the target replica set (N attested TDs on distinct hosts) for an object."""
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
-    obj, peers = await service.plan_object_placement(db, volume, body.key, body.size_bytes)
+    obj, peers = await service.plan_object_placement(
+        db, volume, body.request_id, body.key, body.size_bytes
+    )
     return PlacementResponse(
-        object_id=obj.object_id, replicas=peers, replication_factor=volume.replication_factor
+        object_id=obj.object_id,
+        expected_predecessor_id=obj.expected_predecessor_id,
+        lifecycle_state=obj.lifecycle_state,
+        salt=obj.salt,
+        replicas=peers,
+        replication_factor=volume.replication_factor,
+        replicas_available=len(peers),
+        under_replicated=len(peers) < volume.replication_factor,
+        durability_state=obj.durability_state,
     )
 
 
@@ -282,19 +692,18 @@ async def commit_object(
         volume,
         body.object_id,
         body.key,
-        body.size_bytes,
-        body.sha256,
-        body.holder_server_ids,
         salt=body.salt,
-        plaintext_sha256=body.plaintext_sha256,
     )
     return CommitObjectResponse(
         object_id=obj.object_id,
+        lifecycle_state=obj.lifecycle_state,
+        size_bytes=obj.size_bytes,
         used_bytes=volume.used_bytes,
         quota_bytes=volume.quota_bytes,
         replicas_confirmed=replicas_confirmed,
         replication_factor=volume.replication_factor,
         under_replicated=replicas_confirmed < volume.replication_factor,
+        durability_state=obj.durability_state,
     )
 
 
@@ -306,9 +715,10 @@ async def locate_object(
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
-    obj, peers = await service.locate_object(db, volume, body.key)
+    obj, peers, replicas_confirmed = await service.locate_object(db, volume, body.key)
     return LocateObjectResponse(
         object_id=obj.object_id,
+        lifecycle_state=obj.lifecycle_state,
         key=obj.object_key,
         size_bytes=obj.size_bytes,
         sha256=obj.sha256,
@@ -317,6 +727,10 @@ async def locate_object(
         salt=obj.salt,
         plaintext_sha256=obj.plaintext_sha256,
         peers=peers,
+        replicas_confirmed=replicas_confirmed,
+        replication_factor=volume.replication_factor,
+        under_replicated=replicas_confirmed < volume.replication_factor,
+        durability_state=obj.durability_state,
     )
 
 
@@ -335,10 +749,14 @@ async def list_objects(
         objects=[
             ObjectInfo(
                 object_id=o.object_id,
+                lifecycle_state=o.lifecycle_state,
                 key=o.object_key,
                 size_bytes=o.size_bytes,
                 sha256=o.sha256,
                 created_at=o.created_at.isoformat() if o.created_at else "",
+                replicas_confirmed=o.durable_replica_count,
+                replication_factor=volume.replication_factor,
+                durability_state=o.durability_state,
             )
             for o in objects
         ],
@@ -354,8 +772,14 @@ async def delete_object(
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     volume = await service._get_owned_volume(db, volume_id, current_user.user_id)
-    used = await service.delete_object(db, volume, body.key)
-    return DeleteObjectResponse(deleted=True, used_bytes=used)
+    obj, used, erase_tasks_pending = await service.delete_object(db, volume, body.key)
+    return DeleteObjectResponse(
+        deleted=True,
+        object_id=obj.object_id if obj is not None else None,
+        used_bytes=used,
+        erase_tasks_pending=erase_tasks_pending,
+        purge_pending=erase_tasks_pending > 0 or obj is not None,
+    )
 
 
 # --- object-op grants --------------------------------------------------------------------------

@@ -36,6 +36,13 @@ RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/s
     && mv kubectl /usr/local/bin/ \
     && chmod 755 /usr/local/bin/kubectl
 
+# Release provenance is verified by the API process at activation and every desired-state read.
+# Install cosign in the shared runtime base so both forge and the final API image have verify-blob.
+ARG COSIGN_VERSION=2.5.3
+RUN curl -fsSLO "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign_${COSIGN_VERSION}_amd64.deb" \
+    && dpkg -i "cosign_${COSIGN_VERSION}_amd64.deb" \
+    && rm "cosign_${COSIGN_VERSION}_amd64.deb"
+
 # Set Python 3.12 as default python3
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
@@ -86,12 +93,6 @@ RUN mkdir -p /root/build /forge /var/lib/containers
 RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.70.0
 
 
-# Install cosign
-ENV COSIGN_VERSION=2.5.3
-RUN curl -LO "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign_${COSIGN_VERSION}_amd64.deb" && \
-    dpkg -i cosign_${COSIGN_VERSION}_amd64.deb && \
-    rm cosign_${COSIGN_VERSION}_amd64.deb
-
 # Install uv (instead of Poetry) for dependency management
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
@@ -126,6 +127,7 @@ ENTRYPOINT ["uv", "run", "python", "-m", "api.image.forge"]
 # API
 ###
 FROM base AS api
+RUN cosign verify-blob --help >/dev/null
 RUN curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 && chmod +x /usr/local/bin/dbmate
 RUN useradd chutes -s /bin/bash -d /home/chutes && mkdir -p /home/chutes && chown chutes:chutes /home/chutes
 RUN mkdir -p /app && chown chutes:chutes /app

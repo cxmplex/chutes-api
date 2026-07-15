@@ -3,14 +3,13 @@
 Endpoint groups + auth:
   - release management (create / activate / rollout / status / list): a Chutes admin
     (Permissioning.chutes_support) via the standard API-key / JWT `get_current_user`.
-  - GET /releases/current: the host-facing active manifest an L0 node-agent polls, authenticated by
-    the owning miner's hotkey signature (same style as /hosts/register); the manifest is non-secret.
+  - GET /releases/current and POST /releases/current/reissue: host-facing desired state and explicit
+    logical-token rotation, authenticated by the owning miner's hotkey signature.
 """
 
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
-from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +21,7 @@ from api.releases import service
 from api.releases.schemas import (
     CreateReleaseRequest,
     GuestRelease,
+    ReissueReleaseTargetTokensRequest,
     ReleaseManifest,
     ReleaseResponse,
     ReleaseStatusResponse,
@@ -83,7 +83,7 @@ async def rollout_release_endpoint(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(raise_not_found=False)),
 ):
-    """Dispatch upgrade_image to online hosts of the release's tee_type (host_ids = canary). Admin only.
+    """Nudge online logical targets (host_ids scopes dispatch, not the captured target set). Admin only.
 
     reboot_l0=true also re-netboots the hosts to apply the release's L0 slot (disruptive; opt-in).
     """
@@ -91,7 +91,9 @@ async def rollout_release_endpoint(
     host_ids = body.host_ids if body else None
     reboot_l0 = body.reboot_l0 if body else False
     try:
-        result = await service.rollout_release(db, release_id, host_ids=host_ids, reboot_l0=reboot_l0)
+        result = await service.rollout_release(
+            db, release_id, host_ids=host_ids, reboot_l0=reboot_l0
+        )
     except service.ReleaseError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return result
@@ -103,7 +105,10 @@ async def release_status_endpoint(
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(raise_not_found=False)),
 ):
-    """Convergence report: which hosts have staged the release's images, and servers on it. Admin only."""
+    """Untrusted host data plus quote-backed, same-miner-transferable logical telemetry. Admin only.
+
+    It never proves physical convergence or automatically authorizes measurement-pin pruning.
+    """
     _require_admin(current_user)
     try:
         return await service.release_status(db, release_id)
@@ -134,6 +139,7 @@ async def list_releases_endpoint(
 async def current_release_endpoint(
     tee_type: str = Query(..., description="The polling host's launcher tee_type: sev-snp | tdx"),
     channel: str = Query("stable"),
+    host_id: str = Query(..., description="Enrolled logical L0 launcher requesting its tokens"),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     db: AsyncSession = Depends(get_db_session),
     _: User | None = Depends(
@@ -147,15 +153,70 @@ async def current_release_endpoint(
     """The active manifest an L0 node-agent should converge to (miner-hotkey signed).
 
     Returns 404 when no release is active for this (channel, tee_type) so the agent keeps its
-    current image. The manifest is non-secret (public image URLs + sha256); the signature scopes the
-    poll to miners and prevents anonymous enumeration.
+    current image. Host-specific one-use rollout tokens make the signed ownership check mandatory.
     """
     if not hotkey:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing miner hotkey header.")
-    manifest = await service.active_manifest_for_host(db, tee_type, channel)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing miner hotkey header.",
+        )
+    try:
+        manifest = await service.active_manifest_for_host(
+            db,
+            tee_type,
+            channel,
+            host_id=host_id,
+            miner_hotkey=hotkey,
+        )
+    except service.ReleaseError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     if manifest is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No active release for channel={channel} tee_type={tee_type}",
+        )
+    return manifest
+
+
+@router.post("/current/reissue", response_model=ReleaseManifest)
+async def reissue_current_release_target_tokens_endpoint(
+    body: ReissueReleaseTargetTokensRequest,
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    db: AsyncSession = Depends(get_db_session),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.RELEASE_FETCH.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+        )
+    ),
+):
+    """Rotate selected one-use logical token generations before a role representative relaunch.
+
+    The side effect requires a method/path/body-bound v2 signature with a single-use nonce. The
+    caller is miner-authenticated, but the Model-B L0 remains unattested. Reissued bearer tokens are
+    therefore transferable among that miner's launchers and provide no physical-host proof.
+    """
+    if not hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing miner hotkey header.",
+        )
+    try:
+        manifest = await service.active_manifest_for_host(
+            db,
+            body.tee_type,
+            body.channel,
+            host_id=body.host_id,
+            miner_hotkey=hotkey,
+            reissue_roles=set(body.roles),
+        )
+    except service.ReleaseError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    if manifest is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(f"No active release for channel={body.channel} tee_type={body.tee_type}"),
         )
     return manifest

@@ -15,6 +15,7 @@ from sqlalchemy import (
     Boolean,
     Integer,
     BigInteger,
+    CheckConstraint,
     ForeignKey,
     select,
     case,
@@ -109,6 +110,11 @@ class User(Base):
     # Per-user rate limit overrides (JSONB: {"*": N, "<chute_id>": M}).
     rate_limit_overrides = Column(JSONB, nullable=True)
 
+    # ChuteFS byte entitlements. NULL selects the validator's configured defaults. These are
+    # administrator-controlled account fields; volume owners never submit quota values.
+    storage_volume_quota_bytes = Column(BigInteger, nullable=True)
+    storage_aggregate_quota_bytes = Column(BigInteger, nullable=True)
+
     chutes = relationship("Chute", back_populates="user")
     images = relationship("Image", back_populates="user")
     api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")
@@ -123,6 +129,17 @@ class User(Base):
         viewonly=True,
         uselist=False,
         lazy="joined",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "storage_volume_quota_bytes IS NULL OR storage_volume_quota_bytes > 0",
+            name="ck_users_storage_volume_quota",
+        ),
+        CheckConstraint(
+            "storage_aggregate_quota_bytes IS NULL OR storage_aggregate_quota_bytes > 0",
+            name="ck_users_storage_aggregate_quota",
+        ),
     )
 
     @validates("username")
@@ -199,7 +216,12 @@ class InvocationQuota(Base):
     @staticmethod
     async def get_subscription_record(
         user_id: str,
-    ) -> tuple[int, datetime.datetime | None, datetime.datetime | None, datetime.datetime | None]:
+    ) -> tuple[
+        int,
+        datetime.datetime | None,
+        datetime.datetime | None,
+        datetime.datetime | None,
+    ]:
         """
         Load the wildcard subscription quota row with its anchor timestamps.
         Returns quota, anchor_date, effective_date, updated_at.

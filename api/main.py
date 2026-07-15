@@ -10,15 +10,20 @@ import asyncio
 # import fickling
 import hashlib
 from loguru import logger
-from urllib.parse import quote
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, APIRouter, HTTPException, status, Response
 from fastapi.responses import ORJSONResponse
 from sqlalchemy import text
 import api.database.orms  # noqa: F401
-from prometheus_client import generate_latest, CollectorRegistry, multiprocess, CONTENT_TYPE_LATEST
+from prometheus_client import (
+    generate_latest,
+    CollectorRegistry,
+    multiprocess,
+    CONTENT_TYPE_LATEST,
+)
 from concurrent.futures import ThreadPoolExecutor
 from api.api_key.router import router as api_key_router
+from api.api_key.storage_scope import storage_authorization_scope
 from api.chute.router import router as chute_router
 from api.bounty.router import router as bounty_router
 from api.image.router import router as image_router
@@ -45,7 +50,8 @@ from api.e2e.router import router as e2e_router
 from api.encrypted_logs.router import router as encrypted_logs_router
 from api.model_alias.router import router as model_alias_router
 from api.chute.util import chute_id_by_slug
-from api.database import Base, engine, get_session
+from api.database import get_session
+from api.database.migrations import run_database_migrations
 from api.config import settings
 from api.metrics.util import keep_gauges_fresh
 from api.instance.util import start_instance_invalidation_listener
@@ -103,6 +109,14 @@ async def lifespan(_: FastAPI):
     """
     gc.set_threshold(5000, 50, 50)
 
+    trust_health = settings.tee_measurement_health()
+    if not trust_health["ready"]:
+        raise RuntimeError(
+            f"TEE measurement trust set is not ready at startup: {trust_health['last_error']}"
+        )
+
+    await run_database_migrations()
+
     loop = asyncio.get_event_loop()
     executor = ThreadPoolExecutor(max_workers=64)
     loop.set_default_executor(executor)
@@ -114,73 +128,11 @@ async def lifespan(_: FastAPI):
     # Prom multi-proc dir.
     os.makedirs("/tmp/prometheus_multiproc", exist_ok=True)
 
-    # Normal table creation stuff.
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    # NOTE: Could we use dbmate container in docker compose to do this instead?
-    # Manual DB migrations.
-    db_url = quote(settings.sqlalchemy.replace("+asyncpg", ""), safe=":/@")
-    if "127.0.0.1" in db_url or "@postgres:" in db_url:
-        db_url += "?sslmode=disable"
-
-    # dbmate migrations, make sure we only run them in a single process since we use workers > 1
-    worker_pid_file = "/tmp/api.pid"
-    is_migration_process = False
-    try:
-        if not os.path.exists(worker_pid_file):
-            with open(worker_pid_file, "x") as outfile:
-                outfile.write(str(os.getpid()))
-            is_migration_process = True
-        else:
-            with open(worker_pid_file, "r") as infile:
-                designated_pid = int(infile.read().strip())
-            is_migration_process = os.getpid() == designated_pid
-    except FileExistsError:
-        with open(worker_pid_file, "r") as infile:
-            designated_pid = int(infile.read().strip())
-        is_migration_process = os.getpid() == designated_pid
-    if not is_migration_process:
-        yield
-        return
-
-    # ChuteFS durability reconcile (M7): re-replicate under-target objects + GC dead placements.
-    # Single-process (leader worker) so the fleet isn't reconciled N times in parallel.
+    # Every worker starts the loop. The session-level PostgreSQL advisory lock elects exactly one
+    # worker for each bounded pass and cannot be orphaned by a stale container-local pid file.
     from api.storage.reconcile import storage_reconcile_loop
 
     asyncio.create_task(storage_reconcile_loop())
-
-    ## Run the migrations.
-    # process = await asyncio.create_subprocess_exec(
-    #    "dbmate",
-    #    "--url",
-    #    db_url,
-    #    "--migrations-dir",
-    #    "api/migrations",
-    #    "migrate",
-    #    stdout=asyncio.subprocess.PIPE,
-    #    stderr=asyncio.subprocess.PIPE,
-    # )
-
-    # async def log_migrations(stream, name):
-    #    log_method = logger.info if name == "stdout" else logger.warning
-    #    while True:
-    #        line = await stream.readline()
-    #        if line:
-    #            decoded_line = line.decode().strip()
-    #            log_method(decoded_line)
-    #        else:
-    #            break
-
-    # await asyncio.gather(
-    #    log_migrations(process.stdout, "stdout"),
-    #    log_migrations(process.stderr, "stderr"),
-    #    process.wait(),
-    # )
-    # if process.returncode == 0:
-    #    logger.success("successfull applied all DB migrations")
-    # else:
-    #    logger.error(f"failed to run db migrations returncode={process.returncode}")
 
     yield
 
@@ -230,17 +182,69 @@ async def ping():
         )
 
 
+async def ready(request: Request):
+    """Internal readiness surface: database plus complete TEE trust-set health."""
+    if request.headers.get("x-forwarded-for"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    trust_health = settings.tee_measurement_health()
+    if not trust_health["ready"]:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"tee_measurements": trust_health},
+        )
+    try:
+        async with get_session() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Database connectivity problems: {exc}",
+        ) from exc
+    return {"status": "ready", "tee_measurements": trust_health}
+
+
+def _tee_trust_metrics(health: dict) -> bytes:
+    """Render bounded operator-only trust-load state without registering stale label series."""
+
+    def escape(value) -> str:
+        return (
+            str(value if value is not None else "")
+            .replace("\\", "\\\\")
+            .replace("\n", "\\n")
+            .replace('"', '\\"')
+        )
+
+    labels = (
+        f'status="{escape(health.get("status"))}",'
+        f'fingerprint="{escape(health.get("fingerprint"))}",'
+        f'last_error="{escape(health.get("last_error"))}"'
+    )
+    return (
+        "# HELP chutes_tee_measurement_trust_info Current atomic TEE trust-load state.\n"
+        "# TYPE chutes_tee_measurement_trust_info gauge\n"
+        f"chutes_tee_measurement_trust_info{{{labels}}} 1\n"
+        "# HELP chutes_tee_measurement_trust_ready Whether the complete configured trust set loaded.\n"
+        "# TYPE chutes_tee_measurement_trust_ready gauge\n"
+        f"chutes_tee_measurement_trust_ready {1 if health.get('ready') else 0}\n"
+        "# HELP chutes_tee_measurement_trust_entries Active last-known-good measurement entries.\n"
+        "# TYPE chutes_tee_measurement_trust_entries gauge\n"
+        f"chutes_tee_measurement_trust_entries {int(health.get('measurement_count') or 0)}\n"
+    ).encode()
+
+
 # Prometheus metrics endpoint.
 async def get_latest_metrics(request: Request):
     if request.headers.get("x-forwarded-for"):
         raise HTTPException(status_code=403, detail="Forbidden")
+    trust_health = settings.tee_measurement_health()
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
-    data = generate_latest(registry)
+    data = generate_latest(registry) + _tee_trust_metrics(trust_health)
     return Response(data, media_type=CONTENT_TYPE_LATEST)
 
 
 default_router.get("/ping")(ping)
+default_router.get("/readyz")(ready)
 default_router.get("/_metrics")(get_latest_metrics)
 
 
@@ -386,11 +390,11 @@ async def host_router_middleware(request: Request, call_next):
                     request.state.auth_object_type = "account"
                 request.state.auth_object_id = "__self__"
             elif request.url.path.startswith("/storage/"):
-                # ChuteFS ops (H5): a single "storage" scope object so a storage-scoped API key can be
-                # minted for a deployed storage chute. The deeper /storage/... paths don't fit the
-                # 2-segment object-id regex below, so map them explicitly.
                 request.state.auth_object_type = "storage"
-                request.state.auth_object_id = "__self__"
+                (
+                    request.state.auth_method,
+                    request.state.auth_object_id,
+                ) = await storage_authorization_scope(request)
             else:
                 request.state.auth_object_type = request.url.path.split("/")[-1]
                 # XXX at some point, perhaps we can support objects by name too, but for

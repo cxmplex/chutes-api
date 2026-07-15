@@ -5,10 +5,16 @@ Tests chute attestation flow with e2e_pubkey hash for chutes >= 0.6.0.
 
 import hashlib
 import pytest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import HTTPException
 
-from api.config import settings
+from api.config import (
+    TeeMeasurementConfig,
+    measurement_config_fingerprint,
+    measurement_trust_set_fingerprint,
+    settings,
+)
 from api.instance.util import verify_tee_chute, require_attested_client_cert
 from api.server.exceptions import NoClientCertError
 from api.server.quote import BootTdxQuote
@@ -255,6 +261,7 @@ async def test_require_attested_client_cert_match_passes():
     """Matching client-cert pubkey hash == pinned attested cert -> allowed."""
     db = _db_returning(_cpu_server())
     with (
+        patch("api.server.service.runtime_attestation_context_for_server"),
         patch.object(settings, "require_mtls_client_verify", True),
         patch("api.instance.util._get_client_certificate", return_value=MagicMock()),
         patch("api.instance.util.get_public_key_hash", return_value="samehash"),
@@ -268,6 +275,7 @@ async def test_require_attested_client_cert_mismatch_403():
     """A client cert whose pubkey hash != the pinned attested cert is rejected."""
     db = _db_returning(_cpu_server())
     with (
+        patch("api.server.service.runtime_attestation_context_for_server"),
         patch.object(settings, "require_mtls_client_verify", True),
         patch("api.instance.util._get_client_certificate", return_value=MagicMock()),
         patch(
@@ -286,6 +294,7 @@ async def test_require_attested_client_cert_jwt_only_rejected():
     """JWT-only caller (no verified mTLS client cert) is rejected -- the C-1 secret-exfil block."""
     db = _db_returning(_cpu_server())
     with (
+        patch("api.server.service.runtime_attestation_context_for_server"),
         patch.object(settings, "require_mtls_client_verify", True),
         patch("api.instance.util._get_client_certificate", side_effect=NoClientCertError()),
     ):
@@ -298,7 +307,10 @@ async def test_require_attested_client_cert_jwt_only_rejected():
 async def test_require_attested_client_cert_no_attested_cert_403():
     """A CPU-TEE server with no attested cert on record fails closed (cannot bind)."""
     db = _db_returning(_cpu_server(attested_cert=None))
-    with patch.object(settings, "require_mtls_client_verify", True):
+    with (
+        patch("api.server.service.runtime_attestation_context_for_server"),
+        patch.object(settings, "require_mtls_client_verify", True),
+    ):
         with pytest.raises(HTTPException) as exc_info:
             await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
         assert exc_info.value.status_code == 403
@@ -321,10 +333,132 @@ async def test_require_attested_client_cert_hard_fails_when_mtls_disabled():
     """Without an mTLS terminator (require_mtls_client_verify=false) the binding cannot be proven,
     so CPU-TEE secret endpoints must HARD-FAIL -- never warn-and-skip into unbound secret delivery."""
     db = _db_returning(_cpu_server())
-    with patch.object(settings, "require_mtls_client_verify", False):
+    with (
+        patch("api.server.service.runtime_attestation_context_for_server"),
+        patch.object(settings, "require_mtls_client_verify", False),
+    ):
         with pytest.raises(HTTPException) as exc_info:
             await require_attested_client_cert(db, MagicMock(), _cpu_tee_instance())
         assert exc_info.value.status_code == 403
+
+
+def _active_cpu_pin(*, name="cpu-baremetal-tdx-current", mrtd="A" * 96):
+    config = TeeMeasurementConfig(
+        version="2.0.0-tdx-4vcpu",
+        name=name,
+        tee_type="tdx",
+        provider="bare-metal",
+        mrtd=mrtd,
+        boot_rtmrs={f"RTMR{index}": chr(66 + index) * 96 for index in range(4)},
+        runtime_rtmrs={f"RTMR{index}": chr(70 + index) * 96 for index in range(4)},
+        expected_gpus=[],
+        gpu_count=0,
+        debug=False,
+    )
+    config.config_fingerprint = measurement_config_fingerprint(config)
+    config.trust_set_fingerprint = measurement_trust_set_fingerprint([config])
+    return config
+
+
+def _issued_cpu_server(config):
+    return SimpleNamespace(
+        server_id="srv-issued",
+        ip="192.168.1.1",
+        miner_hotkey="miner_hotkey_123",
+        name="issued-vm",
+        is_tee=True,
+        self_registered=True,
+        compute_type="cpu",
+        tee_type="tdx",
+        host_id="l0-issued",
+        storage_role=False,
+        version=config.version,
+        measurement_name=config.name,
+        measurement_config_fingerprint=config.config_fingerprint,
+        trust_set_fingerprint=config.trust_set_fingerprint,
+        attested_cert=_ATTESTED_PEM,
+        attested_cert_pubkey_hash="ab" * 32,
+    )
+
+
+def _post_issue_measurements(old_config, mutation):
+    if mutation == "retired_name":
+        return []
+    if mutation == "changed_config":
+        return [_active_cpu_pin(mrtd="9" * 96)]
+    if mutation == "changed_trust":
+        return [old_config, _active_cpu_pin(name="cpu-baremetal-tdx-added")]
+    raise AssertionError(f"unknown mutation: {mutation}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["retired_name", "changed_config", "changed_trust"],
+)
+async def test_old_launch_token_is_revoked_before_self_registered_early_return(
+    mutation,
+):
+    old_config = _active_cpu_pin()
+    server = _issued_cpu_server(old_config)
+    active = _post_issue_measurements(old_config, mutation)
+    instance = SimpleNamespace(
+        host=server.ip,
+        server_id=server.server_id,
+        chutes_version="0.6.0",
+        extra={"e2e_pubkey": E2E_PUBKEY},
+    )
+    launch_config = SimpleNamespace(miner_hotkey=server.miner_hotkey)
+
+    with patch(
+        "api.server.service.settings",
+        SimpleNamespace(tee_measurements=active),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await verify_tee_chute(
+                _db_returning(server),
+                instance,
+                launch_config,
+                "deploy-issued",
+                EXPECTED_NONCE,
+                compute_type="cpu",
+            )
+    assert exc_info.value.status_code == 403
+    assert "no longer active" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["retired_name", "changed_config", "changed_trust"],
+)
+async def test_matching_issued_cert_is_revoked_before_secret_release(mutation):
+    old_config = _active_cpu_pin()
+    server = _issued_cpu_server(old_config)
+    active = _post_issue_measurements(old_config, mutation)
+    db = _db_returning(server)
+
+    with (
+        patch(
+            "api.server.service.settings",
+            SimpleNamespace(tee_measurements=active),
+        ),
+        patch.object(settings, "require_mtls_client_verify", True),
+        patch("api.instance.util._get_client_certificate", return_value=MagicMock()),
+        patch("api.instance.util.get_public_key_hash", return_value="samehash"),
+        patch(
+            "api.instance.util.x509.load_pem_x509_certificate",
+            return_value=MagicMock(),
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await require_attested_client_cert(
+                db,
+                MagicMock(),
+                _cpu_tee_instance(server.server_id),
+            )
+    assert exc_info.value.status_code == 403
+    assert "no longer active" in exc_info.value.detail
 
 
 # --------------------------------------------------------------------------------------------------
@@ -342,7 +476,16 @@ def test_create_provision_jwt_mints_unique_jti(tmp_path, monkeypatch):
 
     key_path = tmp_path / "launch_key.pem"
     subprocess.run(
-        ["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(key_path)],
+        [
+            "openssl",
+            "ecparam",
+            "-name",
+            "prime256v1",
+            "-genkey",
+            "-noout",
+            "-out",
+            str(key_path),
+        ],
         check=True,
         capture_output=True,
     )

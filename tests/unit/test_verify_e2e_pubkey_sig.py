@@ -69,12 +69,17 @@ def test_wrong_config_id_rejected():
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     cert_pem = _self_signed_cert(key)
     sig = _rsa_sign(key, E2E_PUBKEY, CONFIG_ID)
-    assert _verify_e2e_pubkey_sig(cert_pem, E2E_PUBKEY, sig, "00000000-0000-0000-0000-000000000000") is False
+    assert (
+        _verify_e2e_pubkey_sig(cert_pem, E2E_PUBKEY, sig, "00000000-0000-0000-0000-000000000000")
+        is False
+    )
 
 
 def test_signature_from_different_key_rejected():
     signer = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    other_cert_pem = _self_signed_cert(rsa.generate_private_key(public_exponent=65537, key_size=2048))
+    other_cert_pem = _self_signed_cert(
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    )
     sig = _rsa_sign(signer, E2E_PUBKEY, CONFIG_ID)
     assert _verify_e2e_pubkey_sig(other_cert_pem, E2E_PUBKEY, sig, CONFIG_ID) is False
 

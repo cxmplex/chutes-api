@@ -2,10 +2,11 @@
 Router for misc. stuff, e.g. score proxy.
 """
 
-import uuid
 import asyncio
 import aiohttp
+import hashlib
 import orjson as json
+import re
 from loguru import logger
 from typing import Optional
 from huggingface_hub import HfApi
@@ -24,8 +25,8 @@ from ipaddress import ip_address
 from api.config import settings
 from api.database import get_session
 from api.chute.util import get_one
-from api.chute.schemas import LLMDetail
-from api.util import get_resolved_ips, is_invalid_ip
+from api.chute.schemas import Chute, LLMDetail
+from api.util import extract_hf_model_name, get_resolved_ips, is_invalid_ip
 
 router = APIRouter()
 
@@ -61,6 +62,34 @@ async def _get_llm_root_map() -> dict[str, str]:
 
     await settings.redis_client.set(cache_key, json.dumps(root_map).decode(), ex=300)
     return root_map
+
+
+async def _get_template_model_map() -> dict[str, str]:
+    """Map literal standard-template HuggingFace repos to chute IDs, including diffusion/embedding."""
+    cache_key = "hf_repo_to_standard_template_chute"
+    cached = await settings.redis_client.get(cache_key)
+    if cached:
+        try:
+            return json.loads(cached)
+        except Exception:
+            await settings.redis_client.delete(cache_key)
+
+    model_map = {}
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(Chute.chute_id, Chute.code)
+                .where(Chute.standard_template.in_(("vllm", "embedding", "diffusion")))
+                .order_by(Chute.chute_id)
+            )
+        ).all()
+        for chute_id, code in rows:
+            repo_id = extract_hf_model_name(chute_id, code)
+            if repo_id and not repo_id.lower().startswith(("http://", "https://")):
+                model_map.setdefault(repo_id, chute_id)
+
+    await settings.redis_client.set(cache_key, json.dumps(model_map).decode(), ex=300)
+    return model_map
 
 
 async def is_url_allowed(url: str) -> bool:
@@ -176,7 +205,9 @@ async def proxy(
                             response_headers[header] = response.headers[header]
 
                     return Response(
-                        content=content, status_code=response.status, headers=response_headers
+                        content=content,
+                        status_code=response.status,
+                        headers=response_headers,
                     )
 
     except HTTPException:
@@ -184,7 +215,8 @@ async def proxy(
     except aiohttp.ClientTimeout:
         logger.error(f"WHITELIST_PROXY: upstream gateway timeout: {url=} {stream=}")
         raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Upstream server timeout"
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Upstream server timeout",
         )
     except aiohttp.ClientError as e:
         logger.error(
@@ -253,7 +285,9 @@ async def proxy_put(
                         response_headers[header] = response.headers[header]
 
                 return Response(
-                    content=content, status_code=response.status, headers=response_headers
+                    content=content,
+                    status_code=response.status,
+                    headers=response_headers,
                 )
 
     except HTTPException:
@@ -261,7 +295,8 @@ async def proxy_put(
     except aiohttp.ClientTimeout:
         logger.error(f"WHITELIST_PROXY: upstream gateway timeout on PUT: {url=}")
         raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail="Upstream server timeout"
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Upstream server timeout",
         )
     except aiohttp.ClientError as e:
         logger.error(
@@ -281,17 +316,30 @@ async def proxy_put(
         )
 
 
-def _fetch_repo_info_sync(repo_id: str, repo_type: str, revision: str, hf_token: Optional[str]):
-    """
-    Load huggingface repo info for cache validation.
-    """
+_IMMUTABLE_HF_REVISION = re.compile(r"^[0-9a-f]{40}$")
+HF_REF_CACHE_TTL_SECONDS = 300
+
+
+def _resolve_repo_revision_sync(
+    repo_id: str, repo_type: str, revision: str, hf_token: Optional[str]
+) -> str:
+    """Resolve a branch/tag/commit through HuggingFace to one immutable commit."""
     api = HfApi(token=hf_token)
-    # Resolve the revision (branch/tag/sha) to its concrete commit hash so a peer-first fetcher can
-    # materialize the canonical HF cache layout (snapshots/<commit>/ + refs/<revision>) offline.
     commit_hash = api.repo_info(repo_id=repo_id, revision=revision, repo_type=repo_type).sha
+    commit_hash = str(commit_hash or "").strip().lower()
+    if not _IMMUTABLE_HF_REVISION.fullmatch(commit_hash):
+        raise ValueError("HuggingFace returned a non-immutable commit identifier")
+    return commit_hash
+
+
+def _fetch_repo_manifest_sync(
+    repo_id: str, repo_type: str, commit_hash: str, hf_token: Optional[str]
+):
+    """Load an immutable HuggingFace commit manifest for cache validation."""
+    api = HfApi(token=hf_token)
     repo_items = api.list_repo_tree(
         repo_id=repo_id,
-        revision=revision,
+        revision=commit_hash,
         repo_type=repo_type,
         recursive=True,
     )
@@ -317,11 +365,16 @@ def _fetch_repo_info_sync(repo_id: str, repo_type: str, revision: str, hf_token:
     return {
         "repo_id": repo_id,
         "repo_type": repo_type,
-        "revision": revision,
+        "revision": commit_hash,
         "commit_hash": commit_hash,
         "files": files,
         "directories": directories,
     }
+
+
+def _hf_cache_key(kind: str, *parts: str) -> str:
+    encoded = json.dumps(parts)
+    return f"hf_repo_info:{kind}:{hashlib.sha256(encoded).hexdigest()}"
 
 
 @router.get("/hf_repo_info")
@@ -329,23 +382,14 @@ async def get_hf_repo_info(
     repo_id: str = Query(...),
     repo_type: str = Query("model"),
     revision: str = Query("main"),
-    hf_token: Optional[str] = Query(None),
     x_hf_token: Optional[str] = Header(None),
 ):
     """
     Proxy endpoint for HF repo file info.
     """
-    # L13: prefer the HF token from the X-HF-Token header (kept out of URLs/access logs); the query
-    # param remains for already-deployed clients that still pass it.
-    hf_token = x_hf_token or hf_token
-    uid = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{repo_id=},{repo_type=},{revision=},{hf_token=}"))
-    cache_key = f"hf_repo_info:{uid}"
-    cached = await settings.redis_client.get(cache_key)
-    if cached:
-        try:
-            return json.loads(cached)
-        except Exception:
-            await settings.redis_client.delete(cache_key)
+    # Credentials are accepted only in an authenticated header so request targets and access logs
+    # cannot contain a gated-model token.
+    hf_token = x_hf_token
 
     # Chute exists?
     chute = await get_one(repo_id)
@@ -361,14 +405,66 @@ async def get_hf_repo_info(
         if chute_name:
             chute = await get_one(chute_name)
     if not chute:
+        template_model_map = await _get_template_model_map()
+        chute_id = template_model_map.get(repo_id)
+        if chute_id:
+            chute = await get_one(chute_id)
+    if not chute:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=f"No chute found for model {repo_id}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No chute found for model {repo_id}",
         )
 
+    token_scope = hashlib.sha256(hf_token.encode()).hexdigest() if hf_token else ""
+    requested_revision = revision.strip()
+    immutable_request = _IMMUTABLE_HF_REVISION.fullmatch(requested_revision.lower())
+
     try:
-        result = await asyncio.to_thread(
-            _fetch_repo_info_sync, repo_id, repo_type, revision, hf_token
-        )
+        if immutable_request:
+            commit_hash = requested_revision.lower()
+        else:
+            ref_cache_key = _hf_cache_key(
+                "ref", repo_id, repo_type, requested_revision, token_scope
+            )
+            cached_commit = await settings.redis_client.get(ref_cache_key)
+            commit_hash = (
+                cached_commit.decode() if isinstance(cached_commit, bytes) else cached_commit
+            )
+            if not commit_hash or not _IMMUTABLE_HF_REVISION.fullmatch(commit_hash):
+                commit_hash = await asyncio.to_thread(
+                    _resolve_repo_revision_sync,
+                    repo_id,
+                    repo_type,
+                    requested_revision,
+                    hf_token,
+                )
+                await settings.redis_client.set(
+                    ref_cache_key,
+                    commit_hash,
+                    ex=HF_REF_CACHE_TTL_SECONDS,
+                )
+
+        # Immutable manifests have no TTL. Mutable names cache only their short-lived
+        # ref->commit mapping above; after it expires the branch/tag is resolved again.
+        manifest_cache_key = _hf_cache_key("commit", repo_id, repo_type, commit_hash, token_scope)
+        cached_manifest = await settings.redis_client.get(manifest_cache_key)
+        if cached_manifest:
+            try:
+                result = json.loads(cached_manifest)
+            except Exception:
+                await settings.redis_client.delete(manifest_cache_key)
+                result = None
+        else:
+            result = None
+        if result is None:
+            result = await asyncio.to_thread(
+                _fetch_repo_manifest_sync,
+                repo_id,
+                repo_type,
+                commit_hash,
+                hf_token,
+            )
+            await settings.redis_client.set(manifest_cache_key, json.dumps(result).decode())
     except RepositoryNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -394,7 +490,4 @@ async def get_hf_repo_info(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
-    # TTL the cache so entries written before commit_hash existed (C1/L20) expire and get refreshed,
-    # rather than serving a commit_hash-less manifest forever.
-    await settings.redis_client.set(cache_key, json.dumps(result).decode(), ex=3600)
-    return result
+    return {**result, "requested_revision": requested_revision}

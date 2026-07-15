@@ -163,7 +163,9 @@ INSPECTO = load_shared_object("chutes", "chutes-inspecto.so")
 INSPECTO.verify_hash.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
 INSPECTO.verify_hash.restype = ctypes.c_char_p
 
-NETNANNY = ctypes.CDLL("/usr/local/lib/chutes-nnverify.so")
+NETNANNY = ctypes.CDLL(
+    os.getenv("CHUTES_NNVERIFY_PATH", "/usr/local/lib/chutes-nnverify.so")
+)
 NETNANNY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 NETNANNY.verify.restype = ctypes.c_int
 
@@ -1507,9 +1509,7 @@ async def _validate_launch_config_instance(
         server_row = None
         if getattr(launch_config, "server_id", None):
             server_row = (
-                await db.execute(
-                    select(Server).where(Server.server_id == launch_config.server_id)
-                )
+                await db.execute(select(Server).where(Server.server_id == launch_config.server_id))
             ).scalar_one_or_none()
         attested_cert = getattr(server_row, "attested_cert", None)
         if not attested_cert:

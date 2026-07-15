@@ -29,9 +29,18 @@ from api.instance.schemas import Instance, LaunchConfig
 from api.config import settings
 from api.job.schemas import Job
 from api.database import get_session
-from api.util import has_legacy_private_billing, notify_deleted, notify_job_deleted, semcomp
+from api.util import (
+    has_legacy_private_billing,
+    notify_deleted,
+    notify_job_deleted,
+    semcomp,
+)
 from api.user.service import chutes_user_id
-from api.bounty.util import create_bounty_if_not_exists, get_bounty_amount, send_bounty_notification
+from api.bounty.util import (
+    create_bounty_if_not_exists,
+    get_bounty_amount,
+    send_bounty_notification,
+)
 from sqlalchemy.future import select
 from sqlalchemy import text, func
 from sqlalchemy.exc import MultipleResultsFound
@@ -43,7 +52,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from api.server.client import TeeServerClient
 from api.server.schemas import Server
 from api.node.schemas import Node
-from api.server.exceptions import GetEvidenceError
+from api.server.exceptions import GetEvidenceError, MeasurementMismatchError
 from api.server.util import verify_quote, verify_gpu_evidence
 from api.server.util import get_public_key_hash, _get_client_certificate
 
@@ -692,7 +701,10 @@ class LeastConnManager:
             logger.error("Error getting target")
             logger.error(str(e))
             logger.error(traceback.format_exc())
-            yield None, f"No infrastructure available to serve request, error code: {str(e)}"
+            yield (
+                None,
+                f"No infrastructure available to serve request, error code: {str(e)}",
+            )
         finally:
             if instance:
                 try:
@@ -1087,6 +1099,7 @@ async def verify_tee_chute(
         # (runtime-integrity commitment + TLS cert + e2e pubkey, validated upstream) covers
         # chute-level integrity, so there is no separate per-chute TDX quote to fetch here.
         if getattr(server, "self_registered", False):
+            _require_current_attestation_identity(server)
             logger.success(
                 f"Chute deployment {deployment_id} on self-registered server "
                 f"{server.server_id}: trust anchored by server attestation + launch-config "
@@ -1166,6 +1179,8 @@ async def require_attested_client_cert(db, request: Request, instance) -> None:
     ):
         return
 
+    _require_current_attestation_identity(server)
+
     if not settings.require_mtls_client_verify:
         logger.error(
             f"require_mtls_client_verify is disabled; cannot bind secret delivery for CPU-TEE "
@@ -1215,6 +1230,23 @@ async def require_attested_client_cert(db, request: Request, instance) -> None:
                 "release chute code/secrets to an unattested caller."
             ),
         )
+
+
+def _require_current_attestation_identity(server: Server) -> None:
+    """Fail closed when a previously issued launch/cert outlives its active measurement pin."""
+    from api.server.service import runtime_attestation_context_for_server
+
+    try:
+        runtime_attestation_context_for_server(server)
+    except MeasurementMismatchError as exc:
+        logger.warning(f"Rejecting stale CPU-TEE server identity {server.server_id}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "CPU-TEE server attestation identity is no longer active; "
+                "re-register against the current measurement policy."
+            ),
+        ) from exc
 
 
 async def get_server_for_gpus(db, gpu_uuids: list[str]) -> Server | None:

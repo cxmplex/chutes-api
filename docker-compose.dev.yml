@@ -32,6 +32,11 @@ services:
       SKIP_GPU_VERIFICATION: "true"
       # Dev: let a self-registering CPU server's hotkey register without being on the metagraph.
       SKIP_METAGRAPH_CHECK: "true"
+      # Dev-only opt-in for the committed/live SNP measurements, which intentionally describe
+      # *-debug.qcow2 artifacts. The default production posture refuses to start with those pins.
+      ALLOW_DEBUG_MEASUREMENTS: "true"
+      TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
+      TRUSTED_PROVENANCE_PUBLIC_KEY_PATH: /etc/chutes/provenance/cosign.pub
       # Dev: this stack is reached directly over plaintext HTTP with no mTLS-terminating nginx, so
       # the agent forwards its attestation cert via X-Client-Cert (CHUTES_SEND_CLIENT_CERT_HEADER)
       # with no X-Client-Verify marker. Disable the marker requirement for this dev validator only.
@@ -58,6 +63,7 @@ services:
     volumes:
       - ./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro
       - ./config/launch_config_private_key.pem:/etc/config/launch_config_private_key.pem:ro
+      - ../sek8s/.dev-cosign/cosign.pub:/etc/chutes/provenance/cosign.pub:ro
 
   socket:
     entrypoint: ["uv", "run", "uvicorn", "api.socket_server:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
@@ -66,6 +72,10 @@ services:
       PRIMARY_REDIS_PORT: "6379"
       REDIS_PASSWORD: redispassword
       SKIP_GPU_VERIFICATION: "true"
+      ALLOW_DEBUG_MEASUREMENTS: "true"
+      TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
+      SKIP_METAGRAPH_CHECK: "true"
+      REQUIRE_MTLS_CLIENT_VERIFY: "false"
       DB_SSL: disable
 
   events_socket:
@@ -74,7 +84,16 @@ services:
       PRIMARY_REDIS_HOST: redis
       PRIMARY_REDIS_PORT: "6379"
       REDIS_PASSWORD: redispassword
+      ALLOW_DEBUG_MEASUREMENTS: "true"
+      SKIP_METAGRAPH_CHECK: "true"
+      REQUIRE_MTLS_CLIENT_VERIFY: "false"
       DB_SSL: disable
+
+  payment_watcher:
+    environment:
+      ALLOW_DEBUG_MEASUREMENTS: "true"
+      SKIP_METAGRAPH_CHECK: "true"
+      REQUIRE_MTLS_CLIENT_VERIFY: "false"
 
   # Validator-side CPU placement loop (api/cpu_scheduler.py): places CPU chutes/jobs onto
   # self-registered servers, dispatches Model-B TD launches over the agent channel (via the
@@ -101,6 +120,7 @@ services:
       VALIDATOR_SS58: 5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4
       VALIDATOR_SEED: 971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20
       SKIP_METAGRAPH_CHECK: "true"
+      ALLOW_DEBUG_MEASUREMENTS: "true"
       # Same dev posture as the api service: SKIP_METAGRAPH_CHECK with the mTLS marker required
       # fails closed at settings init, so the scheduler would crash-loop without this.
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
@@ -140,6 +160,9 @@ services:
       VALIDATOR_SS58: 5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4
       COSIGN_KEY: /etc/cosign/cosign.key
       COSIGN_PASSWORD: ""
+      ALLOW_DEBUG_MEASUREMENTS: "true"
+      SKIP_METAGRAPH_CHECK: "true"
+      REQUIRE_MTLS_CLIENT_VERIFY: "false"
       # forge.py hardcodes overlay storage opts (--storage-opt overlay.mountopt/mount_program), so the
       # base file's STORAGE_DRIVER=vfs is incompatible (vfs rejects those). Use the image's intended
       # overlay + fuse-overlayfs driver, which needs /dev/fuse passed into the container.

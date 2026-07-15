@@ -3,6 +3,7 @@ Core server management and TDX attestation logic.
 """
 
 import asyncio
+import hashlib
 import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
@@ -10,19 +11,34 @@ import secrets
 from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
+from pydantic import ValidationError
 from sqlalchemy import delete, exists, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
+from cryptography.hazmat.primitives import serialization
 
-from api.config import settings
-from api.constants import NONCE_HEADER, NoncePurpose, HOTKEY_HEADER, LUKS_STORAGE_VOLUME
+from api.config import (
+    measurement_config_fingerprint,
+    measurement_trust_set_fingerprint,
+    settings,
+)
+from api.constants import (
+    CHUTEFS_DATA_VOLUME,
+    NONCE_HEADER,
+    NoncePurpose,
+    LUKS_STORAGE_VOLUME,
+)
 from api.cpu import validate_cpu_benchmark
 from api.gpu import SUPPORTED_GPUS
 from api.metagraph import MetagraphNode
 from bittensor_wallet.keypair import Keypair
 from api.node.util import _track_nodes
 from api.server.client import TeeServerClient
-from api.server.quote import BootTdxQuote, RuntimeTdxQuote, TdxQuote, build_runtime_quote
+from api.server.quote import (
+    BootTdxQuote,
+    TdxQuote,
+    build_runtime_quote,
+)
 from api.server.snp_quote import SnpReport
 from api.server.schemas import (
     Server,
@@ -32,6 +48,7 @@ from api.server.schemas import (
     BootAttestation,
     BootAttestationArgs,
     RuntimeAttestationArgs,
+    RuntimeAttestationNonceContext,
     ServerArgs,
     CpuServerRegistrationArgs,
     TeeUpgradeWindow,
@@ -42,8 +59,11 @@ from api.server.schemas import (
     ConfirmMaintenanceResult,
     LuksAttestRequest,
     LuksAttestResult,
+    LuksCapabilityContext,
+    LuksCapabilityPurpose,
     LuksConfirmRequest,
     LuksConfirmResult,
+    BootAttestationNonceContext,
 )
 from api.server.exceptions import (
     AttestationError,
@@ -61,14 +81,15 @@ from api.server.exceptions import (
 )
 from api.server.util import (
     _track_server,
-    _get_vm_cache_config,
+    _get_vm_cache_config_for_update,
     get_matching_measurement_config,
     generate_nonce,
     get_nonce_expiry_seconds,
     verify_quote,
     verify_gpu_evidence,
     sync_server_luks_passphrases,
-    rotate_luks_passphrases,
+    lease_luks_passphrases,
+    confirm_luks_generation_leases,
     generate_confirm_nonce,
     generate_luks_quote_nonce,
     encrypt_passphrase,
@@ -84,10 +105,37 @@ from api.node.schemas import Node
 from sqlalchemy.orm import joinedload
 from api.server.schemas import TeeInstanceEvidence
 from api.node.schemas import NodeArgs
-from api.util import extract_ip, get_signing_message, semcomp
+from api.util import extract_ip, get_signing_message, nonce_is_valid_v2, semcomp
 
 
-async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
+BOOT_LUKS_ALLOWED_VOLUMES = ("storage", "tdx-cache")
+STORAGE_LUKS_ALLOWED_VOLUMES = (CHUTEFS_DATA_VOLUME,)
+BOOT_NONCE_SIGNATURE_PURPOSE = "boot_luks_nonce"
+
+
+def _measurement_fingerprints(measurement_config) -> tuple[str, str]:
+    """Identity of the exact matched config and complete set used for this trust decision."""
+    config_fingerprint = getattr(
+        measurement_config, "config_fingerprint", None
+    ) or measurement_config_fingerprint(measurement_config)
+    trust_set_fingerprint = getattr(measurement_config, "trust_set_fingerprint", None)
+    if not trust_set_fingerprint:
+        trust_set_fingerprint = measurement_trust_set_fingerprint(settings.tee_measurements)
+    return config_fingerprint, trust_set_fingerprint
+
+
+def _stamp_server_measurement(server: Server, measurement_config) -> tuple[str, str]:
+    config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(measurement_config)
+    server.version = measurement_config.version
+    server.measurement_name = measurement_config.name
+    server.measurement_config_fingerprint = config_fingerprint
+    server.trust_set_fingerprint = trust_set_fingerprint
+    return config_fingerprint, trust_set_fingerprint
+
+
+async def create_nonce(
+    server_ip: str, purpose: NoncePurpose, context: Optional[Dict[str, Any]] = None
+) -> Dict[str, str]:
     """
     Create a new attestation nonce using Redis.
 
@@ -101,10 +149,9 @@ async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
     nonce = generate_nonce()
     expiry_seconds = get_nonce_expiry_seconds()
 
-    # Use Redis to store nonce with TTL
-    # Store as JSON to include both server_ip and purpose
+    # Store the caller IP, purpose, and any operation-specific identity context together.
     redis_key = f"nonce:{nonce}"
-    redis_value = json.dumps({"server_ip": server_ip, "purpose": purpose.value})
+    redis_value = json.dumps({"server_ip": server_ip, "purpose": purpose.value, "context": context})
 
     await settings.redis_client.setex(redis_key, expiry_seconds, redis_value)
 
@@ -119,7 +166,7 @@ async def create_nonce(server_ip: str, purpose: NoncePurpose) -> Dict[str, str]:
 
 async def validate_and_consume_nonce(
     nonce_value: str, server_ip: str, purpose: NoncePurpose
-) -> None:
+) -> Dict[str, Any]:
     """
     Validate and consume a nonce using Redis.
 
@@ -164,6 +211,7 @@ async def validate_and_consume_nonce(
         )
 
     logger.info(f"Validated and consumed nonce: {nonce_value[:8]}... for purpose {purpose}")
+    return stored_data
 
 
 def validate_request_nonce(purpose: NoncePurpose):
@@ -189,77 +237,239 @@ def validate_request_nonce(purpose: NoncePurpose):
         except NonceError as e:
             logger.error(f"Request nonce validation failed: {e}")
             raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid nonce supplied"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid nonce supplied",
             )
 
     return _validate_request_nonce
 
 
+def _registered_cert_hash(server: Server) -> str:
+    """Return the persisted attested serving-cert hash, failing closed on incomplete identity."""
+    cert_hash = (server.attested_cert_pubkey_hash or "").strip().lower()
+    if not server.attested_cert or not cert_hash:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Server has no persisted attested serving certificate.",
+        )
+    return cert_hash
+
+
+def _assert_cert_binding(server: Server, expected_cert_hash: str, context_cert_hash: str) -> None:
+    stored_cert_hash = _registered_cert_hash(server)
+    supplied_cert_hash = (expected_cert_hash or "").strip().lower()
+    authorized_cert_hash = (context_cert_hash or "").strip().lower()
+    if not (
+        secrets.compare_digest(stored_cert_hash, supplied_cert_hash)
+        and secrets.compare_digest(stored_cert_hash, authorized_cert_hash)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Presented certificate does not match the registered attested serving certificate.",
+        )
+
+
+async def issue_boot_attestation_nonce(
+    db: AsyncSession,
+    server_ip: str,
+    server_id: str,
+    miner_hotkey: str | None,
+    authorization_nonce: str | None,
+    signature: str | None,
+    expected_cert_hash: str,
+) -> Dict[str, str]:
+    """Authorize a registered non-storage server before issuing its boot quote nonce."""
+    if not miner_hotkey or not authorization_nonce or not signature:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Miner hotkey, authorization nonce, and signature are required.",
+        )
+    if "." not in authorization_nonce or not nonce_is_valid_v2(authorization_nonce):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization nonce must be a fresh '{timestamp}.{random}' value.",
+        )
+
+    # Ownership and role are checked before any quote nonce is created. A miner naming another
+    # miner's server receives the same not-found result as an unknown server.
+    server = await check_server_ownership(db, server_id, miner_hotkey)
+    if not server.is_tee:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Boot attestation nonce requires a registered TEE server.",
+        )
+    if server.storage_role:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Storage-role servers must use the storage LUKS capability.",
+        )
+    if server.ip != server_ip:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Boot attestation nonce request did not originate from the registered server.",
+        )
+    _assert_cert_binding(server, expected_cert_hash, expected_cert_hash)
+
+    signature_purpose = (
+        f"{BOOT_NONCE_SIGNATURE_PURPOSE}:{server.server_id}:"
+        f"{server.attested_cert_pubkey_hash.lower()}"
+    )
+    signing_message = get_signing_message(
+        miner_hotkey,
+        authorization_nonce,
+        payload_str=None,
+        purpose=signature_purpose,
+    )
+    try:
+        signature_bytes = bytes.fromhex(signature.removeprefix("0x"))
+        if not Keypair(ss58_address=miner_hotkey).verify(signing_message, signature_bytes):
+            raise ValueError("signature verification failed")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid miner signature for boot nonce authorization.",
+        ) from exc
+
+    # The authorization itself is one-use, so replaying a valid signed GET cannot mint more quote
+    # nonces. Consume only after ownership, cert, and signature verification.
+    try:
+        claimed = await settings.redis_client.set(
+            f"luks_boot_authorization:{miner_hotkey}:{authorization_nonce}",
+            "1",
+            nx=True,
+            ex=get_nonce_expiry_seconds(),
+        )
+    except Exception as exc:
+        logger.warning(f"Boot nonce authorization cache unavailable: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to validate one-use boot authorization.",
+        ) from exc
+    if not claimed:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Boot nonce authorization has already been used.",
+        )
+
+    context = BootAttestationNonceContext(
+        server_id=server.server_id,
+        miner_hotkey=server.miner_hotkey,
+        vm_name=server.name,
+        cert_hash=server.attested_cert_pubkey_hash.lower(),
+        storage_role=False,
+        allowed_volumes=list(BOOT_LUKS_ALLOWED_VOLUMES),
+    )
+    return await create_nonce(
+        server_ip,
+        purpose=NoncePurpose.BOOT,
+        context=context.model_dump(mode="json"),
+    )
+
+
+async def require_boot_attestation_nonce(
+    request: Request, nonce: str | None = Header(None, alias=NONCE_HEADER)
+) -> tuple[str, BootAttestationNonceContext]:
+    """Consume a boot nonce and return its signature-authorized registered-server context."""
+    if not nonce:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Boot attestation nonce is required.",
+        )
+    try:
+        stored_data = await validate_and_consume_nonce(
+            nonce, extract_ip(request), NoncePurpose.BOOT
+        )
+        context = BootAttestationNonceContext.model_validate(stored_data.get("context"))
+    except (NonceError, ValidationError, TypeError) as exc:
+        logger.warning(f"Invalid boot attestation nonce context: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid boot attestation nonce.",
+        ) from exc
+    return nonce, context
+
+
 async def require_luks_quote_nonce(
-    vm_name: str,
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     quote_nonce: str | None = Header(None, alias="X-Quote-Nonce"),
-) -> str:
+) -> tuple[str, LuksCapabilityContext]:
     """
     FastAPI dependency for POST /luks/attest (new VMs, version >= 1.3.0).
 
-    Mirrors validate_request_nonce: GETDEL luks_quote_nonce:{hotkey}:{vm_name},
-    verify X-Quote-Nonce header matches stored value. Returns the validated nonce
-    so the handler can pass it to verify_quote (which checks signature + all RTMRs
-    including RTMR3 extended in initramfs).
+    The nonce is the Redis lookup key; its value is the immutable registered-server,
+    certificate, measurement, role, and volume context created by boot attestation or
+    signed storage self-registration.
     """
-    if not quote_nonce or not hotkey:
+    if not quote_nonce:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Quote nonce (X-Quote-Nonce) and hotkey are required",
+            detail="Quote nonce (X-Quote-Nonce) is required",
         )
-    redis_key = f"luks_quote_nonce:{hotkey}:{vm_name}"
+    redis_key = f"luks_quote_nonce:{quote_nonce}"
     stored = await settings.redis_client.getdel(redis_key)
     if not stored:
-        logger.warning(f"LUKS quote nonce not found or expired for VM {vm_name} (hotkey: {hotkey})")
+        logger.warning("LUKS quote capability not found, expired, or already consumed")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Quote nonce not found or expired",
         )
-    if stored.decode() != quote_nonce:
-        logger.warning(f"LUKS quote nonce mismatch for VM {vm_name} (hotkey: {hotkey})")
+    try:
+        context = LuksCapabilityContext.model_validate_json(stored)
+    except (ValidationError, ValueError, TypeError) as exc:
+        logger.warning(f"Malformed LUKS quote capability: {exc}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Quote nonce mismatch",
+            detail="Invalid quote capability",
+        ) from exc
+    if context.issued_volumes is not None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid quote capability stage",
         )
-    return quote_nonce
+    return quote_nonce, context
 
 
 async def require_confirm_nonce(
-    vm_name: str,
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     confirm_nonce: str | None = Header(None, alias="X-Confirm-Nonce"),
-) -> None:
+) -> LuksCapabilityContext:
     """
     FastAPI dependency for POST /luks/confirm.
 
-    GETDEL confirm:{hotkey}:{vm_name}, verify X-Confirm-Nonce header matches
-    stored value. Raises 401 on mismatch or missing/expired nonce.
+    Return the exact server/volume/generation context issued by /luks/attest.
+
+    The capability remains readable for its short TTL so an exact confirmation is idempotently
+    queryable if the success response is dropped. Replays cannot select another generation or lease.
     """
-    if not confirm_nonce or not hotkey:
+    if not confirm_nonce:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Confirm nonce (X-Confirm-Nonce) and hotkey are required",
+            detail="Confirm nonce (X-Confirm-Nonce) is required",
         )
-    redis_key = f"confirm:{hotkey}:{vm_name}"
-    stored = await settings.redis_client.getdel(redis_key)
+    redis_key = f"luks_confirm_nonce:{confirm_nonce}"
+    stored = await settings.redis_client.get(redis_key)
     if not stored:
-        logger.warning(f"Confirm nonce not found or expired for VM {vm_name} (hotkey: {hotkey})")
+        logger.warning("LUKS confirm capability not found or expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Confirm nonce not found or expired",
         )
-    if stored.decode() != confirm_nonce:
-        logger.warning(f"Confirm nonce mismatch for VM {vm_name} (hotkey: {hotkey})")
+    try:
+        context = LuksCapabilityContext.model_validate_json(stored)
+    except (ValidationError, ValueError, TypeError) as exc:
+        logger.warning(f"Malformed LUKS confirm capability: {exc}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Confirm nonce mismatch",
+            detail="Invalid confirm capability",
+        ) from exc
+    if (
+        context.issued_volumes is None
+        or context.issued_generations is None
+        or context.issued_lease_ids is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid confirm capability stage",
         )
+    return context
 
 
 def validate_gpus_for_measurements(quote: TdxQuote, gpus: list[NodeArgs]) -> None:
@@ -303,25 +513,109 @@ def validate_gpus_for_measurements(quote: TdxQuote, gpus: list[NodeArgs]) -> Non
     )
 
 
-async def generate_and_store_boot_token(miner_hotkey: str, vm_name: str) -> str:
-    """
-    Generate and store a boot token for a verified VM.
-
-    Args:
-        miner_hotkey: Miner hotkey that owns this VM
-        vm_name: VM name/identifier
-
-    Returns:
-        Boot token string
-    """
+async def generate_and_store_boot_token(capability: LuksCapabilityContext) -> str:
+    """Store a legacy one-use boot capability with the same identity and volume scope."""
     boot_token = generate_nonce()
     redis_key = f"boot_token:{boot_token}"
-    # Store boot token with miner_hotkey:vm_name (10 minute TTL)
-    boot_token_value = f"{miner_hotkey}:{vm_name}"
-    await settings.redis_client.setex(redis_key, 10 * 60, boot_token_value)
-    logger.info(f"Generated boot token for VM {vm_name} (miner: {miner_hotkey})")
-
+    await settings.redis_client.setex(redis_key, 10 * 60, capability.model_dump_json())
+    logger.info(
+        f"Generated legacy boot LUKS capability for server {capability.server_id} "
+        f"volumes={capability.allowed_volumes}"
+    )
     return boot_token
+
+
+async def _registered_boot_server(
+    db: AsyncSession,
+    server_ip: str,
+    args: BootAttestationArgs,
+    context: BootAttestationNonceContext,
+    expected_cert_hash: str,
+) -> Server:
+    """Revalidate every identity field captured before boot nonce issuance."""
+    if context.purpose != "boot_attestation":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Nonce is not authorized for boot attestation.",
+        )
+    if args.server_id != context.server_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Boot request server does not match the authorized nonce.",
+        )
+    if context.storage_role or tuple(context.allowed_volumes) != BOOT_LUKS_ALLOWED_VOLUMES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Boot nonce has an invalid LUKS role or volume namespace.",
+        )
+
+    server = await db.get(Server, context.server_id)
+    if server is None:
+        raise ServerNotFoundError(context.server_id)
+    if (
+        server.miner_hotkey != context.miner_hotkey
+        or server.name != context.vm_name
+        or not server.is_tee
+        or server.storage_role
+        or server.ip != server_ip
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registered server identity changed after nonce issuance.",
+        )
+    _assert_cert_binding(server, expected_cert_hash, context.cert_hash)
+    return server
+
+
+def _validate_boot_measurement(server: Server, measurement_config) -> None:
+    """Reject measurements whose compute/storage role cannot authorize boot LUKS keys."""
+    measurement_name = measurement_config.name or ""
+    if measurement_name.startswith("storage-"):
+        raise MeasurementMismatchError(
+            "Storage measurements cannot authorize a boot LUKS capability."
+        )
+    gpu_count = measurement_config.gpu_count
+    if server.compute_type == "cpu" and gpu_count != 0:
+        raise MeasurementMismatchError(
+            "CPU server boot attestation requires a CPU-only measurement."
+        )
+    if server.compute_type != "cpu" and gpu_count == 0:
+        raise MeasurementMismatchError(
+            "GPU server boot attestation cannot use a CPU-only measurement."
+        )
+    measurement_tee_type = (getattr(measurement_config, "tee_type", None) or "tdx").lower()
+    server_tee_type = (server.tee_type or "tdx").lower()
+    if measurement_tee_type != server_tee_type:
+        raise MeasurementMismatchError(
+            "Boot measurement TEE type does not match the registered server."
+        )
+
+
+def _luks_capability_for_measurement(
+    server: Server,
+    measurement_config,
+    purpose: LuksCapabilityPurpose,
+) -> LuksCapabilityContext:
+    config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(measurement_config)
+    allowed_volumes = (
+        STORAGE_LUKS_ALLOWED_VOLUMES
+        if purpose == LuksCapabilityPurpose.STORAGE
+        else BOOT_LUKS_ALLOWED_VOLUMES
+    )
+    return LuksCapabilityContext(
+        purpose=purpose,
+        server_id=server.server_id,
+        miner_hotkey=server.miner_hotkey,
+        vm_name=server.name,
+        cert_hash=_registered_cert_hash(server),
+        measurement_name=measurement_config.name,
+        measurement_version=measurement_config.version,
+        measurement_config_fingerprint=config_fingerprint,
+        trust_set_fingerprint=trust_set_fingerprint,
+        tee_type=(getattr(measurement_config, "tee_type", None) or "tdx").lower(),
+        storage_role=bool(server.storage_role),
+        allowed_volumes=list(allowed_volumes),
+    )
 
 
 async def process_boot_attestation(
@@ -329,6 +623,7 @@ async def process_boot_attestation(
     server_ip: str,
     args: BootAttestationArgs,
     nonce: str,
+    nonce_context: BootAttestationNonceContext,
     expected_cert_hash: str,
 ) -> tuple[Optional[str], Optional[str]]:
     """
@@ -337,8 +632,9 @@ async def process_boot_attestation(
     Args:
         db: Database session
         server_ip: Server IP address
-        args: Boot attestation arguments (includes miner_hotkey and vm_name)
-        nonce: Validated nonce
+        args: Boot attestation arguments naming the registered server_id
+        nonce: Validated, single-use quote nonce
+        nonce_context: Signature-authorized server identity captured at nonce issuance
         expected_cert_hash: Expected certificate hash
 
     Returns:
@@ -351,16 +647,23 @@ async def process_boot_attestation(
         InvalidQuoteError: If quote is invalid
         MeasurementMismatchError: If measurements don't match
     """
+    server = await _registered_boot_server(db, server_ip, args, nonce_context, expected_cert_hash)
     logger.info(
-        f"Processing boot attestation for VM {args.vm_name} (miner: {args.miner_hotkey}, IP: {server_ip})"
+        f"Processing boot attestation for server {server.server_id} "
+        f"(miner: {server.miner_hotkey}, IP: {server_ip})"
     )
 
     # Parse and verify quote
     try:  # Verify quote signature
         quote = BootTdxQuote.from_base64(args.quote)
-        await verify_quote(quote, nonce, expected_cert_hash)
+        verification_result = await verify_quote(quote, nonce, expected_cert_hash)
+        revocation_status = dict(
+            getattr(verification_result, "revocation_status", {}) or {}
+        )
 
         measurement_config = get_matching_measurement_config(quote)
+        _validate_boot_measurement(server, measurement_config)
+        config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(measurement_config)
 
         minimum_version = settings.tee_minimum_boot_version
         if semcomp(measurement_config.version, minimum_version) < 0:
@@ -377,12 +680,17 @@ async def process_boot_attestation(
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
-            miner_hotkey=args.miner_hotkey,
-            vm_name=args.vm_name,
+            miner_hotkey=server.miner_hotkey,
+            vm_name=server.name,
             measurement_version=measurement_config.version,
+            measurement_name=measurement_config.name,
+            measurement_config_fingerprint=config_fingerprint,
+            trust_set_fingerprint=trust_set_fingerprint,
+            revocation_status=revocation_status,
             created_at=func.now(),
             verified_at=func.now(),
         )
+        server.attestation_revocation_status = revocation_status
 
         db.add(boot_attestation)
         await db.commit()
@@ -391,27 +699,38 @@ async def process_boot_attestation(
         logger.success(f"Boot attestation successful: {boot_attestation.attestation_id}")
 
         await _handle_boot_version_update(
-            db, args.miner_hotkey, args.vm_name, measurement_config.version
+            db,
+            server.miner_hotkey,
+            server.name,
+            measurement_config.version,
+            measurement_config.name,
+            config_fingerprint,
+            trust_set_fingerprint,
         )
 
+        capability = _luks_capability_for_measurement(
+            server, measurement_config, LuksCapabilityPurpose.BOOT
+        )
         # Version-gate: legacy VMs (< 1.3.0) get a boot token for POST /luks;
         # new VMs (>= 1.3.0) get a luks_quote_nonce for POST /luks/attest instead.
         boot_token: Optional[str] = None
         luks_quote_nonce: Optional[str] = None
         if semcomp(measurement_config.version, "1.3.0") >= 0:
-            luks_quote_nonce = await generate_luks_quote_nonce(args.miner_hotkey, args.vm_name)
+            luks_quote_nonce = await generate_luks_quote_nonce(capability)
         else:
-            boot_token = await generate_and_store_boot_token(args.miner_hotkey, args.vm_name)
+            boot_token = await generate_and_store_boot_token(capability)
 
         return boot_token, luks_quote_nonce
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         # Create failed attestation record; set measurement_version if quote matched a config
         measurement_version = None
+        measurement_name = None
         try:
             quote = BootTdxQuote.from_base64(args.quote)
             measurement_config = get_matching_measurement_config(quote)
             measurement_version = measurement_config.version
+            measurement_name = measurement_config.name
         except (InvalidQuoteError, MeasurementMismatchError):
             pass
         if measurement_version is None:
@@ -421,10 +740,11 @@ async def process_boot_attestation(
         boot_attestation = BootAttestation(
             quote_data=args.quote,
             server_ip=server_ip,
-            miner_hotkey=args.miner_hotkey,
-            vm_name=args.vm_name,
+            miner_hotkey=server.miner_hotkey,
+            vm_name=server.name,
             verification_error=str(e.detail),
             measurement_version=measurement_version,
+            measurement_name=measurement_name,
             created_at=func.now(),
         )
 
@@ -436,15 +756,24 @@ async def process_boot_attestation(
 
 
 async def _handle_boot_version_update(
-    db: AsyncSession, miner_hotkey: str, vm_name: str, measurement_version: str
+    db: AsyncSession,
+    miner_hotkey: str,
+    vm_name: str,
+    measurement_version: str,
+    measurement_name: str,
+    measurement_config_fingerprint_value: str,
+    trust_set_fingerprint: str,
 ) -> None:
-    """Update server.version on every successful boot; clear maintenance slot if target met."""
+    """Update the exact latest boot identity; clear maintenance when its version meets target."""
     try:
         server = await get_server_by_name(db, miner_hotkey, vm_name)
     except ServerNotFoundError:
         return
 
     server.version = measurement_version
+    server.measurement_name = measurement_name
+    server.measurement_config_fingerprint = measurement_config_fingerprint_value
+    server.trust_set_fingerprint = trust_set_fingerprint
 
     if server.in_maintenance:
         window = await db.get(TeeUpgradeWindow, server.maintenance_pending_window_id)
@@ -542,6 +871,156 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
         )
 
 
+def _canonical_infrastructure_provider(provider: Optional[str]) -> str:
+    """Normalize the provider names used by measurement manifests."""
+    normalized = (provider or "").strip().lower().replace("_", "-")
+    if normalized in {"baremetal", "bare-metal"}:
+        return "baremetal"
+    return normalized
+
+
+def _expected_gcp_identity(server_id: str) -> Optional[dict]:
+    prefix = "gcp-"
+    if not server_id.startswith(prefix):
+        return None
+    instance_id = server_id[len(prefix) :]
+    if not instance_id.isdigit():
+        return None
+    return {"instance_id": int(instance_id)}
+
+
+def runtime_attestation_context_for_server(
+    server: Server,
+) -> RuntimeAttestationNonceContext:
+    """Build the one accepted runtime identity from current trust and persisted registration."""
+    if not server.is_tee:
+        raise MeasurementMismatchError("Runtime attestation requires a registered TEE server.")
+    measurements = settings.tee_measurements
+    trust_set_fingerprint = measurement_trust_set_fingerprint(measurements)
+    config = next(
+        (
+            measurement
+            for measurement in measurements
+            if measurement.name == server.measurement_name and measurement.version == server.version
+        ),
+        None,
+    )
+    if config is None:
+        raise MeasurementMismatchError(
+            "The server's exact registered measurement is no longer active."
+        )
+    config_fingerprint = measurement_config_fingerprint(config)
+    if (
+        server.measurement_config_fingerprint != config_fingerprint
+        or server.trust_set_fingerprint != trust_set_fingerprint
+    ):
+        raise MeasurementMismatchError(
+            "The server's registered attestation fingerprints are stale."
+        )
+
+    tee_type = (server.tee_type or "tdx").strip().lower()
+    if tee_type != config.tee_type.strip().lower():
+        raise MeasurementMismatchError(
+            "The server's registered TEE type does not match its exact measurement."
+        )
+    provider = _canonical_infrastructure_provider(config.provider)
+    if provider not in {"gcp", "baremetal"}:
+        raise MeasurementMismatchError(
+            "Runtime attestation requires an exact gcp or bare-metal provider pin."
+        )
+    canonical_provider = "bare-metal" if provider == "baremetal" else "gcp"
+    if canonical_provider == "gcp":
+        if server.host_id is not None or _expected_gcp_identity(server.server_id) is None:
+            raise MeasurementMismatchError(
+                "GCP Model-A runtime identity requires hostless server_id='gcp-<instance id>'."
+            )
+        deployment_model = "gcp-model-a"
+    elif server.host_id is not None:
+        deployment_model = "bare-metal-model-b"
+    else:
+        deployment_model = "bare-metal-direct"
+
+    compute_type = (server.compute_type or "").strip().lower()
+    if compute_type not in {"cpu", "gpu"}:
+        raise MeasurementMismatchError("Runtime attestation has an invalid compute class.")
+    if compute_type == "cpu" and (config.gpu_count != 0 or list(config.expected_gpus or [])):
+        raise MeasurementMismatchError("CPU runtime identity matched a GPU-capable measurement.")
+    if compute_type == "gpu" and (config.gpu_count or 0) <= 0:
+        raise MeasurementMismatchError("GPU runtime identity matched a CPU-only measurement.")
+
+    storage_role = bool(server.storage_role)
+    storage_measurement = (config.name or "").startswith("storage-")
+    if storage_role != storage_measurement:
+        raise MeasurementMismatchError(
+            "Runtime storage role does not match the exact measurement prefix."
+        )
+    if storage_role and (
+        compute_type != "cpu"
+        or canonical_provider != "bare-metal"
+        or deployment_model != "bare-metal-model-b"
+    ):
+        raise MeasurementMismatchError(
+            "Storage runtime identity requires a CPU-only bare-metal Model-B server."
+        )
+
+    return RuntimeAttestationNonceContext(
+        server_id=server.server_id,
+        miner_hotkey=server.miner_hotkey,
+        vm_name=server.name,
+        cert_hash=_registered_cert_hash(server),
+        role="storage" if storage_role else "compute",
+        compute_type=compute_type,
+        tee_type=tee_type,
+        provider=canonical_provider,
+        deployment_model=deployment_model,
+        host_id=server.host_id,
+        measurement_name=config.name,
+        measurement_version=config.version,
+        measurement_config_fingerprint=config_fingerprint,
+        trust_set_fingerprint=trust_set_fingerprint,
+    )
+
+
+async def _validate_cpu_registration_host(
+    db: AsyncSession,
+    host_id: Optional[str],
+    miner_hotkey: str,
+    tee_type: str,
+    measurement_config,
+) -> Optional[Host]:
+    """Bind a Model-B TD claim to its enrolled launcher before any capacity mutation."""
+    measurement_provider = _canonical_infrastructure_provider(
+        getattr(measurement_config, "provider", None)
+    )
+    if not host_id:
+        if measurement_provider == "gcp":
+            return None
+        raise ServerRegistrationError(
+            "Bare-metal CPU TEE self-registration requires the enrolled launcher host_id."
+        )
+
+    # A Host row represents the bare-metal Model-B launcher. A GCP Model-A VM is hostless and may
+    # never consume a bare-metal host's scheduler slots.
+    if measurement_provider != "baremetal":
+        raise ServerRegistrationError(
+            f"Measurement provider {measurement_provider or '<missing>'} is incompatible "
+            f"with bare-metal host {host_id}."
+        )
+
+    host = (
+        await db.execute(select(Host).where(Host.host_id == host_id).with_for_update())
+    ).scalar_one_or_none()
+    if host is None:
+        raise ServerRegistrationError(f"Host {host_id} is not registered for this CPU TEE server.")
+    if host.miner_hotkey != miner_hotkey:
+        raise ServerRegistrationError(f"Host {host_id} is registered to a different miner.")
+
+    registered_tee = (host.tee_type or "").strip().lower()
+    if registered_tee != tee_type:
+        raise ServerRegistrationError(f"Host {host_id} launches {registered_tee}, not {tee_type}.")
+    return host
+
+
 async def register_cpu_server(
     db: AsyncSession,
     server_ip: str,
@@ -559,8 +1038,8 @@ async def register_cpu_server(
     here the booted server submits its own runtime TDX quote + CPU benchmark over an outbound
     request. The validator verifies:
       1. the owning miner is registered on the subnet and signed this registration,
-      2. the TDX quote: report_data == nonce || sha256(mTLS client cert pubkey), a valid Intel
-         signature, and MRTD/RTMRs matching a CPU-only (gpu_count=0) measurement config, and
+      2. the TDX quote: report_data == release-bound nonce || sha256(mTLS client cert pubkey), a
+         valid Intel signature, and MRTD/RTMRs matching a CPU-only measurement config, and
       3. the CPU benchmark shape (never trusted from the server),
     then upserts a self-registered CPU Server row (idempotent across reboots by server_id) and
     writes a ServerAttestation audit record. Returns a dict for CpuServerRegistrationResponse.
@@ -569,6 +1048,8 @@ async def register_cpu_server(
     # production, be registered on the subnet. In dev (skip_metagraph_check) the metagraph
     # membership requirement is bypassed and a metagraph_nodes row is auto-created so the servers
     # foreign key is satisfied. The signature is verified in both cases.
+    name = args.name or args.server_id
+    storage_role = bool(getattr(args, "storage_role", False))
     if settings.skip_metagraph_check:
         existing_node = await db.get(MetagraphNode, (miner_hotkey, settings.netuid))
         if existing_node is None:
@@ -599,13 +1080,20 @@ async def register_cpu_server(
             raise ServerRegistrationError(
                 f"Miner hotkey {miner_hotkey} is not registered on netuid {settings.netuid}"
             )
+    release_target_token = getattr(args, "release_target_token", None)
+    registration_purpose = (
+        f"{NoncePurpose.CPU_REGISTER.value}:{args.server_id}:{name}:"
+        f"{expected_cert_hash.lower()}:{'storage' if storage_role else 'compute'}"
+    )
+    if release_target_token:
+        registration_purpose += (
+            f":{hashlib.sha256(release_target_token.encode('utf-8')).hexdigest()}"
+        )
     signing_message = get_signing_message(
-        miner_hotkey, nonce, payload_str=None, purpose=NoncePurpose.CPU_REGISTER.value
+        miner_hotkey, nonce, payload_str=None, purpose=registration_purpose
     )
     try:
-        if not Keypair(ss58_address=miner_hotkey).verify(
-            signing_message, bytes.fromhex(signature)
-        ):
+        if not Keypair(ss58_address=miner_hotkey).verify(signing_message, bytes.fromhex(signature)):
             raise ServerRegistrationError("Invalid miner signature for CPU server registration")
     except ServerRegistrationError:
         raise
@@ -634,12 +1122,86 @@ async def register_cpu_server(
             f"mrtd={quote.mrtd} rtmr0={quote.rtmrs.get('rtmr0')} rtmr1={quote.rtmrs.get('rtmr1')} "
             f"rtmr2={quote.rtmrs.get('rtmr2')} rtmr3={quote.rtmrs.get('rtmr3')}"
         )
-    await verify_quote(quote, nonce, expected_cert_hash)
+    from api.releases.service import ReleaseError, release_bound_attestation_nonce
+
+    try:
+        quote_nonce = release_bound_attestation_nonce(nonce, release_target_token)
+    except ReleaseError as exc:
+        raise ServerRegistrationError(str(exc)) from exc
+    expected_gcp_identity = _expected_gcp_identity(args.server_id)
+    verification_result = await verify_quote(
+        quote,
+        quote_nonce,
+        expected_cert_hash,
+        expected_gcp_identity=expected_gcp_identity,
+    )
+    revocation_status = dict(getattr(verification_result, "revocation_status", {}) or {})
     measurement_config = get_matching_measurement_config(quote)
+    if (
+        _canonical_infrastructure_provider(measurement_config.provider) == "gcp"
+        and expected_gcp_identity is None
+    ):
+        raise MeasurementMismatchError(
+            "A GCP attestation must register as server_id='gcp-<signed instance id>'."
+        )
     if (measurement_config.gpu_count or 0) != 0:
         raise MeasurementMismatchError(
             "Matched a GPU measurement config; CPU self-registration requires a gpu_count=0 config."
         )
+    # The requested role is part of the miner signature above and must also be a capability of the
+    # exact measured image. This happens before any registered server row is mutated.
+    if storage_role and not (measurement_config.name or "").startswith("storage-"):
+        raise MeasurementMismatchError(
+            "storage_role registration requires the pinned storage-TD measurement (name 'storage-*'); "
+            f"matched '{measurement_config.name}'."
+        )
+    if not storage_role and (measurement_config.name or "").startswith("storage-"):
+        raise MeasurementMismatchError(
+            "A storage-TD measurement may register only with storage_role enabled."
+        )
+
+    # Model-B host identity affects scheduler capacity and teardown routing. Validate the exact
+    # enrolled host owner, TEE type, and bare-metal provider before benchmark/capacity accounting
+    # or any Server row mutation. A standalone Model-A registration must omit host_id.
+    host_id = (getattr(args, "host_id", None) or "").strip() or None
+    await _validate_cpu_registration_host(
+        db,
+        host_id,
+        miner_hotkey,
+        tee_type,
+        measurement_config,
+    )
+    release_target = None
+    release_target_token_generation = None
+    release_target_release = None
+    if release_target_token:
+        from api.releases.service import (
+            ReleaseError,
+            resolve_release_target_token,
+            validate_release_target_attestation,
+        )
+
+        try:
+            (
+                release_target,
+                release_target_token_generation,
+                release_target_release,
+            ) = await resolve_release_target_token(
+                db,
+                release_target_token,
+                host_id=host_id,
+                miner_hotkey=miner_hotkey,
+                tee_type=tee_type,
+            )
+            validate_release_target_attestation(
+                release_target,
+                release_target_release,
+                storage_role=storage_role,
+                measurement_name=measurement_config.name,
+                tee_type=tee_type,
+            )
+        except ReleaseError as exc:
+            raise ServerRegistrationError(str(exc)) from exc
 
     # 3. Validate the benchmark shape (the validator never trusts the raw value).
     try:
@@ -647,9 +1209,13 @@ async def register_cpu_server(
     except ValueError as benchmark_error:
         raise InvalidCpuBenchmarkError(f"Invalid CPU benchmark: {benchmark_error}")
 
-    # 4. Upsert the self-registered CPU server (idempotent across reboots by server_id).
-    name = args.name or args.server_id
-    server = await db.get(Server, args.server_id)
+    # 4. Upsert the self-registered CPU server (idempotent across reboots by server_id). Lock an
+    # existing identity before inspecting key-custody state so certificate replacement cannot race
+    # a generation allocation/confirmation (both paths lock Server, then VmCacheConfig).
+    server_result = await db.execute(
+        select(Server).where(Server.server_id == args.server_id).with_for_update()
+    )
+    server = server_result.scalar_one_or_none()
     if server is not None and server.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(
             f"Server {args.server_id} is already registered to a different miner."
@@ -658,7 +1224,6 @@ async def register_cpu_server(
     # public IP -- they are distinguished by their DNAT'd external_ports, not by IP. A co-tenant
     # already registered under the SAME host_id is therefore expected and allowed; only a genuine
     # cross-host IP collision (a server with no/different host_id claiming this IP) is rejected.
-    host_id = getattr(args, "host_id", None) or None
     ip_owners = (
         (
             await db.execute(
@@ -697,21 +1262,18 @@ async def register_cpu_server(
     server.ram_gb = int(benchmark["ram_gb"])
     server.benchmark_score = float(benchmark["composite_score"])
     server.benchmark = benchmark
-    server.version = measurement_config.version
+    config_fingerprint, trust_set_fingerprint = _stamp_server_measurement(
+        server, measurement_config
+    )
+    server.attestation_revocation_status = revocation_status
     # ChuteFS: the always-on storage TD self-registers with storage_role=True so the CPU scheduler
     # never places user chutes on it and the reconcile loop never reaps it; it advertises durable
     # disk capacity for replica placement. A storage TD is a normal attested CPU server otherwise.
-    storage_role = bool(getattr(args, "storage_role", False))
     # storage_role is asserted by the (untrusted) host config volume, so bind it to the dedicated,
     # pinned storage-TD measurement (name 'storage-*'): only the genuine storage image -- whose code
     # is trusted to use the released per-volume key solely for at-rest encryption -- may be a storage
     # node. This prevents a malicious operator from marking an arbitrary CPU-TEE image storage_role to
     # have replicas + per-volume keys released to code that could exfiltrate them.
-    if storage_role and not (measurement_config.name or "").startswith("storage-"):
-        raise MeasurementMismatchError(
-            "storage_role registration requires the pinned storage-TD measurement (name 'storage-*'); "
-            f"matched '{measurement_config.name}'."
-        )
     server.storage_role = storage_role
     server.disk_total_gb = getattr(args, "disk_total_gb", None)
     server.disk_free_gb = getattr(args, "disk_free_gb", None)
@@ -734,8 +1296,30 @@ async def register_cpu_server(
         created_at=func.now(),
         verified_at=func.now(),
         measurement_version=measurement_config.version,
+        measurement_name=measurement_config.name,
+        measurement_config_fingerprint=config_fingerprint,
+        trust_set_fingerprint=trust_set_fingerprint,
+        revocation_status=revocation_status,
     )
     db.add(attestation)
+    await db.flush()
+    if (
+        release_target is not None
+        and release_target_token_generation is not None
+        and release_target_release is not None
+    ):
+        from api.releases.service import ReleaseError, consume_release_target
+
+        try:
+            consume_release_target(
+                release_target,
+                release_target_token_generation,
+                server=server,
+                attestation=attestation,
+                cert_pubkey_hash=expected_cert_hash,
+            )
+        except ReleaseError as exc:
+            raise ServerRegistrationError(str(exc)) from exc
     await db.commit()
     await db.refresh(attestation)
 
@@ -747,13 +1331,17 @@ async def register_cpu_server(
         except Exception:  # noqa: BLE001 - inflight counter is a best-effort hint
             pass
 
-    # ChuteFS: a storage TD then calls POST /{vm_name}/luks/attest to obtain its persistent
+    # ChuteFS: a storage TD then calls POST /{server_id}/luks/attest to obtain its persistent
     # data-volume passphrase. That endpoint is gated on a single-use luks_quote_nonce which, for the
     # validator-dialed GPU flow, is minted in boot attestation. The self-registering storage TD has
-    # no boot-attestation step, so mint + return one here (same >= 1.3.0 attest-flow version gate).
+    # no boot-attestation step, so its already signature-authorized registration mints a separate
+    # storage-only capability after owner, quote, measurement role, and cert persistence all succeed.
     luks_quote_nonce: Optional[str] = None
     if storage_role and semcomp(measurement_config.version, "1.3.0") >= 0:
-        luks_quote_nonce = await generate_luks_quote_nonce(miner_hotkey, name)
+        capability = _luks_capability_for_measurement(
+            server, measurement_config, LuksCapabilityPurpose.STORAGE
+        )
+        luks_quote_nonce = await generate_luks_quote_nonce(capability)
 
     logger.success(
         f"CPU server self-registered: server_id={args.server_id} ip={server_ip} "
@@ -765,6 +1353,10 @@ async def register_cpu_server(
     return {
         "server_id": args.server_id,
         "measurement_version": measurement_config.version,
+        "measurement_name": measurement_config.name,
+        "measurement_config_fingerprint": config_fingerprint,
+        "trust_set_fingerprint": trust_set_fingerprint,
+        "revocation_status": revocation_status,
         "benchmark_score": float(server.benchmark_score),
         "verified_at": (
             verified_at.isoformat()
@@ -805,6 +1397,14 @@ async def register_host(
     """
     if not miner_hotkey:
         raise ServerRegistrationError("Missing miner hotkey for host registration")
+    capacity = int(args.capacity)
+    storage_enabled = bool(getattr(args, "storage_enabled", False))
+    if capacity < 0 or capacity > 64:
+        raise ServerRegistrationError("Host capacity must be in 0..64.")
+    if capacity == 0 and not storage_enabled:
+        raise ServerRegistrationError(
+            "capacity=0 is valid only for an enrolled ChuteFS storage host."
+        )
 
     # Dev (skip_metagraph_check): auto-create the metagraph row so downstream FK references
     # (self-registered server rows) are satisfied. Prod membership is enforced by the router auth.
@@ -812,8 +1412,11 @@ async def register_host(
         if await db.get(MetagraphNode, (miner_hotkey, settings.netuid)) is None:
             db.add(
                 MetagraphNode(
-                    hotkey=miner_hotkey, netuid=settings.netuid,
-                    checksum="dev", coldkey=miner_hotkey, node_id=0,
+                    hotkey=miner_hotkey,
+                    netuid=settings.netuid,
+                    checksum="dev",
+                    coldkey=miner_hotkey,
+                    node_id=0,
                 )
             )
             await db.commit()
@@ -831,7 +1434,9 @@ async def register_host(
     host.miner_hotkey = miner_hotkey
     host.netuid = args.netuid or settings.netuid
     host.tee_type = (args.tee_type or "tdx").strip().lower()
-    host.capacity = int(args.capacity)
+    host.capacity = capacity
+    host.storage_enabled = storage_enabled
+    host.release_channel = args.release_channel
     host.default_mem = args.default_mem
     host.default_vcpus = args.default_vcpus
     host.external_host = args.external_host or None
@@ -849,6 +1454,22 @@ async def register_host(
     # L0 image identity (re-netboot update tracking); tolerate older agents that don't report it.
     if getattr(args, "l0_version", None):
         host.l0_version = args.l0_version
+    # Resolve desired state before committing this refresh. An active storage-carrying manifest is
+    # newer operator intent than stale bootstrap CHUTES_STORAGE_NODE=false, so it reserves the
+    # storage TD first and a reconnect can never restore impossible chute capacity.
+    from api.releases.service import active_manifest_for_host
+
+    await db.flush()
+    manifest = await active_manifest_for_host(
+        db,
+        host.tee_type,
+        args.release_channel,
+        host_id=host.host_id,
+        miner_hotkey=miner_hotkey,
+    )
+    if manifest is not None and manifest.storage is not None and not host.storage_enabled:
+        host.storage_enabled = True
+        host.capacity = max(0, int(host.capacity or 0) - 1)
     await db.commit()
     await db.refresh(host)
 
@@ -856,17 +1477,11 @@ async def register_host(
         f"L0 host registered: host_id={host.host_id} miner={miner_hotkey} tee_type={host.tee_type} "
         f"capacity={host.capacity} cpu_cores={host.cpu_cores} ram_gb={host.ram_gb}"
     )
-    # Fleet image releases: hand the booting host the active manifest for its tee_type so it converges
-    # to the current release on first boot (no separate poll needed). Best-effort -- a release lookup
-    # failure must never block host registration. Local import avoids an import cycle.
-    release = None
-    try:
-        from api.releases.service import active_manifest_for_host
-
-        manifest = await active_manifest_for_host(db, host.tee_type)
-        release = manifest.model_dump() if manifest else None
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Could not attach active release manifest for host {host.host_id}: {exc}")
+    # Fleet image releases: hand the booting host the active manifest for its configured channel so
+    # it converges before any guest launch. Lookup/provenance validation failures MUST fail this
+    # response: returning a successful registration with release=None would make a cold canary boot
+    # indistinguishable from "no desired release" and could allow bootstrap bytes to launch.
+    release = manifest.model_dump() if manifest else None
     return {
         "host_id": host.host_id,
         "capacity": host.capacity,
@@ -897,7 +1512,9 @@ async def request_host_image_upgrade(
     if host.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(f"Host {host_id} belongs to a different miner")
     if not await is_agent_online(host_id):
-        raise ServerRegistrationError(f"Host {host_id} is not currently online (no control channel)")
+        raise ServerRegistrationError(
+            f"Host {host_id} is not currently online (no control channel)"
+        )
 
     command_id = await send_agent_command(host_id, "upgrade_image", {})
     logger.success(f"Dispatched upgrade_image to host {host_id} (command_id={command_id})")
@@ -905,7 +1522,10 @@ async def request_host_image_upgrade(
 
 
 async def request_host_reboot(
-    db: AsyncSession, host_id: str, miner_hotkey: str, target_l0_version: Optional[str] = None
+    db: AsyncSession,
+    host_id: str,
+    miner_hotkey: str,
+    target_l0_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Model B: tell an online L0 host to REBOOT so it re-netboots into the current L0 squashfs.
 
@@ -927,10 +1547,14 @@ async def request_host_reboot(
     if host.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(f"Host {host_id} belongs to a different miner")
     if not await is_agent_online(host_id):
-        raise ServerRegistrationError(f"Host {host_id} is not currently online (no control channel)")
+        raise ServerRegistrationError(
+            f"Host {host_id} is not currently online (no control channel)"
+        )
 
     command_id = await send_agent_command(
-        host_id, "reboot", {"target_l0_version": target_l0_version} if target_l0_version else {}
+        host_id,
+        "reboot",
+        {"target_l0_version": target_l0_version} if target_l0_version else {},
     )
     logger.success(
         f"Dispatched reboot to host {host_id} (command_id={command_id} target_l0={target_l0_version})"
@@ -967,8 +1591,10 @@ async def verify_server(
         expected_cert_hash = get_public_key_hash(cert)
 
         # Verify quote measurements (matches by full MRTD + RTMRs; multiple configs may share RTMR0)
-        await verify_quote(quote, nonce, expected_cert_hash)
-
+        verification_result = await verify_quote(quote, nonce, expected_cert_hash)
+        revocation_status = dict(
+            getattr(verification_result, "revocation_status", {}) or {}
+        )
         if is_cpu:
             # CPU server: skip GPU evidence + GPU matching. Validate and persist the benchmark
             # the validator gathered itself from the attestation response.
@@ -988,6 +1614,15 @@ async def verify_server(
             # Validate GPUs match measurement configuration
             validate_gpus_for_measurements(quote, gpus)
 
+        # Persist the exact serving identity only after every registration check succeeds. Boot
+        # nonce issuance fails closed unless this cert is later presented with live mTLS possession.
+        server.attested_cert = cert.public_bytes(serialization.Encoding.PEM).decode()
+        server.attested_cert_pubkey_hash = expected_cert_hash.lower()
+        config_fingerprint, trust_set_fingerprint = _stamp_server_measurement(
+            server, measurement_config
+        )
+        server.attestation_revocation_status = revocation_status
+
         logger.success(
             f"Verified server server_id={server.server_id} ip={server.ip} for miner: {miner_hotkey}"
         )
@@ -1000,6 +1635,10 @@ async def verify_server(
             created_at=func.now(),
             verified_at=func.now(),
             measurement_version=measurement_config.version,
+            measurement_name=measurement_config.name,
+            measurement_config_fingerprint=config_fingerprint,
+            trust_set_fingerprint=trust_set_fingerprint,
+            revocation_status=revocation_status,
         )
 
         db.add(server_attestation)
@@ -1047,12 +1686,14 @@ async def verify_server(
     finally:
         if failure_reason:
             measurement_version = measurement_config.version if measurement_config else None
+            measurement_name = measurement_config.name if measurement_config else None
             server_attestation = ServerAttestation(
                 quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8") if quote else None,
                 server_id=server.server_id,
                 verification_error=failure_reason,
                 created_at=func.now(),
                 measurement_version=measurement_version,
+                measurement_name=measurement_name,
             )
 
             try:
@@ -1196,6 +1837,7 @@ async def process_runtime_attestation(
     miner_hotkey: str,
     expected_nonce: str,
     expected_cert_hash: str,
+    nonce_context: RuntimeAttestationNonceContext,
 ) -> Dict[str, str]:
     """
     Process a runtime attestation request.
@@ -1221,21 +1863,82 @@ async def process_runtime_attestation(
     server = await check_server_ownership(db, server_id, miner_hotkey)
 
     if server.ip != actual_ip:
-        raise Exception()
+        raise MeasurementMismatchError(
+            "Runtime attestation source IP does not match the registered server."
+        )
+    current_context = runtime_attestation_context_for_server(server)
+    if nonce_context != current_context:
+        raise NonceError("Runtime nonce identity no longer matches the exact registered server.")
+    if (
+        expected_cert_hash.lower() != nonce_context.cert_hash
+        or expected_cert_hash.lower() != _registered_cert_hash(server)
+    ):
+        raise MeasurementMismatchError(
+            "Runtime attestation certificate does not match the registered server."
+        )
 
     # Parse and verify quote
     try:
-        # Verify quote signature
-        quote = RuntimeTdxQuote.from_base64(args.quote)
-        await verify_quote(quote, expected_nonce, expected_cert_hash)
+        tee_type = (args.tee_type or "tdx").strip().lower()
+        if tee_type != (server.tee_type or "tdx").strip().lower():
+            raise MeasurementMismatchError(
+                "Runtime attestation TEE type does not match the registered server."
+            )
+        quote = build_runtime_quote(
+            args.quote,
+            tee_type,
+            args.snp_cert_chain,
+            args.vtpm_quote,
+        )
+        verification_result = await verify_quote(
+            quote,
+            expected_nonce,
+            expected_cert_hash,
+            expected_gcp_identity=_expected_gcp_identity(server.server_id),
+        )
+        revocation_status = dict(
+            getattr(verification_result, "revocation_status", {}) or {}
+        )
 
         # Create runtime attestation record
         measurement_config = get_matching_measurement_config(quote)
+        config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(measurement_config)
+        provider = _canonical_infrastructure_provider(measurement_config.provider)
+        provider = "bare-metal" if provider == "baremetal" else provider
+        storage_measurement = (measurement_config.name or "").startswith("storage-")
+        if (
+            measurement_config.name != nonce_context.measurement_name
+            or measurement_config.version != nonce_context.measurement_version
+            or config_fingerprint != nonce_context.measurement_config_fingerprint
+            or trust_set_fingerprint != nonce_context.trust_set_fingerprint
+            or provider != nonce_context.provider
+            or storage_measurement != (nonce_context.role == "storage")
+            or (
+                nonce_context.compute_type == "cpu"
+                and (
+                    measurement_config.gpu_count != 0
+                    or list(measurement_config.expected_gpus or [])
+                )
+            )
+            or (nonce_context.compute_type == "gpu" and (measurement_config.gpu_count or 0) <= 0)
+        ):
+            raise MeasurementMismatchError(
+                "Runtime quote does not preserve the nonce-bound measurement, role, "
+                "compute class, and provider identity."
+            )
+        config_fingerprint, trust_set_fingerprint = _stamp_server_measurement(
+            server, measurement_config
+        )
+        server.attestation_revocation_status = revocation_status
         attestation = ServerAttestation(
             server_id=server_id,
             quote_data=args.quote,
             verification_error=None,
             measurement_version=measurement_config.version,
+            measurement_name=measurement_config.name,
+            measurement_config_fingerprint=config_fingerprint,
+            trust_set_fingerprint=trust_set_fingerprint,
+            revocation_status=revocation_status,
             verified_at=func.now(),
         )
 
@@ -1249,15 +1952,23 @@ async def process_runtime_attestation(
             "attestation_id": attestation.attestation_id,
             "verified_at": attestation.verified_at.isoformat(),
             "status": "verified",
+            "revocation_status": revocation_status,
         }
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         # Create failed attestation record
         measurement_version = None
+        measurement_name = None
         try:
-            quote_parsed = RuntimeTdxQuote.from_base64(args.quote)
+            quote_parsed = build_runtime_quote(
+                args.quote,
+                (args.tee_type or "tdx").strip().lower(),
+                args.snp_cert_chain,
+                args.vtpm_quote,
+            )
             measurement_config = get_matching_measurement_config(quote_parsed)
             measurement_version = measurement_config.version
+            measurement_name = measurement_config.name
         except (InvalidQuoteError, MeasurementMismatchError):
             pass
         attestation = ServerAttestation(
@@ -1265,6 +1976,7 @@ async def process_runtime_attestation(
             quote_data=args.quote,
             verification_error=str(e.detail),
             measurement_version=measurement_version,
+            measurement_name=measurement_name,
         )
 
         db.add(attestation)
@@ -1348,48 +2060,20 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
     return True
 
 
-async def _get_boot_token_context(boot_token: str) -> tuple[str, str]:
-    """
-    Validate boot token and return the VM identity (miner_hotkey, vm_name).
-
-    Args:
-        boot_token: Boot token from initial attestation
-
-    Returns:
-        Tuple of (miner_hotkey, vm_name)
-
-    Raises:
-        NonceError: If boot token is invalid or expired
-    """
-    # Validate boot token
+async def _get_boot_token_context(boot_token: str) -> LuksCapabilityContext:
+    """Load the registered-server context carried by a legacy boot capability."""
     redis_key = f"boot_token:{boot_token}"
     redis_value = await settings.redis_client.get(redis_key)
-
     if not redis_value:
         raise NonceError("Boot token not found or expired")
-
-    # Parse miner_hotkey:vm_name from the stored value
     try:
-        boot_token_value = redis_value.decode()
-        miner_hotkey, vm_name = boot_token_value.split(":", 1)
-    except (ValueError, AttributeError) as e:
-        logger.error(f"Failed to parse boot token value: {e}")
-        raise NonceError("Invalid boot token format")
-
-    logger.info(f"Retrieved boot token for VM {vm_name} (miner: {miner_hotkey})")
-
-    return miner_hotkey, vm_name
-
-
-async def _validate_boot_token_for_luks(boot_token: str, hotkey: str, vm_name: str) -> None:
-    """Validate boot token and verify hotkey/vm_name match. Raises NonceError on failure."""
-    token_hotkey, token_vm_name = await _get_boot_token_context(boot_token)
-    if token_hotkey != hotkey:
-        logger.warning(f"Hotkey mismatch: expected {token_hotkey}, got {hotkey}")
-        raise NonceError("Hotkey does not match boot token")
-    if token_vm_name != vm_name:
-        logger.warning(f"VM name mismatch: expected {token_vm_name}, got {vm_name}")
-        raise NonceError("VM name does not match boot token")
+        context = LuksCapabilityContext.model_validate_json(redis_value)
+    except (ValidationError, ValueError, TypeError) as exc:
+        logger.warning(f"Malformed legacy boot capability: {exc}")
+        raise NonceError("Invalid boot token context") from exc
+    if context.purpose != LuksCapabilityPurpose.BOOT or context.issued_volumes is not None:
+        raise NonceError("Invalid boot token purpose")
+    return context
 
 
 async def _consume_boot_token(boot_token: str) -> None:
@@ -1397,18 +2081,123 @@ async def _consume_boot_token(boot_token: str) -> None:
     await settings.redis_client.delete(redis_key)
 
 
+async def _validate_luks_capability_identity(
+    db: AsyncSession,
+    capability: LuksCapabilityContext,
+    server_id: str,
+    hotkey: str | None,
+    expected_cert_hash: str,
+    requested_volumes: list[str],
+) -> Server:
+    """Validate owner, server, cert, role, measurement version, and volume namespace."""
+    if not hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Miner hotkey is required.",
+        )
+    if server_id != capability.server_id or hotkey != capability.miner_hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Request identity does not match the issued LUKS capability.",
+        )
+
+    is_storage = capability.purpose == LuksCapabilityPurpose.STORAGE
+    expected_allowed = STORAGE_LUKS_ALLOWED_VOLUMES if is_storage else BOOT_LUKS_ALLOWED_VOLUMES
+    if (
+        capability.storage_role != is_storage
+        or tuple(capability.allowed_volumes) != expected_allowed
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="LUKS capability role or volume namespace is invalid.",
+        )
+    if (
+        not requested_volumes
+        or len(requested_volumes) != len(set(requested_volumes))
+        or not set(requested_volumes).issubset(expected_allowed)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requested volume is outside the LUKS capability namespace.",
+        )
+
+    # Serialize certificate ownership with registration/upsert while a key lease is allocated or
+    # confirmed. Without the row lock, a competing per-boot certificate could replace the server
+    # after validation but before the generation transition commits.
+    server_result = await db.execute(
+        select(Server).where(Server.server_id == capability.server_id).with_for_update()
+    )
+    server = server_result.scalar_one_or_none()
+    if server is None:
+        raise ServerNotFoundError(capability.server_id)
+    if (
+        not server.is_tee
+        or server.miner_hotkey != capability.miner_hotkey
+        or server.name != capability.vm_name
+        or bool(server.storage_role) != is_storage
+        or server.version != capability.measurement_version
+        or server.measurement_name != capability.measurement_name
+        or server.measurement_config_fingerprint != capability.measurement_config_fingerprint
+        or server.trust_set_fingerprint != capability.trust_set_fingerprint
+        or (server.tee_type or "tdx").lower() != capability.tee_type
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registered server no longer matches the issued LUKS capability.",
+        )
+    _assert_cert_binding(server, expected_cert_hash, capability.cert_hash)
+    return server
+
+
+def _validate_luks_capability_measurement(
+    server: Server, capability: LuksCapabilityContext, measurement_config
+) -> None:
+    """Require the fresh quote to match the exact measurement that minted the capability."""
+    measurement_tee_type = (getattr(measurement_config, "tee_type", None) or "tdx").lower()
+    config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(measurement_config)
+    if (
+        measurement_config.name != capability.measurement_name
+        or measurement_config.version != capability.measurement_version
+        or config_fingerprint != capability.measurement_config_fingerprint
+        or trust_set_fingerprint != capability.trust_set_fingerprint
+        or measurement_tee_type != capability.tee_type
+    ):
+        raise MeasurementMismatchError(
+            "LUKS quote measurement does not match the issued capability."
+        )
+    if capability.purpose == LuksCapabilityPurpose.STORAGE:
+        if (
+            measurement_config.gpu_count != 0
+            or not (measurement_config.name or "").startswith("storage-")
+            or not server.storage_role
+        ):
+            raise MeasurementMismatchError(
+                "Storage LUKS capability requires the registered storage role and storage measurement."
+            )
+    else:
+        _validate_boot_measurement(server, measurement_config)
+
+
 async def process_luks_passphrase_request(
     db: AsyncSession,
     boot_token: str,
-    hotkey: str,
-    vm_name: str,
+    server_id: str,
+    hotkey: str | None,
+    expected_cert_hash: str,
     volume_names: list,
     rekey_volume_names: Optional[list] = None,
 ) -> Dict[str, str]:
-    """Validate boot token and run LUKS sync (ensure keys for volumes, prune others, rekey optional). Consumes token."""
-    await _validate_boot_token_for_luks(boot_token, hotkey, vm_name)
+    """Validate a legacy boot capability, release only its scoped keys, then consume it."""
+    capability = await _get_boot_token_context(boot_token)
+    await _validate_luks_capability_identity(
+        db, capability, server_id, hotkey, expected_cert_hash, volume_names
+    )
     result = await sync_server_luks_passphrases(
-        db, hotkey, vm_name, volume_names, rekey_volume_names=rekey_volume_names
+        db,
+        capability.miner_hotkey,
+        capability.vm_name,
+        volume_names,
+        rekey_volume_names=rekey_volume_names,
     )
     await _consume_boot_token(boot_token)
     return result
@@ -1416,116 +2205,112 @@ async def process_luks_passphrase_request(
 
 async def process_luks_attest_request(
     db: AsyncSession,
-    hotkey: str,
-    vm_name: str,
+    server_id: str,
+    hotkey: str | None,
     body: LuksAttestRequest,
-    quote_nonce: str,
+    validated_capability: tuple[str, LuksCapabilityContext],
     expected_cert_hash: str,
 ) -> LuksAttestResult:
     """
     Process POST /luks/attest for new-format VMs (version >= 1.3.0).
 
-    The quote nonce has already been validated and consumed by require_luks_quote_nonce.
-    Verifies the attestation (Intel TDX quote signature + all RTMRs including RTMR3, or an AMD
-    SEV-SNP report's VCEK chain + launch measurement), rotates passphrases, manages the k3s
-    encryption key, and issues a confirm nonce. Provider-aware so an SEV-SNP storage TD can obtain
-    its persistent ChuteFS data-volume passphrase, not just Intel TDX GPU VMs.
+    The quote capability has already been atomically consumed. Revalidate its complete registered
+    identity before any key lookup, then require the fresh quote to match the exact measurement that
+    minted it. Storage capabilities can release only ``chutefs-data`` and never receive the k3s key.
     """
+    quote_nonce, capability = validated_capability
+    server = await _validate_luks_capability_identity(
+        db, capability, server_id, hotkey, expected_cert_hash, body.volumes
+    )
     tee_type = (getattr(body, "tee_type", None) or "tdx").strip().lower()
+    if tee_type != capability.tee_type:
+        raise MeasurementMismatchError(
+            "Requested TEE type does not match the issued LUKS capability."
+        )
     quote = build_runtime_quote(
         body.quote,
         tee_type,
         getattr(body, "snp_cert_chain", None),
         getattr(body, "vtpm_quote", None),
     )
-    await verify_quote(quote, quote_nonce, expected_cert_hash)
+    await verify_quote(
+        quote,
+        quote_nonce,
+        expected_cert_hash,
+        expected_gcp_identity=_expected_gcp_identity(server.server_id),
+    )
+    measurement_config = get_matching_measurement_config(quote)
+    _validate_luks_capability_measurement(server, capability, measurement_config)
 
-    volumes_data, vm_config = await rotate_luks_passphrases(db, hotkey, vm_name, body.volumes)
+    volumes_data, vm_config = await lease_luks_passphrases(db, capability, body.volumes)
 
-    # Derive k3s key lifecycle from DB state: if storage had no current passphrase
-    # (first boot) or no k3s key is stored yet, generate a new one.
-    storage_rotation = volumes_data.get(LUKS_STORAGE_VOLUME)
-    if (
-        storage_rotation is None or storage_rotation.is_first_boot
-    ) or not vm_config.k3s_encryption_key:
-        k3s_bytes = secrets.token_bytes(32)
-        k3s_b64 = base64.b64encode(k3s_bytes).decode()
-        vm_config.k3s_encryption_key = encrypt_passphrase(k3s_b64)
-        await db.commit()
-    else:
-        k3s_b64 = decrypt_passphrase(vm_config.k3s_encryption_key)
+    # The k3s encryption key belongs only to the boot-LUKS namespace and is returned only when that
+    # capability explicitly requested the storage volume. A storage TD receives no unrelated key.
+    k3s_b64: Optional[str] = None
+    if capability.purpose == LuksCapabilityPurpose.BOOT and LUKS_STORAGE_VOLUME in body.volumes:
+        if not vm_config.k3s_encryption_key:
+            k3s_bytes = secrets.token_bytes(32)
+            k3s_b64 = base64.b64encode(k3s_bytes).decode()
+            vm_config.k3s_encryption_key = encrypt_passphrase(k3s_b64)
+            await db.commit()
+        else:
+            k3s_b64 = decrypt_passphrase(vm_config.k3s_encryption_key)
 
-    confirm_nonce = await generate_confirm_nonce(hotkey, vm_name)
-
-    # M16: hand the TD the last-confirmed freshness epoch per volume (0 if never confirmed). The TD
-    # refuses to serve a volume whose in-encrypted-fs epoch is older than this (rollback), then writes
-    # epoch+1 and reports it on confirm.
-    stored_epochs = dict(vm_config.volume_epochs or {})
-    volume_epochs = {vol: int(stored_epochs.get(vol, 0)) for vol in volumes_data}
+    confirm_nonce = await generate_confirm_nonce(capability, volumes_data)
 
     return LuksAttestResult(
         volumes=volumes_data,
         confirm_nonce=confirm_nonce,
         k3s_encryption_key=k3s_b64,
-        volume_epochs=volume_epochs,
     )
 
 
 async def process_luks_confirm(
     db: AsyncSession,
-    hotkey: str,
-    vm_name: str,
+    server_id: str,
+    hotkey: str | None,
     body: LuksConfirmRequest,
+    capability: LuksCapabilityContext,
+    expected_cert_hash: str,
 ) -> LuksConfirmResult:
     """
     Process POST /luks/confirm.
 
-    The confirm nonce has already been validated and consumed by require_confirm_nonce.
-    Promotes pending passphrases to current for volumes that rotated successfully,
-    or discards them for volumes that failed.
+    The short-lived confirm capability authorizes exact volume generations and lease identities.
+    It remains queryable for idempotent retries, and the caller must still present the currently
+    registered attested certificate.
     """
-    vm_config = await _get_vm_cache_config(db, hotkey, vm_name)
+    confirmed_volume_names = list(body.volumes)
+    if set(confirmed_volume_names) != set(capability.issued_volumes or []):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Confirmed volumes do not match the issued LUKS generation leases.",
+        )
+    await _validate_luks_capability_identity(
+        db,
+        capability,
+        server_id,
+        hotkey,
+        expected_cert_hash,
+        confirmed_volume_names,
+    )
+
+    vm_config = await _get_vm_cache_config_for_update(
+        db,
+        capability.miner_hotkey,
+        capability.vm_name,
+        create=False,
+    )
     if vm_config is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No LUKS config found for VM {vm_name}",
+            detail=f"No LUKS config found for server {server_id}",
         )
 
-    stored: Dict[str, str] = dict(vm_config.volume_passphrases or {})
-    epochs: Dict[str, int] = dict(vm_config.volume_epochs or {})
-    confirmed_volumes: Dict[str, dict] = {}
-
-    for vol, vol_status in body.volumes.items():
-        pending_key = f"pending_{vol}"
-        if vol_status.rotated:
-            if pending_key in stored:
-                stored[vol] = stored.pop(pending_key)
-                confirmed_volumes[vol] = {"result": "promoted"}
-                logger.info(
-                    f"LUKS confirm: promoted pending passphrase for volume {vol} (VM: {vm_name})"
-                )
-            else:
-                confirmed_volumes[vol] = {"result": "no_pending"}
-                logger.warning(
-                    f"LUKS confirm: rotated=True but no pending passphrase for volume {vol} (VM: {vm_name})"
-                )
-        else:
-            stored.pop(pending_key, None)
-            confirmed_volumes[vol] = {"result": "discarded"}
-            logger.info(
-                f"LUKS confirm: discarded pending passphrase for volume {vol} (VM: {vm_name})"
-            )
-        # M16: advance the anti-rollback floor to the epoch the TD wrote inside the encrypted volume
-        # on this open. Monotonic (never regress), so a lost confirm just leaves disk ahead of the
-        # validator floor (still safe -- disk_epoch >= floor holds next boot).
-        if vol_status.epoch is not None:
-            new_epoch = int(vol_status.epoch)
-            if new_epoch > int(epochs.get(vol, 0)):
-                epochs[vol] = new_epoch
-
-    vm_config.volume_passphrases = stored
-    vm_config.volume_epochs = epochs
+    confirmed_volumes = confirm_luks_generation_leases(vm_config, capability, body.volumes)
     await db.commit()
+
+    logger.info(f"LUKS generation confirmation for server {server_id}: {confirmed_volumes}")
 
     return LuksConfirmResult(volumes=confirmed_volumes)
 
@@ -1549,7 +2334,10 @@ async def get_instance_server(db: AsyncSession, instance_id: str) -> tuple[Serve
     query = (
         select(Instance)
         .where(Instance.instance_id == instance_id)
-        .options(joinedload(Instance.chute), joinedload(Instance.nodes).joinedload(Node.server))
+        .options(
+            joinedload(Instance.chute),
+            joinedload(Instance.nodes).joinedload(Node.server),
+        )
     )
     result = await db.execute(query)
     instance = result.unique().scalar_one_or_none()
@@ -1921,7 +2709,8 @@ async def confirm_maintenance(
             purged_ids.append(inst.instance_id)
         except Exception:
             logger.error(
-                f"Failed to purge instance {inst.instance_id} during maintenance", exc_info=True
+                f"Failed to purge instance {inst.instance_id} during maintenance",
+                exc_info=True,
             )
 
     return ConfirmMaintenanceResult(

@@ -10,12 +10,18 @@ without depending on SQL string rendering.
 """
 
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatch
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import api.cpu_scheduler as cs
+from api.config import (
+    TeeMeasurementConfig,
+    measurement_config_fingerprint,
+    measurement_trust_set_fingerprint,
+)
 from api.instance.schemas import LaunchConfig
 
 NOW = datetime(2026, 6, 10, 12, 0, 0, tzinfo=timezone.utc)
@@ -62,6 +68,9 @@ class FakeRedis:
     async def publish(self, channel, payload):
         self.published.append((channel, payload))
         return 1
+
+    async def keys(self, pattern):
+        return [key for key in self.store if fnmatch(key, pattern)]
 
 
 class FakeResult:
@@ -244,6 +253,53 @@ def _job(job_id="job-1", chute_id="chute-1", method="run", job_args=None):
     )
 
 
+def _measurement(name="cpu-gcp-tdx-1vcpu"):
+    return TeeMeasurementConfig(
+        version="1.0.0-tdx-1vcpu",
+        name=name,
+        tee_type="tdx",
+        provider="gcp",
+        mrtd="A" * 96,
+        boot_rtmrs={f"RTMR{index}": chr(66 + index) * 96 for index in range(4)},
+        runtime_rtmrs={
+            f"RTMR{index}": value * 96 for index, value in enumerate(("F", "0", "1", "2"))
+        },
+        expected_gpus=[],
+        gpu_count=0,
+        debug=False,
+    )
+
+
+class _AttestationSession:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def execute(self, _stmt):
+        return FakeResult(rows=self.rows)
+
+
+def _attested_server_and_row(*, verified_at=None):
+    measurement = _measurement()
+    config_fingerprint = measurement_config_fingerprint(measurement)
+    trust_set_fingerprint = measurement_trust_set_fingerprint([measurement])
+    server = _server()
+    server.version = measurement.version
+    server.measurement_name = measurement.name
+    server.measurement_config_fingerprint = config_fingerprint
+    server.trust_set_fingerprint = trust_set_fingerprint
+    server.tee_type = "tdx"
+    row = SimpleNamespace(
+        server_id=server.server_id,
+        verification_error=None,
+        measurement_name=measurement.name,
+        measurement_version=measurement.version,
+        measurement_config_fingerprint=config_fingerprint,
+        trust_set_fingerprint=trust_set_fingerprint,
+        verified_at=verified_at or datetime.now(timezone.utc),
+    )
+    return measurement, server, row
+
+
 def _schedule_handlers(
     chutes,
     servers,
@@ -282,6 +338,54 @@ def mock_settings(fake_redis):
         yield settings
 
 
+class TestCurrentAttestedServerFilter:
+    @pytest.mark.asyncio
+    async def test_accepts_only_exact_fresh_current_identity(self, mock_settings):
+        measurement, server, row = _attested_server_and_row()
+        mock_settings.tee_measurements = [measurement]
+        mock_settings.release_attestation_max_age_seconds = 3600
+
+        result = await cs._current_attested_servers(_AttestationSession([row]), [server])
+
+        assert result == [server]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mutation",
+        [
+            "revoked",
+            "full_trust_changed",
+            "server_config_fingerprint",
+            "attestation_trust_fingerprint",
+            "stale",
+            "latest_failed",
+        ],
+    )
+    async def test_rejects_absent_revoked_mismatched_or_stale_identity(
+        self, mock_settings, mutation
+    ):
+        measurement, server, row = _attested_server_and_row()
+        measurements = [measurement]
+        if mutation == "revoked":
+            measurements = [_measurement("cpu-other")]
+        elif mutation == "full_trust_changed":
+            measurements.append(_measurement("cpu-added"))
+        elif mutation == "server_config_fingerprint":
+            server.measurement_config_fingerprint = "0" * 64
+        elif mutation == "attestation_trust_fingerprint":
+            row.trust_set_fingerprint = "0" * 64
+        elif mutation == "stale":
+            row.verified_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        elif mutation == "latest_failed":
+            row.verification_error = "quote rejected"
+        mock_settings.tee_measurements = measurements
+        mock_settings.release_attestation_max_age_seconds = 3600
+
+        result = await cs._current_attested_servers(_AttestationSession([row]), [server])
+
+        assert result == []
+
+
 class TestExpireStaleLaunchConfigs:
     @pytest.mark.asyncio
     async def test_expiry_updates_only_scheduler_minted_configs(self, mock_settings):
@@ -312,15 +416,18 @@ class TestScheduleOncePlacement:
         dispatch = dispatch or AsyncMock()
         launch = launch if launch is not None else AsyncMock(return_value=False)
         purge = purge or AsyncMock()
-        online_mock = (
-            online if callable(online) else AsyncMock(return_value=online)
-        )
+        online_mock = online if callable(online) else AsyncMock(return_value=online)
+        current_attested = AsyncMock(side_effect=lambda _session, servers: servers)
         with (
             patch("api.cpu_scheduler.get_session", _session_ctx(session)),
             patch("api.cpu_scheduler._dispatch_deploy", dispatch),
             patch("api.cpu_scheduler._launch_on_host", launch),
             patch("api.cpu_scheduler.purge_and_notify", purge),
             patch("api.cpu_scheduler.is_agent_online", online_mock),
+            patch(
+                "api.cpu_scheduler._current_attested_servers",
+                current_attested,
+            ),
         ):
             await cs.schedule_once()
         return session, dispatch, launch, purge
@@ -330,18 +437,14 @@ class TestScheduleOncePlacement:
         chute = _chute()
         free = _server(server_id="srv-free")
         occupied = _server(server_id="srv-busy")
-        handlers = _schedule_handlers(
-            [chute], [occupied, free], occupied_instance_ids=["srv-busy"]
-        )
+        handlers = _schedule_handlers([chute], [occupied, free], occupied_instance_ids=["srv-busy"])
         _, dispatch, launch, _ = await self._run(handlers)
         dispatch.assert_awaited_once()
         assert dispatch.await_args.args[2] is free
         launch.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_pending_launch_config_occupies_server_and_counts_to_target(
-        self, mock_settings
-    ):
+    async def test_pending_launch_config_occupies_server_and_counts_to_target(self, mock_settings):
         chute = _chute()
         server = _server(server_id="srv-free")
         handlers = _schedule_handlers(
@@ -423,9 +526,7 @@ class TestScheduleOncePlacement:
         launch.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_scale_target_from_redis_places_second_instance(
-        self, mock_settings, fake_redis
-    ):
+    async def test_scale_target_from_redis_places_second_instance(self, mock_settings, fake_redis):
         chute = _chute()
         fake_redis.store[f"scale:{chute.chute_id}"] = "2"
         current = _instance(version=chute.version, server_id="srv-busy")
@@ -465,7 +566,11 @@ class TestScheduleOnceVersionAware:
         chute = _chute(version="2.0.0")
         stale = _instance(instance_id="inst-old", version="1.0.0", server_id="srv-a")
         live = _instance(
-            instance_id="inst-new", version="2.0.0", server_id="srv-b", active=True, verified=True
+            instance_id="inst-new",
+            version="2.0.0",
+            server_id="srv-b",
+            active=True,
+            verified=True,
         )
         handlers = _schedule_handlers(
             [chute],
@@ -615,11 +720,12 @@ class TestDispatchDeploy:
         assert session.added == []
 
     @pytest.mark.asyncio
-    async def test_tee_without_digest_refuses_and_fails_config(
-        self, mock_settings, metagraph_node
-    ):
+    async def test_tee_without_digest_refuses_and_fails_config(self, mock_settings, metagraph_node):
         session, send = await self._dispatch(
-            _chute(tee=True), _server(), metagraph_node, digest=RuntimeError("registry down")
+            _chute(tee=True),
+            _server(),
+            metagraph_node,
+            digest=RuntimeError("registry down"),
         )
         send.assert_not_awaited()
         # The launch config row was minted before the digest check and must be failed
@@ -646,7 +752,11 @@ class TestDispatchDeploy:
         assert payload["external_ports"] == {"8000": 31000}
         assert payload["job_ports"] == []
         # chutes 0.6.x exposes the attestation port.
-        assert payload["ports"] == {"primary": 8000, "logging": 8001, "attestation": 8002}
+        assert payload["ports"] == {
+            "primary": 8000,
+            "logging": 8001,
+            "attestation": 8002,
+        }
         added = session.added[0]
         assert isinstance(added, LaunchConfig)
         assert added.chute_id == chute.chute_id
@@ -723,9 +833,14 @@ class TestLaunchOnHost:
 
     @pytest.mark.asyncio
     async def test_skips_host_at_capacity_from_used_rows(self, mock_settings):
-        handlers = self._handlers(
-            [self._host(capacity=2)], used_rows=[("host-1", 2)]
-        )
+        handlers = self._handlers([self._host(capacity=2)], used_rows=[("host-1", 2)])
+        launched, send = await self._run(handlers)
+        assert not launched
+        send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zero_schedulable_storage_host_is_never_dispatched(self, mock_settings):
+        handlers = self._handlers([self._host(capacity=0)])
         launched, send = await self._run(handlers)
         assert not launched
         send.assert_not_awaited()
@@ -812,9 +927,7 @@ class TestTickWithLock:
 
         with (
             patch("api.cpu_scheduler.expire_stale_launch_configs", AsyncMock()),
-            patch(
-                "api.cpu_scheduler.schedule_once", AsyncMock(side_effect=steal_lock)
-            ),
+            patch("api.cpu_scheduler.schedule_once", AsyncMock(side_effect=steal_lock)),
         ):
             await cs._tick_with_lock()
         assert fake_redis.store[cs.SCHEDULER_LOCK_KEY] == "other-replica"

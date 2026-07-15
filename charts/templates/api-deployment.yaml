@@ -61,6 +61,12 @@ spec:
         - name: tee-measurements
           configMap:
             name: tee-measurements
+        - name: guest-provenance-public-key
+          secret:
+            secretName: {{ .Values.provenance.publicKeySecretName | quote }}
+            items:
+              - key: {{ .Values.provenance.publicKeySecretKey | quote }}
+                path: cosign.pub
       containers:
         - name: api
           image: "{{ .Values.api.image }}"
@@ -69,6 +75,12 @@ spec:
           env:
             {{- include "chutes.sensitiveEnv" . | nindent 12 }}
             {{- include "chutes.commonEnv" . | nindent 12 }}
+            - name: TEE_MEASUREMENT_CONFIG_REQUIRED
+              value: "true"
+            - name: TRUSTED_PROVENANCE_PUBLIC_KEY_PATH
+              value: /etc/chutes/provenance/cosign.pub
+            - name: SNP_CRL_OUTAGE_GRACE_SECONDS
+              value: {{ .Values.snpCrlOutageGraceSeconds | quote }}
             {{- if .Values.datadog_enabled }}
             - name: DD_LOGS_INJECTION
               value: "true"
@@ -104,6 +116,9 @@ spec:
             - name: tee-measurements
               mountPath: "/etc/config"
               readOnly: true
+            - name: guest-provenance-public-key
+              mountPath: /etc/chutes/provenance
+              readOnly: true
           ports:
             - name: http
               containerPort: {{ .Values.api.service.targetPort }}
@@ -119,7 +134,7 @@ spec:
             failureThreshold: {{ .Values.api.livenessProbe.failureThreshold | default 3 }}
           readinessProbe:
             httpGet:
-              path: /ping
+              path: /readyz
               port: http
             initialDelaySeconds: {{ .Values.api.readinessProbe.initialDelaySeconds | default 10 }}
             periodSeconds: {{ .Values.api.readinessProbe.periodSeconds | default 10 }}

@@ -94,3 +94,8 @@ chutes = { git = "https://github.com/chutesai/chutes.git", rev = "6d0a638498b5be
 
 [tool.ruff]
 extend-exclude = ["nv-attest"]
+
+[tool.pytest.ini_options]
+markers = [
+  "cross_repo: integration tests requiring sibling repository source trees",
+]

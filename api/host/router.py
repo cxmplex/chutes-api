@@ -161,10 +161,10 @@ async def list_hosts(
 ):
     """List the caller miner's registered L0 hosts + their capacity/usage (per-host TD counts)."""
     if not hotkey:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing hotkey header.")
-    hosts = (
-        (await db.execute(select(Host).where(Host.miner_hotkey == hotkey))).scalars().all()
-    )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing hotkey header."
+        )
+    hosts = (await db.execute(select(Host).where(Host.miner_hotkey == hotkey))).scalars().all()
     # Per-host TD usage in one grouped query (mirrors api/cpu_scheduler.py _launch_on_host) rather
     # than a COUNT per host.
     used_rows = (

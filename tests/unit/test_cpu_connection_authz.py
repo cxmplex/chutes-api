@@ -41,6 +41,7 @@ def _inst(instance_id="i1", chute_id="c1"):
 
 # --- _caller_owns_server_workload: query order is instances -> jobs(by instance_id) -> chutes(cord only)
 
+
 @pytest.mark.asyncio
 async def test_cord_chute_owner_authorized():
     """A cord (job-less) instance: the chute author is the workload owner."""
@@ -61,7 +62,9 @@ async def test_public_chute_author_NOT_authorized_for_other_users_job():
     author of a public chute must NOT owner-connect to another user's running rental on it."""
     db = _db([_Res(all_rows=[_inst()]), _Res(all_rows=[("i1", "renter")])])
     # caller is the chute author, not the renter who owns the job -> rejected.
-    assert await sr._caller_owns_server_workload(db, "srv", SimpleNamespace(user_id="author")) is False
+    assert (
+        await sr._caller_owns_server_workload(db, "srv", SimpleNamespace(user_id="author")) is False
+    )
 
 
 @pytest.mark.asyncio
@@ -82,6 +85,7 @@ async def test_no_instances_on_server_rejected():
 
 
 # --- endpoint-level authz (the bypass fix) ---
+
 
 @pytest.mark.asyncio
 async def test_unauthenticated_request_rejected_401():

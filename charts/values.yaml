@@ -1,4 +1,9 @@
 teeMinimumBootVersion: ""
+snpCrlOutageGraceSeconds: 0
+
+provenance:
+  publicKeySecretName: guest-provenance-public-key
+  publicKeySecretKey: cosign.pub
 
 account_settings:
   first_payment_bonus:

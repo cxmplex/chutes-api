@@ -47,7 +47,12 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 ALLOWED_HOST_RE = re.compile(r"(?!-)[a-z\d-]{1,63}(?<!-)$")
-ALLOWED_CHUTE_BUILDERS = {"build_sglang_chute", "build_vllm_chute"}
+HF_MODEL_CHUTE_BUILDERS = {
+    "build_diffusion_chute": "model_name_or_url",
+    "build_embedding_chute": "model_name",
+    "build_sglang_chute": "model_name",
+    "build_vllm_chute": "model_name",
+}
 
 
 @lru_cache(maxsize=2500)
@@ -57,9 +62,19 @@ def extract_hf_model_name(chute_id: str, code: str) -> str:
     except SyntaxError:
         return ""
 
+    def builder_name(node: ast.Call) -> str:
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return ""
+
     def get_model_name(node: ast.Call) -> str:
+        keyword_name = HF_MODEL_CHUTE_BUILDERS.get(builder_name(node))
+        if not keyword_name:
+            return ""
         for keyword in node.keywords:
-            if keyword.arg != "model_name":
+            if keyword.arg != keyword_name:
                 continue
             if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
                 return keyword.value.value
@@ -67,11 +82,7 @@ def extract_hf_model_name(chute_id: str, code: str) -> str:
         return ""
 
     def is_allowed_builder(node: ast.Call) -> bool:
-        if isinstance(node.func, ast.Name):
-            return node.func.id in ALLOWED_CHUTE_BUILDERS
-        if isinstance(node.func, ast.Attribute):
-            return node.func.attr in ALLOWED_CHUTE_BUILDERS
-        return False
+        return builder_name(node) in HF_MODEL_CHUTE_BUILDERS
 
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -181,7 +192,12 @@ def build_v2_signing_message(
 
 
 def build_v2_signing_message_mgmt(
-    miner: str, validator: str, method: str, target: str, nonce: str, body_sha256: str | None
+    miner: str,
+    validator: str,
+    method: str,
+    target: str,
+    nonce: str,
+    body_sha256: str | None,
 ) -> str:
     """4-part v2 signed message (management: miner acting toward a validator)."""
     return f"v2:{miner}:{validator}:{method.upper()}:{target}:{nonce}:{body_sha256 or ''}"

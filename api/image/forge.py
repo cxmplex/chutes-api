@@ -208,7 +208,9 @@ async def build_and_push_image(image, build_dir):
             # pip requires the PEP 427 wheel filename, so keep the original basename.
             wheel_name = os.path.basename(sdk_wheel)
             shutil.copy2(sdk_wheel, os.path.join(build_dir, wheel_name))
-            chutes_install = f"COPY {wheel_name} /tmp/{wheel_name}\nRUN pip install /tmp/{wheel_name}"
+            chutes_install = (
+                f"COPY {wheel_name} /tmp/{wheel_name}\nRUN pip install /tmp/{wheel_name}"
+            )
         elif is_cpu:
             # CPU-TEE never uses graval (now a GPU-only extra), so install base chutes -- no CUDA/torch.
             chutes_install = f"RUN pip install chutes=={image.chutes_version}"
@@ -1201,7 +1203,9 @@ ENV LD_PRELOAD=/usr/local/lib/chutes-netnanny.so:/usr/local/lib/chutes-loginterc
             if not is_cpu:
                 # Stage 2: Build filesystem verification image from the updated image
                 verification_tag = f"{target_tag}-fsv-{uuid.uuid4().hex[:8]}"
-                logger.info(f"Stage 2: Building filesystem verification image as {verification_tag}")
+                logger.info(
+                    f"Stage 2: Building filesystem verification image as {verification_tag}"
+                )
 
                 fsv_dockerfile_content = f"""FROM {updated_tag}
 ARG CFSV_OP
@@ -1323,10 +1327,14 @@ RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
 
                 # Upload JSON manifest for validator if generated.
                 if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
-                    manifest_json_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest.json"
+                    manifest_json_s3_key = (
+                        f"image_hash_blobs/{image_id}/{patch_version}.manifest.json"
+                    )
                     async with settings.s3_client() as s3:
                         await s3.upload_file(
-                            bytecode_manifest_json_path, settings.storage_bucket, manifest_json_s3_key
+                            bytecode_manifest_json_path,
+                            settings.storage_bucket,
+                            manifest_json_s3_key,
                         )
                     logger.success(f"Uploaded bytecode manifest JSON to {manifest_json_s3_key}")
 

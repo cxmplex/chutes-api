@@ -105,9 +105,7 @@ class TestHandleAgentCommandAck:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", sorted(ac.FAILED_ACK_STATUSES))
-    async def test_all_failed_statuses_fail_the_config(
-        self, mock_settings, fake_redis, status
-    ):
+    async def test_all_failed_statuses_fail_the_config(self, mock_settings, fake_redis, status):
         self._store_context(fake_redis)
         session = FakeSession({"text:update_launch_configs": FakeResult(rowcount=1)})
         with patch("api.database.get_session", _session_ctx(session)):
@@ -119,9 +117,7 @@ class TestHandleAgentCommandAck:
         self._store_context(fake_redis)
         session = FakeSession({})
         with patch("api.database.get_session", _session_ctx(session)):
-            await ac.handle_agent_command_ack(
-                "srv-1", {"command_id": "cmd-1", "status": "ok"}
-            )
+            await ac.handle_agent_command_ack("srv-1", {"command_id": "cmd-1", "status": "ok"})
         assert session.executed == []
         assert "agent:cmd:cmd-1" not in fake_redis.store
 
@@ -259,9 +255,7 @@ class TestSendInstanceTeardown:
                 ac, "send_agent_command", AsyncMock(side_effect=RuntimeError("redis down"))
             ),
         ):
-            assert (
-                await ac.send_instance_teardown("chute-1", server_id="srv-1") is None
-            )
+            assert await ac.send_instance_teardown("chute-1", server_id="srv-1") is None
 
 
 class TestSendJobInstanceTeardown:
@@ -269,11 +263,7 @@ class TestSendJobInstanceTeardown:
     async def test_resolves_instance_row_and_dispatches(self, mock_settings):
         row = SimpleNamespace(chute_id="chute-1", server_id="srv-1", config_id="cfg-1")
         session = FakeSession(
-            {
-                "Instance.chute_id|Instance.server_id|Instance.config_id": FakeResult(
-                    rows=[row]
-                )
-            }
+            {"Instance.chute_id|Instance.server_id|Instance.config_id": FakeResult(rows=[row])}
         )
         teardown = AsyncMock(return_value="cmd-1")
         with (
@@ -344,9 +334,7 @@ class TestHandleAgentStatusRouting:
 
     @pytest.mark.asyncio
     async def test_reconcile_errors_swallowed(self, mock_settings):
-        with patch.object(
-            ac, "_reconcile_host_slots", AsyncMock(side_effect=RuntimeError("boom"))
-        ):
+        with patch.object(ac, "_reconcile_host_slots", AsyncMock(side_effect=RuntimeError("boom"))):
             await ac.handle_agent_status("host-1", {"slots": []})
 
 
@@ -401,9 +389,7 @@ class TestReconcileServerContainers:
     async def test_orphan_container_stopped(self, mock_settings):
         purge, send = await self._run([], [], ["cfg-orphan"])
         purge.assert_not_awaited()
-        send.assert_awaited_once_with(
-            "srv-1", "stop_instance", {"config_id": "cfg-orphan"}
-        )
+        send.assert_awaited_once_with("srv-1", "stop_instance", {"config_id": "cfg-orphan"})
 
     @pytest.mark.asyncio
     async def test_container_for_pending_launch_config_kept(self, mock_settings):
@@ -470,9 +456,7 @@ class TestReconcileHostSlots:
         live = _server_row(server_id="td-live", host_id="host-1", created_at=OLD)
         # The reported slot also runs through the host->validator drift pass; its Server
         # row and chute both exist, so nothing is torn down.
-        handlers = self._handlers(
-            [live], slot_server_exists="td-live", slot_chute_exists="chute-1"
-        )
+        handlers = self._handlers([live], slot_server_exists="td-live", slot_chute_exists="chute-1")
         session, purge, send = await self._run(
             handlers, [{"server_id": "td-live", "chute_id": "chute-1"}]
         )
@@ -493,33 +477,23 @@ class TestReconcileHostSlots:
 
     @pytest.mark.asyncio
     async def test_orphan_td_for_deleted_chute_torn_down(self, mock_settings):
-        handlers = self._handlers(
-            [], slot_server_exists="td-1", slot_chute_exists=False
-        )
-        _, _, send = await self._run(
-            handlers, [{"server_id": "td-1", "chute_id": "chute-gone"}]
-        )
+        handlers = self._handlers([], slot_server_exists="td-1", slot_chute_exists=False)
+        _, _, send = await self._run(handlers, [{"server_id": "td-1", "chute_id": "chute-gone"}])
         send.assert_awaited_once_with(
             "host-1", "delete_chute", {"chute_id": "chute-gone", "server_id": "td-1"}
         )
 
     @pytest.mark.asyncio
-    async def test_unregistered_td_with_inflight_marker_kept(
-        self, mock_settings, fake_redis
-    ):
+    async def test_unregistered_td_with_inflight_marker_kept(self, mock_settings, fake_redis):
         fake_redis.store["mb:launch:chute-1:host-1"] = "host-1"
         handlers = self._handlers([], slot_server_exists=False, slot_chute_exists="chute-1")
-        _, _, send = await self._run(
-            handlers, [{"server_id": "td-boot", "chute_id": "chute-1"}]
-        )
+        _, _, send = await self._run(handlers, [{"server_id": "td-boot", "chute_id": "chute-1"}])
         send.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_unregistered_td_without_marker_torn_down(self, mock_settings):
         handlers = self._handlers([], slot_server_exists=False, slot_chute_exists="chute-1")
-        _, _, send = await self._run(
-            handlers, [{"server_id": "td-zombie", "chute_id": "chute-1"}]
-        )
+        _, _, send = await self._run(handlers, [{"server_id": "td-zombie", "chute_id": "chute-1"}])
         send.assert_awaited_once_with(
             "host-1", "delete_chute", {"chute_id": "chute-1", "server_id": "td-zombie"}
         )

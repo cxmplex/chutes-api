@@ -1,13 +1,16 @@
-"""Unit tests for AMD SEV-SNP attestation: parser (snp_quote), verifier (snp_verify), and the
-provider-aware verify_quote dispatch. Exercised against a REAL Genoa report + cert chain
-(tests/assets/snp/), mirroring the TDX suite (test_server_utils / test_server_service)."""
+"""AMD SEV-SNP parser/verifier tests using deterministic valid synthetic crypto fixtures."""
 
-from unittest.mock import AsyncMock, PropertyMock, patch
+# Pytest fixture parameters intentionally reuse the imported fixture function names.
+# ruff: noqa: F811
+
+from unittest.mock import PropertyMock, patch
 
 import pytest
+from cryptography import x509
 
 from api.config import Settings, TeeMeasurementConfig
 from api.server import util
+from api.server import snp_verify
 from api.server.exceptions import InvalidQuoteError, MeasurementMismatchError
 from api.server.quote import build_runtime_quote, quote_from_evidence
 from api.server.snp_quote import SnpReport
@@ -16,6 +19,7 @@ from tests.fixtures.snp import (
     EXPECTED_MEASUREMENT,
     EXPECTED_REPORT_DATA,
     EXPECTED_REPORTED_TCB,
+    PROCESSOR_MODEL,
     gcp_snp_cert_chain,  # noqa: F401 (pytest fixture)
     gcp_snp_report_bytes,  # noqa: F401
     snp_certs,  # noqa: F401
@@ -23,6 +27,51 @@ from tests.fixtures.snp import (
     snp_report_b64,  # noqa: F401
     snp_report_bytes,  # noqa: F401
 )
+from tests.fixtures.snp_synthetic import SYNTHETIC_SNP_BUNDLE
+
+
+class _MemoryRedis:
+    def __init__(self, values=None):
+        self.values = dict(values or {})
+
+    async def get(self, key):
+        return self.values.get(key)
+
+    async def set(self, key, value, **_kwargs):
+        self.values[key] = value
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+
+
+def _synthetic_redis(report=None):
+    ask = x509.load_pem_x509_certificate(SYNTHETIC_SNP_BUNDLE.ask_pem)
+    crl = x509.load_der_x509_crl(SYNTHETIC_SNP_BUNDLE.crl_der)
+    values = {
+        f"snp:crl:{PROCESSOR_MODEL}": snp_verify._crl_cache_payload(
+            SYNTHETIC_SNP_BUNDLE.crl_der, crl, ask
+        )
+    }
+    if report is not None:
+        values.update(
+            {
+                f"snp:vcek:{PROCESSOR_MODEL}:{report.chip_id.lower()}:{report.reported_tcb}": (
+                    SYNTHETIC_SNP_BUNDLE.vcek_der
+                ),
+                f"snp:ca:{PROCESSOR_MODEL}": SYNTHETIC_SNP_BUNDLE.ca_pem,
+            }
+        )
+    return _MemoryRedis(values)
+
+
+@pytest.fixture(autouse=True)
+def _trust_synthetic_ark(monkeypatch):
+    monkeypatch.setitem(
+        snp_verify.ARK_PUBKEY_SHA384,
+        PROCESSOR_MODEL,
+        SYNTHETIC_SNP_BUNDLE.ark_spki_sha384,
+    )
+
 
 # --------------------------------------------------------------------------------------------------
 # Parser (api/server/snp_quote.py)
@@ -101,17 +150,22 @@ def test_snp_matches_measurement_wrong_policy(snp_report_bytes):
     """The full guest policy is pinned: a non-DEBUG policy bit the launch measurement does not cover
     (e.g. MIGRATE_MA, bit 20) must still fail the match when the config pins a different policy."""
     r = SnpReport.from_bytes(snp_report_bytes)  # report policy == EXPECTED_POLICY (0x30000)
-    cfg = snp_measurement_config(policy=0x30000 | (1 << 20))  # not DEBUG (bit 19); differs from report
+    cfg = snp_measurement_config(
+        policy=0x30000 | (1 << 20)
+    )  # not DEBUG (bit 19); differs from report
     assert r.matches_measurement(cfg) is False
 
 
 def test_snp_does_not_match_tdx_config(snp_report_bytes):
     r = SnpReport.from_bytes(snp_report_bytes)
     tdx_cfg = TeeMeasurementConfig(
-        version="1", mrtd="A" * 96, name="tdx",
+        version="1",
+        mrtd="A" * 96,
+        name="tdx",
         boot_rtmrs={f"RTMR{i}": "B" * 96 for i in range(4)},
         runtime_rtmrs={f"RTMR{i}": "B" * 96 for i in range(4)},
-        expected_gpus=[], tee_type="tdx",
+        expected_gpus=[],
+        tee_type="tdx",
     )
     assert r.matches_measurement(tdx_cfg) is False
 
@@ -136,7 +190,14 @@ def test_snp_matches_measurement_debug_rejected(snp_report_bytes):
 async def test_snp_verify_positive(snp_report_bytes, snp_certs):
     vcek_der, ask_pem, ark_pem, _ca = snp_certs
     r = SnpReport.from_bytes(snp_report_bytes)
-    res = await verify_snp_report(r, model="Genoa", vcek_der=vcek_der, ask_pem=ask_pem, ark_pem=ark_pem)
+    res = await verify_snp_report(
+        r,
+        model=PROCESSOR_MODEL,
+        vcek_der=vcek_der,
+        ask_pem=ask_pem,
+        ark_pem=ark_pem,
+        redis=_synthetic_redis(),
+    )
     assert res.is_valid is True
     assert res.status == "VALID"
     assert res.reported_tcb == EXPECTED_REPORTED_TCB
@@ -148,7 +209,14 @@ async def test_snp_verify_tampered_measurement_rejected(snp_report_bytes, snp_ce
     tampered = bytearray(snp_report_bytes)
     tampered[0x90] ^= 0xFF  # flip a measurement byte -> breaks the report signature
     r = SnpReport.from_bytes(bytes(tampered))
-    res = await verify_snp_report(r, model="Genoa", vcek_der=vcek_der, ask_pem=ask_pem, ark_pem=ark_pem)
+    res = await verify_snp_report(
+        r,
+        model=PROCESSOR_MODEL,
+        vcek_der=vcek_der,
+        ask_pem=ask_pem,
+        ark_pem=ark_pem,
+        redis=_synthetic_redis(),
+    )
     assert res.is_valid is False
 
 
@@ -156,7 +224,9 @@ async def test_snp_verify_tampered_measurement_rejected(snp_report_bytes, snp_ce
 async def test_snp_verify_wrong_ark_pin_rejected(snp_report_bytes, snp_certs):
     vcek_der, ask_pem, ark_pem, _ca = snp_certs
     r = SnpReport.from_bytes(snp_report_bytes)
-    res = await verify_snp_report(r, model="Milan", vcek_der=vcek_der, ask_pem=ask_pem, ark_pem=ark_pem)
+    res = await verify_snp_report(
+        r, model="Milan", vcek_der=vcek_der, ask_pem=ask_pem, ark_pem=ark_pem
+    )
     assert res.is_valid is False  # no pinned ARK for Milan
 
 
@@ -165,7 +235,13 @@ async def test_snp_verify_broken_chain_rejected(snp_report_bytes, snp_certs):
     vcek_der, ask_pem, ark_pem, _ca = snp_certs
     r = SnpReport.from_bytes(snp_report_bytes)
     # Swap ASK/ARK so the ARK pin (and chain) fails.
-    res = await verify_snp_report(r, model="Genoa", vcek_der=vcek_der, ask_pem=ark_pem, ark_pem=ask_pem)
+    res = await verify_snp_report(
+        r,
+        model=PROCESSOR_MODEL,
+        vcek_der=vcek_der,
+        ask_pem=ark_pem,
+        ark_pem=ask_pem,
+    )
     assert res.is_valid is False
 
 
@@ -184,38 +260,76 @@ def test_quote_from_evidence_snp(snp_report_b64):
 
 
 @pytest.mark.asyncio
-async def test_gcp_snp_verify_via_inline_cert_chain(gcp_snp_report_bytes, gcp_snp_cert_chain):
-    """GCP SEV-SNP (Milan, report v5): verifies using the inline auxblob cert chain (no KDS fetch)."""
+async def test_synthetic_snp_verify_via_inline_cert_chain(gcp_snp_report_bytes, gcp_snp_cert_chain):
+    """The synthetic GHCB auxblob drives the inline VCEK/ASK/ARK verification path."""
     from api.server.snp_verify import parse_ghcb_cert_table
 
     r = SnpReport.from_bytes(gcp_snp_report_bytes)
-    assert r.version >= 5
+    assert r.version == 3
     vcek, ask, ark = parse_ghcb_cert_table(gcp_snp_cert_chain)
-    assert "ARK-Milan" in ark.subject.rfc4514_string()
+    assert "ARK-Synthetic" in ark.subject.rfc4514_string()
     assert "VCEK" in vcek.subject.rfc4514_string()
-    res = await verify_snp_report(r, cert_chain=gcp_snp_cert_chain)
+    res = await verify_snp_report(r, cert_chain=gcp_snp_cert_chain, redis=_synthetic_redis())
     assert res.is_valid is True
     # Tamper -> the VCEK signature no longer verifies.
     bad = bytearray(gcp_snp_report_bytes)
     bad[0x90] ^= 0xFF
-    res2 = await verify_snp_report(SnpReport.from_bytes(bytes(bad)), cert_chain=gcp_snp_cert_chain)
+    res2 = await verify_snp_report(
+        SnpReport.from_bytes(bytes(bad)),
+        cert_chain=gcp_snp_cert_chain,
+        redis=_synthetic_redis(),
+    )
     assert res2.is_valid is False
+
+
+@pytest.mark.asyncio
+async def test_synthetic_crypto_executes_vmpl_and_id_key_mismatch_checks(
+    snp_report_bytes, snp_certs
+):
+    vcek_der, ask_pem, ark_pem, _ca = snp_certs
+    report = SnpReport.from_bytes(snp_report_bytes)
+    result = await verify_snp_report(
+        report,
+        model=PROCESSOR_MODEL,
+        vcek_der=vcek_der,
+        ask_pem=ask_pem,
+        ark_pem=ark_pem,
+        redis=_synthetic_redis(),
+    )
+    assert result.is_valid
+    util.verify_snp_measurement_constraints(report, snp_measurement_config())
+    with pytest.raises(MeasurementMismatchError, match="VMPL"):
+        util.verify_snp_measurement_constraints(report, snp_measurement_config(expected_vmpl=1))
+    with pytest.raises(MeasurementMismatchError, match="exact configured"):
+        util.verify_snp_measurement_constraints(
+            report, snp_measurement_config(id_key_digest="00" * 48)
+        )
 
 
 @pytest.mark.asyncio
 async def test_verify_quote_snp_dispatch(snp_report_bytes, snp_certs):
     """verify_quote routes an SnpReport through the SNP verifier + config match (offline KDS)."""
-    vcek_der, _ask, _ark, ca_pem = snp_certs
     r = SnpReport.from_bytes(snp_report_bytes)
     nonce = EXPECTED_REPORT_DATA[:64].lower()
     cert_hash = EXPECTED_REPORT_DATA[64:128].lower()
+    redis = _synthetic_redis(r)
 
-    with patch("api.server.snp_verify._fetch_vcek_and_ca", new=AsyncMock(return_value=(vcek_der, ca_pem))):
-        with patch.object(Settings, "tee_measurements", new_callable=PropertyMock, return_value=[snp_measurement_config()]):
+    with patch.object(Settings, "redis_client", new_callable=PropertyMock, return_value=redis):
+        with patch.object(
+            Settings,
+            "tee_measurements",
+            new_callable=PropertyMock,
+            return_value=[snp_measurement_config()],
+        ):
             res = await util.verify_quote(r, nonce, cert_hash)
             assert res.is_valid is True
 
         # Wrong measurement config -> MeasurementMismatchError.
-        with patch.object(Settings, "tee_measurements", new_callable=PropertyMock, return_value=[snp_measurement_config(measurement="00" * 48)]):
+        with patch.object(
+            Settings,
+            "tee_measurements",
+            new_callable=PropertyMock,
+            return_value=[snp_measurement_config(measurement="00" * 48)],
+        ):
             with pytest.raises(MeasurementMismatchError):
                 await util.verify_quote(r, nonce, cert_hash)

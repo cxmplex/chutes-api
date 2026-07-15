@@ -99,8 +99,9 @@ class TdxQuote(ABC):
             InvalidQuoteError: If parsing fails
         """
         try:
-            # Validate minimum size (header + TD report = 48 + 584)
-            if len(quote_bytes) < 632:
+            # Parse the fixed v4 header first so unsupported versions (notably v5, whose body has
+            # a descriptor) are rejected explicitly rather than misreported as a short v4 body.
+            if len(quote_bytes) < 48:
                 raise InvalidQuoteError(f"Quote too short: {len(quote_bytes)} bytes")
 
             # Parse header (48 bytes, little-endian)
@@ -109,12 +110,31 @@ class TdxQuote(ABC):
             version, att_key_type, tee_type, qe_vendor_id, header_user_data = header
 
             # Validate header
-            if version not in (4, 5):
-                raise InvalidQuoteError(f"Invalid quote version: {version} (expected 4 or 5)")
+            # Quote v5 has a body descriptor and may carry TD10 or TD15 reports at offsets that
+            # differ from v4. Until each supported v5 body is parsed and cross-checked explicitly,
+            # reject it rather than reading v4 offsets and publishing incorrect measurements.
+            if version != 4:
+                raise InvalidQuoteError(
+                    f"Unsupported quote version: {version} (only TDX quote v4 is parsed)"
+                )
             if tee_type != 0x81:
                 raise InvalidQuoteError(f"Invalid TEE type: {tee_type:08x} (expected 0x81 for TDX)")
             if att_key_type not in (2, 3):  # ECDSA-256 or ECDSA-384
                 raise InvalidQuoteError(f"Invalid attestation key type: {att_key_type}")
+            # v4 = 48-byte header + 584-byte TD10 report + u32 signature-data length + body.
+            # Some configfs providers append authenticated auxiliary bytes after the declared
+            # signature section, so require the complete declared section but do not reinterpret
+            # or discard a bounded trailing auxblob that dcap-qvl verifies from raw_bytes.
+            if len(quote_bytes) < 636:
+                raise InvalidQuoteError(
+                    f"TDX quote v4 body is truncated: {len(quote_bytes)} bytes (need >= 636)"
+                )
+            signature_data_len = struct.unpack_from("<I", quote_bytes, 632)[0]
+            if signature_data_len <= 0 or signature_data_len > len(quote_bytes) - 636:
+                raise InvalidQuoteError(
+                    "TDX quote v4 signature body is malformed or truncated "
+                    f"(declared={signature_data_len}, available={len(quote_bytes) - 636})"
+                )
 
             # Extract platform identifier (first 16 bytes of user_data)
             platform_id = header_user_data[:16].hex().upper()
