@@ -188,6 +188,12 @@ async def _dispatch_deploy(session, chute: Chute, server: Server, job: "Job" = N
     runs the job (not the cord server) because the activation response carries the job's
     method/data, and we forward the job's declared ports so the agent publishes them for owner-connect.
     """
+    if chute.image.compute_type != "cpu":
+        raise ValueError(
+            f"CPU scheduler refused {chute.chute_id}: image {chute.image_id} is "
+            f"{chute.image.compute_type!r}, not 'cpu'."
+        )
+
     miner = (
         await session.execute(
             select(MetagraphNode).where(
@@ -291,6 +297,7 @@ async def _dispatch_deploy(session, chute: Chute, server: Server, job: "Job" = N
             "chutes_version": chute.chutes_version,
             "validator": settings.validator_ss58,
             "tee": chute.tee,
+            "compute_type": "cpu",
             "ports": ports,
             # Model B: when the TD is reached via the L0 host's DNAT, advertise the externally
             # reachable ports (the container still publishes + the chute still binds the internal

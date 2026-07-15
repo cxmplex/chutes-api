@@ -106,8 +106,6 @@ def _config(*, provider, vtpm_pcrs=None, vtpm_security_flags=None):
         provider=provider,
         tee_type="sev-snp",
         mrtd="",
-        boot_rtmrs={},
-        runtime_rtmrs={},
         expected_gpus=[],
         gpu_count=0,
         measurement=SYNTHETIC_MEASUREMENT,

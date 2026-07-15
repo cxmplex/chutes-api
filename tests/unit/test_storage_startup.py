@@ -55,6 +55,29 @@ def test_historical_baseline_never_marks_enforced_storage_chain_applied():
     assert migrations.TRACKED_MIGRATION_BASELINE not in versions
 
 
+def test_server_health_has_post_remediation_forward_migration():
+    """The upstream pre-baseline file is marked applied on legacy DBs; the forward copy must run."""
+    versions = migrations.historical_migration_versions()
+    assert "20260626120000" in versions
+    assert "20260715120000" not in versions
+    assert "20260715120000" > "20260714110000"
+
+    migration_dir = Path(__file__).resolve().parents[2] / "api/migrations"
+    old_up = (
+        (migration_dir / "20260626120000_server_health.sql")
+        .read_text()
+        .split("-- migrate:up", 1)[1]
+        .split("-- migrate:down", 1)[0]
+    )
+    forward_up = (
+        (migration_dir / "20260715120000_server_health_forward.sql")
+        .read_text()
+        .split("-- migrate:up", 1)[1]
+        .split("-- migrate:down", 1)[0]
+    )
+    assert " ".join(old_up.split()) == " ".join(forward_up.split())
+
+
 @pytest.mark.asyncio
 async def test_startup_serializes_dbmate_after_orm_bootstrap(monkeypatch):
     connection = FakeConnection()

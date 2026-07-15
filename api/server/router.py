@@ -23,7 +23,6 @@ from api.constants import (
     NONCE_HEADER,
     SIGNATURE_HEADER,
     NoncePurpose,
-    SUPPORTED_LUKS_VOLUMES,
 )
 
 from api.server.schemas import (
@@ -38,7 +37,6 @@ from api.server.schemas import (
     NonceResponse,
     BootAttestationResponse,
     RuntimeAttestationResponse,
-    LuksPassphraseRequest,
     LuksAttestRequest,
     LuksAttestResponse,
     LuksVolumeInfo,
@@ -68,12 +66,12 @@ from api.server.service import (
     delete_server,
     validate_request_nonce,
     require_boot_attestation_nonce,
-    process_luks_passphrase_request,
     require_luks_quote_nonce,
     require_confirm_nonce,
     process_luks_attest_request,
     process_luks_confirm,
-    get_active_upgrade_window,
+    get_latest_upgrade_window,
+    is_window_open,
     preflight_maintenance,
     confirm_maintenance,
     _count_active_maintenance_slots,
@@ -89,7 +87,7 @@ from api.server.exceptions import (
     ServerRegistrationError,
 )
 from api.miner.util import is_miner_blacklisted
-from api.util import extract_ip, is_valid_host, semcomp
+from api.util import is_valid_host, semcomp
 
 
 router = APIRouter()
@@ -119,7 +117,7 @@ async def get_nonce(
     try:
         nonce_info = await issue_boot_attestation_nonce(
             db,
-            extract_ip(request),
+            request.state.client_ip,
             server_id,
             hotkey,
             authorization_nonce,
@@ -149,21 +147,17 @@ async def verify_boot_attestation(
     """
     Verify boot attestation and return a scoped follow-up capability.
 
-    The generic/global LUKS passphrase is never returned. For versions >= 1.3.0, the response
-    contains a one-use boot-LUKS quote capability for ``storage``/``tdx-cache`` only; older
-    versions receive an equivalently scoped legacy boot token.
+    The response contains only a one-use exact-identity LUKS quote capability for the
+    boot volume namespace. No global key or legacy ambiguous-finalization path exists.
     """
     try:
-        server_ip = extract_ip(request)
+        server_ip = request.state.client_ip
         nonce, nonce_context = validated_nonce
-        boot_token, luks_quote_nonce = await process_boot_attestation(
+        luks_quote_nonce = await process_boot_attestation(
             db, server_ip, args, nonce, nonce_context, expected_cert_hash
         )
 
-        return BootAttestationResponse(
-            boot_token=boot_token,
-            luks_quote_nonce=luks_quote_nonce,
-        )
+        return BootAttestationResponse(luks_quote_nonce=luks_quote_nonce)
     except NonceError as e:
         logger.warning(f"Boot attestation nonce error: {str(e)}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -191,7 +185,7 @@ async def get_cpu_register_nonce(request: Request):
     consumed when the server posts to /cpu/register.
     """
     try:
-        server_ip = extract_ip(request)
+        server_ip = request.state.client_ip
         nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.CPU_REGISTER)
         return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
     except Exception as e:
@@ -235,7 +229,7 @@ async def register_cpu_server_endpoint(
             reason = await is_miner_blacklisted(db, hotkey)
             if reason:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
-        server_ip = extract_ip(request)
+        server_ip = request.state.client_ip
         return await register_cpu_server(
             db,
             server_ip,
@@ -506,85 +500,6 @@ async def get_cpu_server_connection(
     }
 
 
-def _validate_luks_request(
-    boot_token: str | None,
-    hotkey: str | None,
-    body: LuksPassphraseRequest,
-) -> None:
-    """Validate LUKS POST request: boot token, hotkey, volumes, rekey. Raises HTTPException on invalid."""
-    if not boot_token:
-        detail = "Boot token is required (X-Boot-Token header)"
-        logger.warning(f"LUKS request validation failed: {detail}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-    if not hotkey:
-        detail = "Hotkey is required"
-        logger.warning(f"LUKS request validation failed: {detail}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-    if not body.volumes:
-        detail = "volumes is required and must be non-empty"
-        logger.warning(f"LUKS request validation failed: {detail}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-    invalid_volumes = [v for v in body.volumes if v not in SUPPORTED_LUKS_VOLUMES]
-    if invalid_volumes:
-        detail = (
-            f"Invalid volume name(s): {invalid_volumes}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
-        )
-        logger.warning(f"LUKS request validation failed: {detail}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-    if body.rekey is not None:
-        not_in_volumes = [v for v in body.rekey if v not in body.volumes]
-        if not_in_volumes:
-            detail = f"rekey must be a subset of volumes; not in volumes: {not_in_volumes}"
-            logger.warning(f"LUKS request validation failed: {detail}")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-        invalid_rekey = [v for v in body.rekey if v not in SUPPORTED_LUKS_VOLUMES]
-        if invalid_rekey:
-            detail = f"Invalid rekey volume name(s): {invalid_rekey}. Supported: {list(SUPPORTED_LUKS_VOLUMES)}"
-            logger.warning(f"LUKS request validation failed: {detail}")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
-
-
-@router.post("/{server_id}/luks", response_model=Dict[str, str])
-async def sync_luks_passphrases(
-    server_id: str,
-    body: LuksPassphraseRequest,
-    db: AsyncSession = Depends(get_db_session),
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    boot_token: str | None = Header(None, alias="X-Boot-Token"),
-    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
-):
-    """
-    Sync LUKS passphrases for legacy VMs (version < 1.3.0).
-
-    VM sends its volume list; API returns keys for existing volumes, creates keys
-    for new volumes, rekeys volumes in the rekey list, and prunes stored keys for
-    volumes not in the list. Boot token is validated and consumed on success.
-    """
-    try:
-        _validate_luks_request(boot_token, hotkey, body)
-        result = await process_luks_passphrase_request(
-            db,
-            boot_token,
-            server_id,
-            hotkey,
-            expected_cert_hash,
-            body.volumes,
-            rekey_volume_names=body.rekey,
-        )
-        return result
-    except NonceError as e:
-        logger.warning(f"Boot token validation error: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in LUKS POST: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to sync/create LUKS passphrases",
-        )
-
-
 @router.post(
     "/{server_id}/luks/attest",
     response_model=LuksAttestResponse,
@@ -815,6 +730,7 @@ async def get_tee_measurements():
             trust_set_fingerprint=trust_set_fingerprint,
         )
         for m in measurements
+        if not m.rc
     ]
 
 
@@ -826,25 +742,26 @@ async def get_maintenance_policy(
         get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
     ),
 ):
-    """Return the active upgrade window, concurrency limits, and the miner's pending servers."""
+    """Return the latest upgrade target and whether its maintenance window is open."""
     if not hotkey:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Hotkey header required")
 
-    active_window = await get_active_upgrade_window(db)
+    window = await get_latest_upgrade_window(db)
+    window_open = window is not None and is_window_open(window)
     window_info: UpgradeWindowInfo | None = None
     current_slots = 0
     server_statuses: list[ServerUpgradeStatus] = []
 
-    if active_window is not None:
-        target_version = active_window.target_measurement_version
+    if window is not None:
+        target_version = window.target_measurement_version
         window_info = UpgradeWindowInfo(
-            id=active_window.id,
+            id=window.id,
             target_measurement_version=target_version,
-            upgrade_window_start=str(active_window.upgrade_window_start),
-            upgrade_window_end=str(active_window.upgrade_window_end),
-            max_concurrent_per_miner=active_window.max_concurrent_per_miner,
+            upgrade_window_start=str(window.upgrade_window_start),
+            upgrade_window_end=str(window.upgrade_window_end),
+            max_concurrent_per_miner=window.max_concurrent_per_miner,
         )
-        current_slots = await _count_active_maintenance_slots(db, hotkey, active_window)
+        current_slots = await _count_active_maintenance_slots(db, hotkey, window)
 
         tee_servers = (
             (
@@ -869,6 +786,7 @@ async def get_maintenance_policy(
 
     return MaintenancePolicyResponse(
         active_window=window_info,
+        window_open=window_open,
         current_slots=current_slots,
         servers=server_statuses,
     )
@@ -1033,7 +951,7 @@ async def get_runtime_nonce(
     try:
         server = await check_server_ownership(db, server_id, hotkey)
 
-        actual_ip = extract_ip(request)
+        actual_ip = request.state.client_ip
         if server.ip != actual_ip:
             raise Exception()
 
@@ -1078,7 +996,7 @@ async def verify_runtime_attestation(
     """
     try:
         server = await check_server_ownership(db, server_id, hotkey)
-        actual_ip = extract_ip(request)
+        actual_ip = request.state.client_ip
         stored_nonce = await validate_and_consume_nonce(nonce, actual_ip, NoncePurpose.RUNTIME)
         try:
             nonce_context = RuntimeAttestationNonceContext.model_validate(
@@ -1103,6 +1021,7 @@ async def verify_runtime_attestation(
             attestation_id=result["attestation_id"],
             verified_at=result["verified_at"],
             status=result["status"],
+            revocation_status=result["revocation_status"],
         )
 
     except ServerNotFoundError as e:

@@ -3,7 +3,6 @@ Routes for images.
 """
 
 import io
-import uuid
 import asyncio
 import orjson as json
 from loguru import logger
@@ -22,15 +21,15 @@ from starlette.responses import StreamingResponse
 from sqlalchemy import and_, or_, exists, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import Optional
+from typing import Literal, Optional
 from api.image.schemas import Image
 from api.chute.schemas import Chute
 from api.user.schemas import User
 from api.user.service import get_current_user
-from api.database import get_db_session
+from api.database import get_db_session, db_scalar
 from api.config import settings
 from api.image.response import ImageResponse
-from api.image.util import get_image_by_id_or_name
+from api.image.util import get_image_by_id_or_name, image_id_for
 from api.pagination import PaginatedResponse
 from api.util import limit_images, semcomp, is_registered_to_integrated_subnet
 from api.permissions import Permissioning
@@ -42,14 +41,12 @@ router = APIRouter()
 async def stream_build_logs(
     image_id: str,
     offset: Optional[str] = None,
-    db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(purpose="images", raise_not_found=False)),
 ):
-    image = (
-        (await db.execute(select(Image).where(Image.image_id == image_id)))
-        .unique()
-        .scalar_one_or_none()
-    )
+    # Load + authorize with a short-lived session (db_scalar), then snapshot what the
+    # branches below need. Holding a request-scoped session open across the stream is what
+    # previously left transactions "idle in transaction" for hours (mirrors instance fix #164).
+    image = await db_scalar(select(Image).where(Image.image_id == image_id))
     if not image or (
         not image.public and (not current_user or image.user_id != current_user.user_id)
     ):
@@ -57,11 +54,13 @@ async def stream_build_logs(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Image not found, or does not belong to you",
         )
+    image_status = image.status
+    image_user_id = image.user_id
 
     # Images already built?
-    if image.status.startswith(("built and pushed", "error:")):
+    if image_status.startswith(("built and pushed", "error:")):
         async with settings.s3_client() as s3:
-            log_path = f"forge/{image.user_id}/{image.image_id}.log"
+            log_path = f"forge/{image_user_id}/{image_id}.log"
             try:
                 async with settings.s3_client() as s3:
                     data = io.BytesIO()
@@ -76,7 +75,7 @@ async def stream_build_logs(
                     )
             except Exception:
                 return Response(
-                    content=image.status,
+                    content=image_status,
                     headers={"Content-Type": "text/plain"},
                 )
 
@@ -125,6 +124,7 @@ async def list_images(
     include_public: Optional[bool] = False,
     name: Optional[str] = None,
     tag: Optional[str] = None,
+    compute_type: Optional[Literal["cpu", "gpu"]] = None,
     page: Optional[int] = 0,
     limit: Optional[int] = 25,
     db: AsyncSession = Depends(get_db_session),
@@ -152,6 +152,8 @@ async def list_images(
         query = query.where(Image.name.ilike(f"%{name}%"))
     if tag and tag.strip():
         query = query.where(Image.tag.ilike(f"%{tag}%"))
+    if compute_type:
+        query = query.where(Image.compute_type == compute_type)
 
     # Perform a count.
     total_query = select(func.count()).select_from(query.subquery())
@@ -246,7 +248,7 @@ async def create_image(
     dockerfile: str = Form(...),
     image: str = Form(...),
     public: bool = Form(...),
-    cpu: bool = Form(False),
+    compute_type: Literal["cpu", "gpu"] = Form(...),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user()),
 ):
@@ -286,7 +288,7 @@ async def create_image(
                     detail="You must have a balance of >= $50 to create images.",
                 )
 
-    image_id = str(uuid.uuid5(uuid.NAMESPACE_OID, f"{username.lower()}/{name}:{tag}".lower()))
+    image_id = image_id_for(username, name, tag, compute_type)
     query = select(
         exists().where(
             or_(
@@ -334,7 +336,7 @@ async def create_image(
         tag=tag,
         public=public,
         chutes_version=settings.chutes_version,
-        cpu=cpu,
+        compute_type=compute_type,
     )
     db.add(image)
     await db.commit()

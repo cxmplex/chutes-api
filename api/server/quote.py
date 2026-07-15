@@ -258,8 +258,8 @@ class TdxVerificationResult:
 
     @property
     def is_valid(self) -> bool:
-        """True if signature status is UpToDate and TD debug mode is disabled."""
-        return self.status == "UpToDate" and not self.debug_enabled
+        """Require current TCB, no Intel advisories, and a non-debug TD."""
+        return self.status == "UpToDate" and not self.advisory_ids and not self.debug_enabled
 
     @classmethod
     def from_report(cls, verified_report: VerifiedReport) -> "TdxVerificationResult":
@@ -284,6 +284,34 @@ class TdxVerificationResult:
 
         return result
 
+    @classmethod
+    def from_fields(
+        cls,
+        *,
+        mr_td: Any,
+        rt_mr0: Any,
+        rt_mr1: Any,
+        rt_mr2: Any,
+        rt_mr3: Any,
+        report_data: Any,
+        td_attributes: Any,
+        status: str,
+        advisory_ids: Optional[List[str]] = None,
+    ) -> "TdxVerificationResult":
+        """Build a normalized result for the module-identity TCB fallback."""
+        return cls(
+            mrtd=_hex(mr_td),
+            rtmr0=_hex(rt_mr0),
+            rtmr1=_hex(rt_mr1),
+            rtmr2=_hex(rt_mr2),
+            rtmr3=_hex(rt_mr3),
+            user_data=_hex(report_data),
+            parsed_at=datetime.now(timezone.utc),
+            status=status,
+            advisory_ids=advisory_ids or [],
+            td_attributes=_hex(td_attributes),
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary format for compatibility."""
         return {
@@ -293,6 +321,161 @@ class TdxVerificationResult:
             "parsed_at": self.parsed_at,
             "is_valid": self.is_valid,
         }
+
+
+def _hex(value: Any) -> str:
+    """Normalize bytes/bytearray/hex-str to lowercase hex."""
+    if isinstance(value, (bytes, bytearray)):
+        return value.hex()
+    if isinstance(value, str):
+        return value.lower()
+    raise InvalidQuoteError(f"Cannot interpret {type(value).__name__} as hex bytes")
+
+
+def _as_bytes(value: Any) -> bytes:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        try:
+            return bytes.fromhex(value)
+        except ValueError as exc:
+            raise InvalidQuoteError("Invalid hex value in TDX module field") from exc
+    raise InvalidQuoteError(f"Cannot interpret {type(value).__name__} as bytes")
+
+
+_TCB_STATUS_SEVERITY = {
+    "UpToDate": 0,
+    "SWHardeningNeeded": 1,
+    "ConfigurationNeeded": 2,
+    "ConfigurationAndSWHardeningNeeded": 3,
+    "OutOfDate": 4,
+    "OutOfDateConfigurationNeeded": 5,
+    "Revoked": 6,
+}
+
+
+def _merge_tcb_status(
+    platform: tuple[str, List[str]], module: Optional[tuple[str, List[str]]]
+) -> tuple[str, List[str]]:
+    if module is None:
+        return platform
+    platform_status, platform_advisories = platform
+    module_status, module_advisories = module
+    unknown = max(_TCB_STATUS_SEVERITY.values()) + 1
+    status = (
+        module_status
+        if _TCB_STATUS_SEVERITY.get(module_status, unknown)
+        > _TCB_STATUS_SEVERITY.get(platform_status, unknown)
+        else platform_status
+    )
+    advisories = list(platform_advisories)
+    advisories.extend(item for item in module_advisories if item not in advisories)
+    return status, advisories
+
+
+def _match_platform_tcb_level(
+    tcb_info: Dict[str, Any],
+    tee_tcb_svn: List[int],
+    sgx_tcb_components: List[int],
+    pce_svn: int,
+) -> tuple[str, List[str]]:
+    """Apply Intel's platform-level matching, excluding module-governed SVN bytes."""
+    tdx_start = 2 if tee_tcb_svn[1] > 0 else 0
+    for level in tcb_info.get("tcbLevels", []):
+        tcb = level["tcb"]
+        if pce_svn < tcb["pcesvn"]:
+            continue
+        sgx_components = [component["svn"] for component in tcb.get("sgxtcbcomponents", [])]
+        if len(sgx_components) != len(sgx_tcb_components):
+            raise InvalidQuoteError("SGX TCB component count mismatch in TCB Info")
+        if any(actual < required for actual, required in zip(sgx_tcb_components, sgx_components)):
+            continue
+        tdx_components = [component["svn"] for component in tcb.get("tdxtcbcomponents", [])]
+        if len(tdx_components) != len(tee_tcb_svn):
+            raise InvalidQuoteError("TDX TCB component count mismatch in TCB Info")
+        if any(
+            actual < required
+            for actual, required in zip(tee_tcb_svn[tdx_start:], tdx_components[tdx_start:])
+        ):
+            continue
+        return level["tcbStatus"], level.get("advisoryIDs", []) or []
+    raise InvalidQuoteError("No matching platform TCB level found")
+
+
+def _verify_tdx_module(
+    tcb_info: Dict[str, Any],
+    tee_tcb_svn: List[int],
+    mr_signer_seam: Any,
+    seam_attributes: Any,
+) -> Optional[tuple[str, List[str]]]:
+    """Verify the exact Intel-signed TDX module identity and select its TCB level."""
+    if tcb_info.get("id") != "TDX" or tcb_info.get("version", 0) < 3:
+        return None
+    base = tcb_info.get("tdxModule")
+    if base is None:
+        raise InvalidQuoteError("TDX TCB Info is missing tdxModule field")
+
+    module_isvsvn, module_version = tee_tcb_svn[0], tee_tcb_svn[1]
+    expected_mrsigner = base["mrsigner"]
+    expected_attributes = base["attributes"]
+    attributes_mask = base["attributesMask"]
+    identity_levels: Optional[List[Dict[str, Any]]] = None
+
+    identities = tcb_info.get("tdxModuleIdentities") or []
+    if module_version > 0 and identities:
+        wanted_id = f"TDX_{module_version:02X}"
+        identity = next(
+            (item for item in identities if item.get("id", "").upper() == wanted_id.upper()),
+            None,
+        )
+        if identity is None:
+            raise InvalidQuoteError(
+                f"Unsupported TDX module version: no identity '{wanted_id}' in TCB Info"
+            )
+        expected_mrsigner = identity["mrsigner"]
+        expected_attributes = identity["attributes"]
+        attributes_mask = identity["attributesMask"]
+        identity_levels = identity.get("tcbLevels", [])
+
+    if _as_bytes(expected_mrsigner) != _as_bytes(mr_signer_seam):
+        raise InvalidQuoteError("TDX module MRSIGNER mismatch")
+
+    expected = _as_bytes(expected_attributes)
+    mask = _as_bytes(attributes_mask)
+    actual = _as_bytes(seam_attributes)
+    if not (len(expected) == len(mask) == len(actual)):
+        raise InvalidQuoteError("TDX module SEAMATTRIBUTES length mismatch")
+    for expected_byte, mask_byte, actual_byte in zip(expected, mask, actual):
+        if (
+            expected_byte & mask_byte != actual_byte & mask_byte
+            or actual_byte & (~mask_byte & 0xFF) != 0
+        ):
+            raise InvalidQuoteError("TDX module SEAMATTRIBUTES mismatch")
+
+    if identity_levels is not None:
+        for level in identity_levels:
+            if module_isvsvn >= level["tcb"]["isvsvn"]:
+                return level["tcbStatus"], level.get("advisoryIDs", []) or []
+        raise InvalidQuoteError(
+            f"TDX module ISVSVN {module_isvsvn} below minimum in TDX module TCB levels"
+        )
+    return None
+
+
+def resolve_tdx_tcb_status(
+    tcb_info: Dict[str, Any],
+    tee_tcb_svn: List[int],
+    sgx_tcb_components: List[int],
+    pce_svn: int,
+    mr_signer_seam: Any,
+    seam_attributes: Any,
+) -> tuple[str, List[str]]:
+    """Resolve platform and module TCB status using Intel's module-identity algorithm."""
+    if len(tee_tcb_svn) < 2:
+        raise InvalidQuoteError("TEE_TCB_SVN too short to resolve TDX TCB status")
+    platform = _match_platform_tcb_level(tcb_info, tee_tcb_svn, sgx_tcb_components, pce_svn)
+    module = _verify_tdx_module(tcb_info, tee_tcb_svn, mr_signer_seam, seam_attributes)
+    return _merge_tcb_status(platform, module)
 
 
 # --- Provider-agnostic quote factory (Intel TDX vs AMD SEV-SNP) ----------------------------------

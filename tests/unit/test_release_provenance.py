@@ -46,10 +46,7 @@ _REAL_BAREMETAL_TDX_CAPTURE = {
             "6B7A522EC51FB88EF932C0F8573A5CE837261CEB206871C2319C96CCB65424A3"
             "F026F1B1C498497B130C543C0A90031B"
         ),
-        "RTMR3": (
-            "B73823F33F1BAB37A35224FAF07D5EE18B2822956A2420AB38E68E70C06BD01D"
-            "254908F6EE5F24162674339EB7103AF8"
-        ),
+        "RTMR3": "0" * 96,
     },
     "runtime_rtmrs": {
         "RTMR0": (
@@ -268,8 +265,10 @@ def _production_tdx_fixture():
             tee_type="tdx",
             provider="bare-metal",
             mrtd=_REAL_BAREMETAL_TDX_CAPTURE["mrtd"],
-            boot_rtmrs=dict(_REAL_BAREMETAL_TDX_CAPTURE["boot_rtmrs"]),
-            runtime_rtmrs=dict(_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]),
+            rtmr0=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR0"],
+            rtmr1=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR1"],
+            rtmr2=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR2"],
+            runtime_rtmr3=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR3"],
             expected_gpus=[],
             gpu_count=0,
             debug=False,

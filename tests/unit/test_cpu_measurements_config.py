@@ -24,9 +24,7 @@ def _settings_for_yaml(tmp_path: Path, yaml_text: str) -> Settings:
     config_path.write_text(textwrap.dedent(yaml_text))
     settings = Settings()
     settings.tee_measurement_config_path = config_path
-    settings.tee_committed_measurement_config_path = (
-        tmp_path / "no-committed-measurements.yaml"
-    )
+    settings.tee_committed_measurement_config_path = tmp_path / "no-committed-measurements.yaml"
     return settings
 
 
@@ -38,16 +36,10 @@ def test_loads_cpu_measurement_gpu_count_zero(tmp_path):
         name: "cpu-gcp"
         provider: "gcp"
         debug: false
-        boot_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
-        runtime_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
+        rtmr0: "{HEX96_RTMR0}"
+        rtmr1: "{HEX96_RTMR1}"
+        rtmr2: "{HEX96_RTMR2}"
+        runtime_rtmr3: "{HEX96_RTMR3}"
         expected_gpus: []
         gpu_count: 0
     """
@@ -61,6 +53,60 @@ def test_loads_cpu_measurement_gpu_count_zero(tmp_path):
     assert cpu.mrtd == HEX96_MRTD
 
 
+def test_rejects_legacy_nested_tdx_schema_instead_of_dual_parsing(tmp_path):
+    settings = _settings_for_yaml(
+        tmp_path,
+        f"""
+        measurements:
+          - version: "1"
+            name: "cpu-gcp"
+            provider: "gcp"
+            tee_type: "tdx"
+            debug: false
+            mrtd: "{HEX96_MRTD}"
+            boot_rtmrs:
+              rtmr0: "{HEX96_RTMR0}"
+            runtime_rtmrs:
+              rtmr3: "{HEX96_RTMR3}"
+            expected_gpus: []
+            gpu_count: 0
+        """,
+    )
+    with pytest.raises(ValueError, match="Unsupported field.*boot_rtmrs"):
+        settings._load_tee_measurements()
+
+
+def test_release_candidate_is_attestable_but_not_minimum_version(tmp_path):
+    entries = []
+    for version, name, rc in (
+        ("1.3.0", "cpu-gcp-stable", False),
+        ("9.0.0", "cpu-gcp-rc", True),
+    ):
+        entries.append(
+            {
+                "version": version,
+                "name": name,
+                "provider": "gcp",
+                "tee_type": "tdx",
+                "debug": False,
+                "rc": rc,
+                "mrtd": HEX96_MRTD,
+                "rtmr0": HEX96_RTMR0,
+                "rtmr1": HEX96_RTMR1,
+                "rtmr2": HEX96_RTMR2,
+                "runtime_rtmr3": HEX96_RTMR3,
+                "expected_gpus": [],
+                "gpu_count": 0,
+            }
+        )
+    settings = _settings_for_yaml(
+        tmp_path,
+        yaml.safe_dump({"measurements": entries}, sort_keys=False),
+    )
+    assert [entry.rc for entry in settings.tee_measurements] == [False, True]
+    assert settings.tee_minimum_boot_version == "1.3.0"
+
+
 def test_measurement_absent_gpu_count_rejected(tmp_path):
     """A config omitting gpu_count must hard-fail at load: silently treating it as a CPU
     config would skip GPU evidence verification for a GPU image. CPU-ness is explicit
@@ -72,16 +118,10 @@ def test_measurement_absent_gpu_count_rejected(tmp_path):
         name: "cpu-baremetal"
         provider: "bare-metal"
         debug: false
-        boot_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
-        runtime_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
+        rtmr0: "{HEX96_RTMR0}"
+        rtmr1: "{HEX96_RTMR1}"
+        rtmr2: "{HEX96_RTMR2}"
+        runtime_rtmr3: "{HEX96_RTMR3}"
         expected_gpus: []
     """
     settings = _settings_for_yaml(tmp_path, yaml_text)
@@ -100,16 +140,10 @@ def test_measurement_gpu_count_requires_nonnegative_integer(tmp_path, gpu_count)
                 name: "cpu-gcp"
                 provider: "gcp"
                 debug: false
-                boot_rtmrs:
-                  rtmr0: "{HEX96_RTMR0}"
-                  rtmr1: "{HEX96_RTMR1}"
-                  rtmr2: "{HEX96_RTMR2}"
-                  rtmr3: "{HEX96_RTMR3}"
-                runtime_rtmrs:
-                  rtmr0: "{HEX96_RTMR0}"
-                  rtmr1: "{HEX96_RTMR1}"
-                  rtmr2: "{HEX96_RTMR2}"
-                  rtmr3: "{HEX96_RTMR3}"
+                rtmr0: "{HEX96_RTMR0}"
+                rtmr1: "{HEX96_RTMR1}"
+                rtmr2: "{HEX96_RTMR2}"
+                runtime_rtmr3: "{HEX96_RTMR3}"
                 expected_gpus: []
                 gpu_count: 0
             """
@@ -128,16 +162,10 @@ def test_gpu_measurement_still_loads_with_provider_none(tmp_path):
         mrtd: "{HEX96_MRTD}"
         name: "8xh200"
         debug: false
-        boot_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
-        runtime_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
+        rtmr0: "{HEX96_RTMR0}"
+        rtmr1: "{HEX96_RTMR1}"
+        rtmr2: "{HEX96_RTMR2}"
+        runtime_rtmr3: "{HEX96_RTMR3}"
         expected_gpus:
           - "h200"
         gpu_count: 8
@@ -159,16 +187,10 @@ def test_provider_is_normalized_lowercase(tmp_path):
         name: "cpu-gcp"
         provider: "GCP"
         debug: false
-        boot_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
-        runtime_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
+        rtmr0: "{HEX96_RTMR0}"
+        rtmr1: "{HEX96_RTMR1}"
+        rtmr2: "{HEX96_RTMR2}"
+        runtime_rtmr3: "{HEX96_RTMR3}"
         expected_gpus: []
         gpu_count: 0
     """
@@ -183,22 +205,17 @@ def test_invalid_rtmr0_length_still_raises(tmp_path):
       - version: "1"
         mrtd: "{HEX96_MRTD}"
         name: "cpu-bad"
+        provider: "bare-metal"
         debug: false
-        boot_rtmrs:
-          rtmr0: "TOOSHORT"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
-        runtime_rtmrs:
-          rtmr0: "{HEX96_RTMR0}"
-          rtmr1: "{HEX96_RTMR1}"
-          rtmr2: "{HEX96_RTMR2}"
-          rtmr3: "{HEX96_RTMR3}"
+        rtmr0: "TOOSHORT"
+        rtmr1: "{HEX96_RTMR1}"
+        rtmr2: "{HEX96_RTMR2}"
+        runtime_rtmr3: "{HEX96_RTMR3}"
         expected_gpus: []
         gpu_count: 0
     """
     settings = _settings_for_yaml(tmp_path, yaml_text)
-    with pytest.raises(ValueError, match="Invalid boot_rtmrs.rtmr0"):
+    with pytest.raises(ValueError, match="Invalid rtmr0"):
         settings._load_tee_measurements()
 
 
@@ -297,9 +314,7 @@ def test_snp_config_missing_min_tcb_rejected(tmp_path):
         for value in (True, False, 7.0, "7", None, -1, 256)
     ],
 )
-def test_snp_config_requires_actual_bounded_integer_for_every_tcb_component(
-    tmp_path, key, value
-):
+def test_snp_config_requires_actual_bounded_integer_for_every_tcb_component(tmp_path, key, value):
     document = yaml.safe_load(textwrap.dedent(_snp_yaml()))
     document["measurements"][0]["min_tcb"][key] = value
     settings = _settings_for_yaml(tmp_path, yaml.safe_dump(document))
@@ -642,8 +657,7 @@ def _committed_snp_matrix_yaml() -> str:
 def test_actual_committed_debug_measurements_rejected_in_production(tmp_path):
     settings = Settings()
     settings.tee_committed_measurement_config_path = (
-        Path(__file__).resolve().parents[2]
-        / "api/config/tee_measurements.committed.yaml"
+        Path(__file__).resolve().parents[2] / "api/config/tee_measurements.committed.yaml"
     )
     settings.tee_measurement_config_path = tmp_path / "no-mounted-measurements.yaml"
     settings.allow_debug_measurements = False
@@ -664,8 +678,7 @@ def test_debug_measurement_opt_in_is_rejected_outside_dev_posture():
 def test_actual_committed_measurements_have_bound_debug_provenance(tmp_path):
     settings = Settings()
     settings.tee_committed_measurement_config_path = (
-        Path(__file__).resolve().parents[2]
-        / "api/config/tee_measurements.committed.yaml"
+        Path(__file__).resolve().parents[2] / "api/config/tee_measurements.committed.yaml"
     )
     settings.tee_measurement_config_path = tmp_path / "no-mounted-measurements.yaml"
     settings.allow_debug_measurements = True
@@ -677,9 +690,7 @@ def test_actual_committed_measurements_have_bound_debug_provenance(tmp_path):
         assert measurement.image_sha256
         assert measurement.image_measurement_names
         by_digest.setdefault(measurement.image_sha256, set()).add(measurement.name)
-        debug_by_digest.setdefault(measurement.image_sha256, set()).add(
-            measurement.debug
-        )
+        debug_by_digest.setdefault(measurement.image_sha256, set()).add(measurement.debug)
 
     assert by_digest == {
         "688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3": {
@@ -713,10 +724,7 @@ def test_actual_committed_measurements_have_bound_debug_provenance(tmp_path):
         for digest in by_digest
     }
     for measurement in measurements:
-        assert (
-            set(measurement.image_measurement_names)
-            == by_digest[measurement.image_sha256]
-        )
+        assert set(measurement.image_measurement_names) == by_digest[measurement.image_sha256]
 
 
 @pytest.mark.parametrize("debug_value", ["false", 0, None])
@@ -728,9 +736,7 @@ def test_debug_posture_requires_explicit_yaml_boolean(tmp_path, debug_value):
 
 
 def test_missing_debug_posture_rejected(tmp_path):
-    settings = _settings_for_yaml(
-        tmp_path, _snp_yaml().replace("        debug: false\n", "")
-    )
+    settings = _settings_for_yaml(tmp_path, _snp_yaml().replace("        debug: false\n", ""))
     with pytest.raises(ValueError, match="Missing or invalid 'debug' posture"):
         settings._load_tee_measurements()
 

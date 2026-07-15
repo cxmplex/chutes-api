@@ -162,9 +162,12 @@ def test_snp_does_not_match_tdx_config(snp_report_bytes):
         version="1",
         mrtd="A" * 96,
         name="tdx",
-        boot_rtmrs={f"RTMR{i}": "B" * 96 for i in range(4)},
-        runtime_rtmrs={f"RTMR{i}": "B" * 96 for i in range(4)},
+        rtmr0="B" * 96,
+        rtmr1="C" * 96,
+        rtmr2="D" * 96,
+        runtime_rtmr3="E" * 96,
         expected_gpus=[],
+        gpu_count=0,
         tee_type="tdx",
     )
     assert r.matches_measurement(tdx_cfg) is False

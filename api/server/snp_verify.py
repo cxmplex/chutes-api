@@ -308,9 +308,7 @@ def _check_crl_freshness(
         or isinstance(outage_grace_seconds, bool)
         or not 0 <= outage_grace_seconds <= MAX_SNP_CRL_OUTAGE_GRACE_SECONDS
     ):
-        raise InvalidQuoteError(
-            "AMD VCEK CRL outage grace exceeds the enforced safe maximum"
-        )
+        raise InvalidQuoteError("AMD VCEK CRL outage grace exceeds the enforced safe maximum")
     now = datetime.now(timezone.utc)
     last_update, next_update = _crl_times(crl)
     if last_update > now:
@@ -438,10 +436,7 @@ async def _cache_authenticated_crl(
     _last_update, next_update = _crl_times(crl)
     if next_update is None:
         raise InvalidQuoteError("AMD VCEK CRL has no nextUpdate freshness bound")
-    ttl = int(
-        (next_update - datetime.now(timezone.utc)).total_seconds()
-        + outage_grace_seconds
-    )
+    ttl = int((next_update - datetime.now(timezone.utc)).total_seconds() + outage_grace_seconds)
     if ttl <= 0:
         return
     await redis.set(
@@ -479,9 +474,7 @@ async def _check_revocation(
         or isinstance(outage_grace_seconds, bool)
         or not 0 <= outage_grace_seconds <= MAX_SNP_CRL_OUTAGE_GRACE_SECONDS
     ):
-        raise InvalidQuoteError(
-            "AMD VCEK CRL outage grace exceeds the enforced safe maximum"
-        )
+        raise InvalidQuoteError("AMD VCEK CRL outage grace exceeds the enforced safe maximum")
     cache_key = f"snp:crl:{model}"
     outage_candidate = None
     if redis is not None:

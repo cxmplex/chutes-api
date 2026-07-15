@@ -188,7 +188,7 @@ async def _seed_launch(
             tag="latest",
             status="built and pushed",
             public=False,
-            cpu=env_type == "tee",
+            compute_type="cpu" if env_type == "tee" else "gpu",
         )
     )
     code = (

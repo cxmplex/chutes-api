@@ -177,7 +177,11 @@ def _chute(
     jobs=None,
 ):
     image = SimpleNamespace(
-        user=SimpleNamespace(username="User"), name="Img", tag="0.1", patch_version=None
+        user=SimpleNamespace(username="User"),
+        name="Img",
+        tag="0.1",
+        patch_version=None,
+        compute_type="cpu",
     )
     node_selector = {"compute_type": "cpu", "cpu_cores": cpu_cores, "ram_gb": ram_gb}
     if min_benchmark_score is not None:
@@ -190,6 +194,7 @@ def _chute(
         jobs=jobs or [],
         node_selector=node_selector,
         image=image,
+        image_id="image-1",
         chutes_version="0.6.10",
         standard_template=None,
         lock_modules=None,
@@ -260,10 +265,10 @@ def _measurement(name="cpu-gcp-tdx-1vcpu"):
         tee_type="tdx",
         provider="gcp",
         mrtd="A" * 96,
-        boot_rtmrs={f"RTMR{index}": chr(66 + index) * 96 for index in range(4)},
-        runtime_rtmrs={
-            f"RTMR{index}": value * 96 for index, value in enumerate(("F", "0", "1", "2"))
-        },
+        rtmr0="B" * 96,
+        rtmr1="C" * 96,
+        rtmr2="D" * 96,
+        runtime_rtmr3="E" * 96,
         expected_gpus=[],
         gpu_count=0,
         debug=False,
@@ -714,6 +719,13 @@ class TestDispatchDeploy:
         return session, send
 
     @pytest.mark.asyncio
+    async def test_cpu_scheduler_rejects_gpu_image_identity(self):
+        chute = _chute()
+        chute.image.compute_type = "gpu"
+        with pytest.raises(ValueError, match="not 'cpu'"):
+            await cs._dispatch_deploy(FakeSession({}), chute, _server())
+
+    @pytest.mark.asyncio
     async def test_no_metagraph_node_no_dispatch(self, mock_settings):
         session, send = await self._dispatch(_chute(), _server(), miner=None)
         send.assert_not_awaited()
@@ -747,6 +759,7 @@ class TestDispatchDeploy:
         assert payload["chute_id"] == chute.chute_id
         assert payload["image"] == "user/img:0.1"
         assert payload["image_digest"] == "sha256:abc"
+        assert payload["compute_type"] == "cpu"
         assert payload["token"] == "jwt-token"
         assert payload["registry"] == "registry.example.com:5000"
         assert payload["external_ports"] == {"8000": 31000}

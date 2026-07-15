@@ -18,34 +18,17 @@ engine = create_async_engine(
     pool_use_lifo=True,
     connect_args={"ssl": settings.db_ssl},
 )
-iengine = create_async_engine(
-    settings.invocations_db_url,
-    echo=settings.debug,
-    pool_size=settings.db_pool_size,
-    max_overflow=settings.db_overflow,
-    pool_pre_ping=True,
-    pool_reset_on_return="rollback",
-    pool_timeout=30,
-    pool_recycle=900,
-    pool_use_lifo=True,
-    connect_args={"ssl": settings.db_ssl},
-)
 
 SessionLocal = sessionmaker(
     bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,
 )
-ISessionLocal = sessionmaker(
-    bind=iengine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
 
-ro_engine = None
-SessionLocalRead = None
-if settings.postgres_ro:
-    ro_engine = create_async_engine(
+ro_engine = (
+    engine
+    if not settings.postgres_ro
+    else create_async_engine(
         settings.postgres_ro,
         echo=settings.debug,
         pool_size=settings.db_pool_size,
@@ -57,21 +40,19 @@ if settings.postgres_ro:
         pool_use_lifo=True,
         connect_args={"ssl": settings.db_ssl},
     )
-    SessionLocalRead = sessionmaker(
-        bind=ro_engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-    )
+)
+SessionLocalRead = sessionmaker(
+    bind=ro_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
 
 Base = declarative_base()
 
 
 @asynccontextmanager
 async def get_session(readonly=False) -> AsyncGenerator[AsyncSession, None]:
-    # Fall back to the primary session when no read replica is configured (settings.postgres_ro
-    # unset -> SessionLocalRead is None). Without this, any readonly query (e.g. the invocation
-    # path's get_manual_boost) raises "'NoneType' object is not callable" on a single-DB validator.
-    session_maker = (SessionLocalRead or SessionLocal) if readonly else SessionLocal
+    session_maker = SessionLocalRead if readonly else SessionLocal
     async with session_maker() as session:
         try:
             yield session
@@ -83,20 +64,6 @@ async def get_session(readonly=False) -> AsyncGenerator[AsyncSession, None]:
                     await session.rollback()
                 except Exception:
                     pass
-            raise
-
-
-@asynccontextmanager
-async def get_inv_session() -> AsyncGenerator[AsyncSession, None]:
-    async with ISessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            try:
-                await session.rollback()
-            except Exception:
-                pass
             raise
 
 
@@ -116,6 +83,30 @@ async def get_db_session():
 async def get_db_ro_session():
     async with SessionLocalRead() as session:
         yield session
+
+
+async def db_scalar(stmt, *, readonly=True):
+    """
+    Execute a SELECT in its own short-lived session and return scalar_one_or_none().
+
+    Use this (not a request-scoped ``Depends(get_db_session)`` session) for any DB
+    access inside a ``StreamingResponse`` generator or other long-lived task: the
+    transaction opens and closes per call, so the connection is never left "idle in
+    transaction" for the life of the stream.
+    """
+    async with get_session(readonly=readonly) as session:
+        return (await session.execute(stmt)).unique().scalar_one_or_none()
+
+
+async def db_scalars(stmt, *, readonly=True):
+    """
+    Execute a SELECT in its own short-lived session and return scalars().all().
+
+    See :func:`db_scalar` for why streaming endpoints must use this instead of a
+    request-scoped session.
+    """
+    async with get_session(readonly=readonly) as session:
+        return (await session.execute(stmt)).unique().scalars().all()
 
 
 def generate_uuid():

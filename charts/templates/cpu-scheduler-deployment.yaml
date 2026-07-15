@@ -16,6 +16,8 @@ spec:
       labels:
         {{- include "cpuScheduler.labels" . | nindent 8 }}
     spec:
+      securityContext:
+        {{- include "chutes.podSecurityContext" . | nindent 8 }}
       {{- with .Values.cpuScheduler.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -24,28 +26,58 @@ spec:
       affinity:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.cpuScheduler.tolerations }}
       tolerations:
+        {{- include "chutes.defaultTolerations" . | nindent 8 }}
+        {{- with .Values.cpuScheduler.tolerations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       volumes:
         - name: tee-measurements
           configMap:
             name: tee-measurements
+        - name: guest-provenance-public-key
+          secret:
+            secretName: {{ .Values.provenance.publicKeySecretName | quote }}
+            items:
+              - key: {{ .Values.provenance.publicKeySecretKey | quote }}
+                path: cosign.pub
+        - name: lc-certs
+          secret:
+            secretName: launch-config-certs
+            items:
+              - key: lc_jwt_private.pem
+                path: lc_jwt_private.pem
+        {{- include "chutes.redisCacertVolume" . | nindent 8 }}
       containers:
         - name: cpu-scheduler
-          image: "{{ .Values.cpuScheduler.image }}"
+          image: {{ include "chutes.image" (list . .Values.cpuScheduler.image) | quote }}
           imagePullPolicy: {{ .Values.cpuScheduler.imagePullPolicy }}
-          command: ["poetry", "run", "python", "-m", "api.cpu_scheduler"]
+          securityContext:
+            {{- include "chutes.containerSecurityContext" . | nindent 12 }}
+          command: ["uv", "run", "python", "-m", "api.cpu_scheduler"]
           env:
             {{- include "chutes.sensitiveEnv" . | nindent 12 }}
             {{- include "chutes.commonEnv" . | nindent 12 }}
+            {{- include "chutes.loggingEnv" . | nindent 12 }}
             - name: TEE_MEASUREMENT_CONFIG_REQUIRED
               value: "true"
+            - name: TRUSTED_PROVENANCE_PUBLIC_KEY_PATH
+              value: /etc/chutes/provenance/cosign.pub
+            - name: LAUNCH_CONFIG_PRIVATE_KEY_PATH
+              value: /etc/lc-certs/lc_jwt_private.pem
+            - name: DB_SSL
+              value: {{ .Values.dbSsl | quote }}
           volumeMounts:
             - name: tee-measurements
               mountPath: "/etc/config"
               readOnly: true
+            - name: guest-provenance-public-key
+              mountPath: /etc/chutes/provenance
+              readOnly: true
+            - name: lc-certs
+              mountPath: /etc/lc-certs
+              readOnly: true
+            {{- include "chutes.redisCacertMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.cpuScheduler.resources | nindent 12 }}
 {{- end }}

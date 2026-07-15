@@ -200,6 +200,13 @@ PRE_MIGRATION_DDL = """
     ALTER TABLE servers DROP COLUMN IF EXISTS storage_incarnation;
 """
 
+FORWARD_MIGRATION_HAZARD_DDL = """
+    DROP INDEX IF EXISTS idx_servers_last_health;
+    ALTER TABLE servers DROP COLUMN IF EXISTS last_health_at;
+    ALTER TABLE images ADD COLUMN IF NOT EXISTS cpu BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE images DROP COLUMN IF EXISTS compute_type;
+"""
+
 
 async def _rewind_to_legacy_schema(engine) -> None:
     async with engine.connect() as connection:
@@ -1270,6 +1277,9 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
             await connection.run_sync(Base.metadata.create_all)
         if legacy_upgrade:
             await _rewind_to_legacy_schema(engine)
+            async with engine.connect() as connection:
+                raw = await connection.get_raw_connection()
+                await raw.driver_connection.execute(FORWARD_MIGRATION_HAZARD_DDL)
         async with engine.connect() as connection:
             await database_migrations.record_historical_migration_baseline(connection)
 
@@ -1315,7 +1325,54 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
                 "20260714073000",
                 "20260714100000",
                 "20260714110000",
+                "20260715120000",
+                "20260715121000",
             }
+            server_health_shape = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT
+                            EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_schema = current_schema()
+                                  AND table_name = 'servers'
+                                  AND column_name = 'last_health_at'
+                                  AND data_type = 'timestamp with time zone'
+                            ),
+                            EXISTS (
+                                SELECT 1 FROM pg_indexes
+                                WHERE schemaname = current_schema()
+                                  AND indexname = 'idx_servers_last_health'
+                            )
+                        """
+                    )
+                )
+            ).one()
+            assert tuple(server_health_shape) == (True, True)
+            image_compute_shape = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT
+                            EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_schema = current_schema()
+                                  AND table_name = 'images'
+                                  AND column_name = 'compute_type'
+                                  AND is_nullable = 'NO'
+                            ),
+                            NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_schema = current_schema()
+                                  AND table_name = 'images'
+                                  AND column_name = 'cpu'
+                            )
+                        """
+                    )
+                )
+            ).one()
+            assert tuple(image_compute_shape) == (True, True)
             assert (
                 await connection.execute(
                     text(

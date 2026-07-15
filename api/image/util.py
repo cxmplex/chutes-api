@@ -1,9 +1,19 @@
 import re
+import uuid
 from sqlalchemy import or_
 from sqlalchemy.future import select
 from api.image.schemas import Image
 from api.user.schemas import User
 from api.database import get_session
+
+
+def image_id_for(username: str, name: str, tag: str, compute_type: str) -> str:
+    """Canonical image identity shared with the SDK build contract."""
+    normalized_compute = str(compute_type).lower()
+    if normalized_compute not in {"cpu", "gpu"}:
+        raise ValueError("compute_type must be 'cpu' or 'gpu'")
+    identity = f"{username.lower()}/{name}:{tag}:{normalized_compute}".lower()
+    return str(uuid.uuid5(uuid.NAMESPACE_OID, identity))
 
 
 async def get_image_by_id_or_name(image_id_or_name, db, current_user):
@@ -36,7 +46,7 @@ async def get_image_by_id_or_name(image_id_or_name, db, current_user):
 
 
 async def get_inspecto_hash(image_id: str):
-    async with get_session() as session:
+    async with get_session(readonly=True) as session:
         return (
             (await session.execute(select(Image.inspecto).where(Image.image_id == image_id)))
             .unique()

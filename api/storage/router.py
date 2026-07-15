@@ -22,7 +22,6 @@ from api.server.util import extract_client_cert_hash
 from api.permissions import Permissioning
 from api.user.schemas import User
 from api.user.service import get_current_user
-from api.util import extract_ip
 from api.storage import service
 from api.storage.schemas import (
     AnnounceModelHoldingsRequest,
@@ -821,7 +820,7 @@ async def verify_grant(
 @router.get("/key-nonce", response_model=KeyNonceResponse)
 async def key_nonce(request: Request):
     """Mint a single-use nonce the storage TD must embed in its volume-key attestation quote."""
-    nonce_info = await create_nonce(extract_ip(request), purpose=NoncePurpose.STORAGE_KEY)
+    nonce_info = await create_nonce(request.state.client_ip, purpose=NoncePurpose.STORAGE_KEY)
     return KeyNonceResponse(nonce=nonce_info["nonce"])
 
 

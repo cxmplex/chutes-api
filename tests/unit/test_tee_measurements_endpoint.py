@@ -21,18 +21,10 @@ def _make_measurement(**overrides):
         version="1",
         name="8xh200",
         mrtd="A" * 96,
-        boot_rtmrs={
-            "RTMR0": "B" * 96,
-            "RTMR1": "C" * 96,
-            "RTMR2": "D" * 96,
-            "RTMR3": "E" * 96,
-        },
-        runtime_rtmrs={
-            "RTMR0": "B" * 96,
-            "RTMR1": "C" * 96,
-            "RTMR2": "F" * 96,
-            "RTMR3": "A" * 96,
-        },
+        rtmr0="B" * 96,
+        rtmr1="C" * 96,
+        rtmr2="D" * 96,
+        runtime_rtmr3="E" * 96,
         expected_gpus=["h200"],
         gpu_count=8,
     )
@@ -53,6 +45,19 @@ async def test_returns_all_measurements(mock_settings):
 
     assert len(result) == 2
     assert all(isinstance(r, TeeMeasurementResponse) for r in result)
+
+
+@pytest.mark.asyncio
+@patch("api.server.router.settings")
+async def test_release_candidates_are_excluded_from_public_transparency_list(mock_settings):
+    stable = _make_measurement(name="stable", rc=False)
+    candidate = _make_measurement(name="candidate", version="2", rc=True)
+    mock_settings.tee_measurements = [stable, candidate]
+
+    result = await get_tee_measurements()
+
+    assert [entry.name for entry in result] == ["stable"]
+    assert result[0].trust_set_fingerprint == measurement_trust_set_fingerprint([stable, candidate])
 
 
 @pytest.mark.asyncio
@@ -138,8 +143,10 @@ async def test_gcp_snp_security_identity_fields_round_trip(mock_settings):
         tee_type="sev-snp",
         provider="gcp",
         mrtd="",
-        boot_rtmrs={},
-        runtime_rtmrs={},
+        rtmr0="",
+        rtmr1="",
+        rtmr2="",
+        runtime_rtmr3="",
         expected_gpus=[],
         gpu_count=0,
         measurement="A" * 96,
@@ -184,8 +191,10 @@ def test_connection_manifest_uses_persisted_exact_name_and_fingerprints(
         tee_type="sev-snp",
         provider="gcp",
         mrtd="",
-        boot_rtmrs={},
-        runtime_rtmrs={},
+        rtmr0="",
+        rtmr1="",
+        rtmr2="",
+        runtime_rtmr3="",
         expected_gpus=[],
         gpu_count=0,
         measurement="A" * 96,

@@ -14,8 +14,11 @@ from sqlalchemy import (
     Index,
     ForeignKey,
     UniqueConstraint,
+    CheckConstraint,
+    event,
 )
 from api.database import Base
+from api.log import image_logger, LifecycleEvent
 
 
 class Image(Base):
@@ -35,9 +38,7 @@ class Image(Base):
     build_completed_at = Column(DateTime(timezone=True))
     inspecto = Column(String, nullable=True)
     package_hashes = Column(JSONB, nullable=True)
-    # CPU-only chutes skip the GPU-oriented filesystem-verification (cfsv) + inspecto build stage.
-    # nullable=False matches the migration (NOT NULL DEFAULT false), so the ORM and schema agree.
-    cpu = Column(Boolean, default=False, nullable=False)
+    compute_type = Column(String, default="gpu", server_default="gpu", nullable=False)
 
     chutes = relationship("Chute", back_populates="image")
     logo = relationship("Logo", back_populates="images", lazy="joined")
@@ -48,6 +49,10 @@ class Image(Base):
         Index("idx_name_public", "name", "public"),
         Index("idx_name_created_at", "name", "created_at"),
         UniqueConstraint("user_id", "name", "tag", name="constraint_user_id_image_name_tag"),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu')",
+            name="ck_images_compute_type",
+        ),
     )
 
     @validates("name")
@@ -85,3 +90,51 @@ class ImageHistory(Base):
     chutes_version = Column(String, nullable=True)
     build_started_at = Column(DateTime(timezone=True))
     build_completed_at = Column(DateTime(timezone=True))
+
+
+# ---------------------------------------------------------------------------
+# Image build (forge) lifecycle logging -- same ORM-event approach as instances/launch configs, so
+# the build stage of a chute's lifecycle is searchable in OpenSearch by image_id (a chute ties to
+# its build via chute.image_id). Build state is driven by the `status` column, set via ORM in both
+# api/image/forge.py and api/image/remote_forge.py:
+#   pending build -> building -> "built and pushed" | "error: <detail>"
+# The "pending build" default is applied at INSERT (not an attribute 'set'), so image creation is
+# captured by after_insert; subsequent transitions by the status 'set' event.
+# ---------------------------------------------------------------------------
+
+_BUILD_STATUS_EVENTS = {
+    "building": LifecycleEvent.IMAGE_BUILD_START,
+    "built and pushed": LifecycleEvent.IMAGE_BUILD_COMPLETE,
+}
+
+
+def _build_event_for_status(status: str) -> LifecycleEvent:
+    if status in _BUILD_STATUS_EVENTS:
+        return _BUILD_STATUS_EVENTS[status]
+    if status and status.lower().startswith("error"):
+        return LifecycleEvent.IMAGE_BUILD_FAIL
+    return LifecycleEvent.IMAGE_BUILD_STATUS
+
+
+@event.listens_for(Image, "after_insert")
+def _on_image_created(mapper, connection, target):
+    image_logger(target, event=LifecycleEvent.IMAGE_CREATE).info(
+        f"image created (build queued): {target.image_id} "
+        f"({target.name}:{target.tag}, user {target.user_id})"
+    )
+
+
+@event.listens_for(Image.status, "set")
+def _on_image_status_changed(target, value, oldvalue, initiator):
+    # Fires on ORM status assignment (not on load), covering both forge and remote_forge builders.
+    if not value or value == oldvalue:
+        return
+    build_event = _build_event_for_status(value)
+    log = image_logger(target, event=build_event, build_status=value)
+    message = f"image build status -> {value}: {target.image_id} ({target.name}:{target.tag})"
+    if build_event == LifecycleEvent.IMAGE_BUILD_FAIL:
+        log.warning(message)
+    elif build_event == LifecycleEvent.IMAGE_BUILD_COMPLETE:
+        log.success(message)
+    else:
+        log.info(message)

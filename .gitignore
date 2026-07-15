@@ -183,3 +183,7 @@ tests/integration/keys
 # Private signing keys (launch-config JWT signer, etc.) — must never be committed.
 **/config/*.pem
 *.pem
+# Public certificate fixture used to verify the checked-in GCP vTPM quote.
+!tests/assets/snp/gcp-ak-intermediate.pem
+# Attestation quotes embed host-identifying data (PPID and measurements).
+tests/assets/*.quote

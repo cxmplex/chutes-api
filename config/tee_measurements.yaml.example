@@ -1,152 +1,56 @@
-# TEE Measurement Configuration Example
-# This file should be used to create the Kubernetes ConfigMap
-# 
-# Usage:
-#   kubectl create configmap tee-measurements --from-file=tee_measurements.yaml=./config/tee_measurements.yaml.example
+# Canonical TEE measurement configuration.
 #
-# Or update the ConfigMap:
-#   kubectl create configmap tee-measurements --from-file=tee_measurements.yaml=./config/tee_measurements.yaml.example --dry-run=client -o yaml | kubectl apply -f -
+# Every list item is one exact hardware/provider/role pin. The loader rejects unknown fields and
+# does not accept the former nested `hardware` or `boot_rtmrs`/`runtime_rtmrs` formats.
+# `debug` and `gpu_count` are mandatory. `rc: true` remains attestable but is excluded from the
+# public measurement endpoint and minimum-version fallback.
 #
-# Note: Matching is by full MRTD + RTMRs (not just RTMR0). Multiple configs may share the same
-# RTMR0 (e.g. old and new VM versions during transition). Each config must have a unique version.
-# `debug` is mandatory and must be a YAML boolean. Managed-release pins additionally set
-# image_sha256 + the ordered complete image_measurement_names matrix. Production activation also
-# verifies the canonical detached-cosign provenance payload; do not invent any value.
-
+# Managed release pins also carry `image_sha256` and the complete ordered
+# `image_measurement_names` set. Production activation verifies detached cosign provenance.
 measurements:
-  # Example: 8x H200 GPU configuration (version for audit trail; server version = latest attestation)
-  - version: "1"
-    mrtd: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
+  # Intel TDX: RTMR0-2 are common to boot/runtime. Boot RTMR3 is always derived as 96 zeroes;
+  # runtime_rtmr3 is the measured guest/root identity.
+  - version: "1.3.0"
     name: "8xh200"
-    description: "8x H200 GPU configuration"
+    description: "8x H200 GPU TDX configuration"
+    tee_type: "tdx"
     debug: false
-    boot_rtmrs:
-      rtmr0: "B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr1: "C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr2: "D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr3: "E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-    runtime_rtmrs:
-      rtmr0: "B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr1: "C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr2: "F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr3: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
+    rc: false
+    mrtd: "REPLACE_WITH_MRTD_96_HEX"
+    rtmr0: "REPLACE_WITH_RTMR0_96_HEX"
+    rtmr1: "REPLACE_WITH_RTMR1_96_HEX"
+    rtmr2: "REPLACE_WITH_RTMR2_96_HEX"
+    runtime_rtmr3: "REPLACE_WITH_RUNTIME_RTMR3_96_HEX"
     expected_gpus:
       - "h200"
     gpu_count: 8
 
-  # Example: 8x B200 GPU configuration (same MRTD, different RTMR0 due to different ACPI tables)
-  - version: "1"
-    mrtd: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-    name: "8xb200"
-    description: "8x B200 GPU configuration"
-    debug: false
-    boot_rtmrs:
-      rtmr0: "X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6"
-      rtmr1: "C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr2: "D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr3: "E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-    runtime_rtmrs:
-      rtmr0: "X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6X1Y2Z3W4V5U6"
-      rtmr1: "C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr2: "F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-      rtmr3: "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6"
-    expected_gpus:
-      - "b200"
-    gpu_count: 8
-
-  # Example: CPU-only (GPU-less) TEE configuration.
-  # gpu_count: 0 and expected_gpus: [] mark this as a CPU measurement: the validator verifies
-  # MRTD + RTMRs only and skips all GPU-evidence / GPU-count checks. provider is an optional
-  # infrastructure hint ("gcp" | "bare-metal").
-  - version: "1"
-    mrtd: "A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30"
-    name: "cpu-gcp"
-    description: "CPU-only TEE configuration (no GPU)"
+  - version: "1.3.0"
+    name: "cpu-gcp-tdx-1.3.0"
+    description: "CPU-only GCP TDX configuration"
     provider: "gcp"
+    tee_type: "tdx"
     debug: false
-    boot_rtmrs:
-      rtmr0: "B1C2D3E4F5061728B9CADBECFD0E1F20B1C2D3E4F5061728B9CADBECFD0E1F20B1C2D3E4F5061728B9CADBECFD0E1F20"
-      rtmr1: "C1D2E3F405162738C9DAEBFC0D1E2F30C1D2E3F405162738C9DAEBFC0D1E2F30C1D2E3F405162738C9DAEBFC0D1E2F30"
-      rtmr2: "D1E2F30415263748D9EAFB0C1D2E3F40D1E2F30415263748D9EAFB0C1D2E3F40D1E2F30415263748D9EAFB0C1D2E3F40"
-      rtmr3: "E1F20314253647580E1F2D3C4B5A6978E1F20314253647580E1F2D3C4B5A6978E1F20314253647580E1F2D3C4B5A6978"
-    runtime_rtmrs:
-      rtmr0: "B1C2D3E4F5061728B9CADBECFD0E1F20B1C2D3E4F5061728B9CADBECFD0E1F20B1C2D3E4F5061728B9CADBECFD0E1F20"
-      rtmr1: "C1D2E3F405162738C9DAEBFC0D1E2F30C1D2E3F405162738C9DAEBFC0D1E2F30C1D2E3F405162738C9DAEBFC0D1E2F30"
-      rtmr2: "F1A2B3C4D5E6071829FAEBDC0D1E2F30F1A2B3C4D5E6071829FAEBDC0D1E2F30F1A2B3C4D5E6071829FAEBDC0D1E2F30"
-      rtmr3: "0A1B2C3D4E5F60718293A4B5C6D7E8F00A1B2C3D4E5F60718293A4B5C6D7E8F00A1B2C3D4E5F60718293A4B5C6D7E8F0"
+    rc: false
+    mrtd: "REPLACE_WITH_CPU_MRTD_96_HEX"
+    rtmr0: "REPLACE_WITH_CPU_RTMR0_96_HEX"
+    rtmr1: "REPLACE_WITH_CPU_RTMR1_96_HEX"
+    rtmr2: "REPLACE_WITH_CPU_RTMR2_96_HEX"
+    runtime_rtmr3: "REPLACE_WITH_CPU_RUNTIME_RTMR3_96_HEX"
     expected_gpus: []
     gpu_count: 0
 
-  # Example: CPU-only AMD SEV-SNP (tee_type: sev-snp) configuration.
-  # SNP has no MRTD/RTMRs -- instead pin a single 48B launch `measurement` (96 hex), the guest
-  # `policy` (the DEBUG bit MUST be off), a minimum reported TCB (anti-rollback), and the AMD
-  # `processor_model` (Genoa | Milan | Turin), which selects the KDS endpoint + pinned ARK root.
-  # The `measurement` is the SHA-384 launch digest (OVMF + per-vCPU VMSA, plus kernel/initrd/cmdline
-  # when booting via direct-kernel-boot with kernel-hashes), reproduced offline by `sev-snp-measure`.
-  # `id_key_digest` (optional, 96 hex) pins an owner id-block so the PSP enforces the measurement at
-  # launch. mrtd/boot_rtmrs/runtime_rtmrs are omitted for SNP.
-  - version: "1"
-    name: "cpu-snp-genoa"
-    description: "CPU-only AMD SEV-SNP configuration (no GPU)"
+  # AMD SEV-SNP: bare-metal image identity is folded into the launch measurement. GCP SNP must
+  # additionally pin real PCR8/PCR9 and the four signed Google AK extension flags.
+  - version: "1.3.0-snp-4vcpu"
+    name: "cpu-baremetal-snp-genoa-1.3.0-4vcpu"
+    description: "CPU-only bare-metal AMD SEV-SNP configuration"
     provider: "bare-metal"
     tee_type: "sev-snp"
     processor_model: "Genoa"
     debug: false
-    measurement: "A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30A1B2C3D4E5F6A7B8C9DAEBFC0D1E2F30"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
-    # id_key_digest: "..."   # optional: pin an owner id-block digest (launch-time enforcement)
-    # A provider: "gcp" SNP entry must additionally pin PCR8/PCR9 and the exact four boolean values
-    # from its real signed Google AK extension. Keep the undocumented flag tags numeric:
-    # vtpm_pcrs:
-    #   "8": "REPLACE_WITH_REAL_PCR8_SHA256"
-    #   "9": "REPLACE_WITH_REAL_PCR9_SHA256"
-    # vtpm_security_flags:
-    #   "2": true
-    #   "3": false
-    #   "4": false
-    #   "5": false
-    expected_gpus: []
-    gpu_count: 0
-
-  # --- ChuteFS storage-TD measurements (the always-on storage node image) -----------------------
-  # The storage-TD image (inventory.storage*.yml, guest VERSION 1.6.0) is a DISTINCT image from the
-  # per-chute image (it bakes the storage-node + persistent-LUKS units), so it has its OWN
-  # measurement, pinned here per provider + size class. Fill MRTD/RTMRs (TDX) or measurement (SNP)
-  # from the storage image build output (rtmr3-measure / snp-measure), exactly like the cpu-* entries.
-  # gpu_count MUST be 0 (CPU self-registration requires it). Version 1.6.0 matches ansible/guest/VERSION.
-  - version: "1.6.0"
-    name: "storage-baremetal-tdx-1.6.0-4c8g"
-    description: "ChuteFS storage TD (Intel TDX, bare-metal, 4c/8g)"
-    provider: "bare-metal"
-    debug: false
-    mrtd: "REPLACE_WITH_STORAGE_TDX_MRTD_96HEX"
-    boot_rtmrs:
-      rtmr0: "REPLACE_WITH_STORAGE_TDX_RTMR0"
-      rtmr1: "REPLACE_WITH_STORAGE_TDX_RTMR1"
-      rtmr2: "REPLACE_WITH_STORAGE_TDX_RTMR2"
-      rtmr3: "REPLACE_WITH_STORAGE_TDX_RTMR3"
-    runtime_rtmrs:
-      rtmr0: "REPLACE_WITH_STORAGE_TDX_RTMR0"
-      rtmr1: "REPLACE_WITH_STORAGE_TDX_RTMR1"
-      rtmr2: "REPLACE_WITH_STORAGE_TDX_RTMR2"
-      rtmr3: "REPLACE_WITH_STORAGE_TDX_RTMR3"
-    expected_gpus: []
-    gpu_count: 0
-
-  - version: "1.6.0-snp"
-    name: "storage-baremetal-snp-genoa-1.6.0"
-    description: "ChuteFS storage TD (AMD SEV-SNP, bare-metal Genoa)"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    measurement: "REPLACE_WITH_STORAGE_SNP_LAUNCH_MEASUREMENT_96HEX"
+    rc: false
+    measurement: "REPLACE_WITH_SNP_LAUNCH_MEASUREMENT_96_HEX"
     policy: "0x30000"
     min_tcb:
       bootloader: 7
@@ -156,3 +60,32 @@ measurements:
     expected_vmpl: 0
     expected_gpus: []
     gpu_count: 0
+
+  - version: "1.3.0-snp-gcp"
+    name: "cpu-gcp-snp-milan-1.3.0"
+    description: "CPU-only GCP AMD SEV-SNP configuration"
+    provider: "gcp"
+    tee_type: "sev-snp"
+    processor_model: "Milan"
+    debug: false
+    rc: true
+    measurement: "REPLACE_WITH_GCP_SNP_FIRMWARE_MEASUREMENT_96_HEX"
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 4
+      tee: 0
+      snp: 29
+      microcode: 222
+    expected_vmpl: 0
+    vtpm_pcrs:
+      "8": "REPLACE_WITH_REAL_PCR8_SHA256_64_HEX"
+      "9": "REPLACE_WITH_REAL_PCR9_SHA256_64_HEX"
+    vtpm_security_flags:
+      "2": true
+      "3": false
+      "4": false
+      "5": false
+    expected_gpus: []
+    gpu_count: 0
+
+revoked_measurements: []

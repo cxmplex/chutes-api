@@ -54,18 +54,10 @@ def _tee_measurements_for_quotes():
             version="1",
             mrtd="a" * 96,
             name="test-boot",
-            boot_rtmrs={
-                "RTMR0": "b" * 96,
-                "RTMR1": "c" * 96,
-                "RTMR2": "d" * 96,
-                "RTMR3": "e" * 96,
-            },
-            runtime_rtmrs={
-                "RTMR0": "d" * 96,
-                "RTMR1": "e" * 96,
-                "RTMR2": "f" * 96,
-                "RTMR3": "0" * 96,
-            },
+            rtmr0="b" * 96,
+            rtmr1="c" * 96,
+            rtmr2="d" * 96,
+            runtime_rtmr3="e" * 96,
             expected_gpus=["h200"],
             gpu_count=8,
         ),
@@ -96,7 +88,7 @@ def sample_boot_quote():
         rtmr0="b" * 96,
         rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         report_data=BOOT_NONCE_HEX + "0" * 64,
         user_data="746573745f6e6f6e63655f31323300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
         platform_id="0" * 32,
@@ -114,10 +106,10 @@ def sample_runtime_quote():
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="d" * 96,
-        rtmr1="e" * 96,
-        rtmr2="f" * 96,
-        rtmr3="0" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
         report_data=RUNTIME_NONCE_HEX + "0" * 64,
         user_data="72756e74696d655f6e6f6e63655f34353600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
         platform_id="0" * 32,
@@ -166,7 +158,7 @@ def test_tdx_quote_rtmrs_property(sample_boot_quote):
     assert rtmrs["rtmr0"] == "b" * 96
     assert rtmrs["rtmr1"] == "c" * 96
     assert rtmrs["rtmr2"] == "d" * 96
-    assert rtmrs["rtmr3"] == "e" * 96
+    assert rtmrs["rtmr3"] == "0" * 96
 
 
 def test_tdx_quote_to_dict(sample_boot_quote):
@@ -202,6 +194,38 @@ def test_tdx_verification_result_creation():
     assert result.is_valid is True
     assert result.user_data == "test_data"
     assert isinstance(result.parsed_at, datetime)
+
+
+def test_is_valid_false_when_advisories_present():
+    result = TdxVerificationResult(
+        mrtd="a" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
+        user_data="test",
+        parsed_at=datetime.now(timezone.utc),
+        status="UpToDate",
+        advisory_ids=["INTEL-SA-01036"],
+        td_attributes="0000000000000000",
+    )
+    assert result.is_valid is False
+
+
+def test_is_valid_false_when_status_not_uptodate():
+    result = TdxVerificationResult(
+        mrtd="a" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
+        user_data="test",
+        parsed_at=datetime.now(timezone.utc),
+        status="OutOfDate",
+        advisory_ids=[],
+        td_attributes="0000000000000000",
+    )
+    assert result.is_valid is False
 
 
 def test_tdx_verification_result_rtmrs_property():
@@ -533,7 +557,7 @@ def _sample_verification_result():
         rtmr0="b" * 96,
         rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         user_data=None,
         parsed_at=datetime.now(timezone.utc),
         status="UpToDate",
@@ -624,6 +648,34 @@ async def test_verify_quote_signature_success(sample_boot_quote):
 
 
 @pytest.mark.asyncio
+async def test_module_identity_fallback_preserves_pinned_root_verification(sample_boot_quote):
+    from api.server.intel_root import INTEL_SGX_ROOT_CA_DER
+
+    collateral = Mock()
+    fallback_result = _sample_verification_result()
+    with (
+        patch(
+            "api.server.util.get_collateral",
+            new_callable=AsyncMock,
+            return_value=collateral,
+        ),
+        patch(
+            "api.server.util.verify_with_root_ca",
+            side_effect=ValueError("No matching TCB level found"),
+        ) as pinned_verify,
+        patch(
+            "api.server.util._resolve_tdx_tcb_via_module_identity",
+            return_value=fallback_result,
+        ) as fallback,
+    ):
+        assert await verify_quote_signature(sample_boot_quote) is fallback_result
+
+    assert pinned_verify.call_args.args[2] == INTEL_SGX_ROOT_CA_DER
+    fallback.assert_called_once()
+    assert fallback.call_args.args[1] is collateral
+
+
+@pytest.mark.asyncio
 async def test_verify_quote_signature_failure(sample_boot_quote):
     """Test failed quote signature verification (util wraps in InvalidQuoteError)."""
     mock_verified_report = Mock()
@@ -672,20 +724,12 @@ def test_verify_measurements_mrtd_mismatch(mock_settings, sample_boot_quote):
             version="1",
             mrtd="different" + "0" * 88,
             name="other",
-            boot_rtmrs={
-                "RTMR0": "b" * 96,
-                "RTMR1": "c" * 96,
-                "RTMR2": "d" * 96,
-                "RTMR3": "e" * 96,
-            },
-            runtime_rtmrs={
-                "RTMR0": "d" * 96,
-                "RTMR1": "e" * 96,
-                "RTMR2": "f" * 96,
-                "RTMR3": "0" * 96,
-            },
+            rtmr0="b" * 96,
+            rtmr1="c" * 96,
+            rtmr2="d" * 96,
+            runtime_rtmr3="e" * 96,
             expected_gpus=[],
-            gpu_count=None,
+            gpu_count=0,
         ),
     ]
 
@@ -701,20 +745,12 @@ def test_verify_measurements_rtmr_mismatch(mock_settings, sample_boot_quote):
             version="1",
             mrtd=sample_boot_quote.mrtd,
             name="other",
-            boot_rtmrs={
-                "RTMR0": "different" + "0" * 88,
-                "RTMR1": "c" * 96,
-                "RTMR2": "d" * 96,
-                "RTMR3": "e" * 96,
-            },
-            runtime_rtmrs={
-                "RTMR0": "d" * 96,
-                "RTMR1": "e" * 96,
-                "RTMR2": "f" * 96,
-                "RTMR3": "0" * 96,
-            },
+            rtmr0="different" + "0" * 88,
+            rtmr1="c" * 96,
+            rtmr2="d" * 96,
+            runtime_rtmr3="e" * 96,
             expected_gpus=[],
-            gpu_count=None,
+            gpu_count=0,
         ),
     ]
 
@@ -1066,20 +1102,12 @@ def test_measurement_verification_with_actual_config(mock_settings):
             version="1",
             mrtd=EXPECTED_MRTD,
             name="fixture",
-            boot_rtmrs={
-                "RTMR0": EXPECTED_RMTR0,
-                "RTMR1": EXPECTED_RMTR1,
-                "RTMR2": EXPECTED_RMTR2,
-                "RTMR3": EXPECTED_RMTR3,
-            },
-            runtime_rtmrs={
-                "RTMR0": EXPECTED_RMTR0,
-                "RTMR1": EXPECTED_RMTR1,
-                "RTMR2": "0" * 96,
-                "RTMR3": "0" * 96,
-            },
+            rtmr0=EXPECTED_RMTR0,
+            rtmr1=EXPECTED_RMTR1,
+            rtmr2=EXPECTED_RMTR2,
+            runtime_rtmr3=EXPECTED_RMTR3,
             expected_gpus=[],
-            gpu_count=None,
+            gpu_count=0,
         ),
     ]
 
@@ -1091,7 +1119,7 @@ def test_measurement_verification_with_actual_config(mock_settings):
         rtmr0=EXPECTED_RMTR0,
         rtmr1=EXPECTED_RMTR1,
         rtmr2=EXPECTED_RMTR2,
-        rtmr3=EXPECTED_RMTR3,
+        rtmr3="0" * 96,
         report_data=None,
         user_data=None,
         platform_id="0" * 32,
@@ -1107,8 +1135,8 @@ def test_measurement_verification_with_actual_config(mock_settings):
         mrtd=EXPECTED_MRTD,
         rtmr0=EXPECTED_RMTR0,
         rtmr1=EXPECTED_RMTR1,
-        rtmr2="0" * 96,
-        rtmr3="0" * 96,  # Different runtime values
+        rtmr2=EXPECTED_RMTR2,
+        rtmr3=EXPECTED_RMTR3,
         report_data=None,
         user_data=None,
         platform_id="0" * 32,
@@ -1120,7 +1148,7 @@ def test_measurement_verification_with_actual_config(mock_settings):
     # Boot quote should verify successfully
     assert verify_measurements(boot_quote) is True
 
-    # Runtime quote should also verify (only checks configured RTMRs)
+    # Runtime quote should also verify against the shared RTMR0-2 plus runtime RTMR3.
     assert verify_measurements(runtime_quote) is True
 
 
@@ -1228,17 +1256,17 @@ def test_nonce_edge_cases():
 
 # Cross-type verification tests
 def test_boot_vs_runtime_verification_differences():
-    """Test that boot and runtime quotes use different verification settings."""
+    """RTMR0-2 are shared; only boot-zero versus measured runtime RTMR3 differs."""
 
     boot_quote = BootTdxQuote(
         version=4,
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="boot_specific_rtmr0",
-        rtmr1="boot_specific_rtmr1",
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         report_data=None,
         user_data=None,
         platform_id="0" * 32,
@@ -1252,10 +1280,10 @@ def test_boot_vs_runtime_verification_differences():
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="runtime_specific_rtmr0",
-        rtmr1="runtime_specific_rtmr1",
-        rtmr2="f" * 96,
-        rtmr3="0" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
         report_data=None,
         user_data=None,
         platform_id="0" * 32,
@@ -1265,42 +1293,33 @@ def test_boot_vs_runtime_verification_differences():
     )
 
     with patch("api.server.util.settings") as mock_settings:
-        # One config: boot and runtime have different RTMR0/1; both quotes match this config
         mock_settings.tee_measurements = [
             TeeMeasurementConfig(
                 version="1",
                 mrtd="a" * 96,
                 name="test",
-                boot_rtmrs={
-                    "RTMR0": "boot_specific_rtmr0",
-                    "RTMR1": "boot_specific_rtmr1",
-                    "RTMR2": "d" * 96,
-                    "RTMR3": "e" * 96,
-                },
-                runtime_rtmrs={
-                    "RTMR0": "runtime_specific_rtmr0",
-                    "RTMR1": "runtime_specific_rtmr1",
-                    "RTMR2": "f" * 96,
-                    "RTMR3": "0" * 96,
-                },
+                rtmr0="b" * 96,
+                rtmr1="c" * 96,
+                rtmr2="d" * 96,
+                runtime_rtmr3="e" * 96,
                 expected_gpus=[],
-                gpu_count=None,
+                gpu_count=0,
             ),
         ]
 
         assert verify_measurements(boot_quote) is True
         assert verify_measurements(runtime_quote) is True
 
-        # Boot quote with runtime RTMRs should not match boot_rtmrs
+        # A boot quote carrying the runtime measurement must not match the derived zero RTMR3.
         boot_quote_copy = BootTdxQuote(
             version=4,
             att_key_type=2,
             tee_type=0x81,
             mrtd="a" * 96,
-            rtmr0="runtime_specific_rtmr0",
-            rtmr1="runtime_specific_rtmr1",
-            rtmr2="f" * 96,
-            rtmr3="0" * 96,
+            rtmr0="b" * 96,
+            rtmr1="c" * 96,
+            rtmr2="d" * 96,
+            rtmr3="e" * 96,
             report_data=None,
             user_data=None,
             platform_id="0" * 32,
@@ -1308,28 +1327,6 @@ def test_boot_vs_runtime_verification_differences():
             parsed_at=datetime.now(timezone.utc).isoformat(),
             raw_bytes=b"boot",
         )
-
-        mock_settings.tee_measurements = [
-            TeeMeasurementConfig(
-                version="1",
-                mrtd="a" * 96,
-                name="test",
-                boot_rtmrs={
-                    "RTMR0": "different_boot_rtmr0",
-                    "RTMR1": "c" * 96,
-                    "RTMR2": "d" * 96,
-                    "RTMR3": "e" * 96,
-                },
-                runtime_rtmrs={
-                    "RTMR0": "d" * 96,
-                    "RTMR1": "e" * 96,
-                    "RTMR2": "f" * 96,
-                    "RTMR3": "0" * 96,
-                },
-                expected_gpus=[],
-                gpu_count=None,
-            ),
-        ]
 
         with pytest.raises(MeasurementMismatchError):
             verify_measurements(boot_quote_copy)

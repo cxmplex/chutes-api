@@ -87,7 +87,6 @@ from api.server.util import (
     get_nonce_expiry_seconds,
     verify_quote,
     verify_gpu_evidence,
-    sync_server_luks_passphrases,
     lease_luks_passphrases,
     confirm_luks_generation_leases,
     generate_confirm_nonce,
@@ -105,7 +104,7 @@ from api.node.schemas import Node
 from sqlalchemy.orm import joinedload
 from api.server.schemas import TeeInstanceEvidence
 from api.node.schemas import NodeArgs
-from api.util import extract_ip, get_signing_message, nonce_is_valid_v2, semcomp
+from api.util import get_signing_message, nonce_is_valid_v2, semcomp
 
 
 BOOT_LUKS_ALLOWED_VOLUMES = ("storage", "tdx-cache")
@@ -228,7 +227,7 @@ def validate_request_nonce(purpose: NoncePurpose):
     async def _validate_request_nonce(
         request: Request, nonce: str | None = Header(None, alias=NONCE_HEADER)
     ):
-        server_ip = extract_ip(request)
+        server_ip = request.state.client_ip
 
         try:
             await validate_and_consume_nonce(nonce, server_ip, purpose)
@@ -377,7 +376,7 @@ async def require_boot_attestation_nonce(
         )
     try:
         stored_data = await validate_and_consume_nonce(
-            nonce, extract_ip(request), NoncePurpose.BOOT
+            nonce, request.state.client_ip, NoncePurpose.BOOT
         )
         context = BootAttestationNonceContext.model_validate(stored_data.get("context"))
     except (NonceError, ValidationError, TypeError) as exc:
@@ -513,18 +512,6 @@ def validate_gpus_for_measurements(quote: TdxQuote, gpus: list[NodeArgs]) -> Non
     )
 
 
-async def generate_and_store_boot_token(capability: LuksCapabilityContext) -> str:
-    """Store a legacy one-use boot capability with the same identity and volume scope."""
-    boot_token = generate_nonce()
-    redis_key = f"boot_token:{boot_token}"
-    await settings.redis_client.setex(redis_key, 10 * 60, capability.model_dump_json())
-    logger.info(
-        f"Generated legacy boot LUKS capability for server {capability.server_id} "
-        f"volumes={capability.allowed_volumes}"
-    )
-    return boot_token
-
-
 async def _registered_boot_server(
     db: AsyncSession,
     server_ip: str,
@@ -625,7 +612,7 @@ async def process_boot_attestation(
     nonce: str,
     nonce_context: BootAttestationNonceContext,
     expected_cert_hash: str,
-) -> tuple[Optional[str], Optional[str]]:
+) -> str:
     """
     Process a boot attestation request.
 
@@ -638,9 +625,7 @@ async def process_boot_attestation(
         expected_cert_hash: Expected certificate hash
 
     Returns:
-        Tuple of (boot_token, luks_quote_nonce). Exactly one is set depending on
-        the VM's measurement version: boot_token for version < 1.3.0 (legacy POST
-        /luks flow), luks_quote_nonce for version >= 1.3.0 (POST /luks/attest flow).
+        A one-use, exact-identity LUKS quote capability.
 
     Raises:
         NonceError: If nonce validation fails
@@ -657,9 +642,7 @@ async def process_boot_attestation(
     try:  # Verify quote signature
         quote = BootTdxQuote.from_base64(args.quote)
         verification_result = await verify_quote(quote, nonce, expected_cert_hash)
-        revocation_status = dict(
-            getattr(verification_result, "revocation_status", {}) or {}
-        )
+        revocation_status = dict(getattr(verification_result, "revocation_status", {}) or {})
 
         measurement_config = get_matching_measurement_config(quote)
         _validate_boot_measurement(server, measurement_config)
@@ -711,16 +694,7 @@ async def process_boot_attestation(
         capability = _luks_capability_for_measurement(
             server, measurement_config, LuksCapabilityPurpose.BOOT
         )
-        # Version-gate: legacy VMs (< 1.3.0) get a boot token for POST /luks;
-        # new VMs (>= 1.3.0) get a luks_quote_nonce for POST /luks/attest instead.
-        boot_token: Optional[str] = None
-        luks_quote_nonce: Optional[str] = None
-        if semcomp(measurement_config.version, "1.3.0") >= 0:
-            luks_quote_nonce = await generate_luks_quote_nonce(capability)
-        else:
-            boot_token = await generate_and_store_boot_token(capability)
-
-        return boot_token, luks_quote_nonce
+        return await generate_luks_quote_nonce(capability)
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         # Create failed attestation record; set measurement_version if quote matched a config
@@ -1337,7 +1311,7 @@ async def register_cpu_server(
     # no boot-attestation step, so its already signature-authorized registration mints a separate
     # storage-only capability after owner, quote, measurement role, and cert persistence all succeed.
     luks_quote_nonce: Optional[str] = None
-    if storage_role and semcomp(measurement_config.version, "1.3.0") >= 0:
+    if storage_role:
         capability = _luks_capability_for_measurement(
             server, measurement_config, LuksCapabilityPurpose.STORAGE
         )
@@ -1592,9 +1566,7 @@ async def verify_server(
 
         # Verify quote measurements (matches by full MRTD + RTMRs; multiple configs may share RTMR0)
         verification_result = await verify_quote(quote, nonce, expected_cert_hash)
-        revocation_status = dict(
-            getattr(verification_result, "revocation_status", {}) or {}
-        )
+        revocation_status = dict(getattr(verification_result, "revocation_status", {}) or {})
         if is_cpu:
             # CPU server: skip GPU evidence + GPU matching. Validate and persist the benchmark
             # the validator gathered itself from the attestation response.
@@ -1896,9 +1868,7 @@ async def process_runtime_attestation(
             expected_cert_hash,
             expected_gcp_identity=_expected_gcp_identity(server.server_id),
         )
-        revocation_status = dict(
-            getattr(verification_result, "revocation_status", {}) or {}
-        )
+        revocation_status = dict(getattr(verification_result, "revocation_status", {}) or {})
 
         # Create runtime attestation record
         measurement_config = get_matching_measurement_config(quote)
@@ -2060,27 +2030,6 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
     return True
 
 
-async def _get_boot_token_context(boot_token: str) -> LuksCapabilityContext:
-    """Load the registered-server context carried by a legacy boot capability."""
-    redis_key = f"boot_token:{boot_token}"
-    redis_value = await settings.redis_client.get(redis_key)
-    if not redis_value:
-        raise NonceError("Boot token not found or expired")
-    try:
-        context = LuksCapabilityContext.model_validate_json(redis_value)
-    except (ValidationError, ValueError, TypeError) as exc:
-        logger.warning(f"Malformed legacy boot capability: {exc}")
-        raise NonceError("Invalid boot token context") from exc
-    if context.purpose != LuksCapabilityPurpose.BOOT or context.issued_volumes is not None:
-        raise NonceError("Invalid boot token purpose")
-    return context
-
-
-async def _consume_boot_token(boot_token: str) -> None:
-    redis_key = f"boot_token:{boot_token}"
-    await settings.redis_client.delete(redis_key)
-
-
 async def _validate_luks_capability_identity(
     db: AsyncSession,
     capability: LuksCapabilityContext,
@@ -2176,31 +2125,6 @@ def _validate_luks_capability_measurement(
             )
     else:
         _validate_boot_measurement(server, measurement_config)
-
-
-async def process_luks_passphrase_request(
-    db: AsyncSession,
-    boot_token: str,
-    server_id: str,
-    hotkey: str | None,
-    expected_cert_hash: str,
-    volume_names: list,
-    rekey_volume_names: Optional[list] = None,
-) -> Dict[str, str]:
-    """Validate a legacy boot capability, release only its scoped keys, then consume it."""
-    capability = await _get_boot_token_context(boot_token)
-    await _validate_luks_capability_identity(
-        db, capability, server_id, hotkey, expected_cert_hash, volume_names
-    )
-    result = await sync_server_luks_passphrases(
-        db,
-        capability.miner_hotkey,
-        capability.vm_name,
-        volume_names,
-        rekey_volume_names=rekey_volume_names,
-    )
-    await _consume_boot_token(boot_token)
-    return result
 
 
 async def process_luks_attest_request(
@@ -2542,13 +2466,28 @@ async def get_active_upgrade_window(
     return rows[0]
 
 
+async def get_latest_upgrade_window(
+    db: AsyncSession,
+) -> Optional[TeeUpgradeWindow]:
+    """Return the newest upgrade target even after its maintenance window closes."""
+    query = select(TeeUpgradeWindow).order_by(TeeUpgradeWindow.upgrade_window_start.desc()).limit(1)
+    result = await db.execute(query)
+    return result.scalars().first()
+
+
+def is_window_open(window: TeeUpgradeWindow) -> bool:
+    """Whether the supplied maintenance window currently accepts confirmations."""
+    now = datetime.now(timezone.utc)
+    return window.upgrade_window_start <= now <= window.upgrade_window_end
+
+
 async def _get_instances_on_server(db: AsyncSession, server_id: str) -> list[Instance]:
-    """Return all instances hosted on a server via Instance → instance_nodes → Node → Server."""
+    """Return GPU-node-linked and directly linked CPU instances on a server."""
     query = (
         select(Instance)
-        .join(instance_nodes, Instance.instance_id == instance_nodes.c.instance_id)
-        .join(Node, instance_nodes.c.node_id == Node.uuid)
-        .where(Node.server_id == server_id)
+        .outerjoin(instance_nodes, Instance.instance_id == instance_nodes.c.instance_id)
+        .outerjoin(Node, instance_nodes.c.node_id == Node.uuid)
+        .where(or_(Instance.server_id == server_id, Node.server_id == server_id))
         .distinct()
     )
     result = await db.execute(query)

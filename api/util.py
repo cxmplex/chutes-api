@@ -5,6 +5,7 @@ Utility/helper functions.
 import os
 import re
 import time
+import socket
 import uuid
 import ast
 import aiodns
@@ -28,7 +29,7 @@ from typing import Set
 from loguru import logger
 from api.config import settings
 from async_lru import alru_cache
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from sqlalchemy.future import select
 from api.constants import VLM_MAX_SIZE, MIN_REG_BALANCE, INTEGRATED_SUBNETS
 from api.metagraph import MetagraphNode
@@ -265,20 +266,6 @@ async def get_resolved_ips(host: str) -> Set[IPv4Address | IPv6Address]:
         return resolved_ips
     except Exception as exc:
         raise ValueError(f"DNS resolution failed for host {host}: {str(exc)}")
-
-
-def extract_ip(request: Request) -> str:
-    # M5: use the RIGHTMOST X-Forwarded-For entry (the value appended by our trusted mTLS/proxy edge),
-    # not the leftmost. The proxy APPENDS rather than overwrites, so the leftmost hop is fully
-    # client-controlled -- an attacker could set X-Forwarded-For to spoof the "attestation must
-    # originate from the registered IP" + per-host nonce checks. The rightmost hop is the peer our
-    # own edge actually observed; fall back to the real socket peer when the header is absent.
-    x_forwarded_for = request.headers.get("X-Forwarded-For")
-    if x_forwarded_for:
-        hops = [p.strip() for p in x_forwarded_for.split(",") if p.strip()]
-        if hops:
-            return hops[-1]
-    return request.client.host
 
 
 async def is_valid_host(host: str) -> bool:
@@ -799,11 +786,7 @@ def use_opencl_graval(chutes_version: str):
 
 
 async def notify_created(instance, gpu_count: int = None, gpu_type: str = None):
-    message = f"Instance created: {instance.miner_hotkey=} {instance.instance_id=}"
-    if gpu_count:
-        message += f" {gpu_count=} {gpu_type=}"
-    message += ", broadcasting"
-    logger.success(message)
+    # The ORM lifecycle event owns the durable structured log; this helper broadcasts only.
     try:
         log_suffix = ""
         if gpu_count:
@@ -831,9 +814,7 @@ async def notify_created(instance, gpu_count: int = None, gpu_type: str = None):
 async def notify_deleted(
     instance, message: str = None, gpu_count: int = None, gpu_type: str = None
 ):
-    logger.warning(
-        f"Instance deleted: {instance.miner_hotkey=} {instance.instance_id=}, broadcasting"
-    )
+    # ORM/raw-delete chokepoints own structured lifecycle logs; this helper broadcasts only.
     if not message:
         message = f"Miner {instance.miner_hotkey} has deleted instance an instance of chute {instance.chute_id}."
     try:
@@ -869,9 +850,7 @@ async def notify_deleted(
 
 
 async def notify_verified(instance, gpu_count: int = None, gpu_type: str = None):
-    logger.success(
-        f"Instance verified: {instance.miner_hotkey=} {instance.instance_id=}, broadcasting"
-    )
+    # The verification chokepoint owns the structured lifecycle log.
     try:
         event_data = {
             "reason": "instance_verified",
@@ -930,7 +909,6 @@ async def notify_job_deleted(job):
 async def notify_activated(instance, gpu_count: int = None, gpu_type: str = None):
     try:
         message = f"Miner {instance.miner_hotkey} has activated instance {instance.instance_id} chute {instance.chute_id}"
-        logger.success(message)
         event_data = {
             "reason": "instance_activated",
             "message": message,
@@ -954,7 +932,6 @@ async def notify_activated(instance, gpu_count: int = None, gpu_type: str = None
 async def notify_disabled(instance, gpu_count: int = None, gpu_type: str = None):
     try:
         message = f"Miner {instance.miner_hotkey} has disabled instance {instance.instance_id} chute {instance.chute_id}"
-        logger.warning(message)
         event_data = {
             "reason": "instance_disabled",
             "message": message,
@@ -1071,57 +1048,153 @@ async def recreate_vlm_payload(request_body: dict):
             )
 
 
+class _SSRFSafeResolver:
+    """aiohttp resolver that rejects every private/internal resolved address."""
+
+    async def resolve(self, host: str, port: int = 0, family: int = socket.AF_UNSPEC):
+        resolved = await get_resolved_ips(host)
+        if not resolved or any(is_invalid_ip(addr) for addr in resolved):
+            raise ValueError(f"blocked resolved IP for {host}")
+        return [
+            {
+                "hostname": host,
+                "host": str(addr),
+                "port": port,
+                "family": socket.AF_INET6 if addr.version == 6 else socket.AF_INET,
+                "proto": 0,
+                "flags": 0,
+            }
+            for addr in resolved
+        ]
+
+    async def close(self):
+        return None
+
+
+def _validate_vlm_url_syntax(target_url: str) -> str:
+    parsed = urlparse(target_url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme: {parsed.scheme!r}")
+    if not parsed.hostname:
+        raise ValueError(f"missing hostname in {target_url!r}")
+    return parsed.hostname
+
+
+def _validate_ip_literal(hostname: str) -> None:
+    try:
+        literal = ip_address(hostname)
+    except ValueError:
+        return
+    if is_invalid_ip(literal):
+        raise ValueError(f"blocked IP literal: {literal}")
+
+
 async def fetch_vlm_asset(url: str) -> bytes:
     """
     Fetch an asset (image or video) from the specified URL (for VLMs).
     """
     logger.info(f"VLM sixtyfourer: downloading vision asset from {url=}")
+    try:
+        hostname = _validate_vlm_url_syntax(url)
+        _validate_ip_literal(hostname)
+    except ValueError as exc:
+        logger.warning(f"VLM sixtyfourer: blocked initial URL {url=}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid VLM image/video URL",
+        ) from exc
+
+    max_redirects = 5
+    current_url = url
     timeout = aiohttp.ClientTimeout(connect=2, total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = aiohttp.TCPConnector(resolver=_SSRFSafeResolver())
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         try:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Failed to fetch {url}: {response.status=}",
-                    )
-                content_type = response.headers.get("Content-Type", "").lower()
-                if not content_type.startswith(("image/", "video/")):
-                    logger.error(f"VLM sixtyfourer: invalid image URL: {content_type=} for {url=}")
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Invalid image URL: {content_type=} for {url=}",
-                    )
-                content_length = response.headers.get("Content-Length")
-                if content_length and int(content_length) > VLM_MAX_SIZE:
-                    logger.error(
-                        f"VLM sixtyfourer: max size is {VLM_MAX_SIZE} bytes, {url=} has size {content_length} bytes"
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"VLM asset max size is {VLM_MAX_SIZE} bytes, {url=} has size {content_length} bytes",
-                    )
-                chunks = []
-                total_size = 0
-                async for chunk in response.content.iter_chunked(32768):
-                    total_size += len(chunk)
-                    if total_size > VLM_MAX_SIZE:
+            for _redirect_count in range(max_redirects + 1):
+                async with session.get(current_url, allow_redirects=False) as response:
+                    if response.status in (301, 302, 303, 307, 308):
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"Redirect with no Location header from {current_url}",
+                            )
+                        redirect_url = urljoin(current_url, location)
+                        try:
+                            redirect_hostname = _validate_vlm_url_syntax(redirect_url)
+                            _validate_ip_literal(redirect_hostname)
+                        except ValueError as exc:
+                            logger.warning(
+                                f"VLM sixtyfourer: blocked redirect "
+                                f"{current_url} -> {redirect_url}: {exc}"
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Invalid VLM image/video URL",
+                            ) from exc
+                        current_url = redirect_url
+                        continue
+
+                    if response.status != 200:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Failed to fetch {url}: {response.status=}",
+                        )
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    if not content_type.startswith(
+                        ("image/", "video/", "application/octet-stream")
+                    ):
                         logger.error(
-                            f"VLM sixtyfourer: max size is {VLM_MAX_SIZE} bytes, already read {total_size=}"
+                            f"VLM sixtyfourer: invalid image URL: {content_type=} for {url=}"
                         )
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
-                            detail=f"VLM asset max size is {VLM_MAX_SIZE} bytes, already read {total_size=}",
+                            detail=f"Invalid image URL: {content_type=} for {url=}",
                         )
-                    chunks.append(chunk)
-                logger.success(f"VLM sixtyfourer: successfully downloaded {url=}")
-                return b"".join(chunks)
+                    content_length = response.headers.get("Content-Length")
+                    if content_length and int(content_length) > VLM_MAX_SIZE:
+                        logger.error(
+                            f"VLM sixtyfourer: max size is {VLM_MAX_SIZE} bytes, "
+                            f"{url=} has size {content_length} bytes"
+                        )
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(
+                                f"VLM asset max size is {VLM_MAX_SIZE} bytes, "
+                                f"{url=} has size {content_length} bytes"
+                            ),
+                        )
+                    chunks = []
+                    total_size = 0
+                    async for chunk in response.content.iter_chunked(32768):
+                        total_size += len(chunk)
+                        if total_size > VLM_MAX_SIZE:
+                            logger.error(
+                                f"VLM sixtyfourer: max size is {VLM_MAX_SIZE} bytes, "
+                                f"already read {total_size=}"
+                            )
+                            raise HTTPException(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=(
+                                    f"VLM asset max size is {VLM_MAX_SIZE} bytes, "
+                                    f"already read {total_size=}"
+                                ),
+                            )
+                        chunks.append(chunk)
+                    logger.success(f"VLM sixtyfourer: successfully downloaded {url=}")
+                    return b"".join(chunks)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Too many redirects fetching VLM asset",
+            )
         except asyncio.TimeoutError:
             logger.error(f"VLM sixtyfourer: timeout downloading {url=}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Timeout fetching image for VLM processing from {url=}",
             )
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.error(f"VLM sixtyfourer: unhandled download exception: {str(exc)}")
             raise HTTPException(

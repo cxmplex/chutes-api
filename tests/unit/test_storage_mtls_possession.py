@@ -1,10 +1,15 @@
 """Storage control-plane calls require proxy-proven live certificate possession."""
 
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
@@ -34,8 +39,22 @@ def _request(cert_pem: str, verify: str | None) -> Request:
     )
 
 
+@lru_cache(maxsize=1)
 def _certificate() -> str:
-    return (Path(__file__).resolve().parents[1] / "assets/snp/gcp-ak-root.pem").read_text()
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "storage-test")])
+    now = datetime.now(timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(minutes=10))
+        .sign(key, hashes.SHA256())
+    )
+    return certificate.public_bytes(serialization.Encoding.PEM).decode()
 
 
 def test_header_only_public_certificate_does_not_prove_possession(monkeypatch):

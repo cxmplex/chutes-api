@@ -2,6 +2,7 @@
 Socket.IO poowered websocket server for continuous bi-directional vali/miner comms.
 """
 
+import api.logging_bootstrap  # noqa: F401  # configure structured logging before imports log
 import asyncio
 import socketio
 import api.constants as cst
@@ -16,6 +17,7 @@ from api.server.schemas import Host, Server
 from api.user.router import get_current_user
 from api.socket_shared import SyntheticRequest
 from api.redis_pubsub import RedisListener, AgentCommandListener
+from api.log import install_asyncio_exception_handler
 from api.agent_channel import (
     handle_agent_command_ack,
     handle_agent_status,
@@ -38,6 +40,7 @@ async def initialize_socket_app():
     """
     Start our redis subscriber when the server starts.
     """
+    install_asyncio_exception_handler()
     fastapi_app.state.redis_listener = RedisListener(sio, "miner_broadcast")
     asyncio.create_task(fastapi_app.state.redis_listener.start())
     fastapi_app.state.agent_listener = AgentCommandListener(sio, cst.AGENT_COMMAND_CHANNEL)

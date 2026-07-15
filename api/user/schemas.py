@@ -195,7 +195,7 @@ class InvocationQuota(Base):
         cached = (await settings.redis_client.get(key) or b"").decode()
         if cached and cached.isdigit():
             return int(cached)
-        async with get_session() as session:
+        async with get_session(readonly=True) as session:
             result = await session.execute(
                 select(InvocationQuota.quota)
                 .where(InvocationQuota.user_id == user_id)
@@ -286,7 +286,7 @@ class InvocationQuota(Base):
         if cached is not None:
             quota_type = cached.decode()
         else:
-            async with get_session() as session:
+            async with get_session(readonly=True) as session:
                 result = await session.execute(
                     select(InvocationQuota.chute_id)
                     .where(InvocationQuota.user_id == user_id)
@@ -329,7 +329,7 @@ class InvocationDiscount(Base):
             except ValueError:
                 await settings.redis_client.delete(key)
 
-        async with get_session() as session:
+        async with get_session(readonly=True) as session:
             result = await session.execute(
                 select(InvocationDiscount.discount)
                 .where(InvocationDiscount.user_id == user_id)
@@ -359,7 +359,7 @@ class JobQuota(Base):
 
     @staticmethod
     async def get(user_id: str, chute_id: str):
-        async with get_session() as session:
+        async with get_session(readonly=True) as session:
             result = await session.execute(
                 select(JobQuota.quota)
                 .where(JobQuota.user_id == user_id)
@@ -395,7 +395,7 @@ class PriceOverride(Base):
             except Exception:
                 await settings.redis_client.delete(key)
 
-        async with get_session() as session:
+        async with get_session(readonly=True) as session:
             override = (
                 (
                     await session.execute(

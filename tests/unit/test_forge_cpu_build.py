@@ -3,7 +3,7 @@
 CPU-TEE chutes ship NO confidential-runtime layer (no aegis/netnanny/cfsv/inspecto/
 graval): the Trust Domain is the security boundary. These tests run
 build_and_push_image with buildah/push subprocesses faked and assert the generated
-Dockerfiles + skipped stages differ correctly between cpu=True and cpu=False images.
+Dockerfiles + skipped stages differ correctly between CPU and GPU images.
 """
 
 import os
@@ -44,7 +44,7 @@ def _image(cpu: bool):
     image.patch_version = None
     image.chutes_version = "0.6.10"
     image.image_id = "img-1"
-    image.cpu = cpu
+    image.compute_type = "cpu" if cpu else "gpu"
     image.user_id = "user-1"
     return image
 

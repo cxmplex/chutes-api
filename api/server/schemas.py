@@ -3,6 +3,7 @@ ORM definitions for servers and TDX attestations.
 """
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from datetime import datetime, timezone
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from sqlalchemy import (
@@ -19,11 +20,19 @@ from sqlalchemy import (
     Index,
     ForeignKeyConstraint,
     UniqueConstraint,
+    case,
 )
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.dialects.postgresql import JSONB
 from typing import Dict, Any, List, Literal, Optional
 from dataclasses import dataclass
 from enum import Enum
+from api.config import settings
+from api.constants import (
+    ATTESTATION_PROXY_HEALTH_PATH,
+    ATTESTATION_PROXY_PORT,
+    ServerHealthStatus,
+)
 from api.database import Base, generate_uuid
 from api.node.schemas import NodeArgs
 
@@ -61,12 +70,11 @@ class BootAttestationArgs(BaseModel):
 class BootAttestationResponse(BaseModel):
     """Capability-only response for successful boot attestation.
 
-    Root/global disk key material is deliberately never returned here. The caller receives exactly
-    one scoped follow-up capability according to the matched image version.
+    Root/global disk key material is deliberately never returned here. The caller receives
+    one exact-identity quote capability for generation-leased volume keys.
     """
 
-    boot_token: Optional[str] = None
-    luks_quote_nonce: Optional[str] = None
+    luks_quote_nonce: str
 
 
 class RuntimeAttestationArgs(BaseModel):
@@ -244,20 +252,8 @@ class LuksConfirmResult:
     """Per-volume outcome: promoted, confirmed, or already_confirmed plus generation."""
 
 
-class LuksPassphraseRequest(BaseModel):
-    """Request model for LUKS POST: VM sends volume list, API returns keys (existing/new/rekey), prunes others."""
-
-    volumes: List[str] = Field(
-        ..., description="Volume names the VM is managing (defines full set)"
-    )
-    rekey: Optional[List[str]] = Field(
-        None,
-        description="Volume names that must receive new passphrases (no reuse); must be subset of volumes",
-    )
-
-
 class LuksAttestRequest(BaseModel):
-    """Request model for POST /luks/attest (new VMs, version >= 1.3.0)."""
+    """Request model for the sole LUKS key-release path."""
 
     quote: str = Field(
         ...,
@@ -431,7 +427,9 @@ class CpuServerRegistrationArgs(BaseModel):
     endpoints: Optional[Dict[str, Any]] = Field(
         None,
         description="User-attestable reach info advertised by the in-TEE agent: "
-        "{host, attest_port, provision_port, ssh_port, wg_port}. Discovery convenience only.",
+        "{host, attest_port, provision_port, ssh_port, wg_port}; CPU/storage health probing is "
+        "enabled only when this also contains an integer health_port and absolute health_path. "
+        "Discovery convenience only.",
     )
     storage_role: bool = Field(
         False,
@@ -457,6 +455,31 @@ class CpuServerRegistrationArgs(BaseModel):
         description="ChuteFS storage TD: currently free disk (GB) on its data volume.",
     )
 
+    @field_validator("endpoints")
+    @classmethod
+    def validate_optional_health_endpoint(cls, endpoints):
+        if not endpoints:
+            return endpoints
+        has_port = "health_port" in endpoints
+        has_path = "health_path" in endpoints
+        if has_port != has_path:
+            raise ValueError("health_port and health_path must be supplied together")
+        if not has_port:
+            return endpoints
+        port = endpoints["health_port"]
+        path = endpoints["health_path"]
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError("health_port must be an integer in 1..65535")
+        if (
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or path.startswith("//")
+            or len(path) > 256
+            or any(character.isspace() for character in path)
+        ):
+            raise ValueError("health_path must be a bounded absolute path without whitespace")
+        return endpoints
+
 
 class CpuServerRegistrationResponse(BaseModel):
     """Response for a successful CPU TEE server self-registration."""
@@ -472,7 +495,7 @@ class CpuServerRegistrationResponse(BaseModel):
     status: str = "registered"
     # ChuteFS: the single-use nonce a self-registering storage TD must embed in its next quote to
     # call POST /{server_id}/luks/attest for its persistent data-volume key. Minted (and returned) only
-    # for storage_role registrations whose measurement version supports the attest flow (>= 1.3.0).
+    # for storage_role registrations.
     luks_quote_nonce: Optional[str] = None
 
 
@@ -682,6 +705,7 @@ class MaintenancePolicyResponse(BaseModel):
     """Response for GET /servers/maintenance/policy."""
 
     active_window: Optional[UpgradeWindowInfo] = None
+    window_open: bool = False
     current_slots: int = 0
     servers: List[ServerUpgradeStatus] = Field(default_factory=list)
 
@@ -878,10 +902,65 @@ class Server(Base):
     model_inventory_snapshot_started_at = Column(DateTime(timezone=True), nullable=True)
     model_inventory_snapshot_id = Column(String, nullable=True)
     model_inventory_fresh_at = Column(DateTime(timezone=True), nullable=True)
+    last_health_at = Column(DateTime(timezone=True), nullable=True)
 
     @property
     def in_maintenance(self) -> bool:
         return self.maintenance_pending_window_id is not None
+
+    @property
+    def health_check_url(self) -> Optional[str]:
+        """Return only a health endpoint represented for this server's role.
+
+        Legacy GPU TEE servers use the historical attestation-proxy endpoint. CPU and
+        storage rows are never sent there implicitly; they must advertise an explicit
+        health_port and health_path in tee_endpoints.
+        """
+        if self.compute_type == "cpu" or self.storage_role:
+            endpoints = self.tee_endpoints or {}
+            port = endpoints.get("health_port")
+            path = endpoints.get("health_path")
+            if (
+                not isinstance(port, int)
+                or isinstance(port, bool)
+                or not 1 <= port <= 65535
+                or not isinstance(path, str)
+                or not path.startswith("/")
+                or path.startswith("//")
+            ):
+                return None
+            return f"https://{self.ip}:{port}{path}"
+        return f"https://{self.ip}:{ATTESTATION_PROXY_PORT}{ATTESTATION_PROXY_HEALTH_PATH}"
+
+    @hybrid_property
+    def health_status(self) -> ServerHealthStatus:
+        if self.last_health_at is None:
+            return ServerHealthStatus.UNKNOWN
+        observed_at = self.last_health_at
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - observed_at).total_seconds()
+        if age >= settings.server_health_offline_threshold_seconds:
+            return ServerHealthStatus.OFFLINE
+        if age >= settings.server_health_degraded_threshold_seconds:
+            return ServerHealthStatus.DEGRADED
+        return ServerHealthStatus.HEALTHY
+
+    @health_status.expression
+    def health_status(cls):
+        age = func.extract("epoch", func.now() - cls.last_health_at)
+        return case(
+            (cls.last_health_at.is_(None), ServerHealthStatus.UNKNOWN.value),
+            (
+                age >= settings.server_health_offline_threshold_seconds,
+                ServerHealthStatus.OFFLINE.value,
+            ),
+            (
+                age >= settings.server_health_degraded_threshold_seconds,
+                ServerHealthStatus.DEGRADED.value,
+            ),
+            else_=ServerHealthStatus.HEALTHY.value,
+        )
 
     # Relationships
     nodes = relationship("Node", back_populates="server", cascade="all, delete-orphan")
@@ -915,6 +994,7 @@ class Server(Base):
             "server_id",
             postgresql_where=storage_role.is_(True),
         ),
+        Index("idx_servers_last_health", "last_health_at"),
         CheckConstraint(
             "("
             "model_inventory_fresh_at IS NULL "

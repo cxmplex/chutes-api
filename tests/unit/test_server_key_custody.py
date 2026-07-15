@@ -92,8 +92,10 @@ def _measurement(*, storage: bool = False, name: str | None = None) -> TeeMeasur
         version="1.6.1",
         mrtd="a" * 96,
         name=name or ("storage-test" if storage else "gpu-test"),
-        boot_rtmrs={},
-        runtime_rtmrs={},
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        runtime_rtmr3="e" * 96,
         expected_gpus=[] if storage else ["h200"],
         gpu_count=0 if storage else 1,
         tee_type="tdx",
@@ -544,3 +546,13 @@ def test_boot_response_cannot_serialize_global_or_disk_key():
     assert payload == {"luks_quote_nonce": QUOTE_NONCE}
     assert "key" not in BootAttestationResponse.model_fields
     assert "key" not in payload
+    assert set(BootAttestationResponse.model_fields) == {"luks_quote_nonce"}
+
+
+def test_legacy_ambiguous_luks_route_is_absent():
+    from api.server.router import router
+
+    paths = {route.path for route in router.routes}
+    assert "/{server_id}/luks" not in paths
+    assert "/{server_id}/luks/attest" in paths
+    assert "/{server_id}/luks/confirm" in paths

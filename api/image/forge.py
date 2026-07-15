@@ -2,6 +2,7 @@
 Image forge -- build images and push to local registry with buildah.
 """
 
+import api.logging_bootstrap  # noqa: F401  # configures JSON logging before anything logs
 import asyncio
 from typing import Any, Callable
 import zipfile
@@ -15,6 +16,7 @@ import shutil
 import chutes
 import orjson as json
 from loguru import logger
+from api.log import install_asyncio_exception_handler, image_logger
 from api.config import settings
 from api.database import get_session
 from api.exceptions import (
@@ -198,7 +200,7 @@ async def build_and_push_image(image, build_dir):
         # inspecto/graval/bytecode-manifest. The Trust Domain itself (TDX memory encryption + dm-verity
         # root + RTMR attestation) is the security boundary, so the in-image LD_PRELOAD machinery is
         # redundant. GPU + GPU-TEE images keep the full confidential runtime below.
-        is_cpu = bool(getattr(image, "cpu", False))
+        is_cpu = image.compute_type == "cpu"
 
         # Dev: install the local SDK wheel (CHUTES_SDK_WHEEL) instead of PyPI -- the dev forge runs the
         # modified 0.6.10 source (e.g. the CPU-TEE no-aegis branch) that isn't published to any index.
@@ -979,25 +981,29 @@ async def forge(image_id: str):
     with tempfile.TemporaryDirectory() as build_dir:
         context_path = os.path.join(build_dir, "chute.zip")
         dockerfile_path = os.path.join(build_dir, "Dockerfile")
-        async with settings.s3_client() as s3:
-            await s3.download_file(
-                settings.storage_bucket, f"forge/{image.user_id}/{image_id}.zip", context_path
-            )
-        async with settings.s3_client() as s3:
-            await s3.download_file(
-                settings.storage_bucket,
-                f"forge/{image.user_id}/{image_id}.Dockerfile",
-                dockerfile_path,
-            )
+        starting_dir = os.getcwd()
         try:
-            starting_dir = os.getcwd()
+            # Fetch the build context inside the try so a missing/forbidden object marks the
+            # image as errored instead of crashing the worker and orphaning it in "building".
+            async with settings.s3_client() as s3:
+                await s3.download_file(
+                    settings.storage_bucket, f"forge/{image.user_id}/{image_id}.zip", context_path
+                )
+            async with settings.s3_client() as s3:
+                await s3.download_file(
+                    settings.storage_bucket,
+                    f"forge/{image.user_id}/{image_id}.Dockerfile",
+                    dockerfile_path,
+                )
             os.chdir(build_dir)
             safe_extract(context_path)
             short_tag = await build_and_push_image(image, build_dir)
             inspecto_hash = image.inspecto
             package_hashes = image.package_hashes
         except Exception as exc:
-            logger.error(f"Error building {image_id=}: {exc}\n{traceback.format_exc()}")
+            image_logger(image).error(
+                f"error building image {image_id}: {exc}\n{traceback.format_exc()}"
+            )
             error_message = str(exc)
         finally:
             os.chdir(starting_dir)
@@ -1118,7 +1124,7 @@ async def update_chutes_lib(image_id: str, chutes_version: str, force: bool = Fa
 
             # CPU-only chutes skip the GPU confidential-runtime layer (no aegis/cfsv/graval) and the
             # GPU verification stage; resolved once here and reused for every CPU/GPU branch below.
-            is_cpu = bool(getattr(image, "cpu", False))
+            is_cpu = image.compute_type == "cpu"
 
             # graval is a GPU-only extra; CPU chutes install base chutes (no CUDA/torch).
             _upd_install = (
@@ -1565,6 +1571,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 
 async def main():
+    install_asyncio_exception_handler()
     await initialize()
 
     while True:
@@ -1576,7 +1583,12 @@ async def main():
         if not image_id:
             await asyncio.sleep(10)
             continue
-        await forge(image_id)
+        try:
+            await forge(image_id)
+        except Exception as exc:
+            # forge() handles its own build errors; this guard ensures an unexpected failure
+            # can never crash the worker and leave the image orphaned in "building".
+            logger.error(f"Unhandled error forging {image_id=}: {exc}\n{traceback.format_exc()}")
 
 
 if __name__ == "__main__":

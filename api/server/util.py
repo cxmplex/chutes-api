@@ -18,7 +18,7 @@ from aiohttp import ClientResponse
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request, status
 from loguru import logger
-from dcap_qvl import PHALA_PCCS_URL, get_collateral, verify_with_root_ca
+from dcap_qvl import PHALA_PCCS_URL, Quote, get_collateral, verify_with_root_ca
 from api.config import settings, TeeMeasurementConfig
 from api.server.intel_root import INTEL_SGX_ROOT_CA_DER
 from cryptography import x509
@@ -38,7 +38,7 @@ from api.server.exceptions import (
     NoServerCertError,
     NonceError,
 )
-from api.server.quote import TdxQuote, TdxVerificationResult
+from api.server.quote import TdxQuote, TdxVerificationResult, resolve_tdx_tcb_status
 from api.server.snp_quote import SnpReport
 from api.server.snp_verify import SnpVerificationResult, verify_snp_report
 import hashlib
@@ -314,11 +314,18 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
     try:
         # Perform quote verification against the pinned Intel root.
         collateral = await get_collateral(PHALA_PCCS_URL, quote.raw_bytes)
-        verified_report = verify_with_root_ca(
-            quote.raw_bytes, collateral, INTEL_SGX_ROOT_CA_DER, int(time.time())
-        )
-
-        result = TdxVerificationResult.from_report(verified_report)
+        try:
+            verified_report = verify_with_root_ca(
+                quote.raw_bytes, collateral, INTEL_SGX_ROOT_CA_DER, int(time.time())
+            )
+            result = TdxVerificationResult.from_report(verified_report)
+        except ValueError as exc:
+            # dcap-qvl may fail to select a platform level for newer module generations.
+            # The pinned-root verifier has already authenticated the quote and Intel collateral;
+            # only this exact level-selection failure is recomputed via Intel module identities.
+            if "No matching TCB level found" not in str(exc):
+                raise
+            result = _resolve_tdx_tcb_via_module_identity(quote, collateral, exc)
 
         if result.is_valid:
             logger.success("TDX quote signature verification successful")
@@ -333,6 +340,40 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
     except Exception as e:
         logger.error(f"Unexpected error during quote verification: {e}")
         raise InvalidQuoteError("Unable to parse provided quote for verification.")
+
+
+def _resolve_tdx_tcb_via_module_identity(
+    quote: TdxQuote, collateral, original_error: Exception
+) -> TdxVerificationResult:
+    """Recompute only the TCB level after pinned-root cryptographic verification."""
+    parsed = Quote.parse(quote.raw_bytes)
+    if not parsed.is_tdx():
+        raise original_error
+    report = parsed.report
+    pck = parsed.pck_extension()
+    status_value, advisory_ids = resolve_tdx_tcb_status(
+        tcb_info=json.loads(collateral.tcb_info),
+        tee_tcb_svn=list(report.tee_tcb_svn),
+        sgx_tcb_components=list(pck.cpu_svn),
+        pce_svn=pck.pce_svn,
+        mr_signer_seam=report.mr_signer_seam,
+        seam_attributes=report.seam_attributes,
+    )
+    logger.info(
+        "Resolved TDX TCB via pinned module identity: "
+        f"status={status_value}, tee_tcb_svn={list(report.tee_tcb_svn)[:2]}..."
+    )
+    return TdxVerificationResult.from_fields(
+        mr_td=report.mr_td,
+        rt_mr0=report.rt_mr0,
+        rt_mr1=report.rt_mr1,
+        rt_mr2=report.rt_mr2,
+        rt_mr3=report.rt_mr3,
+        report_data=report.report_data,
+        td_attributes=report.td_attributes,
+        status=status_value,
+        advisory_ids=advisory_ids,
+    )
 
 
 def get_latest_measurement_version() -> str:
@@ -689,71 +730,6 @@ def decrypt_passphrase(encrypted_passphrase: str) -> str:
     fernet = _get_fernet()
     decrypted = fernet.decrypt(encrypted_passphrase.encode())
     return decrypted.decode()
-
-
-async def _get_vm_cache_config(
-    db: AsyncSession, miner_hotkey: str, vm_name: str
-) -> Optional[VmCacheConfig]:
-    """Get VmCacheConfig row if it exists."""
-    result = await db.execute(
-        select(VmCacheConfig).where(
-            VmCacheConfig.miner_hotkey == miner_hotkey,
-            VmCacheConfig.vm_name == vm_name,
-        )
-    )
-    return result.scalar_one_or_none()
-
-
-async def _create_vm_cache_config(
-    db: AsyncSession, miner_hotkey: str, vm_name: str
-) -> VmCacheConfig:
-    """Create and persist a new VmCacheConfig row."""
-    vm_config = VmCacheConfig(
-        miner_hotkey=miner_hotkey,
-        vm_name=vm_name,
-        volume_passphrases={},
-        volume_epochs={},
-        volume_generation_leases={},
-        last_boot_at=func.now(),
-    )
-    db.add(vm_config)
-    await db.flush()
-    return vm_config
-
-
-async def sync_server_luks_passphrases(
-    db: AsyncSession,
-    miner_hotkey: str,
-    vm_name: str,
-    volume_names: List[str],
-    rekey_volume_names: Optional[List[str]] = None,
-) -> Dict[str, str]:
-    """
-    Sync LUKS state: ensure passphrases for every volume in volume_names, prune others.
-    Volumes in rekey_volume_names get new passphrases (no reuse).
-    """
-    rekey_set = set(rekey_volume_names or [])
-    vm_config = await _get_vm_cache_config(db, miner_hotkey, vm_name)
-    if vm_config is None:
-        vm_config = await _create_vm_cache_config(db, miner_hotkey, vm_name)
-    stored: Dict[str, str] = dict(vm_config.volume_passphrases or {})
-
-    result: Dict[str, str] = {}
-    for vol in volume_names:
-        if vol in rekey_set or vol not in stored:
-            passphrase = generate_cache_passphrase()
-            stored[vol] = encrypt_passphrase(passphrase)
-            result[vol] = passphrase
-        else:
-            result[vol] = decrypt_passphrase(stored[vol])
-
-    # Prune: keep only volume_names
-    vm_config.volume_passphrases = {k: v for k, v in stored.items() if k in volume_names}
-    vm_config.last_boot_at = func.now()
-    await db.commit()
-    await db.refresh(vm_config)
-    logger.info(f"LUKS sync for VM {vm_name}: volumes={volume_names}, rekey={list(rekey_set)}")
-    return result
 
 
 async def delete_luks_passphrases_for_server(

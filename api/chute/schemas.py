@@ -26,6 +26,7 @@ from api.gpu import (
 from api.fmv.fetcher import get_fetcher
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     computed_field,
     validator,
@@ -83,6 +84,8 @@ class Job(BaseModel):
 
 
 class NodeSelector(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     compute_type: str = Field("gpu")
     gpu_count: Optional[int] = Field(1, ge=1, le=8)
     min_vram_gb_per_gpu: Optional[int] = Field(16, ge=16, le=140)

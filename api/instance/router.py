@@ -29,6 +29,7 @@ from sqlalchemy.dialects.postgresql import insert
 from api.gpu import SUPPORTED_GPUS, COMPUTE_MULTIPLIER
 from api.database import get_db_session, generate_uuid, get_session
 from api.config import settings
+from api.metrics.warmup import track_warmup_seconds, track_warmup_seconds_since, WarmupTrigger
 from api.constants import (
     TEE_BONUS,
     HOTKEY_HEADER,
@@ -103,12 +104,14 @@ from api.util import (
     notify_disabled,
     load_shared_object,
     has_legacy_private_billing,
-    extract_ip,
 )
 from api.encrypted_logs.capture import start_encrypted_log_capture
+from api.metrics.launch_config import track_failure as track_launch_config_failure
+from api.log import instance_logger, LifecycleEvent
 from api.bounty.util import check_bounty_exists, delete_bounty
 from starlette.responses import StreamingResponse
 from api.graval_worker import graval_encrypt, verify_proof, generate_fs_hash
+from taskiq import TaskiqResultTimeoutError
 from watchtower import is_kubernetes_env, verify_expected_command, verify_fs_hash
 
 router = APIRouter()
@@ -163,9 +166,7 @@ INSPECTO = load_shared_object("chutes", "chutes-inspecto.so")
 INSPECTO.verify_hash.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
 INSPECTO.verify_hash.restype = ctypes.c_char_p
 
-NETNANNY = ctypes.CDLL(
-    os.getenv("CHUTES_NNVERIFY_PATH", "/usr/local/lib/chutes-nnverify.so")
-)
+NETNANNY = ctypes.CDLL(os.getenv("CHUTES_NNVERIFY_PATH", "/usr/local/lib/chutes-nnverify.so"))
 NETNANNY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 NETNANNY.verify.restype = ctypes.c_int
 
@@ -1065,7 +1066,8 @@ async def _validate_launch_config_env(
                 miner_hotkey=launch_config.miner_hotkey,
             )
             if semcomp(chute.chutes_version or "0.0.0", "0.3.61") < 0:
-                assert code == chute.code, f"Incorrect code:\n{code=}\n{chute.code=}"
+                if code != chute.code:
+                    raise AssertionError("Incorrect code supplied")
         except AssertionError as exc:
             logger.error(
                 f"Attempt to claim {launch_config.config_id=} failed, invalid command: {exc}"
@@ -1203,6 +1205,23 @@ async def _validate_launch_config_inspecto(
                 )
 
 
+FS_HASH_RESULT_TIMEOUT = 600.0
+
+
+async def _await_fs_hash(task, config_id: str, miner_hotkey: str):
+    """Bound worker waits so a stalled hash task cannot pin a request DB session."""
+    try:
+        return await task.wait_result(timeout=FS_HASH_RESULT_TIMEOUT)
+    except TaskiqResultTimeoutError as exc:
+        logger.error(
+            f"FSHASH: task timed out after {FS_HASH_RESULT_TIMEOUT}s {config_id=} {miner_hotkey=}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Filesystem verification timed out; retry the launch claim.",
+        ) from exc
+
+
 async def _validate_launch_config_filesystem(
     db: AsyncSession, launch_config: LaunchConfig, chute: Chute, args: LaunchConfigArgs
 ):
@@ -1218,7 +1237,7 @@ async def _validate_launch_config_filesystem(
                 sparse=False,
                 exclude_path=f"/app/{chute.filename}",
             )
-            result = await task.wait_result()
+            result = await _await_fs_hash(task, launch_config.config_id, launch_config.miner_hotkey)
             expected_hash = result.return_value
             if expected_hash != args.fsv:
                 logger.error(
@@ -1282,8 +1301,7 @@ async def _validate_launch_config_instance(
             raise
 
     # IP matches?
-    x_forwarded_for = request.headers.get("X-Forwarded-For")
-    actual_ip = x_forwarded_for.split(",")[0] if x_forwarded_for else request.client.host
+    actual_ip = request.state.client_ip
     if actual_ip != args.host:
         logger.warning(
             f"Instance with {launch_config.config_id=} {launch_config.miner_hotkey=} EGRESS INGRESS mismatch!: {actual_ip=} {args.host=}"
@@ -2260,9 +2278,30 @@ async def claim_tee_launch_config(
 
     # Verify TEE attestation evidence. CPU chutes have no GPU nodes; skip GPU evidence.
     compute_type = "cpu" if not nodes else "gpu"
-    await verify_tee_chute(
-        db, instance, launch_config, args.deployment_id, expected_nonce, compute_type=compute_type
-    )
+    try:
+        await verify_tee_chute(
+            db,
+            instance,
+            launch_config,
+            args.deployment_id,
+            expected_nonce,
+            compute_type=compute_type,
+        )
+    except Exception as exc:
+        chute_id = launch_config.chute_id
+        detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+        reason = detail if isinstance(detail, str) else str(detail)
+        await db.rollback()
+        async with get_session() as error_session:
+            await error_session.execute(
+                text(
+                    "UPDATE launch_configs SET failed_at = NOW(), "
+                    "verification_error = :reason WHERE config_id = :config_id"
+                ),
+                {"config_id": config_id, "reason": reason},
+            )
+        track_launch_config_failure(chute_id, reason)
+        raise
 
     instance.deployment_id = args.deployment_id
     await db.commit()
@@ -2645,10 +2684,27 @@ async def activate_launch_config_instance(
             instance.bounty = True
             bounty_boost = calculate_bounty_boost(bounty["age_seconds"])
             instance.compute_multiplier *= bounty_boost
-            logger.info(
+            instance_logger(
+                instance,
+                event=LifecycleEvent.BOUNTY_CLAIM,
+                bounty_age_seconds=bounty["age_seconds"],
+                bounty_boost=round(bounty_boost, 2),
+                compute_multiplier=instance.compute_multiplier,
+            ).info(
                 f"Claimed bounty for {instance.chute_id}: age={bounty['age_seconds']}s, "
                 f"bounty_boost={bounty_boost:.2f}x, total compute_multiplier={instance.compute_multiplier}"
             )
+
+        track_warmup_seconds(
+            chute.chute_id,
+            WarmupTrigger.BOUNTY,
+            bounty["age_seconds"] if bounty else None,
+        )
+        track_warmup_seconds_since(
+            chute.chute_id,
+            WarmupTrigger.EXPLICIT,
+            await settings.redis_client.getdel(f"warmup_requested_at:{chute.chute_id}"),
+        )
 
         # Insert warmup compute history record (created_at → now) at the base
         # multiplier rate (no bounty/urgency boosts).
@@ -2764,7 +2820,7 @@ async def _validate_legacy_filesystem(
                 sparse=False,
                 exclude_path=f"/app/{instance.chute.filename}",
             )
-            result = await task.wait_result()
+            result = await _await_fs_hash(task, config_id, instance.miner_hotkey)
             expected_hash = result.return_value
             if expected_hash != response_body["fsv"]:
                 reason = (
@@ -2838,6 +2894,9 @@ async def _mark_instance_verified(
 
     await db.commit()
     await db.refresh(launch_config)
+    instance_logger(instance, event=LifecycleEvent.INSTANCE_VERIFY).success(
+        f"instance verified: {instance.instance_id} (chute {instance.chute_id})"
+    )
 
 
 async def _build_launch_config_verified_response(
@@ -3106,7 +3165,7 @@ async def get_instance_nonce(request: Request):
     The nonce is used to bind the attestation evidence to this specific verification request.
     """
     try:
-        server_ip = extract_ip(request)
+        server_ip = request.state.client_ip
         nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.INSTANCE_VERIFICATION)
 
         # Return just the nonce string as JSON (library expects this format)
@@ -3121,7 +3180,7 @@ async def get_instance_nonce(request: Request):
 
 @router.get("/token_check")
 async def get_token(salt: str = None, request: Request = None):
-    origin_ip = request.headers.get("x-forwarded-for", "").split(",")[0]
+    origin_ip = request.state.client_ip
     return {"token": generate_ip_token(origin_ip, extra_salt=salt)}
 
 
@@ -3312,8 +3371,13 @@ async def delete_instance(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Instance with {chute_id=} {instance_id} associated with {hotkey=} not found",
         )
-    origin_ip = request.headers.get("x-forwarded-for")
-    logger.info(f"INSTANCE DELETION INITIALIZED: {instance_id=} {hotkey=} {origin_ip=}")
+    origin_ip = request.state.client_ip
+    instance_logger(
+        instance,
+        event=LifecycleEvent.INSTANCE_DELETE,
+        trigger="miner",
+        origin_ip=origin_ip,
+    ).info(f"instance deletion initialized: {instance_id} by {hotkey}")
 
     # Fail the job.
     job = (

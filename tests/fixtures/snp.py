@@ -80,8 +80,6 @@ def snp_measurement_config(
         version=version,
         mrtd="",
         name=name,
-        boot_rtmrs={},
-        runtime_rtmrs={},
         expected_gpus=[],
         gpu_count=0,
         provider="bare-metal",

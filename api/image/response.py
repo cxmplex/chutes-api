@@ -14,6 +14,7 @@ class MinimalImageResponse(BaseModel):
     name: str
     tag: str
     public: bool
+    compute_type: str
     chutes_version: Optional[str]
     patch_version: Optional[str]
 
@@ -27,6 +28,7 @@ class ImageResponse(BaseModel):
     readme: str
     tag: str
     public: bool
+    compute_type: str
     status: str
     created_at: datetime
     build_started_at: Optional[datetime]

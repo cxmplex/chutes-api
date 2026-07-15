@@ -2,6 +2,7 @@
 Main API entrypoint.
 """
 
+import api.logging_bootstrap  # noqa: F401  # configure structured logging before imports log
 import os
 import re
 import gc
@@ -21,6 +22,7 @@ from prometheus_client import (
     multiprocess,
     CONTENT_TYPE_LATEST,
 )
+from prometheus_fastapi_instrumentator import Instrumentator
 from concurrent.futures import ThreadPoolExecutor
 from api.api_key.router import router as api_key_router
 from api.api_key.storage_scope import storage_authorization_scope
@@ -55,6 +57,8 @@ from api.database.migrations import run_database_migrations
 from api.config import settings
 from api.metrics.util import keep_gauges_fresh
 from api.instance.util import start_instance_invalidation_listener
+from api.log import install_asyncio_exception_handler
+from api.client_ip import resolve_client_ip
 
 
 async def loop_lag_monitor(interval: float = 0.1, warn_threshold: float = 0.2):
@@ -108,6 +112,7 @@ async def lifespan(_: FastAPI):
     Execute all initialization/startup code, e.g. ensuring tables exist and such.
     """
     gc.set_threshold(5000, 50, 50)
+    install_asyncio_exception_handler()
 
     trust_health = settings.tee_measurement_health()
     if not trust_health["ready"]:
@@ -138,6 +143,12 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
+os.makedirs("/tmp/prometheus_multiproc", exist_ok=True)
+Instrumentator(
+    should_instrument_requests_inprogress=True,
+    inprogress_name="http_requests_inprogress",
+    inprogress_labels=False,
+).instrument(app)
 
 default_router = APIRouter()
 default_router.include_router(user_router, prefix="/users", tags=["Users"])
@@ -174,7 +185,9 @@ async def ping():
     try:
         async with get_session() as session:
             await session.execute(text("SELECT 1"))
-            return {"message": "pong"}
+        async with get_session(readonly=True) as session:
+            await session.execute(text("SELECT 1"))
+        return {"message": "pong"}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -184,7 +197,7 @@ async def ping():
 
 async def ready(request: Request):
     """Internal readiness surface: database plus complete TEE trust-set health."""
-    if request.headers.get("x-forwarded-for"):
+    if request.state.has_resolved_ip:
         raise HTTPException(status_code=403, detail="Forbidden")
     trust_health = settings.tee_measurement_health()
     if not trust_health["ready"]:
@@ -194,6 +207,8 @@ async def ready(request: Request):
         )
     try:
         async with get_session() as session:
+            await session.execute(text("SELECT 1"))
+        async with get_session(readonly=True) as session:
             await session.execute(text("SELECT 1"))
     except Exception as exc:
         raise HTTPException(
@@ -234,7 +249,7 @@ def _tee_trust_metrics(health: dict) -> bytes:
 
 # Prometheus metrics endpoint.
 async def get_latest_metrics(request: Request):
-    if request.headers.get("x-forwarded-for"):
+    if request.state.has_resolved_ip:
         raise HTTPException(status_code=403, detail="Forbidden")
     trust_health = settings.tee_measurement_health()
     registry = CollectorRegistry()
@@ -297,6 +312,8 @@ async def host_router_middleware(request: Request, call_next):
     """
     Route differentiation for hostname-based simple invocations.
     """
+    request.state.client_ip, request.state.has_resolved_ip = resolve_client_ip(request)
+
     if request.url.path == "/ping":
         app.router = default_router
         return await call_next(request)

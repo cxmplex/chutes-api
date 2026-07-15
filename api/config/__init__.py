@@ -4,6 +4,7 @@ Application-wide settings.
 
 import os
 import hashlib
+import ipaddress
 from pathlib import Path
 import aioboto3
 import json
@@ -76,6 +77,7 @@ _CHUTEFS_FRAME_PLAINTEXT_BYTES = 1024 * 1024
 _CHUTEFS_FIXED_CIPHERTEXT_BYTES = 48
 _CHUTEFS_PER_DATA_FRAME_BYTES = 20
 MAX_SNP_CRL_OUTAGE_GRACE_SECONDS = 3600
+ZERO_RTMR = "0" * 96
 
 
 def _max_plaintext_for_ciphertext_limit(ciphertext_limit: int) -> int:
@@ -97,28 +99,27 @@ def _max_plaintext_for_ciphertext_limit(ciphertext_limit: int) -> int:
 
 @dataclass
 class TeeMeasurementConfig:
-    """Configuration for allowed measurements for a TEE VM.
+    """One canonical, per-hardware TEE trust entry.
 
-    Two TEE providers are supported, discriminated by ``tee_type``:
-      - ``tdx`` (default): Intel TDX -- pins ``mrtd`` + ``boot_rtmrs``/``runtime_rtmrs`` (RTMR0-3).
-      - ``sev-snp``: AMD SEV-SNP -- pins a single launch ``measurement`` (48B/96 hex) plus the
-        guest ``policy`` (DEBUG must be off) and a minimum reported TCB (anti-rollback); there is
-        no MRTD/RTMR concept. ``processor_model`` selects the AMD KDS/ARK (Genoa/Milan/Turin) and
-        ``id_key_digest`` optionally pins an owner id-block. mrtd/rtmrs are left empty for SNP.
+    TDX stores only the independent values: MRTD, RTMR0-2, and runtime RTMR3. Boot
+    RTMR3 is always zero and the full boot/runtime maps are derived properties. SNP
+    uses its launch measurement and policy fields, leaving the TDX scalars empty.
     """
 
     version: str
-    mrtd: str
     name: str
-    boot_rtmrs: Dict[str, str]
-    runtime_rtmrs: Dict[str, str]
     expected_gpus: List[str]
-    gpu_count: Optional[int] = None
-    # Optional infrastructure provider hint ("gcp" | "bare-metal"). Used for CPU (gpu_count==0)
-    # measurement configs; None for legacy GPU configs that don't specify it.
+    gpu_count: int
     provider: Optional[str] = None
-    # TEE provider discriminator: "tdx" (default) or "sev-snp".
     tee_type: str = "tdx"
+    debug: bool = False
+    rc: bool = False
+    # --- Intel TDX fields (empty for SNP) ---
+    mrtd: str = ""
+    rtmr0: str = ""
+    rtmr1: str = ""
+    rtmr2: str = ""
+    runtime_rtmr3: str = ""
     # --- AMD SEV-SNP fields (only set when tee_type == "sev-snp") ---
     measurement: Optional[str] = None  # 96 hex (48B SHA-384 launch digest)
     policy: Optional[int] = None  # guest policy bits (DEBUG bit must be off)
@@ -139,9 +140,6 @@ class TeeMeasurementConfig:
     # Keys are the undocumented ASN.1 context tags, deliberately kept numeric rather than assigned
     # local semantic names. GCP SNP verification requires exactly tags 2, 3, 4, and 5.
     vtpm_security_flags: Optional[Dict[str, bool]] = None
-    # Build posture is explicit in YAML. The loader never defaults a missing value to hardened:
-    # debug images retain known credentials/host-visible logging and require a validator opt-in.
-    debug: bool = False
     # Pin-side image binding. Managed production activation additionally requires canonical detached
     # cosign provenance and compares these fields plus the cryptographic measurement values to it.
     # Unsigned bindings are accepted only for explicit debug artifacts on an explicit dev validator.
@@ -150,6 +148,28 @@ class TeeMeasurementConfig:
     # Canonical identities assigned only after every configured source validates successfully.
     config_fingerprint: str = ""
     trust_set_fingerprint: str = ""
+
+    @property
+    def boot_rtmrs(self) -> Dict[str, str]:
+        if self.tee_type != "tdx":
+            return {}
+        return {
+            "RTMR0": self.rtmr0,
+            "RTMR1": self.rtmr1,
+            "RTMR2": self.rtmr2,
+            "RTMR3": ZERO_RTMR,
+        }
+
+    @property
+    def runtime_rtmrs(self) -> Dict[str, str]:
+        if self.tee_type != "tdx":
+            return {}
+        return {
+            "RTMR0": self.rtmr0,
+            "RTMR1": self.rtmr1,
+            "RTMR2": self.rtmr2,
+            "RTMR3": self.runtime_rtmr3,
+        }
 
 
 def measurement_config_fingerprint(config: TeeMeasurementConfig) -> str:
@@ -198,6 +218,11 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context) -> None:
         """Validate configuration after initialization."""
+        for cidr in self.trusted_proxy_cidrs:
+            try:
+                ipaddress.ip_network(cidr, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"Invalid TRUSTED_PROXY_CIDRS entry {cidr!r}") from exc
         # ALLOW_DEBUG_MEASUREMENTS is not a production escape hatch. The metagraph bypass is the
         # validator's explicit dev marker (including the dev-attested-mTLS posture); without that
         # marker, reject the opt-in itself before loading any debug pins.
@@ -293,12 +318,6 @@ class Settings(BaseSettings):
     )
     postgres_ro: Optional[str] = os.getenv("POSTGRESQL_RO")
 
-    # Invocations database.
-    invocations_db_url: Optional[str] = os.getenv(
-        "INVOCATIONS_DB_URL",
-        os.getenv("POSTGRESQL", "postgresql+asyncpg://user:password@127.0.0.1:5432/chutes"),
-    )
-
     # asyncpg sslmode for the postgres connections. Defaults to "require" (prod hosted
     # postgres); set DB_SSL=disable for a local postgres that has no TLS.
     db_ssl: str = os.getenv("DB_SSL", "require")
@@ -308,6 +327,7 @@ class Settings(BaseSettings):
     aws_endpoint_url: Optional[str] = os.getenv("AWS_ENDPOINT_URL", "http://minio:9000")
     aws_region: str = os.getenv("AWS_REGION", "local")
     storage_bucket: str = os.getenv("STORAGE_BUCKET", "chutes")
+    s3_proxy_url: Optional[str] = os.getenv("S3_PROXY_URL")
 
     @property
     def s3_session(self) -> aioboto3.Session:
@@ -324,7 +344,10 @@ class Settings(BaseSettings):
         async with session.client(
             "s3",
             endpoint_url=self.aws_endpoint_url,
-            config=Config(signature_version="s3v4"),
+            config=Config(
+                signature_version="s3v4",
+                proxies={"https": self.s3_proxy_url} if self.s3_proxy_url else None,
+            ),
         ) as client:
             yield client
 
@@ -334,15 +357,14 @@ class Settings(BaseSettings):
     pg_encryption_key: Optional[str] = os.getenv("PG_ENCRYPTION_KEY", "secret")
 
     validator_ss58: Optional[str] = os.getenv("VALIDATOR_SS58")
-    storage_bucket: str = os.getenv("STORAGE_BUCKET", "REPLACEME")
 
     # Base redis settings.
     redis_host: str = Field(
-        default_factory=lambda: os.getenv("HOST_IP", "172.16.0.100"),
+        default_factory=lambda: os.getenv("REDIS_HOST", "172.16.0.100"),
         validation_alias="PRIMARY_REDIS_HOST",
     )
     redis_port: int = Field(
-        default=1600,
+        default_factory=lambda: int(os.getenv("REDIS_PORT", "6378")),
         validation_alias="PRIMARY_REDIS_PORT",
     )
     redis_password: str = str(os.getenv("REDIS_PASSWORD", "password"))
@@ -353,19 +375,22 @@ class Settings(BaseSettings):
     redis_op_timeout: float = float(
         os.getenv("REDIS_OP_TIMEOUT", os.getenv("REDIS_SOCKET_TIMEOUT", "2.5"))
     )
+    redis_cacert: Optional[str] = os.getenv("REDIS_CACERT")
 
     _redis_client: Optional[redis.Redis] = None
     _lite_redis_client: Optional[redis.Redis] = None
     _billing_redis_client: Optional[redis.Redis] = None
-    _cm_redis_clients: Optional[list[redis.Redis]] = None
-    cm_redis_shard_count: int = int(os.getenv("CM_REDIS_SHARD_COUNT", "6"))
-    cm_redis_start_port: int = int(os.getenv("CM_REDIS_START_PORT", "1700"))
-    cm_redis_socket_timeout: float = float(os.getenv("CM_REDIS_SOCKET_TIMEOUT", "30.0"))
-    cm_redis_op_timeout: float = float(os.getenv("CM_REDIS_OP_TIMEOUT", "2.5"))
+    _cm_redis_client: Optional[redis.Redis] = None
 
     @property
     def redis_url(self) -> str:
-        return f"redis://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
+        scheme = "rediss" if self.redis_cacert else "redis"
+        base = (
+            f"{scheme}://:{self.redis_password}@{self.redis_host}:{self.redis_port}/{self.redis_db}"
+        )
+        if self.redis_cacert:
+            return f"{base}?ssl_cert_reqs=required&ssl_ca_certs={self.redis_cacert}"
+        return base
 
     @property
     def redis_client(self) -> redis.Redis:
@@ -383,6 +408,7 @@ class Settings(BaseSettings):
                 health_check_interval=30,
                 retry_on_timeout=True,
                 retry=Retry(ConstantBackoff(0.5), 2),
+                ssl_ca_certs=self.redis_cacert,
             )
         return self._redis_client
 
@@ -402,6 +428,7 @@ class Settings(BaseSettings):
                 health_check_interval=30,
                 retry_on_timeout=True,
                 retry=Retry(ConstantBackoff(0.5), 2),
+                ssl_ca_certs=self.redis_cacert,
             )
         return self._lite_redis_client
 
@@ -421,30 +448,29 @@ class Settings(BaseSettings):
                 health_check_interval=30,
                 retry_on_timeout=True,
                 retry=Retry(ConstantBackoff(0.5), 2),
+                ssl_ca_certs=self.redis_cacert,
             )
         return self._billing_redis_client
 
     @property
-    def cm_redis_client(self) -> list[redis.Redis]:
-        if self._cm_redis_clients is None:
-            self._cm_redis_clients = [
-                SafeRedis(
-                    host=self.redis_host,
-                    port=self.cm_redis_start_port + idx,
-                    db=self.redis_db,
-                    password=self.redis_password,
-                    socket_connect_timeout=self.redis_connect_timeout,
-                    socket_timeout=self.cm_redis_socket_timeout,
-                    op_timeout=self.cm_redis_op_timeout,
-                    max_connections=self.redis_max_connections,
-                    socket_keepalive=True,
-                    health_check_interval=30,
-                    retry_on_timeout=True,
-                    retry=Retry(ConstantBackoff(0.5), 2),
-                )
-                for idx in range(self.cm_redis_shard_count)
-            ]
-        return self._cm_redis_clients
+    def cm_redis_client(self) -> redis.Redis:
+        if self._cm_redis_client is None:
+            self._cm_redis_client = SafeRedis(
+                host=self.redis_host,
+                port=self.redis_port,
+                db=self.redis_db + 3,
+                password=self.redis_password,
+                socket_connect_timeout=self.redis_connect_timeout,
+                socket_timeout=self.redis_socket_timeout,
+                op_timeout=self.redis_op_timeout,
+                max_connections=self.redis_max_connections,
+                socket_keepalive=True,
+                health_check_interval=30,
+                retry_on_timeout=True,
+                retry=Retry(ConstantBackoff(0.5), 2),
+                ssl_ca_certs=self.redis_cacert,
+            )
+        return self._cm_redis_client
 
     registry_host: str = os.getenv("REGISTRY_HOST", "registry:5000")
     registry_external_host: str = os.getenv("REGISTRY_EXTERNAL_HOST", "registry.chutes.ai")
@@ -488,6 +514,13 @@ class Settings(BaseSettings):
     require_mtls_client_verify: bool = (
         os.getenv("REQUIRE_MTLS_CLIENT_VERIFY", "true").lower() == "true"
     )
+    # X-Resolved-IP is proxy-owned and is accepted only from these directly connected networks.
+    # The chart explicitly supplies its internal pod CIDR; direct clients cannot opt themselves in.
+    trusted_proxy_cidrs: List[str] = [
+        value.strip()
+        for value in os.getenv("TRUSTED_PROXY_CIDRS", "127.0.0.0/8,::1/128").split(",")
+        if value.strip()
+    ]
 
     # Database settings.
     db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "16"))
@@ -616,6 +649,13 @@ class Settings(BaseSettings):
 
     # Auto stake amount when DCAing into alpha after receiving payments.
     autostake_amount: float = float(os.getenv("AUTOSTAKE_AMOUNT", "10.0"))
+
+    # Depot.dev settings (remote image building).
+    depot_token: str = os.getenv("DEPOT_TOKEN", "")
+    depot_project_id: str = os.getenv("DEPOT_PROJECT_ID", "")
+    depot_registry: str = os.getenv("DEPOT_REGISTRY", "")
+    depot_registry_token: str = os.getenv("DEPOT_REGISTRY_TOKEN", "")
+    depot_registry_rw_token: str = os.getenv("DEPOT_REGISTRY_RW_TOKEN", "")
 
     # Cosign Settings
     cosign_password: Optional[str] = os.getenv("COSIGN_PASSWORD")
@@ -797,6 +837,12 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"Invalid TEE measurement config {path}: document root must be a mapping."
                 )
+            unknown_document_fields = sorted(set(doc) - {"measurements", "revoked_measurements"})
+            if unknown_document_fields:
+                raise ValueError(
+                    f"Invalid TEE measurement config {path}: unsupported document field(s) "
+                    f"{unknown_document_fields}."
+                )
             raw_measurements = doc.get("measurements") or []
             if not isinstance(raw_measurements, list):
                 raise ValueError(
@@ -807,7 +853,13 @@ class Settings(BaseSettings):
                     raise ValueError(
                         f"Invalid TEE measurement config {path}: each measurement must be a mapping."
                     )
-                name = measurement_config.get("name", "unnamed")
+                name = measurement_config.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError(
+                        f"Invalid TEE measurement config {path}: every measurement requires "
+                        "a non-empty string name."
+                    )
+                name = name.strip()
                 if name in names_in_source:
                     raise ValueError(
                         f"Invalid TEE measurement config {path}: duplicate measurement name "
@@ -975,11 +1027,85 @@ class Settings(BaseSettings):
             provider = measurement_config.get("provider")
             if provider is not None:
                 provider = str(provider).strip().lower() or None
-            expected_gpus = [gpu.lower() for gpu in measurement_config.get("expected_gpus", [])]
+            raw_expected_gpus = measurement_config.get("expected_gpus")
+            if not isinstance(raw_expected_gpus, list) or any(
+                not isinstance(gpu, str) or not gpu.strip() for gpu in raw_expected_gpus
+            ):
+                raise ValueError(
+                    f"Invalid 'expected_gpus' for measurement config '{config_name}': "
+                    "expected a list of non-empty strings."
+                )
+            expected_gpus = [gpu.strip().lower() for gpu in raw_expected_gpus]
+            if len(expected_gpus) != len(set(expected_gpus)):
+                raise ValueError(
+                    f"Invalid 'expected_gpus' for measurement config '{config_name}': "
+                    "duplicate GPU identifiers are not allowed."
+                )
+            if gpu_count == 0 and expected_gpus:
+                raise ValueError(
+                    f"CPU-only measurement config '{config_name}' cannot declare expected_gpus."
+                )
+            if gpu_count > 0 and not expected_gpus:
+                raise ValueError(
+                    f"GPU measurement config '{config_name}' must declare expected_gpus."
+                )
             tee_type = (str(measurement_config.get("tee_type") or "tdx")).strip().lower()
+            if tee_type not in {"tdx", "sev-snp"}:
+                raise ValueError(
+                    f"Invalid tee_type for measurement config '{config_name}': "
+                    "expected exactly 'tdx' or 'sev-snp'."
+                )
+            if gpu_count == 0 and provider not in {"gcp", "bare-metal"}:
+                raise ValueError(
+                    f"CPU-only measurement config '{config_name}' must set provider to "
+                    "'gcp' or 'bare-metal'."
+                )
+            if provider is not None and provider not in {"gcp", "bare-metal"}:
+                raise ValueError(
+                    f"Invalid provider for measurement config '{config_name}': "
+                    "expected 'gcp' or 'bare-metal'."
+                )
+            raw_rc = measurement_config.get("rc", False)
+            if not isinstance(raw_rc, bool):
+                raise ValueError(
+                    f"Invalid 'rc' for measurement config '{config_name}': expected a YAML boolean."
+                )
+            rc = raw_rc
+
+            common_fields = {
+                "version",
+                "name",
+                "description",
+                "provider",
+                "tee_type",
+                "debug",
+                "rc",
+                "image_sha256",
+                "image_measurement_names",
+                "expected_gpus",
+                "gpu_count",
+            }
+            tdx_fields = {"mrtd", "rtmr0", "rtmr1", "rtmr2", "runtime_rtmr3"}
+            snp_fields = {
+                "measurement",
+                "policy",
+                "min_tcb",
+                "id_key_digest",
+                "processor_model",
+                "expected_vmpl",
+                "vtpm_pcrs",
+                "vtpm_security_flags",
+            }
+            allowed_fields = common_fields | (snp_fields if tee_type == "sev-snp" else tdx_fields)
+            unexpected_fields = sorted(set(measurement_config) - allowed_fields)
+            if unexpected_fields:
+                raise ValueError(
+                    f"Unsupported field(s) for canonical {tee_type} measurement config "
+                    f"'{config_name}': {unexpected_fields}."
+                )
 
             # --- AMD SEV-SNP: single launch measurement + policy + min-TCB; no MRTD/RTMRs ---
-            if tee_type in ("sev-snp", "snp", "amd-snp"):
+            if tee_type == "sev-snp":
                 measurement_hex = _require_hex96(
                     measurement_config.get("measurement"), "measurement"
                 )
@@ -1061,6 +1187,11 @@ class Settings(BaseSettings):
                 processor_model = (
                     str(measurement_config.get("processor_model") or "Genoa")
                 ).strip()
+                if processor_model not in {"Genoa", "Milan", "Turin"}:
+                    raise ValueError(
+                        f"Invalid processor_model for SNP measurement config '{config_name}': "
+                        "expected Genoa, Milan, or Turin."
+                    )
                 # GCP image identity: pinned GCE vTPM PCRs (sha256, 64 hex each). REQUIRED for
                 # provider 'gcp': there the SNP launch measurement is Google firmware only, so a
                 # config without vtpm_pcrs would match on firmware alone and never check WHICH
@@ -1160,14 +1291,12 @@ class Settings(BaseSettings):
                 measurements.append(
                     TeeMeasurementConfig(
                         version=str(version).strip(),
-                        mrtd="",
                         name=measurement_config["name"],
-                        boot_rtmrs={},
-                        runtime_rtmrs={},
                         expected_gpus=expected_gpus,
                         gpu_count=gpu_count,
                         provider=provider,
                         tee_type="sev-snp",
+                        rc=rc,
                         measurement=measurement_hex,
                         policy=policy,
                         min_tcb=min_tcb,
@@ -1183,66 +1312,29 @@ class Settings(BaseSettings):
                 )
                 continue
 
-            # --- Intel TDX (default): MRTD + RTMR0-3 in both boot and runtime sets ---
-            mrtd_upper = _require_hex96(measurement_config.get("mrtd"), "MRTD")
-
-            # Every config MUST fully pin all four RTMRs in BOTH the boot and runtime
-            # sets. The matcher only compares the RTMRs that are present in the config,
-            # so a partially-specified config silently leaves the unlisted RTMRs
-            # unconstrained -- a measurement-bypass footgun (e.g. omitting RTMR3 would
-            # drop all runtime guest-stack enforcement). Reject it at load time.
-            #
-            # RTMR1/RTMR2 are LOAD-BEARING for the CPU-TEE integrity story, not optional
-            # hardening: /boot (kernel, initramfs, grub.cfg) lives OUTSIDE the dm-verity
-            # root, and the verity-roothash -> RTMR3 binding is performed by the initramfs
-            # rtmr3-measure/verity-open scripts measured into RTMR1 (initramfs+kernel) with
-            # the cmdline/grub.cfg in RTMR2. Without those pins a host could boot a tampered
-            # initramfs that extends RTMR3 with the expected value WITHOUT opening the
-            # verified root, voiding the agent/cosign integrity chain.
-            if not isinstance(measurement_config.get("boot_rtmrs"), dict) or not isinstance(
-                measurement_config.get("runtime_rtmrs"), dict
-            ):
-                raise ValueError(
-                    f"Measurement config '{config_name}' must define both 'boot_rtmrs' and "
-                    "'runtime_rtmrs' mappings."
-                )
-            boot_rtmrs = {
-                k.upper(): _require_hex96(v, f"boot_rtmrs.{k}")
-                for k, v in measurement_config["boot_rtmrs"].items()
-            }
-            runtime_rtmrs = {
-                k.upper(): _require_hex96(v, f"runtime_rtmrs.{k}")
-                for k, v in measurement_config["runtime_rtmrs"].items()
-            }
-            for set_name, rtmr_set in (
-                ("boot_rtmrs", boot_rtmrs),
-                ("runtime_rtmrs", runtime_rtmrs),
-            ):
-                missing = [r for r in ("RTMR0", "RTMR1", "RTMR2", "RTMR3") if r not in rtmr_set]
-                if missing:
-                    raise ValueError(
-                        f"Measurement config '{config_name}' is missing {', '.join(missing)} in "
-                        f"{set_name}; every config must pin RTMR0-3 in both the boot and runtime sets."
-                    )
-
-            if boot_rtmrs.get("RTMR0") != runtime_rtmrs.get("RTMR0"):
-                logger.warning(
-                    f"RTMR0 mismatch between boot and runtime for measurement config {config_name}. "
-                    "This is unexpected - RTMR0 should be the same (ACPI tables don't change)."
-                )
+            # --- Intel TDX: canonical normalized scalars. RTMR0-2 are identical at boot/runtime;
+            # boot RTMR3 is fixed to zero and runtime RTMR3 binds the measured guest stack.
+            mrtd_upper = _require_hex96(measurement_config.get("mrtd"), "mrtd")
+            rtmr0 = _require_hex96(measurement_config.get("rtmr0"), "rtmr0")
+            rtmr1 = _require_hex96(measurement_config.get("rtmr1"), "rtmr1")
+            rtmr2 = _require_hex96(measurement_config.get("rtmr2"), "rtmr2")
+            runtime_rtmr3 = _require_hex96(measurement_config.get("runtime_rtmr3"), "runtime_rtmr3")
 
             measurements.append(
                 TeeMeasurementConfig(
                     version=str(version).strip(),
-                    mrtd=mrtd_upper,
                     name=measurement_config["name"],
-                    boot_rtmrs=boot_rtmrs,
-                    runtime_rtmrs=runtime_rtmrs,
                     expected_gpus=expected_gpus,
                     gpu_count=gpu_count,
                     provider=provider,
                     tee_type="tdx",
                     debug=is_debug,
+                    rc=rc,
+                    mrtd=mrtd_upper,
+                    rtmr0=rtmr0,
+                    rtmr1=rtmr1,
+                    rtmr2=rtmr2,
+                    runtime_rtmr3=runtime_rtmr3,
                     image_sha256=image_sha256,
                     image_measurement_names=image_measurement_names,
                 )
@@ -1285,15 +1377,14 @@ class Settings(BaseSettings):
 
         Returns TEE_MINIMUM_BOOT_VERSION when set, allowing new platform measurement
         configs to be added to the YAML incrementally without immediately enforcing a
-        version bump for platforms not yet upgraded.  Falls back to the highest version
-        found across all loaded measurement configs, or "0.0.0" if the config file is
-        not present (e.g. pods that don't mount the TEE measurements ConfigMap).
+        version bump for platforms not yet upgraded. Falls back to the highest non-RC
+        version in the complete trust set, or "0.0.0" when no source is present.
         """
         if pinned := os.getenv("TEE_MINIMUM_BOOT_VERSION"):
             return pinned
         if not self._measurement_source_paths():
             return "0.0.0"
-        versions = [m.version for m in self.tee_measurements if m.version]
+        versions = [m.version for m in self.tee_measurements if m.version and not m.rc]
         if not versions:
             return "0.0.0"
         latest = versions[0]
@@ -1302,7 +1393,6 @@ class Settings(BaseSettings):
                 latest = v
         return latest
 
-    luks_passphrase: Optional[str] = os.getenv("LUKS_PASSPHRASE")
     cache_passphrase_key: Optional[str] = os.getenv("CACHE_PASSPHRASE_KEY")
 
     # TDX verification service URLs (if using Intel's remote verification)
@@ -1319,6 +1409,15 @@ class Settings(BaseSettings):
     agent_registration_threshold: float = float(os.getenv("AGENT_REGISTRATION_THRESHOLD", "50.0"))
     agent_registration_tolerance: float = float(os.getenv("AGENT_REGISTRATION_TOLERANCE", "0.10"))
     agent_registration_ttl_hours: int = int(os.getenv("AGENT_REGISTRATION_TTL_HOURS", "24"))
+
+    # TEE server health materialization.
+    server_health_degraded_threshold_seconds: int = int(
+        os.getenv("SERVER_HEALTH_DEGRADED_THRESHOLD_SECONDS", str(12 * 3600))
+    )
+    server_health_offline_threshold_seconds: int = int(
+        os.getenv("SERVER_HEALTH_OFFLINE_THRESHOLD_SECONDS", str(72 * 3600))
+    )
+    server_health_max_concurrent: int = int(os.getenv("SERVER_HEALTH_MAX_CONCURRENT", "32"))
 
 
 # Subscription tier: quota -> monthly price in USD (canonical values only).

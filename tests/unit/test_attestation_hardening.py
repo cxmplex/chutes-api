@@ -821,11 +821,7 @@ async def test_snp_recently_expired_cache_is_used_only_during_real_kds_outage():
     recently_expired = _crl(issuer, key, expired=True)
     encoded = recently_expired.public_bytes(serialization.Encoding.DER)
     redis = _Redis(
-        {
-            "snp:crl:Genoa": snp_verify._crl_cache_payload(
-                encoded, recently_expired, issuer
-            )
-        }
+        {"snp:crl:Genoa": snp_verify._crl_cache_payload(encoded, recently_expired, issuer)}
     )
     with patch.object(
         snp_verify,
@@ -850,11 +846,7 @@ async def test_snp_grace_never_masks_malformed_kds_revocation_state():
     recently_expired = _crl(issuer, key, expired=True)
     encoded = recently_expired.public_bytes(serialization.Encoding.DER)
     redis = _Redis(
-        {
-            "snp:crl:Genoa": snp_verify._crl_cache_payload(
-                encoded, recently_expired, issuer
-            )
-        }
+        {"snp:crl:Genoa": snp_verify._crl_cache_payload(encoded, recently_expired, issuer)}
     )
     with patch.object(
         snp_verify,
@@ -943,9 +935,7 @@ def test_snp_crl_outage_grace_has_a_hard_safe_maximum():
             outage_grace_seconds=MAX_SNP_CRL_OUTAGE_GRACE_SECONDS + 1,
         )
     with pytest.raises(ValueError, match="SNP_CRL_OUTAGE_GRACE_SECONDS"):
-        Settings(
-            snp_crl_outage_grace_seconds=MAX_SNP_CRL_OUTAGE_GRACE_SECONDS + 1
-        )
+        Settings(snp_crl_outage_grace_seconds=MAX_SNP_CRL_OUTAGE_GRACE_SECONDS + 1)
 
 
 @pytest.mark.asyncio

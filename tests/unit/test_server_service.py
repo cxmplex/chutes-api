@@ -26,7 +26,6 @@ from api.server.service import (
     update_server_name,
     get_server_attestation_status,
     delete_server,
-    process_luks_passphrase_request,
 )
 from api.server.schemas import (
     Server,
@@ -34,8 +33,6 @@ from api.server.schemas import (
     BootAttestation,
     BootAttestationArgs,
     BootAttestationNonceContext,
-    LuksCapabilityContext,
-    LuksCapabilityPurpose,
     RuntimeAttestationArgs,
     ServerArgs,
 )
@@ -68,18 +65,10 @@ def _tee_measurements_for_service_tests():
             version="1",
             mrtd="a" * 96,
             name="test",
-            boot_rtmrs={
-                "RTMR0": "b" * 96,
-                "RTMR1": "c" * 96,
-                "RTMR2": "d" * 96,
-                "RTMR3": "e" * 96,
-            },
-            runtime_rtmrs={
-                "RTMR0": "d" * 96,
-                "RTMR1": "e" * 96,
-                "RTMR2": "f" * 96,
-                "RTMR3": "0" * 96,
-            },
+            rtmr0="b" * 96,
+            rtmr1="c" * 96,
+            rtmr2="d" * 96,
+            runtime_rtmr3="e" * 96,
             expected_gpus=["h200"],
             gpu_count=1,
             provider="bare-metal",
@@ -171,7 +160,7 @@ def sample_boot_quote():
         rtmr0="b" * 96,
         rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         report_data=None,
         user_data="746573745f6e6f6e63655f31323300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",  # TEST_NONCE
         platform_id="0" * 32,
@@ -189,10 +178,10 @@ def sample_runtime_quote():
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="d" * 96,
-        rtmr1="e" * 96,
-        rtmr2="f" * 96,
-        rtmr3="0" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
         report_data=None,
         user_data="72756e74696d655f6e6f6e63655f34353600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",  # runtime_nonce_456
         platform_id="0" * 32,
@@ -210,7 +199,7 @@ def sample_verification_result():
         rtmr0="b" * 96,
         rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         user_data="test_data",
         parsed_at=datetime.now(timezone.utc),
         status="UpToDate",
@@ -298,25 +287,6 @@ def boot_nonce_context(sample_server):
         miner_hotkey=sample_server.miner_hotkey,
         vm_name=sample_server.name,
         cert_hash=TEST_CERT_HASH,
-        storage_role=False,
-        allowed_volumes=["storage", "tdx-cache"],
-    )
-
-
-@pytest.fixture
-def boot_luks_capability(sample_server):
-    measurement = _tee_measurements_for_service_tests()[0]
-    return LuksCapabilityContext(
-        purpose=LuksCapabilityPurpose.BOOT,
-        server_id=sample_server.server_id,
-        miner_hotkey=sample_server.miner_hotkey,
-        vm_name=sample_server.name,
-        cert_hash=TEST_CERT_HASH,
-        measurement_name="test",
-        measurement_version="1",
-        measurement_config_fingerprint=measurement_config_fingerprint(measurement),
-        trust_set_fingerprint=measurement_trust_set_fingerprint([measurement]),
-        tee_type="tdx",
         storage_role=False,
         allowed_volumes=["storage", "tdx-cache"],
     )
@@ -526,8 +496,9 @@ async def test_process_boot_attestation_success(
 
         with (
             patch(
-                "api.server.service.generate_and_store_boot_token",
-                return_value="test-boot-token",
+                "api.server.service.generate_luks_quote_nonce",
+                new_callable=AsyncMock,
+                return_value="test-luks-nonce",
             ),
             patch(
                 "api.server.service._handle_boot_version_update",
@@ -543,8 +514,7 @@ async def test_process_boot_attestation_success(
                 TEST_CERT_HASH,
             )
 
-        # Measurement version "1" < 1.3.0 -> legacy boot-token path, no luks nonce.
-        assert result == ("test-boot-token", None)
+        assert result == "test-luks-nonce"
 
         # Verify database operations
         mock_db_session.add.assert_called_once()
@@ -932,59 +902,6 @@ async def test_update_server_name_conflict(mock_db_session, sample_server):
     mock_db_session.rollback.assert_called_once()
 
 
-# LUKS passphrase tests
-
-
-@pytest.mark.asyncio
-async def test_sync_luks_passphrase(
-    mock_db_session,
-    mock_redis_client,
-    sample_server,
-    boot_luks_capability,
-):
-    """Test POST LUKS sync: validates token, calls sync_server_luks_passphrases, consumes token."""
-    boot_token = "test-boot-token"
-    volume_names = ["storage", "tdx-cache"]
-    rekey = ["tdx-cache"]
-
-    with (
-        patch(
-            "api.server.service._get_boot_token_context",
-            new_callable=AsyncMock,
-            return_value=boot_luks_capability,
-        ),
-        patch(
-            "api.server.service._validate_luks_capability_identity",
-            new_callable=AsyncMock,
-            return_value=sample_server,
-        ),
-        patch(
-            "api.server.service.sync_server_luks_passphrases",
-            AsyncMock(return_value={"storage": "pass1", "tdx-cache": "pass2_new"}),
-        ) as mock_sync,
-        patch("api.server.service.settings") as mock_settings,
-    ):
-        mock_settings.redis_client.delete = AsyncMock(return_value=1)
-        result = await process_luks_passphrase_request(
-            mock_db_session,
-            boot_token,
-            sample_server.server_id,
-            sample_server.miner_hotkey,
-            TEST_CERT_HASH,
-            volume_names,
-            rekey_volume_names=rekey,
-        )
-        assert result == {"storage": "pass1", "tdx-cache": "pass2_new"}
-        mock_sync.assert_called_once_with(
-            mock_db_session,
-            sample_server.miner_hotkey,
-            sample_server.name,
-            volume_names,
-            rekey_volume_names=rekey,
-        )
-        mock_settings.redis_client.delete.assert_called_once()
-
-
 # Edge Cases and Error Handling Tests
 
 
@@ -1081,7 +998,7 @@ async def test_full_boot_flow_end_to_end(
         rtmr0="b" * 96,
         rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         report_data=None,
         user_data="626f6f745f6e6f6e63655f31323300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",  # boot_nonce_123
         platform_id="0" * 32,
@@ -1103,7 +1020,7 @@ async def test_full_boot_flow_end_to_end(
                 rtmr0="b" * 96,
                 rtmr1="c" * 96,
                 rtmr2="d" * 96,
-                rtmr3="e" * 96,
+                rtmr3="0" * 96,
                 user_data="test",
                 parsed_at=datetime.now(timezone.utc),
                 status="UpToDate",
@@ -1119,8 +1036,9 @@ async def test_full_boot_flow_end_to_end(
 
             with (
                 patch(
-                    "api.server.service.generate_and_store_boot_token",
-                    return_value="test-boot-token",
+                    "api.server.service.generate_luks_quote_nonce",
+                    new_callable=AsyncMock,
+                    return_value="test-luks-nonce",
                 ),
                 patch(
                     "api.server.service._handle_boot_version_update",
@@ -1136,8 +1054,7 @@ async def test_full_boot_flow_end_to_end(
                     TEST_CERT_HASH,
                 )
 
-            # Measurement version "1" < 1.3.0 -> legacy boot-token path, no luks nonce.
-            assert result == ("test-boot-token", None)
+            assert result == "test-luks-nonce"
 
 
 @pytest.mark.asyncio
@@ -1166,10 +1083,10 @@ async def test_full_runtime_flow_end_to_end(
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="d" * 96,
-        rtmr1="e" * 96,
-        rtmr2="f" * 96,
-        rtmr3="0" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
+        rtmr3="e" * 96,
         report_data=None,
         user_data="72756e74696d655f6e6f6e63655f34353600000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",  # runtime_nonce_456
         platform_id="0" * 32,
@@ -1185,10 +1102,10 @@ async def test_full_runtime_flow_end_to_end(
             with patch("api.server.util.verify_quote_signature") as mock_verify:
                 mock_verify.return_value = TdxVerificationResult(
                     mrtd="a" * 96,
-                    rtmr0="d" * 96,
-                    rtmr1="e" * 96,
-                    rtmr2="f" * 96,
-                    rtmr3="0" * 96,
+                    rtmr0="b" * 96,
+                    rtmr1="c" * 96,
+                    rtmr2="d" * 96,
+                    rtmr3="e" * 96,
                     user_data="test",
                     parsed_at=datetime.now(timezone.utc),
                     status="UpToDate",
@@ -1354,16 +1271,16 @@ async def test_multiple_nonce_operations_concurrent(mock_settings):
 
 @pytest.mark.asyncio
 async def test_verify_quote_boot_vs_runtime_different_settings(mock_settings):
-    """Test that boot and runtime quotes use different verification settings."""
+    """Boot/runtime share RTMR0-2 and use zero versus measured RTMR3."""
     boot_quote = BootTdxQuote(
         version=4,
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="boot_specific_rtmr0",
-        rtmr1="boot_specific_rtmr1",
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         report_data=None,
         user_data="test",
         platform_id="0" * 32,
@@ -1377,9 +1294,9 @@ async def test_verify_quote_boot_vs_runtime_different_settings(mock_settings):
         att_key_type=2,
         tee_type=0x81,
         mrtd="a" * 96,
-        rtmr0="runtime_specific_rtmr0",
-        rtmr1="runtime_specific_rtmr1",
-        rtmr2="h" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
         rtmr3="i" * 96,
         report_data=None,
         user_data="test",
@@ -1394,30 +1311,22 @@ async def test_verify_quote_boot_vs_runtime_different_settings(mock_settings):
             version="1",
             mrtd="a" * 96,
             name="test",
-            boot_rtmrs={
-                "RTMR0": "boot_specific_rtmr0",
-                "RTMR1": "boot_specific_rtmr1",
-                "RTMR2": "d" * 96,
-                "RTMR3": "e" * 96,
-            },
-            runtime_rtmrs={
-                "RTMR0": "runtime_specific_rtmr0",
-                "RTMR1": "runtime_specific_rtmr1",
-                "RTMR2": "h" * 96,
-                "RTMR3": "i" * 96,
-            },
+            rtmr0="b" * 96,
+            rtmr1="c" * 96,
+            rtmr2="d" * 96,
+            runtime_rtmr3="i" * 96,
             expected_gpus=[],
-            gpu_count=None,
+            gpu_count=0,
         ),
     ]
 
     # DCAP result must match each quote for verify_result(); return matching result per call
     boot_dcap_result = TdxVerificationResult(
         mrtd="a" * 96,
-        rtmr0="boot_specific_rtmr0",
-        rtmr1="boot_specific_rtmr1",
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
         rtmr2="d" * 96,
-        rtmr3="e" * 96,
+        rtmr3="0" * 96,
         user_data="test",
         parsed_at=datetime.now(timezone.utc),
         status="UpToDate",
@@ -1426,9 +1335,9 @@ async def test_verify_quote_boot_vs_runtime_different_settings(mock_settings):
     )
     runtime_dcap_result = TdxVerificationResult(
         mrtd="a" * 96,
-        rtmr0="runtime_specific_rtmr0",
-        rtmr1="runtime_specific_rtmr1",
-        rtmr2="h" * 96,
+        rtmr0="b" * 96,
+        rtmr1="c" * 96,
+        rtmr2="d" * 96,
         rtmr3="i" * 96,
         user_data="test",
         parsed_at=datetime.now(timezone.utc),
@@ -1658,18 +1567,10 @@ def _cpu_measurement_config():
         version="1",
         mrtd="a" * 96,
         name="cpu-gcp",
-        boot_rtmrs={
-            "RTMR0": "d" * 96,
-            "RTMR1": "e" * 96,
-            "RTMR2": "f" * 96,
-            "RTMR3": "0" * 96,
-        },
-        runtime_rtmrs={
-            "RTMR0": "d" * 96,
-            "RTMR1": "e" * 96,
-            "RTMR2": "f" * 96,
-            "RTMR3": "0" * 96,
-        },
+        rtmr0="d" * 96,
+        rtmr1="e" * 96,
+        rtmr2="f" * 96,
+        runtime_rtmr3="0" * 96,
         expected_gpus=[],
         gpu_count=0,
         provider="gcp",

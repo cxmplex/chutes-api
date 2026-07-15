@@ -28,6 +28,14 @@ from api.instance.util import load_job_from_jwt, create_job_jwt
 router = APIRouter()
 
 
+def job_compute_multiplier(node_selector: NodeSelector) -> float:
+    """Apply the legacy H200 queue boost only to GPU-only H200 jobs."""
+    multiplier = node_selector.compute_multiplier
+    if node_selector.compute_type == "gpu" and set(node_selector.supported_gpus) == {"h200"}:
+        multiplier *= 16
+    return multiplier
+
+
 async def get_job_by_id(
     db: AsyncSession,
     job_id: str,
@@ -135,7 +143,7 @@ async def create_job(
 
     # Cleverly determine compute multiplier, such that jobs have equal priority to normal chutes.
     node_selector = NodeSelector(**chute.node_selector)
-    compute_multiplier = node_selector.compute_multiplier
+    compute_multiplier = job_compute_multiplier(node_selector)
 
     # Disk requirements?
     job_args = await request.json()
@@ -149,16 +157,6 @@ async def create_job(
     if not disk_gb:
         disk_gb = 10
     job_args["_disk_gb"] = int(disk_gb)
-
-    # XXX for this version, we'll be.. not clever - ultimately needs a way
-    # to calculate the maximum any particular GPU is getting at any point in time.
-    if not set(node_selector.supported_gpus) - set(["h200"]):
-        # 2025-07-08: all h200 chutes are at max capacity really, so we need
-        # the multiplier to be quite aggressive. Each of those chutes have
-        # 16-20 concurrency specified, meaning each node can have far more
-        # compute units than just the baseline, i.e. they are getting
-        # 16-20x the compute units at any given time.
-        compute_multiplier *= 16
 
     # Create the job.
     job = Job(
