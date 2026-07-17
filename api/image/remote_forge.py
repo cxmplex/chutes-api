@@ -1098,12 +1098,14 @@ async def _forge(image_id: str):
             # image as errored instead of crashing the orker and orphaning it in "building".
             async with settings.s3_client() as s3:
                 await s3.download_file(
-                    settings.storage_bucket, f"forge/{image.user_id}/{image_id}.zip", context_path
+                    settings.storage_bucket,
+                    f"forge/{image.user_id}/{image.artifact_id}.zip",
+                    context_path,
                 )
             async with settings.s3_client() as s3:
                 await s3.download_file(
                     settings.storage_bucket,
-                    f"forge/{image.user_id}/{image_id}.Dockerfile",
+                    f"forge/{image.user_id}/{image.artifact_id}.Dockerfile",
                     dockerfile_path,
                 )
             os.chdir(build_dir)
@@ -1120,7 +1122,7 @@ async def _forge(image_id: str):
             os.chdir(starting_dir)
 
         if os.path.exists(log_path := os.path.join(build_dir, "build.log")):
-            destination = f"forge/{image.user_id}/{image.image_id}.log"
+            destination = f"forge/{image.user_id}/{image.artifact_id}.log"
             async with settings.s3_client() as s3:
                 await s3.upload_file(log_path, settings.storage_bucket, destination)
 
@@ -1618,7 +1620,7 @@ RUN --mount=type=secret,id=cfsv_op,mode=0444 CFSV_OP="$(cat /run/secrets/cfsv_op
                     package_hashes = json.loads(infile.read())
 
             # Upload cfsv data.
-            s3_key = f"image_hash_blobs/{image_id}/{patch_version}.data"
+            s3_key = f"image_hash_blobs/{image.artifact_id}/{patch_version}.data"
             async with settings.s3_client() as s3:
                 await s3.upload_file(data_file_path, settings.storage_bucket, s3_key)
             logger.success(f"Uploaded filesystem verification data to {s3_key}")
@@ -1631,7 +1633,7 @@ RUN --mount=type=secret,id=cfsv_op,mode=0444 CFSV_OP="$(cat /run/secrets/cfsv_op
                 bytecode_manifest_json_path = None
 
             if bytecode_manifest_path:
-                manifest_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest"
+                manifest_s3_key = f"image_hash_blobs/{image.artifact_id}/{patch_version}.manifest"
                 async with settings.s3_client() as s3:
                     await s3.upload_file(
                         bytecode_manifest_path, settings.storage_bucket, manifest_s3_key
@@ -1639,7 +1641,9 @@ RUN --mount=type=secret,id=cfsv_op,mode=0444 CFSV_OP="$(cat /run/secrets/cfsv_op
                 logger.success(f"Uploaded bytecode manifest to {manifest_s3_key}")
 
             if bytecode_manifest_json_path:
-                manifest_json_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest.json"
+                manifest_json_s3_key = (
+                    f"image_hash_blobs/{image.artifact_id}/{patch_version}.manifest.json"
+                )
                 async with settings.s3_client() as s3:
                     await s3.upload_file(
                         bytecode_manifest_json_path, settings.storage_bucket, manifest_json_s3_key

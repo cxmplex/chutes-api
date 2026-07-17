@@ -4,10 +4,12 @@ Tests TDX quote parsing, validation, and utility functions.
 """
 
 import base64
+import json
 import pytest
 import secrets
 import struct
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch, AsyncMock, Mock
 
 from api.config import TeeMeasurementConfig
@@ -19,6 +21,8 @@ from api.server.util import (
     verify_result,
     get_matching_measurement_config,
     extract_nonce,
+    _extract_tdx_v4_qe_isv_svn,
+    _resolve_authenticated_qe_tcb_status,
 )
 from api.server.quote import (
     TdxQuote,
@@ -324,6 +328,31 @@ def test_missing_or_invalid_td_attributes_treated_as_debug():
     assert _result_with_td_attributes("0100000000000000").is_valid is False
 
 
+@pytest.mark.parametrize(
+    "td_attributes",
+    [
+        "0000000000000000",  # SEPT_VE_DISABLE is absent
+        "0200001000000000",  # reserved TUD bit 1
+        "0001001000000000",  # reserved SEC bit 8
+        "0000003000000000",  # reserved SEC bit 29
+        "0000001001000000",  # reserved OTHER bit 32
+        "0000001000000080",  # PERFMON/bit 63 is rejected by dcap-qvl 0.5.3
+    ],
+)
+def test_tdx_reserved_or_missing_required_attributes_rejected(td_attributes):
+    result = _result_with_td_attributes(td_attributes)
+    assert result.td_attributes_valid is False
+    assert result.is_valid is False
+
+
+def test_tdx_documented_non_reserved_attributes_are_allowed():
+    # SEPT_VE_DISABLE + PKS + KL are the non-debug bits accepted by the fallback.
+    result = _result_with_td_attributes("000000d000000000")
+    assert result.td_attributes_valid is True
+    assert result.debug_enabled is False
+    assert result.is_valid is True
+
+
 # Utility function tests
 def test_generate_nonce():
     """Test nonce generation."""
@@ -612,6 +641,52 @@ def test_verify_result_raises_when_rtmr_differs_from_dcap_result(sample_boot_quo
 
 
 # Quote signature verification tests
+def _qe_identity_json(status="UpToDate", advisory_ids=None):
+    level = {
+        "tcb": {"isvsvn": 4},
+        "tcbStatus": status,
+    }
+    if advisory_ids is not None:
+        level["advisoryIDs"] = advisory_ids
+    return json.dumps(
+        {
+            "id": "TD_QE",
+            "version": 2,
+            "tcbLevels": [level],
+        }
+    )
+
+
+def _committed_fallback_quote(td_attributes=None):
+    raw_quote = bytearray(Path("tests/assets/quote.bin").read_bytes())
+    if td_attributes is not None:
+        # TDREPORT10 starts at byte 48; TDATTRIBUTES follows
+        # TEE_TCB_SVN, MRSEAM, MRSIGNERSEAM, and SEAMATTRIBUTES.
+        raw_quote[168:176] = bytes.fromhex(td_attributes)
+    return BootTdxQuote.from_bytes(bytes(raw_quote))
+
+
+def _fallback_collateral(status="UpToDate", advisory_ids=None):
+    tcb_info = json.loads(Path("tests/assets/tdx_tcb_90C06F000000.json").read_text())["tcbInfo"]
+    collateral = Mock()
+    collateral.tcb_info = json.dumps(tcb_info)
+    collateral.qe_identity = _qe_identity_json(status, advisory_ids)
+    return collateral
+
+
+def test_qe_tcb_status_is_extracted_from_authenticated_qe_report():
+    quote = _committed_fallback_quote()
+    assert _extract_tdx_v4_qe_isv_svn(quote.raw_bytes) == 6
+    assert _resolve_authenticated_qe_tcb_status(quote.raw_bytes, _qe_identity_json()) == (
+        "UpToDate",
+        [],
+    )
+    assert _resolve_authenticated_qe_tcb_status(
+        quote.raw_bytes,
+        _qe_identity_json("OutOfDate", ["INTEL-SA-QE"]),
+    ) == ("OutOfDate", ["INTEL-SA-QE"])
+
+
 @pytest.mark.asyncio
 async def test_verify_quote_signature_success(sample_boot_quote):
     """Test successful quote signature verification (collateral fetch + pinned-root verify)."""
@@ -662,7 +737,7 @@ async def test_module_identity_fallback_preserves_pinned_root_verification(sampl
         ),
         patch(
             "api.server.util.verify_with_root_ca",
-            side_effect=ValueError("No matching TCB level found"),
+            side_effect=ValueError("Verification failed: No matching TCB level found"),
         ) as pinned_verify,
         patch(
             "api.server.util._resolve_tdx_tcb_via_module_identity",
@@ -674,6 +749,113 @@ async def test_module_identity_fallback_preserves_pinned_root_verification(sampl
     assert pinned_verify.call_args.args[2] == INTEL_SGX_ROOT_CA_DER
     fallback.assert_called_once()
     assert fallback.call_args.args[1] is collateral
+
+
+@pytest.mark.asyncio
+async def test_module_identity_fallback_preserves_qe_tcb_verdict():
+    quote = _committed_fallback_quote()
+    collateral = _fallback_collateral()
+    with (
+        patch(
+            "api.server.util.get_collateral",
+            new_callable=AsyncMock,
+            return_value=collateral,
+        ),
+        patch(
+            "api.server.util.verify_with_root_ca",
+            side_effect=ValueError("Verification failed: No matching TCB level found"),
+        ),
+    ):
+        result = await verify_quote_signature(quote)
+
+    assert result.status == "UpToDate"
+    assert result.advisory_ids == []
+    assert result.td_attributes_valid is True
+    assert result.is_valid is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("qe_status", "advisory_ids"),
+    [
+        ("OutOfDate", []),
+        ("UpToDate", ["INTEL-SA-QE"]),
+        ("Revoked", []),
+    ],
+)
+async def test_module_identity_fallback_rejects_qe_tcb_policy(qe_status, advisory_ids):
+    quote = _committed_fallback_quote()
+    collateral = _fallback_collateral(qe_status, advisory_ids)
+    with (
+        patch(
+            "api.server.util.get_collateral",
+            new_callable=AsyncMock,
+            return_value=collateral,
+        ),
+        patch(
+            "api.server.util.verify_with_root_ca",
+            side_effect=ValueError("Verification failed: No matching TCB level found"),
+        ),
+    ):
+        with pytest.raises(InvalidSignatureError):
+            await verify_quote_signature(quote)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "td_attributes",
+    [
+        "0100001000000000",  # DEBUG
+        "0000000000000000",  # SEPT_VE_DISABLE absent
+        "0200001000000000",  # reserved TUD bit
+        "0000003000000000",  # reserved SEC bit
+        "0000001000000080",  # OTHER/PERFMON bit
+    ],
+)
+async def test_module_identity_fallback_rejects_unsafe_td_attributes(td_attributes):
+    quote = _committed_fallback_quote(td_attributes)
+    collateral = _fallback_collateral()
+    with (
+        patch(
+            "api.server.util.get_collateral",
+            new_callable=AsyncMock,
+            return_value=collateral,
+        ),
+        patch(
+            "api.server.util.verify_with_root_ca",
+            side_effect=ValueError("Verification failed: No matching TCB level found"),
+        ),
+    ):
+        with pytest.raises(InvalidSignatureError):
+            await verify_quote_signature(quote)
+
+
+@pytest.mark.asyncio
+async def test_module_identity_fallback_is_version_and_error_exact(sample_boot_quote):
+    fallback_result = _sample_verification_result()
+    for verifier_version, error_message in (
+        ("0.5.4", "Verification failed: No matching TCB level found"),
+        ("0.5.3", "wrapped No matching TCB level found failure"),
+    ):
+        with (
+            patch(
+                "api.server.util.get_collateral",
+                new_callable=AsyncMock,
+                return_value=Mock(),
+            ),
+            patch("api.server.util.DCAP_QVL_VERSION", verifier_version),
+            patch(
+                "api.server.util.verify_with_root_ca",
+                side_effect=ValueError(error_message),
+            ),
+            patch(
+                "api.server.util._resolve_tdx_tcb_via_module_identity",
+                return_value=fallback_result,
+            ) as fallback,
+        ):
+            with pytest.raises(InvalidQuoteError):
+                await verify_quote_signature(sample_boot_quote)
+        fallback.assert_not_called()
 
 
 @pytest.mark.asyncio

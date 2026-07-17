@@ -21,9 +21,19 @@ from api.database import Base
 from api.log import image_logger, LifecycleEvent
 
 
+def _artifact_id_default(context):
+    image_id = context.get_current_parameters().get("image_id")
+    if not image_id:
+        raise ValueError("image_id is required to derive artifact_id")
+    return image_id
+
+
 class Image(Base):
     __tablename__ = "images"
     image_id = Column(String, primary_key=True, default="replaceme")
+    # Immutable S3 namespace for source bundles, logs, and verification blobs.
+    # The compute-class ID migration rekeys image_id while preserving existing objects here.
+    artifact_id = Column(String, nullable=False, default=_artifact_id_default)
     user_id = Column(String, ForeignKey("users.user_id"), nullable=False)
     name = Column(String, nullable=False)
     tag = Column(String, nullable=False)
@@ -49,6 +59,7 @@ class Image(Base):
         Index("idx_name_public", "name", "public"),
         Index("idx_name_created_at", "name", "created_at"),
         UniqueConstraint("user_id", "name", "tag", name="constraint_user_id_image_name_tag"),
+        UniqueConstraint("artifact_id", name="uq_images_artifact_id"),
         CheckConstraint(
             "compute_type IN ('cpu', 'gpu')",
             name="ck_images_compute_type",

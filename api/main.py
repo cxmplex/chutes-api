@@ -312,7 +312,16 @@ async def host_router_middleware(request: Request, call_next):
     """
     Route differentiation for hostname-based simple invocations.
     """
-    request.state.client_ip, request.state.has_resolved_ip = resolve_client_ip(request)
+    try:
+        request.state.client_ip, request.state.has_resolved_ip = resolve_client_ip(request)
+    except HTTPException as exc:
+        # Exceptions raised from user middleware bypass FastAPI's exception handlers and can
+        # otherwise surface as a 500 from Starlette's middleware stack.
+        return ORJSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers,
+        )
 
     if request.url.path == "/ping":
         app.router = default_router

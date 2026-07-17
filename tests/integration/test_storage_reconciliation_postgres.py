@@ -30,6 +30,7 @@ from api.config import (
 )
 from api.database import Base
 from api.database import migrations as database_migrations
+from api.image.util import image_id_for
 from api.metagraph import MetagraphNode
 from api.server.schemas import (
     ContentHolding,
@@ -205,6 +206,7 @@ FORWARD_MIGRATION_HAZARD_DDL = """
     ALTER TABLE servers DROP COLUMN IF EXISTS last_health_at;
     ALTER TABLE images ADD COLUMN IF NOT EXISTS cpu BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE images DROP COLUMN IF EXISTS compute_type;
+    ALTER TABLE images DROP COLUMN IF EXISTS artifact_id;
 """
 
 
@@ -1259,6 +1261,241 @@ async def test_orm_bootstrap_cannot_skip_secure_replication_quarantine():
         await admin.dispose()
 
 
+async def test_image_compute_type_migration_rekeys_legacy_rows():
+    schema = f"image_id_cutover_{uuid.uuid4().hex}"
+    admin = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    engine = None
+    username = "Alice"
+    user_id = f"image-cutover-{uuid.uuid4()}"
+    legacy_ids = {
+        "gpu-model": str(uuid.uuid5(uuid.NAMESPACE_OID, "alice/gpu-model:v1")),
+        "cpu-model": str(uuid.uuid5(uuid.NAMESPACE_OID, "alice/cpu-model:v1")),
+    }
+    canonical_ids = {
+        "gpu-model": image_id_for(username, "gpu-model", "v1", "gpu"),
+        "cpu-model": image_id_for(username, "cpu-model", "v1", "cpu"),
+    }
+    try:
+        async with admin.begin() as connection:
+            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+        engine = create_async_engine(
+            TEST_DATABASE_URL,
+            poolclass=NullPool,
+            connect_args={"server_settings": {"search_path": schema}},
+        )
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            raw = await connection.get_raw_connection()
+            await raw.driver_connection.execute(FORWARD_MIGRATION_HAZARD_DDL)
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO users (user_id, username, coldkey, fingerprint_hash)
+                    VALUES (:user_id, :username, 'coldkey', :fingerprint_hash)
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "username": username,
+                    "fingerprint_hash": uuid.uuid4().hex,
+                },
+            )
+            for index, (name, legacy_id) in enumerate(legacy_ids.items()):
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO images (
+                            image_id, user_id, name, tag, public, status, patch_version, cpu
+                        )
+                        VALUES (
+                            :image_id, :user_id, :name, 'v1', false,
+                            'built and pushed', 'initial', :cpu
+                        )
+                        """
+                    ),
+                    {
+                        "image_id": legacy_id,
+                        "user_id": user_id,
+                        "name": name,
+                        "cpu": name == "cpu-model",
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO image_history (
+                            entry_id, image_id, user_id, name, tag, public, status
+                        )
+                        VALUES (
+                            :entry_id, :image_id, :user_id, :name, 'v1', false,
+                            'built and pushed'
+                        )
+                        """
+                    ),
+                    {
+                        "entry_id": str(uuid.uuid4()),
+                        "image_id": legacy_id,
+                        "user_id": user_id,
+                        "name": name,
+                    },
+                )
+                chute_id = f"cutover-chute-{index}"
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO chutes (
+                            chute_id, user_id, name, image_id, cords, node_selector,
+                            code, filename, ref_str, public
+                        )
+                        VALUES (
+                            :chute_id, :user_id, :name, :image_id, '[]'::jsonb,
+                            CAST(:node_selector AS jsonb), 'pass', 'app.py', 'app:chute', false
+                        )
+                        """
+                    ),
+                    {
+                        "chute_id": chute_id,
+                        "user_id": user_id,
+                        "name": f"{name}-chute",
+                        "image_id": legacy_id,
+                        "node_selector": (
+                            '{"compute_type":"cpu","gpu_count":0}'
+                            if name == "cpu-model"
+                            else '{"compute_type":"gpu","gpu_count":1}'
+                        ),
+                    },
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO chute_history (
+                            entry_id, chute_id, user_id, version, name, image_id,
+                            cords, node_selector, code, filename, ref_str
+                        )
+                        VALUES (
+                            :entry_id, :chute_id, :user_id, 'v1', :name, :image_id,
+                            '[]'::jsonb, '{}'::jsonb, 'pass', 'app.py', 'app:chute'
+                        )
+                        """
+                    ),
+                    {
+                        "entry_id": str(uuid.uuid4()),
+                        "chute_id": chute_id,
+                        "user_id": user_id,
+                        "name": f"{name}-chute",
+                        "image_id": legacy_id,
+                    },
+                )
+            await connection.execute(
+                text(
+                    """
+                    CREATE TABLE partitioned_invocations (
+                        invocation_id TEXT PRIMARY KEY,
+                        image_id TEXT NOT NULL
+                    )
+                    """
+                )
+            )
+            for index, legacy_id in enumerate(legacy_ids.values()):
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO partitioned_invocations (invocation_id, image_id)
+                        VALUES (:invocation_id, :image_id)
+                        """
+                    ),
+                    {"invocation_id": f"inv-{index}", "image_id": legacy_id},
+                )
+
+            raw = await connection.get_raw_connection()
+            await raw.driver_connection.execute(
+                _migration_up_sql("20260715121000_image_compute_type.sql")
+            )
+
+        async with engine.connect() as connection:
+            image_rows = {
+                row.name: row
+                for row in (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT image_id, artifact_id, compute_type, name
+                            FROM images
+                            """
+                        )
+                    )
+                )
+            }
+            assert set(image_rows) == set(legacy_ids)
+            for name, row in image_rows.items():
+                assert row.image_id == canonical_ids[name]
+                assert row.artifact_id == legacy_ids[name]
+                assert row.compute_type == ("cpu" if name == "cpu-model" else "gpu")
+
+            for table in (
+                "chutes",
+                "image_history",
+                "chute_history",
+                "partitioned_invocations",
+            ):
+                migrated = set(
+                    (await connection.execute(text(f"SELECT image_id FROM {table}"))).scalars()
+                )
+                assert migrated == set(canonical_ids.values())
+
+            assert (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT update_rule
+                        FROM information_schema.referential_constraints
+                        WHERE constraint_schema = current_schema()
+                          AND constraint_name = (
+                              SELECT constraint_name
+                              FROM information_schema.key_column_usage
+                              WHERE table_schema = current_schema()
+                                AND table_name = 'chutes'
+                                AND column_name = 'image_id'
+                          )
+                        """
+                    )
+                )
+            ).scalar_one() == "CASCADE"
+
+        async with engine.begin() as connection:
+            raw = await connection.get_raw_connection()
+            await raw.driver_connection.execute(
+                _migration_down_sql("20260715121000_image_compute_type.sql")
+            )
+        async with engine.connect() as connection:
+            assert set(
+                (await connection.execute(text("SELECT image_id FROM images"))).scalars()
+            ) == set(legacy_ids.values())
+            columns = set(
+                (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT column_name
+                            FROM information_schema.columns
+                            WHERE table_schema = current_schema()
+                              AND table_name = 'images'
+                            """
+                        )
+                    )
+                ).scalars()
+            )
+            assert "cpu" in columns
+            assert "compute_type" not in columns
+            assert "artifact_id" not in columns
+    finally:
+        if engine is not None:
+            await engine.dispose()
+        async with admin.begin() as connection:
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        await admin.dispose()
+
+
 @pytest.mark.skipif(not DBMATE_BIN, reason="DBMATE_BIN is required for migration-runner test")
 @pytest.mark.parametrize("legacy_upgrade", [False, True])
 async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
@@ -1362,6 +1599,13 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
                                   AND column_name = 'compute_type'
                                   AND is_nullable = 'NO'
                             ),
+                            EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_schema = current_schema()
+                                  AND table_name = 'images'
+                                  AND column_name = 'artifact_id'
+                                  AND is_nullable = 'NO'
+                            ),
                             NOT EXISTS (
                                 SELECT 1 FROM information_schema.columns
                                 WHERE table_schema = current_schema()
@@ -1372,7 +1616,7 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
                     )
                 )
             ).one()
-            assert tuple(image_compute_shape) == (True, True)
+            assert tuple(image_compute_shape) == (True, True, True)
             assert (
                 await connection.execute(
                     text(

@@ -1,3 +1,6 @@
+{{- if and .Values.ingress.enabled .Values.ingress.cloudflareClientIp.enabled (empty (trim .Values.ingress.whitelistSourceRange)) }}
+{{- fail "ingress.cloudflareClientIp.enabled requires a non-empty ingress.whitelistSourceRange" }}
+{{- end }}
 {{- if .Values.ingress.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -18,7 +21,11 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "90"
+    {{- if .Values.ingress.cloudflareClientIp.enabled }}
     nginx.ingress.kubernetes.io/server-snippet: "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;"
+    {{- else }}
+    nginx.ingress.kubernetes.io/server-snippet: "proxy_set_header X-Resolved-IP $remote_addr;"
+    {{- end }}
     {{- with .Values.ingress.whitelistSourceRange }}
     nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
     {{- end }}

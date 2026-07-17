@@ -3,12 +3,11 @@ Stale-inventory sweep for TEE servers.
 
 Probes each TEE server that has a role-specific health endpoint. Legacy GPU rows use
 the attestation proxy; CPU/storage rows are skipped unless they explicitly advertise one.
-Successful probes materialize
-both `last_health_at` (timestamp of the last successful probe) and `health_status`
-(healthy / stale / unknown) on the servers row in a single bulk update per sweep.
+Successful probes persist only `last_health_at` in a single bulk update per sweep.
+`health_status` is derived when read as healthy / degraded / offline / unknown.
 
 A failed probe never touches `last_health_at` and never deletes anything — a server
-flips to `stale` purely because its last success has aged past the threshold.
+derives as `degraded` and then `offline` as its last success ages past the configured thresholds.
 """
 
 import api.logging_bootstrap  # noqa: F401  # configure structured logging before imports log

@@ -284,7 +284,7 @@ class Chute(Base):
     tagline = Column(String, default="")
     readme = Column(String, default="")
     tool_description = Column(String, nullable=True)
-    image_id = Column(String, ForeignKey("images.image_id"))
+    image_id = Column(String, ForeignKey("images.image_id", onupdate="CASCADE"))
     logo_id = Column(String, ForeignKey("logos.logo_id", ondelete="SET NULL"), nullable=True)
     public = Column(Boolean, default=False)
     standard_template = Column(String)

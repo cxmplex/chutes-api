@@ -842,11 +842,14 @@ async def generate_fs_hash(
 
     # Get the chutes version to determine the cfsv binary to use.
     async with get_session(readonly=True) as session:
-        chutes_version = (
-            (await session.execute(select(Image.chutes_version).where(Image.image_id == image_id)))
-            .unique()
-            .scalar_one_or_none()
-        )
+        image_metadata = (
+            await session.execute(
+                select(Image.chutes_version, Image.artifact_id).where(Image.image_id == image_id)
+            )
+        ).one_or_none()
+        if image_metadata is None:
+            raise ValueError(f"Image does not exist: {image_id}")
+        chutes_version, artifact_id = image_metadata
 
     bin_name = "cfsv"
     if semcomp(chutes_version or "0.0.0", "0.5.5") >= 0:
@@ -863,8 +866,8 @@ async def generate_fs_hash(
 
     # Make sure our FS datamap is cached (bounded cache; see _cached_s3_blob).
     cache_path = await _cached_s3_blob(
-        f"image_hash_blobs/{image_id}/{patch_version}.data",
-        f"{image_id}.{patch_version}.data",
+        f"image_hash_blobs/{artifact_id}/{patch_version}.data",
+        f"{artifact_id}.{patch_version}.data",
         "data file",
     )
 
@@ -907,10 +910,17 @@ async def verify_bytecode_integrity(
     Download JSON bytecode manifest from S3 and return expected hashes
     for the given modules so the caller can compare against the miner's response.
     """
+    async with get_session(readonly=True) as session:
+        artifact_id = (
+            await session.execute(select(Image.artifact_id).where(Image.image_id == image_id))
+        ).scalar_one_or_none()
+        if artifact_id is None:
+            raise ValueError(f"Image does not exist: {image_id}")
+
     # Download JSON manifest from S3 (bounded cache; see _cached_s3_blob).
     cache_path = await _cached_s3_blob(
-        f"image_hash_blobs/{image_id}/{patch_version}.manifest.json",
-        f"{image_id}.{patch_version}.manifest.json",
+        f"image_hash_blobs/{artifact_id}/{patch_version}.manifest.json",
+        f"{artifact_id}.{patch_version}.manifest.json",
         "bytecode manifest JSON",
     )
 

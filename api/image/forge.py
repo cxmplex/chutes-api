@@ -897,7 +897,7 @@ async def upload_filesystem_verification_data(image, data_file_path: str):
     """
     # Handle None patch_version by defaulting to "initial"
     patch_version = image.patch_version if image.patch_version is not None else "initial"
-    s3_key = f"image_hash_blobs/{image.image_id}/{patch_version}.data"
+    s3_key = f"image_hash_blobs/{image.artifact_id}/{patch_version}.data"
     async with settings.s3_client() as s3:
         await s3.upload_file(data_file_path, settings.storage_bucket, s3_key)
     logger.success(f"Uploaded filesystem verification data to {s3_key}")
@@ -908,7 +908,7 @@ async def upload_bytecode_manifest(image, manifest_path: str):
     Upload the bytecode manifest to S3.
     """
     patch_version = image.patch_version if image.patch_version is not None else "initial"
-    s3_key = f"image_hash_blobs/{image.image_id}/{patch_version}.manifest"
+    s3_key = f"image_hash_blobs/{image.artifact_id}/{patch_version}.manifest"
     async with settings.s3_client() as s3:
         await s3.upload_file(manifest_path, settings.storage_bucket, s3_key)
     logger.success(f"Uploaded bytecode manifest to {s3_key}")
@@ -919,7 +919,7 @@ async def upload_bytecode_manifest_json(image, manifest_json_path: str):
     Upload the cleartext JSON bytecode manifest to S3 (for validator lookups).
     """
     patch_version = image.patch_version if image.patch_version is not None else "initial"
-    s3_key = f"image_hash_blobs/{image.image_id}/{patch_version}.manifest.json"
+    s3_key = f"image_hash_blobs/{image.artifact_id}/{patch_version}.manifest.json"
     async with settings.s3_client() as s3:
         await s3.upload_file(manifest_json_path, settings.storage_bucket, s3_key)
     logger.success(f"Uploaded bytecode manifest JSON to {s3_key}")
@@ -987,12 +987,14 @@ async def forge(image_id: str):
             # image as errored instead of crashing the worker and orphaning it in "building".
             async with settings.s3_client() as s3:
                 await s3.download_file(
-                    settings.storage_bucket, f"forge/{image.user_id}/{image_id}.zip", context_path
+                    settings.storage_bucket,
+                    f"forge/{image.user_id}/{image.artifact_id}.zip",
+                    context_path,
                 )
             async with settings.s3_client() as s3:
                 await s3.download_file(
                     settings.storage_bucket,
-                    f"forge/{image.user_id}/{image_id}.Dockerfile",
+                    f"forge/{image.user_id}/{image.artifact_id}.Dockerfile",
                     dockerfile_path,
                 )
             os.chdir(build_dir)
@@ -1010,7 +1012,7 @@ async def forge(image_id: str):
 
         # Upload logs
         if os.path.exists(log_path := os.path.join(build_dir, "build.log")):
-            destination = f"forge/{image.user_id}/{image.image_id}.log"
+            destination = f"forge/{image.user_id}/{image.artifact_id}.log"
             async with settings.s3_client() as s3:
                 await s3.upload_file(log_path, settings.storage_bucket, destination)
 
@@ -1317,14 +1319,16 @@ RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
                     bytecode_manifest_path,
                     bytecode_manifest_json_path,
                 ) = await extract_cfsv_data_from_verification_image(verification_tag, build_dir)
-                s3_key = f"image_hash_blobs/{image_id}/{patch_version}.data"
+                s3_key = f"image_hash_blobs/{image.artifact_id}/{patch_version}.data"
                 async with settings.s3_client() as s3:
                     await s3.upload_file(data_file_path, settings.storage_bucket, s3_key)
                 logger.success(f"Uploaded filesystem verification data to {s3_key}")
 
                 # Upload bytecode manifest if generated.
                 if bytecode_manifest_path and os.path.exists(bytecode_manifest_path):
-                    manifest_s3_key = f"image_hash_blobs/{image_id}/{patch_version}.manifest"
+                    manifest_s3_key = (
+                        f"image_hash_blobs/{image.artifact_id}/{patch_version}.manifest"
+                    )
                     async with settings.s3_client() as s3:
                         await s3.upload_file(
                             bytecode_manifest_path, settings.storage_bucket, manifest_s3_key
@@ -1334,7 +1338,7 @@ RUN CFSV_OP="${CFSV_OP}" python -m cllmv.pkg_hash > /tmp/package_hashes.json
                 # Upload JSON manifest for validator if generated.
                 if bytecode_manifest_json_path and os.path.exists(bytecode_manifest_json_path):
                     manifest_json_s3_key = (
-                        f"image_hash_blobs/{image_id}/{patch_version}.manifest.json"
+                        f"image_hash_blobs/{image.artifact_id}/{patch_version}.manifest.json"
                     )
                     async with settings.s3_client() as s3:
                         await s3.upload_file(

@@ -257,9 +257,33 @@ class TdxVerificationResult:
             return True  # treat unparseable as unsafe
 
     @property
+    def td_attributes_valid(self) -> bool:
+        """Enforce dcap-qvl's production TD10 attribute policy.
+
+        Bits 7:1, 27:8, 29, and 63:32 are rejected; SEPT_VE_DISABLE (bit 28)
+        is mandatory. PKS (30) and KL (31) are permitted. DEBUG (0) is
+        handled separately by :attr:`debug_enabled`. Rejecting every OTHER
+        bit is at least as strict as dcap-qvl 0.5.3's post-TCB validator.
+        """
+        try:
+            raw = bytes.fromhex(self.td_attributes)
+        except (ValueError, TypeError):
+            return False
+        if len(raw) != 8:
+            return False
+        value = int.from_bytes(raw, "little")
+        allowed = (1 << 0) | (1 << 28) | (1 << 30) | (1 << 31)
+        return bool(value & (1 << 28)) and not bool(value & ~allowed)
+
+    @property
     def is_valid(self) -> bool:
-        """Require current TCB, no Intel advisories, and a non-debug TD."""
-        return self.status == "UpToDate" and not self.advisory_ids and not self.debug_enabled
+        """Require current TCB, no advisories, and production-safe TD attributes."""
+        return (
+            self.status == "UpToDate"
+            and not self.advisory_ids
+            and self.td_attributes_valid
+            and not self.debug_enabled
+        )
 
     @classmethod
     def from_report(cls, verified_report: VerifiedReport) -> "TdxVerificationResult":
@@ -354,7 +378,7 @@ _TCB_STATUS_SEVERITY = {
 }
 
 
-def _merge_tcb_status(
+def merge_tcb_status(
     platform: tuple[str, List[str]], module: Optional[tuple[str, List[str]]]
 ) -> tuple[str, List[str]]:
     if module is None:
@@ -475,7 +499,7 @@ def resolve_tdx_tcb_status(
         raise InvalidQuoteError("TEE_TCB_SVN too short to resolve TDX TCB status")
     platform = _match_platform_tcb_level(tcb_info, tee_tcb_svn, sgx_tcb_components, pce_svn)
     module = _verify_tdx_module(tcb_info, tee_tcb_svn, mr_signer_seam, seam_attributes)
-    return _merge_tcb_status(platform, module)
+    return merge_tcb_status(platform, module)
 
 
 # --- Provider-agnostic quote factory (Intel TDX vs AMD SEV-SNP) ----------------------------------

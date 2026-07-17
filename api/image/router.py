@@ -56,11 +56,12 @@ async def stream_build_logs(
         )
     image_status = image.status
     image_user_id = image.user_id
+    image_artifact_id = image.artifact_id
 
     # Images already built?
     if image_status.startswith(("built and pushed", "error:")):
         async with settings.s3_client() as s3:
-            log_path = f"forge/{image_user_id}/{image_id}.log"
+            log_path = f"forge/{image_user_id}/{image_artifact_id}.log"
             try:
                 async with settings.s3_client() as s3:
                     data = io.BytesIO()
@@ -329,6 +330,7 @@ async def create_image(
     # Create the image once we've persisted the context, which will trigger the build via events.
     image = Image(
         image_id=image_id,
+        artifact_id=image_id,
         user_id=current_user.user_id,
         name=name,
         readme=readme,

@@ -48,6 +48,11 @@ ingress:
   # set per-environment in the overlay values. Left empty here so the whitelist annotation is
   # omitted entirely when unset (no allowlist == nginx allows all).
   whitelistSourceRange: ""
+  # API ingress client-IP source. The safe default ignores request headers and forwards nginx's
+  # direct peer address. Enable this only when every API request arrives through Cloudflare;
+  # chart rendering then requires whitelistSourceRange to contain the trusted Cloudflare CIDRs.
+  cloudflareClientIp:
+    enabled: false
   # socket-servers uses its own list (the other ingresses add a trailing ops IP); set in overlay.
   socketWhitelistSourceRange: ""
 

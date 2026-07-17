@@ -6,6 +6,7 @@ import asyncio
 import secrets
 import base64
 import json
+import struct
 import tempfile
 import time
 from typing import Dict, List, Optional
@@ -18,7 +19,13 @@ from aiohttp import ClientResponse
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request, status
 from loguru import logger
-from dcap_qvl import PHALA_PCCS_URL, Quote, get_collateral, verify_with_root_ca
+from dcap_qvl import (
+    PHALA_PCCS_URL,
+    Quote,
+    __version__ as DCAP_QVL_VERSION,
+    get_collateral,
+    verify_with_root_ca,
+)
 from api.config import settings, TeeMeasurementConfig
 from api.server.intel_root import INTEL_SGX_ROOT_CA_DER
 from cryptography import x509
@@ -38,7 +45,12 @@ from api.server.exceptions import (
     NoServerCertError,
     NonceError,
 )
-from api.server.quote import TdxQuote, TdxVerificationResult, resolve_tdx_tcb_status
+from api.server.quote import (
+    TdxQuote,
+    TdxVerificationResult,
+    merge_tcb_status,
+    resolve_tdx_tcb_status,
+)
 from api.server.snp_quote import SnpReport
 from api.server.snp_verify import SnpVerificationResult, verify_snp_report
 import hashlib
@@ -320,10 +332,9 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
             )
             result = TdxVerificationResult.from_report(verified_report)
         except ValueError as exc:
-            # dcap-qvl may fail to select a platform level for newer module generations.
-            # The pinned-root verifier has already authenticated the quote and Intel collateral;
-            # only this exact level-selection failure is recomputed via Intel module identities.
-            if "No matching TCB level found" not in str(exc):
+            # dcap-qvl 0.5.3 compares module-governed SVN bytes while selecting the
+            # platform level. Only its exact step-8 error enters the audited fallback.
+            if not _is_audited_dcap_platform_tcb_error(exc):
                 raise
             result = _resolve_tdx_tcb_via_module_identity(quote, collateral, exc)
 
@@ -346,15 +357,135 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
         raise InvalidQuoteError("Unable to parse provided quote for verification.")
 
 
+_AUDITED_DCAP_QVL_FALLBACK_VERSION = "0.5.3"
+_DCAP_PLATFORM_TCB_ERROR = "No matching TCB level found"
+_TDX_V4_AUTH_LENGTH_OFFSET = 632
+_TDX_V4_AUTH_DATA_OFFSET = 636
+_ECDSA_SIGNATURE_AND_KEY_LENGTH = 128
+_CERTIFICATION_DATA_HEADER_LENGTH = 6
+_QE_REPORT_CERTIFICATION_DATA_TYPE = 6
+_QE_REPORT_LENGTH = 384
+_QE_REPORT_ISV_SVN_OFFSET = 258
+_KNOWN_TCB_STATUSES = {
+    "UpToDate",
+    "SWHardeningNeeded",
+    "ConfigurationNeeded",
+    "ConfigurationAndSWHardeningNeeded",
+    "OutOfDate",
+    "OutOfDateConfigurationNeeded",
+    "Revoked",
+}
+
+
+def _is_audited_dcap_platform_tcb_error(error: ValueError) -> bool:
+    """Accept only the single audited dcap-qvl 0.5.3 step-8 failure."""
+    if DCAP_QVL_VERSION != _AUDITED_DCAP_QVL_FALLBACK_VERSION:
+        return False
+    return str(error) in {
+        _DCAP_PLATFORM_TCB_ERROR,
+        f"Verification failed: {_DCAP_PLATFORM_TCB_ERROR}",
+    }
+
+
+def _extract_tdx_v4_qe_isv_svn(raw_quote: bytes) -> int:
+    """Extract QE ISVSVN from dcap-qvl's authenticated v4 QE report."""
+    try:
+        auth_data_length = struct.unpack_from("<I", raw_quote, _TDX_V4_AUTH_LENGTH_OFFSET)[0]
+    except struct.error as exc:
+        raise InvalidQuoteError(
+            "TDX quote is too short for its authentication-data length"
+        ) from exc
+
+    auth_data_end = _TDX_V4_AUTH_DATA_OFFSET + auth_data_length
+    if auth_data_end > len(raw_quote):
+        raise InvalidQuoteError("TDX quote authentication data is truncated")
+
+    outer_cert_offset = _TDX_V4_AUTH_DATA_OFFSET + _ECDSA_SIGNATURE_AND_KEY_LENGTH
+    try:
+        cert_type, cert_body_length = struct.unpack_from("<HI", raw_quote, outer_cert_offset)
+    except struct.error as exc:
+        raise InvalidQuoteError("TDX quote is missing QE report certification data") from exc
+    if cert_type != _QE_REPORT_CERTIFICATION_DATA_TYPE:
+        raise InvalidQuoteError(
+            f"TDX quote has unexpected outer certification data type {cert_type}"
+        )
+
+    qe_report_offset = outer_cert_offset + _CERTIFICATION_DATA_HEADER_LENGTH
+    cert_body_end = qe_report_offset + cert_body_length
+    if cert_body_end > auth_data_end or cert_body_length < _QE_REPORT_LENGTH:
+        raise InvalidQuoteError("TDX quote QE report certification data is truncated")
+
+    try:
+        return struct.unpack_from("<H", raw_quote, qe_report_offset + _QE_REPORT_ISV_SVN_OFFSET)[0]
+    except struct.error as exc:
+        raise InvalidQuoteError("TDX quote QE report is truncated") from exc
+
+
+def _resolve_authenticated_qe_tcb_status(
+    raw_quote: bytes, qe_identity_json: str
+) -> tuple[str, List[str]]:
+    """Recover the QE verdict that dcap-qvl computed before its step-8 error.
+
+    The exact dcap-qvl 0.5.3 error is reachable only after the pinned-root QE
+    identity signature, PCK/QE/quote signatures, QE identity policy, and QE TCB
+    match have succeeded. The fallback still has to carry that matched QE
+    status and its advisories into the final verdict.
+    """
+    try:
+        qe_identity = json.loads(qe_identity_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise InvalidQuoteError("Unable to parse authenticated QE Identity collateral") from exc
+    if (
+        not isinstance(qe_identity, dict)
+        or qe_identity.get("id") != "TD_QE"
+        or qe_identity.get("version") not in (2, 3)
+    ):
+        raise InvalidQuoteError("Authenticated QE Identity has an unsupported id or version")
+
+    qe_isv_svn = _extract_tdx_v4_qe_isv_svn(raw_quote)
+    levels = qe_identity.get("tcbLevels")
+    if not isinstance(levels, list) or not levels:
+        raise InvalidQuoteError("Authenticated QE Identity has no TCB levels")
+
+    for level in levels:
+        try:
+            required_isv_svn = level["tcb"]["isvsvn"]
+            status_value = level["tcbStatus"]
+            advisory_ids = level.get("advisoryIDs", []) or []
+        except (KeyError, TypeError) as exc:
+            raise InvalidQuoteError("Authenticated QE Identity TCB level is malformed") from exc
+        if (
+            isinstance(required_isv_svn, bool)
+            or not isinstance(required_isv_svn, int)
+            or not isinstance(status_value, str)
+            or status_value not in _KNOWN_TCB_STATUSES
+            or not isinstance(advisory_ids, list)
+            or any(not isinstance(item, str) for item in advisory_ids)
+        ):
+            raise InvalidQuoteError("Authenticated QE Identity TCB level is malformed")
+        if qe_isv_svn >= required_isv_svn:
+            return status_value, advisory_ids
+
+    raise InvalidQuoteError(
+        f"QE ISVSVN {qe_isv_svn} is below every authenticated QE Identity TCB level"
+    )
+
+
 def _resolve_tdx_tcb_via_module_identity(
     quote: TdxQuote, collateral, original_error: Exception
 ) -> TdxVerificationResult:
-    """Recompute only the TCB level after pinned-root cryptographic verification."""
+    """Replace only dcap-qvl's faulty platform match and finish its policy."""
+    if not isinstance(original_error, ValueError) or not _is_audited_dcap_platform_tcb_error(
+        original_error
+    ):
+        raise original_error
     parsed = Quote.parse(quote.raw_bytes)
     if not parsed.is_tdx():
         raise original_error
     report = parsed.report
     pck = parsed.pck_extension()
+    if pck is None:
+        raise InvalidQuoteError("Unable to parse the verified quote's PCK extension")
     status_value, advisory_ids = resolve_tdx_tcb_status(
         tcb_info=json.loads(collateral.tcb_info),
         tee_tcb_svn=list(report.tee_tcb_svn),
@@ -363,6 +494,8 @@ def _resolve_tdx_tcb_via_module_identity(
         mr_signer_seam=report.mr_signer_seam,
         seam_attributes=report.seam_attributes,
     )
+    qe_status = _resolve_authenticated_qe_tcb_status(quote.raw_bytes, collateral.qe_identity)
+    status_value, advisory_ids = merge_tcb_status((status_value, advisory_ids), qe_status)
     logger.info(
         "Resolved TDX TCB via pinned module identity: "
         f"status={status_value}, tee_tcb_svn={list(report.tee_tcb_svn)[:2]}..."
