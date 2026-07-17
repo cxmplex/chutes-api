@@ -46,6 +46,13 @@ class _SessionContext:
         return False
 
 
+def test_remote_forge_chart_enables_structured_logging():
+    template = (
+        Path(__file__).resolve().parents[2] / "charts/templates/remote-forge-deployment.yaml"
+    ).read_text()
+    assert 'include "chutes.loggingEnv"' in template
+
+
 @pytest.mark.asyncio
 async def test_remote_cpu_build_skips_gpu_runtime_and_cfsv(tmp_path):
     build_dir = Path(tmp_path)

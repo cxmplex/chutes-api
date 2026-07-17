@@ -8,7 +8,8 @@
 # Managed release pins also carry `image_sha256` and the complete ordered
 # `image_measurement_names` set. Production activation verifies detached cosign provenance.
 measurements:
-  # Intel TDX: RTMR0-2 are common to boot/runtime. Boot RTMR3 is always derived as 96 zeroes;
+  # Intel TDX: RTMR0-2 are common to boot/runtime. Boot RTMR3 defaults to 96 zeroes;
+  # bare-metal guests that extend it in initramfs set boot_rtmr3 explicitly.
   # runtime_rtmr3 is the measured guest/root identity.
   - version: "1.3.0"
     name: "8xh200"
@@ -36,6 +37,7 @@ measurements:
     rtmr0: "REPLACE_WITH_CPU_RTMR0_96_HEX"
     rtmr1: "REPLACE_WITH_CPU_RTMR1_96_HEX"
     rtmr2: "REPLACE_WITH_CPU_RTMR2_96_HEX"
+    # boot_rtmr3: "REPLACE_IF_BOOT_RTMR3_IS_NOT_ZERO"
     runtime_rtmr3: "REPLACE_WITH_CPU_RUNTIME_RTMR3_96_HEX"
     expected_gpus: []
     gpu_count: 0

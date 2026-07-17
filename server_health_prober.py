@@ -11,6 +11,7 @@ A failed probe never touches `last_health_at` and never deletes anything — a s
 flips to `stale` purely because its last success has aged past the threshold.
 """
 
+import api.logging_bootstrap  # noqa: F401  # configure structured logging before imports log
 import gc
 import asyncio
 import traceback
@@ -22,6 +23,7 @@ from sqlalchemy import select, text
 from api.config import settings
 from api.database import get_session
 from api.constants import ServerHealthStatus
+from api.log import install_asyncio_exception_handler
 from api.server.schemas import Server
 
 PROBE_TIMEOUT = _httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
@@ -29,16 +31,17 @@ PROBE_TIMEOUT = _httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 
 async def probe(server: Server) -> bool:
     """
-    Hit a server's attestation-proxy health endpoint. Returns True only on
-    200 + {"status": "healthy"}. The cert is self-signed (CN=attestation-service),
-    so TLS verification is disabled.
+    Hit the represented role-specific health endpoint. Legacy GPU/CPU attestation
+    endpoints report {"status": "healthy"}; ChuteFS storage reports {"status": "ok"}.
+    The endpoint certificate is self-signed, so TLS verification is disabled.
     """
     if not server.health_check_url:
         return False
     try:
         async with _httpx.AsyncClient(timeout=PROBE_TIMEOUT, verify=False) as client:
             resp = await client.get(server.health_check_url)
-            return resp.status_code == 200 and resp.json().get("status") == "healthy"
+            expected_status = "ok" if server.storage_role else "healthy"
+            return resp.status_code == 200 and resp.json().get("status") == expected_status
     except Exception as exc:
         # Some httpx errors (e.g. ConnectTimeout) stringify to "", so include the type name.
         logger.debug(
@@ -52,6 +55,7 @@ async def sweep(max_concurrent: int = None):
     """
     Probe all TEE servers concurrently and bulk-update their health columns.
     """
+    install_asyncio_exception_handler()
     max_concurrent = max_concurrent or settings.server_health_max_concurrent
     semaphore = asyncio.Semaphore(max_concurrent)
     now = datetime.now(timezone.utc)

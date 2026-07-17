@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -67,3 +68,10 @@ def test_restricted_hotkey_uses_middleware_owned_state():
     with pytest.raises(HTTPException) as exc_info:
         _enforce_restricted_hotkey_ip(request, _RESTRICTED_HOTKEY, "images")
     assert exc_info.value.status_code == 401
+
+
+def test_public_api_ingress_overwrites_canonical_client_ip_header():
+    template = (
+        Path(__file__).resolve().parents[2] / "charts/templates/api-ingress.yaml"
+    ).read_text()
+    assert "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;" in template

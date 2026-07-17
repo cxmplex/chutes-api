@@ -101,9 +101,10 @@ def _max_plaintext_for_ciphertext_limit(ciphertext_limit: int) -> int:
 class TeeMeasurementConfig:
     """One canonical, per-hardware TEE trust entry.
 
-    TDX stores only the independent values: MRTD, RTMR0-2, and runtime RTMR3. Boot
-    RTMR3 is always zero and the full boot/runtime maps are derived properties. SNP
-    uses its launch measurement and policy fields, leaving the TDX scalars empty.
+    TDX stores only the independent values: MRTD, RTMR0-2, boot RTMR3, and runtime
+    RTMR3. Boot RTMR3 defaults to zero, but bare-metal guests that extend it in the
+    initramfs pin the observed non-zero value explicitly. SNP uses its launch
+    measurement and policy fields, leaving the TDX scalars empty.
     """
 
     version: str
@@ -119,6 +120,7 @@ class TeeMeasurementConfig:
     rtmr0: str = ""
     rtmr1: str = ""
     rtmr2: str = ""
+    boot_rtmr3: str = ZERO_RTMR
     runtime_rtmr3: str = ""
     # --- AMD SEV-SNP fields (only set when tee_type == "sev-snp") ---
     measurement: Optional[str] = None  # 96 hex (48B SHA-384 launch digest)
@@ -157,7 +159,7 @@ class TeeMeasurementConfig:
             "RTMR0": self.rtmr0,
             "RTMR1": self.rtmr1,
             "RTMR2": self.rtmr2,
-            "RTMR3": ZERO_RTMR,
+            "RTMR3": self.boot_rtmr3,
         }
 
     @property
@@ -183,6 +185,9 @@ def measurement_config_fingerprint(config: TeeMeasurementConfig) -> str:
     )
     payload.pop("config_fingerprint", None)
     payload.pop("trust_set_fingerprint", None)
+    # rc controls publication and minimum-version selection, not attestation identity.
+    # Promoting an identical candidate must not invalidate persisted exact-pin fingerprints.
+    payload.pop("rc", None)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -1085,7 +1090,14 @@ class Settings(BaseSettings):
                 "expected_gpus",
                 "gpu_count",
             }
-            tdx_fields = {"mrtd", "rtmr0", "rtmr1", "rtmr2", "runtime_rtmr3"}
+            tdx_fields = {
+                "mrtd",
+                "rtmr0",
+                "rtmr1",
+                "rtmr2",
+                "boot_rtmr3",
+                "runtime_rtmr3",
+            }
             snp_fields = {
                 "measurement",
                 "policy",
@@ -1312,12 +1324,16 @@ class Settings(BaseSettings):
                 )
                 continue
 
-            # --- Intel TDX: canonical normalized scalars. RTMR0-2 are identical at boot/runtime;
-            # boot RTMR3 is fixed to zero and runtime RTMR3 binds the measured guest stack.
+            # --- Intel TDX: canonical normalized scalars. RTMR0-2 are identical at boot/runtime.
+            # Boot RTMR3 defaults to zero, while bare-metal guests that extend it before their boot
+            # quote pin the observed value. Runtime RTMR3 binds the measured guest stack.
             mrtd_upper = _require_hex96(measurement_config.get("mrtd"), "mrtd")
             rtmr0 = _require_hex96(measurement_config.get("rtmr0"), "rtmr0")
             rtmr1 = _require_hex96(measurement_config.get("rtmr1"), "rtmr1")
             rtmr2 = _require_hex96(measurement_config.get("rtmr2"), "rtmr2")
+            boot_rtmr3 = _require_hex96(
+                measurement_config.get("boot_rtmr3", ZERO_RTMR), "boot_rtmr3"
+            )
             runtime_rtmr3 = _require_hex96(measurement_config.get("runtime_rtmr3"), "runtime_rtmr3")
 
             measurements.append(
@@ -1334,6 +1350,7 @@ class Settings(BaseSettings):
                     rtmr0=rtmr0,
                     rtmr1=rtmr1,
                     rtmr2=rtmr2,
+                    boot_rtmr3=boot_rtmr3,
                     runtime_rtmr3=runtime_rtmr3,
                     image_sha256=image_sha256,
                     image_measurement_names=image_measurement_names,
@@ -1356,6 +1373,7 @@ class Settings(BaseSettings):
                     or list(peer.image_measurement_names or [])
                     != list(config.image_measurement_names or [])
                     or peer.debug != config.debug
+                    or peer.rc != config.rc
                     or peer.tee_type != config.tee_type
                     or peer.provider != config.provider
                     or peer.gpu_count != config.gpu_count
@@ -1364,7 +1382,7 @@ class Settings(BaseSettings):
                     raise ValueError(
                         f"Inconsistent image provenance for measurement set "
                         f"{sorted(declared_names)}: every declared entry must be loaded and bind "
-                        "the same image_sha256, ordered set, debug posture, TEE, provider, and "
+                        "the same image_sha256, ordered set, debug/RC posture, TEE, provider, and "
                         "CPU/GPU inventory."
                     )
 

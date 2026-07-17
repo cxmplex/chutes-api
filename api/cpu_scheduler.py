@@ -13,6 +13,7 @@ for CPU chutes). On an interval it:
 Run as its own process (e.g. `python -m api.cpu_scheduler`), like chute_autoscaler.
 """
 
+import api.logging_bootstrap  # noqa: F401  # configure structured logging before imports log
 import asyncio
 import secrets
 import uuid
@@ -34,6 +35,7 @@ from api.database import get_session
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2, purge_and_notify
 from api.job.schemas import Job
+from api.log import install_asyncio_exception_handler
 from api.metagraph import MetagraphNode
 from api.server.schemas import Host, Server, ServerAttestation
 from api.util import semcomp
@@ -725,6 +727,7 @@ async def _tick_with_lock() -> None:
 
 
 async def main() -> None:
+    install_asyncio_exception_handler()
     logger.info("CPU chute scheduler starting")
     while True:
         try:

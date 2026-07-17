@@ -28,6 +28,7 @@ from api.server.quote import (
 )
 from api.server.exceptions import (
     InvalidQuoteError,
+    InvalidSignatureError,
     MeasurementMismatchError,
 )
 from tests.fixtures.tdx import (
@@ -677,7 +678,7 @@ async def test_module_identity_fallback_preserves_pinned_root_verification(sampl
 
 @pytest.mark.asyncio
 async def test_verify_quote_signature_failure(sample_boot_quote):
-    """Test failed quote signature verification (util wraps in InvalidQuoteError)."""
+    """An authenticated quote with an unacceptable verdict keeps its structured failure."""
     mock_verified_report = Mock()
     mock_verified_report.to_json.return_value = (
         '{"status": "Unknown", "advisory_ids": [], '
@@ -693,7 +694,7 @@ async def test_verify_quote_signature_failure(sample_boot_quote):
         ),
         patch("api.server.util.verify_with_root_ca", return_value=mock_verified_report),
     ):
-        with pytest.raises(InvalidQuoteError, match="Unable to parse provided quote"):
+        with pytest.raises(InvalidSignatureError):
             await verify_quote_signature(sample_boot_quote)
 
 

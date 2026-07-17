@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from api.config import Settings
+from api.config import (
+    Settings,
+    TeeMeasurementConfig,
+    measurement_config_fingerprint,
+    measurement_trust_set_fingerprint,
+)
 from api.main import _tee_trust_metrics
 
 
@@ -51,6 +56,34 @@ def test_loads_cpu_measurement_gpu_count_zero(tmp_path):
     assert cpu.expected_gpus == []
     assert cpu.provider == "gcp"
     assert cpu.mrtd == HEX96_MRTD
+    assert cpu.boot_rtmrs["RTMR3"] == "0" * 96
+
+
+def test_canonical_tdx_accepts_explicit_nonzero_boot_rtmr3(tmp_path):
+    settings = _settings_for_yaml(
+        tmp_path,
+        f"""
+        measurements:
+          - version: "1"
+            name: "cpu-baremetal"
+            provider: "bare-metal"
+            tee_type: "tdx"
+            debug: false
+            mrtd: "{HEX96_MRTD}"
+            rtmr0: "{HEX96_RTMR0}"
+            rtmr1: "{HEX96_RTMR1}"
+            rtmr2: "{HEX96_RTMR2}"
+            boot_rtmr3: "{HEX96_RTMR3}"
+            runtime_rtmr3: "{HEX96_RTMR3}"
+            expected_gpus: []
+            gpu_count: 0
+        """,
+    )
+
+    (measurement,) = settings._load_tee_measurements()
+
+    assert measurement.boot_rtmrs["RTMR3"] == HEX96_RTMR3
+    assert measurement.runtime_rtmrs["RTMR3"] == HEX96_RTMR3
 
 
 def test_rejects_legacy_nested_tdx_schema_instead_of_dual_parsing(tmp_path):
@@ -105,6 +138,62 @@ def test_release_candidate_is_attestable_but_not_minimum_version(tmp_path):
     )
     assert [entry.rc for entry in settings.tee_measurements] == [False, True]
     assert settings.tee_minimum_boot_version == "1.3.0"
+
+
+def test_release_candidate_promotion_does_not_change_trust_identity():
+    common = {
+        "version": "1.3.0",
+        "name": "cpu-gcp",
+        "provider": "gcp",
+        "tee_type": "tdx",
+        "debug": False,
+        "mrtd": HEX96_MRTD,
+        "rtmr0": HEX96_RTMR0,
+        "rtmr1": HEX96_RTMR1,
+        "rtmr2": HEX96_RTMR2,
+        "runtime_rtmr3": HEX96_RTMR3,
+        "expected_gpus": [],
+        "gpu_count": 0,
+    }
+    candidate = TeeMeasurementConfig(**common, rc=True)
+    released = TeeMeasurementConfig(**common, rc=False)
+
+    assert measurement_config_fingerprint(candidate) == measurement_config_fingerprint(released)
+    assert measurement_trust_set_fingerprint([candidate]) == measurement_trust_set_fingerprint(
+        [released]
+    )
+
+
+def test_one_image_measurement_set_requires_consistent_rc_posture(tmp_path):
+    names = ["cpu-gcp-a", "cpu-gcp-b"]
+    entries = []
+    for name, rc in zip(names, (False, True), strict=True):
+        entries.append(
+            {
+                "version": "1.3.0",
+                "name": name,
+                "provider": "gcp",
+                "tee_type": "tdx",
+                "debug": False,
+                "rc": rc,
+                "image_sha256": "a" * 64,
+                "image_measurement_names": names,
+                "mrtd": HEX96_MRTD,
+                "rtmr0": HEX96_RTMR0,
+                "rtmr1": HEX96_RTMR1,
+                "rtmr2": HEX96_RTMR2,
+                "runtime_rtmr3": HEX96_RTMR3,
+                "expected_gpus": [],
+                "gpu_count": 0,
+            }
+        )
+    settings = _settings_for_yaml(
+        tmp_path,
+        yaml.safe_dump({"measurements": entries}, sort_keys=False),
+    )
+
+    with pytest.raises(ValueError, match="Inconsistent image provenance"):
+        settings._load_tee_measurements()
 
 
 def test_measurement_absent_gpu_count_rejected(tmp_path):
@@ -684,6 +773,14 @@ def test_actual_committed_measurements_have_bound_debug_provenance(tmp_path):
     settings.allow_debug_measurements = True
 
     measurements = settings._load_tee_measurements()
+    committed_tdx = next(
+        measurement
+        for measurement in measurements
+        if measurement.name == "storage-baremetal-tdx-1.6.0-4vcpu"
+    )
+    assert committed_tdx.boot_rtmrs["RTMR3"] == committed_tdx.runtime_rtmrs["RTMR3"]
+    assert committed_tdx.boot_rtmrs["RTMR3"] != "0" * 96
+
     by_digest = {}
     debug_by_digest = {}
     for measurement in measurements:

@@ -17,7 +17,7 @@ import shutil
 import orjson as json
 from loguru import logger
 from api.config import settings
-from api.log import image_logger, LogType
+from api.log import image_logger, install_asyncio_exception_handler, LogType
 from api.database import get_session
 from api.exceptions import (
     SignFailure,
@@ -1811,6 +1811,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 
 async def main():
+    install_asyncio_exception_handler()
     await initialize()
 
     while True:

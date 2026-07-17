@@ -49,5 +49,6 @@ spec:
                 - server_health_prober.py
               env:
                 {{- include "chutes.cronjobEnv" . | nindent 16 }}
+                {{- include "chutes.loggingEnv" . | nindent 16 }}
               resources:
                 {{- include "chutes.cronjobResources" .Values.serverHealthProber.resources | nindent 16 }}

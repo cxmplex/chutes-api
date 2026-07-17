@@ -21,6 +21,7 @@ spec:
           imagePullPolicy: {{ .Values.remoteForge.imagePullPolicy | default "IfNotPresent" }}
           env:
             {{- include "chutes.commonEnv" . | nindent 12 }}
+            {{- include "chutes.loggingEnv" . | nindent 12 }}
             - name: DEPOT_TOKEN
               valueFrom:
                 secretKeyRef:

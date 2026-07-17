@@ -18,6 +18,7 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "90"
+    nginx.ingress.kubernetes.io/server-snippet: "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;"
     {{- with .Values.ingress.whitelistSourceRange }}
     nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
     {{- end }}

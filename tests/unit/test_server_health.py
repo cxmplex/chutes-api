@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -23,6 +24,13 @@ def _server(**overrides) -> Server:
 
 def test_legacy_gpu_server_keeps_attestation_proxy_health_endpoint():
     assert _server().health_check_url == "https://192.0.2.10:30443/health"
+
+
+def test_server_health_chart_enables_structured_logging():
+    template = (
+        Path(__file__).resolve().parents[2] / "charts/templates/server-health-cronjob.yaml"
+    ).read_text()
+    assert 'include "chutes.loggingEnv"' in template
 
 
 @pytest.mark.parametrize(
@@ -70,6 +78,28 @@ async def test_probe_does_not_open_client_without_role_endpoint():
     with patch("server_health_prober._httpx.AsyncClient") as client:
         assert await probe(server) is False
     client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("storage_role", "status_value", "expected"),
+    [
+        (False, "healthy", True),
+        (True, "ok", True),
+        (True, "healthy", False),
+    ],
+)
+async def test_probe_uses_role_specific_health_contract(storage_role, status_value, expected):
+    server = _server(
+        compute_type="cpu",
+        storage_role=storage_role,
+        tee_endpoints={"health_port": 31997, "health_path": "/storage/health"},
+    )
+    response = Mock(status_code=200)
+    response.json.return_value = {"status": status_value}
+    with patch("server_health_prober._httpx.AsyncClient") as client:
+        client.return_value.__aenter__.return_value.get = AsyncMock(return_value=response)
+        assert await probe(server) is expected
 
 
 def test_health_status_is_derived_from_last_success(monkeypatch):

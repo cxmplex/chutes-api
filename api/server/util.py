@@ -337,6 +337,10 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
             raise InvalidSignatureError("TDX quote signature verification failed")
 
         return result
+    except AttestationError:
+        # Preserve structured fail-closed attestation verdicts such as an authenticated
+        # quote whose TCB/advisory/debug status is unacceptable.
+        raise
     except Exception as e:
         logger.error(f"Unexpected error during quote verification: {e}")
         raise InvalidQuoteError("Unable to parse provided quote for verification.")
