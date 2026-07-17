@@ -433,28 +433,36 @@ def _verify_tdx_module(
     seam_attributes: Any,
 ) -> Optional[tuple[str, List[str]]]:
     """Verify the exact Intel-signed TDX module identity and select its TCB level."""
+    module_minor_svn, module_major_svn = tee_tcb_svn[0], tee_tcb_svn[1]
     if tcb_info.get("id") != "TDX" or tcb_info.get("version", 0) < 3:
+        if module_major_svn > 0:
+            raise InvalidQuoteError("TDX TCB Info cannot authenticate a non-base module identity")
         return None
     base = tcb_info.get("tdxModule")
     if base is None:
         raise InvalidQuoteError("TDX TCB Info is missing tdxModule field")
 
-    module_isvsvn, module_version = tee_tcb_svn[0], tee_tcb_svn[1]
     expected_mrsigner = base["mrsigner"]
     expected_attributes = base["attributes"]
     attributes_mask = base["attributesMask"]
     identity_levels: Optional[List[Dict[str, Any]]] = None
 
-    identities = tcb_info.get("tdxModuleIdentities") or []
-    if module_version > 0 and identities:
-        wanted_id = f"TDX_{module_version:02X}"
+    # Intel PCS evaluates tdxModule only when the major SVN at index 1 is zero.
+    # A non-zero major SVN must resolve through the matching TDX_XX module identity.
+    identities = tcb_info.get("tdxModuleIdentities")
+    if module_major_svn > 0:
+        if not isinstance(identities, list) or not identities:
+            raise InvalidQuoteError(
+                "TDX TCB Info is missing tdxModuleIdentities for a non-base module"
+            )
+        wanted_id = f"TDX_{module_major_svn:02X}"
         identity = next(
             (item for item in identities if item.get("id", "").upper() == wanted_id.upper()),
             None,
         )
         if identity is None:
             raise InvalidQuoteError(
-                f"Unsupported TDX module version: no identity '{wanted_id}' in TCB Info"
+                f"Unsupported TDX module major SVN: no identity '{wanted_id}' in TCB Info"
             )
         expected_mrsigner = identity["mrsigner"]
         expected_attributes = identity["attributes"]
@@ -478,10 +486,10 @@ def _verify_tdx_module(
 
     if identity_levels is not None:
         for level in identity_levels:
-            if module_isvsvn >= level["tcb"]["isvsvn"]:
+            if module_minor_svn >= level["tcb"]["isvsvn"]:
                 return level["tcbStatus"], level.get("advisoryIDs", []) or []
         raise InvalidQuoteError(
-            f"TDX module ISVSVN {module_isvsvn} below minimum in TDX module TCB levels"
+            f"TDX module minor SVN {module_minor_svn} below minimum in TDX module TCB levels"
         )
     return None
 

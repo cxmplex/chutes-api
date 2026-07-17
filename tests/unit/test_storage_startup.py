@@ -69,13 +69,12 @@ def test_server_health_has_post_remediation_forward_migration():
         .split("-- migrate:up", 1)[1]
         .split("-- migrate:down", 1)[0]
     )
-    forward_up = (
-        (migration_dir / "20260715120000_server_health_forward.sql")
-        .read_text()
-        .split("-- migrate:up", 1)[1]
-        .split("-- migrate:down", 1)[0]
-    )
+    forward = (migration_dir / "20260715120000_server_health_forward.sql").read_text()
+    forward_up = forward.split("-- migrate:up", 1)[1].split("-- migrate:down", 1)[0]
+    forward_down = forward.split("-- migrate:down", 1)[1]
     assert " ".join(old_up.split()) == " ".join(forward_up.split())
+    assert "DROP " not in forward_down
+    assert "20260626120000_server_health.sql" in forward_down
 
 
 @pytest.mark.asyncio

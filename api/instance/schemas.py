@@ -84,9 +84,12 @@ class LaunchConfigArgs(BaseModel):
     # The aegis-backed envdump. CPU-TEE chutes ship no aegis and send no envdump; TD attestation
     # (dm-verity + RTMR) + cosign image verification anchor integrity instead.
     env: Optional[str] = None
-    code: Optional[str] = None
-    run_code: Optional[str] = None
     inspecto: Optional[str] = None
+
+
+class LaunchConfigResponse(BaseModel):
+    token: str
+    config_id: str
 
 
 class TeeLaunchConfigArgs(LaunchConfigArgs):
@@ -260,8 +263,7 @@ def _on_launch_config_retrieved(target, value, oldvalue, initiator):
     if value is not None:
         _safe_metric(launch_config_metrics.track_retrieved, target.chute_id)
         launch_config_logger(target, event=LifecycleEvent.LAUNCH_CONFIG_RETRIEVE).info(
-            f"launch config retrieved by miner {target.miner_hotkey}: {target.config_id} "
-            f"(chute {target.chute_id})"
+            f"launch config retrieved by miner {target.miner_hotkey}: {target.config_id} (chute {target.chute_id})"
         )
 
 

@@ -1428,7 +1428,7 @@ class Settings(BaseSettings):
     agent_registration_tolerance: float = float(os.getenv("AGENT_REGISTRATION_TOLERANCE", "0.10"))
     agent_registration_ttl_hours: int = int(os.getenv("AGENT_REGISTRATION_TTL_HOURS", "24"))
 
-    # TEE server health materialization.
+    # TEE endpoint-health probe thresholds.
     server_health_degraded_threshold_seconds: int = int(
         os.getenv("SERVER_HEALTH_DEGRADED_THRESHOLD_SECONDS", str(12 * 3600))
     )

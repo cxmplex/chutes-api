@@ -417,8 +417,7 @@ async def start_instance_invalidation_listener():
                     if not chute_id or not instance_id:
                         continue
                     logger.info(
-                        f"Pubsub: invalidating cache for {reason} instance {instance_id} "
-                        f"of chute {chute_id}"
+                        f"Pubsub: invalidating cache for {reason} instance {instance_id} of chute {chute_id}"
                     )
                     await invalidate_instance_cache(chute_id, instance_id=instance_id)
                     if reason in ("instance_deleted", "instance_disabled"):
@@ -893,31 +892,6 @@ def generate_fs_key(launch_config) -> str:
     signature = settings.launch_config_private_key.sign(message, ec.ECDSA(hashes.SHA256()))
     encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
     return f"{timestamp}:{encoded_signature}"
-
-
-def create_launch_jwt(launch_config: LaunchConfig, disk_gb: int = None) -> str:
-    """
-    Create JWT for a given launch config (updated chutes lib with new graval etc).
-    """
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(hours=3, minutes=30)
-    env_type = launch_config.env_type if launch_config.env_type else "graval"
-    payload = {
-        "exp": int(expires_at.timestamp()),
-        "sub": launch_config.config_id,
-        "chute_id": launch_config.chute_id,
-        "iat": int(now.timestamp()),
-        "url": f"{(settings.launch_config_base_url or f'https://api.{settings.base_domain}').rstrip('/')}/instances/launch_config/{launch_config.config_id}",
-        "env_key": launch_config.env_key,
-        "iss": "chutes",
-        "env_type": env_type,
-    }
-    if launch_config.job_id:
-        payload["job_id"] = launch_config.job_id
-    if disk_gb:
-        payload["disk_gb"] = disk_gb
-    encoded_jwt = jwt.encode(payload, settings.launch_config_key, algorithm="HS256")
-    return encoded_jwt
 
 
 def create_job_jwt(job_id, filename: str = None) -> str:

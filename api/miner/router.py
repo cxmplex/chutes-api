@@ -64,8 +64,10 @@ async def model_to_dict(obj, bounty_info: Optional[dict] = None):
                 "supported_gpus": ns.supported_gpus,
             }
         )
-        # Miner inventory must never expose source; runtimes obtain it through launch config.
-        data["code"] = f"print('legacy placeholder for {obj.version=}')"
+        # Source is delivered only to the verified runtime through launch config.
+        # Do not expose either real or executable placeholder source to miners.
+        data.pop("code", None)
+        data.pop("filename", None)
         data["preemptible"] = obj.preemptible
 
         # Add effective compute multiplier and factors.
@@ -203,7 +205,9 @@ async def release_job(
         (
             await db.execute(
                 select(Job).where(
-                    Job.miner_hotkey == hotkey, Job.finished_at.is_(None), Job.job_id == job_id
+                    Job.miner_hotkey == hotkey,
+                    Job.finished_at.is_(None),
+                    Job.job_id == job_id,
                 )
             )
         )
@@ -522,7 +526,11 @@ async def get_stats(
     """
 
     results = {}
-    for interval, label in (("1 hour", "past_hour"), ("1 day", "past_day"), ("7 days", "all")):
+    for interval, label in (
+        ("1 hour", "past_hour"),
+        ("1 day", "past_day"),
+        ("7 days", "all"),
+    ):
         if per_chute:
             result = await session.execute(text(per_chute_stats_query.format(interval=interval)))
             stats_data = [
@@ -559,7 +567,10 @@ async def get_stats(
             "instance_stats": stats_data,
             # Legacy keys for backwards compatibility
             "bounties": [
-                {"miner_hotkey": s["miner_hotkey"], "total_bounty": float(s["bounty_count"])}
+                {
+                    "miner_hotkey": s["miner_hotkey"],
+                    "total_bounty": float(s["bounty_count"]),
+                }
                 for s in stats_data
             ]
             if not per_chute
@@ -634,7 +645,8 @@ async def get_metagraph():
             (
                 await session.execute(
                     select(MetagraphNode).where(
-                        MetagraphNode.netuid == settings.netuid, MetagraphNode.node_id >= 0
+                        MetagraphNode.netuid == settings.netuid,
+                        MetagraphNode.node_id >= 0,
                     )
                 )
             )

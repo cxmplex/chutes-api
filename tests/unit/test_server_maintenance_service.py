@@ -203,6 +203,18 @@ async def test_find_sole_survivor_chutes_deduplicates_by_chute():
     assert len(result) == 1
 
 
+@pytest.mark.asyncio
+async def test_find_sole_survivor_chutes_excludes_complete_target_batch():
+    inst_a = _make_instance(instance_id="inst-1", chute_id=TEST_CHUTE_ID)
+    inst_b = _make_instance(instance_id="inst-2", chute_id=TEST_CHUTE_ID)
+    db = AsyncMock()
+    db.execute.return_value = _mock_scalar_result(0)
+
+    result = await _find_sole_survivor_chutes(db, [inst_a, inst_b])
+
+    assert result == [SoleSurvivorBlock(chute_id=TEST_CHUTE_ID, instance_id="inst-1")]
+
+
 # ---------------------------------------------------------------------------
 # _count_active_maintenance_slots
 # ---------------------------------------------------------------------------
@@ -342,6 +354,47 @@ async def test_preflight_sole_survivor_blocks(
 
 
 @pytest.mark.asyncio
+@patch(
+    "api.server.service._find_storage_durability_blocks",
+    new_callable=AsyncMock,
+    return_value=[
+        {
+            "object_id": "object-1",
+            "volume_id": "volume-1",
+            "remaining_replicas": 1,
+            "required_replicas": 2,
+        }
+    ],
+)
+@patch("api.server.service._find_sole_survivor_chutes", new_callable=AsyncMock, return_value=[])
+@patch("api.server.service._get_instances_on_server", new_callable=AsyncMock, return_value=[])
+@patch("api.server.service._count_active_maintenance_slots", new_callable=AsyncMock, return_value=0)
+@patch("api.server.service.get_active_upgrade_window", new_callable=AsyncMock)
+async def test_preflight_storage_durability_blocks(
+    mock_window,
+    _mock_slots,
+    _mock_instances,
+    _mock_survivors,
+    _mock_storage_blocks,
+):
+    mock_window.return_value = _make_window()
+    server = _make_server(storage_role=True)
+
+    result = await preflight_maintenance(AsyncMock(), server, TEST_HOTKEY)
+
+    assert result.eligible is False
+    reason = next(item for item in result.denial_reasons if item.reason == "storage_durability")
+    assert reason.blocking == [
+        {
+            "object_id": "object-1",
+            "volume_id": "volume-1",
+            "remaining_replicas": 1,
+            "required_replicas": 2,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 @patch("api.server.service._find_sole_survivor_chutes", new_callable=AsyncMock, return_value=[])
 @patch("api.server.service._get_instances_on_server", new_callable=AsyncMock, return_value=[])
 @patch("api.server.service._count_active_maintenance_slots", new_callable=AsyncMock, return_value=0)
@@ -383,30 +436,37 @@ async def test_preflight_eligible_old_version(
 
 
 @pytest.mark.asyncio
-@patch("api.server.service.get_active_upgrade_window", new_callable=AsyncMock)
-@patch("api.server.service.preflight_maintenance", new_callable=AsyncMock)
-async def test_confirm_raises_on_ineligible(mock_preflight, mock_window):
-    mock_preflight.return_value = _make_preflight(
+@patch("api.server.service._evaluate_maintenance", new_callable=AsyncMock)
+@patch("api.server.service._lock_maintenance_server", new_callable=AsyncMock)
+@patch("api.server.service._lock_active_upgrade_window", new_callable=AsyncMock)
+async def test_confirm_raises_on_ineligible(mock_window, mock_server_lock, mock_evaluate):
+    mock_evaluate.return_value = _make_preflight(
         eligible=False,
         denial_reasons=[MaintenanceReason(reason="concurrency_cap", current_slots=1, limit=1)],
         current_slots=1,
     )
     server = _make_server()
+    mock_window.return_value = _make_window()
+    mock_server_lock.return_value = server
     db = AsyncMock()
     with pytest.raises(HTTPException) as exc_info:
         await confirm_maintenance(db, server, TEST_HOTKEY)
     assert exc_info.value.status_code == 409
+    db.rollback.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-@patch("api.server.service.get_active_upgrade_window", new_callable=AsyncMock)
-@patch("api.server.service.preflight_maintenance", new_callable=AsyncMock)
-async def test_confirm_raises_403_for_non_tee(mock_preflight, mock_window):
-    mock_preflight.return_value = _make_preflight(
+@patch("api.server.service._evaluate_maintenance", new_callable=AsyncMock)
+@patch("api.server.service._lock_maintenance_server", new_callable=AsyncMock)
+@patch("api.server.service._lock_active_upgrade_window", new_callable=AsyncMock)
+async def test_confirm_raises_403_for_non_tee(mock_window, mock_server_lock, mock_evaluate):
+    mock_evaluate.return_value = _make_preflight(
         eligible=False,
         denial_reasons=[MaintenanceReason(reason="not_tee")],
     )
     server = _make_server(is_tee=False)
+    mock_window.return_value = _make_window()
+    mock_server_lock.return_value = server
     db = AsyncMock()
     with pytest.raises(HTTPException) as exc_info:
         await confirm_maintenance(db, server, TEST_HOTKEY)
@@ -416,15 +476,23 @@ async def test_confirm_raises_403_for_non_tee(mock_preflight, mock_window):
 @pytest.mark.asyncio
 @patch("api.server.service.purge_and_notify", new_callable=AsyncMock)
 @patch("api.server.service._get_instances_on_server", new_callable=AsyncMock)
-@patch("api.server.service.get_active_upgrade_window", new_callable=AsyncMock)
-@patch("api.server.service.preflight_maintenance", new_callable=AsyncMock)
-async def test_confirm_success(mock_preflight, mock_window, mock_instances, mock_purge):
+@patch("api.server.service._evaluate_maintenance", new_callable=AsyncMock)
+@patch("api.server.service._lock_maintenance_server", new_callable=AsyncMock)
+@patch("api.server.service._lock_active_upgrade_window", new_callable=AsyncMock)
+async def test_confirm_success(
+    mock_window,
+    mock_server_lock,
+    mock_evaluate,
+    mock_instances,
+    mock_purge,
+):
     window = _make_window()
-    mock_preflight.return_value = _make_preflight(eligible=True)
+    mock_evaluate.return_value = _make_preflight(eligible=True)
     mock_window.return_value = window
     inst = _make_instance()
     mock_instances.return_value = [inst]
     server = _make_server()
+    mock_server_lock.return_value = server
     db = AsyncMock()
     result = await confirm_maintenance(db, server, TEST_HOTKEY)
 
@@ -443,17 +511,23 @@ async def test_confirm_success(mock_preflight, mock_window, mock_instances, mock
 @pytest.mark.asyncio
 @patch("api.server.service.purge_and_notify", new_callable=AsyncMock)
 @patch("api.server.service._get_instances_on_server", new_callable=AsyncMock)
-@patch("api.server.service.get_active_upgrade_window", new_callable=AsyncMock)
-@patch("api.server.service.preflight_maintenance", new_callable=AsyncMock)
+@patch("api.server.service._evaluate_maintenance", new_callable=AsyncMock)
+@patch("api.server.service._lock_maintenance_server", new_callable=AsyncMock)
+@patch("api.server.service._lock_active_upgrade_window", new_callable=AsyncMock)
 async def test_confirm_purge_failure_does_not_crash(
-    mock_preflight, mock_window, mock_instances, mock_purge
+    mock_window,
+    mock_server_lock,
+    mock_evaluate,
+    mock_instances,
+    mock_purge,
 ):
     window = _make_window()
-    mock_preflight.return_value = _make_preflight(eligible=True)
+    mock_evaluate.return_value = _make_preflight(eligible=True)
     mock_window.return_value = window
     mock_instances.return_value = [_make_instance()]
     mock_purge.side_effect = RuntimeError("purge failed")
     server = _make_server()
+    mock_server_lock.return_value = server
     db = AsyncMock()
     result = await confirm_maintenance(db, server, TEST_HOTKEY)
     assert result.purged_instance_ids == []

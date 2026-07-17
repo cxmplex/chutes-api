@@ -38,7 +38,7 @@ def _pad16(values: list[int]) -> list[int]:
 # --- B200 (FMSPC 00A06D080000): the real failing case -----------------------
 # These are the exact values parsed from the real failing quote
 # (tests/assets/b200_boot.quote) plus Intel's live TCB Info:
-#   TEE_TCB_SVN        = [3, 3, 4, 0, ...]   (module version=3, isvsvn=3)
+#   TEE_TCB_SVN        = [3, 3, 4, 0, ...]   (module minor SVN=3, major SVN=3)
 #   PCK SGX components = [4, 4, 2, 2, 4, 1, 0, 2, ...], PCESVN = 13
 #   Platform Level 1   : tdxtcbcomponents = [5, 0, 2, ...] UpToDate @ PCESVN 13
 #   tdxModuleIdentities: TDX_03 @ isvsvn 3 = UpToDate
@@ -66,7 +66,7 @@ def test_index_skip_is_what_unblocks_b200():
     """
     The fix hinges on skipping tdxtcbcomponents[0..1] when tee_tcb_svn[1] > 0.
     Index 0 is 3 (quote) vs 5 (platform); comparing it (as dcap-qvl does) would
-    reject the host. Forcing module version 0 disables the skip and must fail
+    reject the host. Forcing module major SVN 0 disables the skip and must fail
     closed, proving the skip is load-bearing and legacy hosts stay strict.
     """
     legacy_like = _pad16([3, 0, 4])  # tee_tcb_svn[1] == 0 -> no skip, no module
@@ -83,7 +83,7 @@ def test_index_skip_is_what_unblocks_b200():
 
 def test_module_out_of_date_downgrades_final_status():
     """
-    A TDX_01 module at isvsvn 4 is OutOfDate per Intel even though the platform
+    A TDX_01 module at minor SVN 4 is OutOfDate per Intel even though the platform
     level is UpToDate; final status is the worse of the two, with advisories.
     """
     status, advisory_ids = resolve_tdx_tcb_status(
@@ -98,8 +98,8 @@ def test_module_out_of_date_downgrades_final_status():
     assert "INTEL-SA-01036" in advisory_ids
 
 
-def test_unsupported_module_version_fails_closed():
-    with pytest.raises(InvalidQuoteError, match="Unsupported TDX module version"):
+def test_unsupported_module_major_svn_fails_closed():
+    with pytest.raises(InvalidQuoteError, match="Unsupported TDX module major SVN"):
         resolve_tdx_tcb_status(
             tcb_info=_tcb_info(B200_FMSPC),
             tee_tcb_svn=_pad16([3, 99, 4]),  # no TDX_63 identity
@@ -108,6 +108,63 @@ def test_unsupported_module_version_fails_closed():
             mr_signer_seam=ZERO_MRSIGNER,
             seam_attributes=ZERO_SEAM_ATTRS,
         )
+
+
+@pytest.mark.parametrize(
+    "module_identities",
+    [
+        pytest.param(None, id="omitted"),
+        pytest.param([], id="empty"),
+    ],
+)
+def test_nonbase_module_without_module_identities_fails_closed(module_identities):
+    tcb_info = _tcb_info(B200_FMSPC)
+    if module_identities is None:
+        tcb_info.pop("tdxModuleIdentities")
+    else:
+        tcb_info["tdxModuleIdentities"] = module_identities
+
+    with pytest.raises(InvalidQuoteError, match="missing tdxModuleIdentities"):
+        resolve_tdx_tcb_status(
+            tcb_info=tcb_info,
+            tee_tcb_svn=B200_TEE_TCB_SVN,
+            sgx_tcb_components=B200_SGX_COMPONENTS,
+            pce_svn=B200_PCE_SVN,
+            mr_signer_seam=ZERO_MRSIGNER,
+            seam_attributes=ZERO_SEAM_ATTRS,
+        )
+
+
+def test_nonbase_module_rejects_collateral_without_module_identity_schema():
+    tcb_info = _tcb_info(B200_FMSPC)
+    tcb_info["version"] = 2
+    tcb_info.pop("tdxModuleIdentities")
+
+    with pytest.raises(InvalidQuoteError, match="cannot authenticate a non-base module identity"):
+        resolve_tdx_tcb_status(
+            tcb_info=tcb_info,
+            tee_tcb_svn=B200_TEE_TCB_SVN,
+            sgx_tcb_components=B200_SGX_COMPONENTS,
+            pce_svn=B200_PCE_SVN,
+            mr_signer_seam=ZERO_MRSIGNER,
+            seam_attributes=ZERO_SEAM_ATTRS,
+        )
+
+
+def test_base_module_uses_base_identity_without_module_identities():
+    tcb_info = _tcb_info(B200_FMSPC)
+    tcb_info.pop("tdxModuleIdentities")
+
+    status, advisory_ids = resolve_tdx_tcb_status(
+        tcb_info=tcb_info,
+        tee_tcb_svn=_pad16([5, 0, 4]),
+        sgx_tcb_components=B200_SGX_COMPONENTS,
+        pce_svn=B200_PCE_SVN,
+        mr_signer_seam=ZERO_MRSIGNER,
+        seam_attributes=ZERO_SEAM_ATTRS,
+    )
+    assert status == "UpToDate"
+    assert advisory_ids == []
 
 
 def test_mrsigner_mismatch_fails_closed():
@@ -161,7 +218,7 @@ def test_pcesvn_below_level_fails_closed():
 # --- Legacy TDX_01 host (FMSPC 90C06F000000): no-regression -----------------
 # Real values parsed from tests/assets/quote.bin (a genuine TDX_01 host that
 # dcap-qvl already verifies UpToDate):
-#   TEE_TCB_SVN        = [6, 1, 3, 0, ...]   (module version=1, isvsvn=6)
+#   TEE_TCB_SVN        = [6, 1, 3, 0, ...]   (module minor SVN=6, major SVN=1)
 #   PCK SGX components = [3, 3, 2, 2, 4, 1, 0, 5, ...], PCESVN = 13
 LEGACY_FMSPC = "90C06F000000"
 

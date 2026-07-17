@@ -260,7 +260,7 @@ async def test_get_chute_code_keeps_ordinary_public_source_visible(mock_get_one)
 
 @pytest.mark.asyncio
 @patch("api.miner.router.calculate_effective_compute_multiplier", new_callable=AsyncMock)
-async def test_miner_always_replaces_public_code_but_keeps_operational_image(mock_multiplier):
+async def test_miner_omits_public_source_and_keeps_operational_image(mock_multiplier):
     mock_multiplier.return_value = {
         "effective_compute_multiplier": 1.0,
         "compute_multiplier_factors": {},
@@ -269,14 +269,16 @@ async def test_miner_always_replaces_public_code_but_keeps_operational_image(moc
 
     data = await model_to_dict(_miner_chute())
 
-    assert SECRET_CODE not in data["code"]
-    assert "legacy placeholder" in data["code"]
+    assert "code" not in data
+    assert "filename" not in data
+    assert SECRET_CODE not in repr(data)
+    assert "legacy placeholder" not in repr(data)
     assert data["image"] == "owner/source-visibility-image:latest"
 
 
 @pytest.mark.asyncio
 @patch("api.miner.router.calculate_effective_compute_multiplier", new_callable=AsyncMock)
-async def test_miner_always_replaces_private_code(mock_multiplier):
+async def test_miner_omits_private_source_without_a_placeholder(mock_multiplier):
     mock_multiplier.return_value = {
         "effective_compute_multiplier": 1.0,
         "compute_multiplier_factors": {},
@@ -285,5 +287,7 @@ async def test_miner_always_replaces_private_code(mock_multiplier):
 
     data = await model_to_dict(_miner_chute(public=False))
 
-    assert SECRET_CODE not in data["code"]
-    assert "legacy placeholder" in data["code"]
+    assert "code" not in data
+    assert "filename" not in data
+    assert SECRET_CODE not in repr(data)
+    assert "legacy placeholder" not in repr(data)

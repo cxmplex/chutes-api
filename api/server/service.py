@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
 from pydantic import ValidationError
-from sqlalchemy import delete, exists, or_, select, func
+from sqlalchemy import and_, delete, exists, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from cryptography.hazmat.primitives import serialization
@@ -64,6 +64,9 @@ from api.server.schemas import (
     LuksConfirmRequest,
     LuksConfirmResult,
     BootAttestationNonceContext,
+    ReplicaPlacement,
+    StorageObject,
+    StorageVolume,
 )
 from api.server.exceptions import (
     AttestationError,
@@ -101,7 +104,7 @@ from api.instance.schemas import Instance, instance_nodes
 from api.instance.util import purge_and_notify
 from api.chute.schemas import Chute
 from api.node.schemas import Node
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import aliased, joinedload
 from api.server.schemas import TeeInstanceEvidence
 from api.node.schemas import NodeArgs
 from api.util import get_signing_message, nonce_is_valid_v2, semcomp
@@ -2497,13 +2500,43 @@ async def _get_instances_on_server(db: AsyncSession, server_id: str) -> list[Ins
 async def _find_sole_survivor_chutes(
     db: AsyncSession, instances: list[Instance]
 ) -> list[SoleSurvivorBlock]:
-    """For each instance, check if it is the only active instance globally for its chute.
+    """Find chutes with no active instance outside this maintenance batch.
 
-    Returns a list of SoleSurvivorBlock for blocking sole survivors.
+    Instances on a server that already entered maintenance do not count as survivors: its
+    post-commit purge runs after the maintenance slot is durable. Excluding the complete target
+    batch also prevents two same-chute instances on one server from incorrectly protecting each
+    other when both are about to be purged.
     """
     blocking: list[SoleSurvivorBlock] = []
     seen_chutes: set[str] = set()
-    for inst in instances:
+    active_instances = [instance for instance in instances if instance.active]
+    target_instance_ids = [instance.instance_id for instance in active_instances]
+    if not target_instance_ids:
+        return blocking
+
+    direct_server_in_maintenance = (
+        exists()
+        .where(
+            Server.server_id == Instance.server_id,
+            Server.maintenance_pending_window_id.is_not(None),
+        )
+        .correlate(Instance)
+    )
+    node_server_in_maintenance = (
+        exists()
+        .select_from(
+            instance_nodes.join(Node, instance_nodes.c.node_id == Node.uuid).join(
+                Server, Server.server_id == Node.server_id
+            )
+        )
+        .where(
+            instance_nodes.c.instance_id == Instance.instance_id,
+            Server.maintenance_pending_window_id.is_not(None),
+        )
+        .correlate(Instance)
+    )
+
+    for inst in active_instances:
         if inst.chute_id in seen_chutes:
             continue
         seen_chutes.add(inst.chute_id)
@@ -2513,7 +2546,9 @@ async def _find_sole_survivor_chutes(
             .where(
                 Instance.chute_id == inst.chute_id,
                 Instance.active.is_(True),
-                Instance.instance_id != inst.instance_id,
+                Instance.instance_id.notin_(target_instance_ids),
+                ~direct_server_in_maintenance,
+                ~node_server_in_maintenance,
             )
         )
         result = await db.execute(count_query)
@@ -2539,23 +2574,159 @@ async def _count_active_maintenance_slots(
     return result.scalar() or 0
 
 
-async def preflight_maintenance(
-    db: AsyncSession, server: Server, miner_hotkey: str
+async def _find_storage_durability_blocks(db: AsyncSession, server: Server) -> list[dict]:
+    """Return committed objects that would fall below their configured RF.
+
+    This deliberately uses only durable PostgreSQL state: exact present-replica receipts, the
+    holder's current disk incarnation and attested certificate identity, distinct physical host
+    failure domains, and durable maintenance slots. Redis liveness is not a serialization or
+    durability authority. Servers already admitted to maintenance are excluded so a later
+    confirmation cannot count a replica that is committed to going offline but not yet shut down.
+    """
+    if not server.storage_role:
+        return []
+    storage_incarnation = server.storage_incarnation
+    cert_hash = (server.attested_cert_pubkey_hash or "").lower()
+    if not storage_incarnation or not cert_hash:
+        return []
+
+    candidate = aliased(ReplicaPlacement, name="maintenance_candidate_replica")
+    remaining = aliased(ReplicaPlacement, name="maintenance_remaining_replica")
+    remaining_server = aliased(Server, name="maintenance_remaining_server")
+    valid_proof_modes = ("direct_upload", "replication_capability", "legacy_adoption")
+    remaining_count = func.count(
+        func.distinct(func.coalesce(remaining_server.host_id, remaining_server.server_id))
+    )
+
+    query = (
+        select(
+            StorageObject.object_id,
+            StorageObject.volume_id,
+            StorageVolume.replication_factor.label("required_replicas"),
+            remaining_count.label("remaining_replicas"),
+        )
+        .join(StorageVolume, StorageVolume.volume_id == StorageObject.volume_id)
+        .join(
+            candidate,
+            and_(
+                candidate.object_id == StorageObject.object_id,
+                candidate.server_id == server.server_id,
+                candidate.status == "present",
+                candidate.storage_incarnation == storage_incarnation,
+                func.lower(candidate.target_cert_pubkey_hash) == cert_hash,
+                candidate.proof_sha256.is_not(None),
+                StorageObject.sha256.is_not(None),
+                func.lower(candidate.proof_sha256) == func.lower(StorageObject.sha256),
+                candidate.proof_size_bytes == StorageObject.ciphertext_size_bytes,
+                candidate.proof_mode.in_(valid_proof_modes),
+            ),
+        )
+        .outerjoin(
+            remaining,
+            and_(
+                remaining.object_id == StorageObject.object_id,
+                remaining.server_id != server.server_id,
+                remaining.status == "present",
+                remaining.proof_sha256.is_not(None),
+                StorageObject.sha256.is_not(None),
+                func.lower(remaining.proof_sha256) == func.lower(StorageObject.sha256),
+                remaining.proof_size_bytes == StorageObject.ciphertext_size_bytes,
+                remaining.proof_mode.in_(valid_proof_modes),
+            ),
+        )
+        .outerjoin(
+            remaining_server,
+            and_(
+                remaining_server.server_id == remaining.server_id,
+                remaining_server.storage_role.is_(True),
+                remaining_server.maintenance_pending_window_id.is_(None),
+                remaining.storage_incarnation == remaining_server.storage_incarnation,
+                remaining.target_cert_pubkey_hash.is_not(None),
+                remaining_server.attested_cert_pubkey_hash.is_not(None),
+                func.lower(remaining.target_cert_pubkey_hash)
+                == func.lower(remaining_server.attested_cert_pubkey_hash),
+            ),
+        )
+        .where(
+            StorageObject.lifecycle_state == "committed",
+            StorageVolume.deleted.is_(False),
+        )
+        .group_by(
+            StorageObject.object_id,
+            StorageObject.volume_id,
+            StorageVolume.replication_factor,
+        )
+        .having(remaining_count < StorageVolume.replication_factor)
+        .order_by(StorageObject.object_id)
+    )
+    rows = (await db.execute(query)).all()
+    return [
+        {
+            "object_id": row.object_id,
+            "volume_id": row.volume_id,
+            "remaining_replicas": int(row.remaining_replicas),
+            "required_replicas": int(row.required_replicas),
+        }
+        for row in rows
+    ]
+
+
+async def _lock_active_upgrade_window(db: AsyncSession) -> Optional[TeeUpgradeWindow]:
+    """Lock the one global admission row for this transaction.
+
+    Every confirmation acquires this row first. PostgreSQL therefore serializes confirmations
+    across API workers and miners, which is required because chute and ChuteFS safety predicates
+    span multiple miners. The stable lock order (window, then target server) avoids confirm/confirm
+    deadlocks.
+    """
+    now = func.clock_timestamp()
+    query = (
+        select(TeeUpgradeWindow)
+        .where(
+            TeeUpgradeWindow.upgrade_window_start <= now,
+            TeeUpgradeWindow.upgrade_window_end >= now,
+        )
+        .order_by(TeeUpgradeWindow.created_at.desc(), TeeUpgradeWindow.id.desc())
+        .limit(1)
+        .with_for_update()
+    )
+    window = (await db.execute(query)).scalars().first()
+    if window is not None and not is_window_open(window):
+        return None
+    return window
+
+
+async def _lock_maintenance_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> Server:
+    """Reload and lock the target after waiting for the global admission lock."""
+    query = (
+        select(Server)
+        .where(Server.server_id == server_id, Server.miner_hotkey == miner_hotkey)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    server = (await db.execute(query)).scalar_one_or_none()
+    if server is None:
+        raise ServerNotFoundError(server_id)
+    return server
+
+
+async def _evaluate_maintenance(
+    db: AsyncSession,
+    server: Server,
+    miner_hotkey: str,
+    active_window: Optional[TeeUpgradeWindow],
 ) -> PreflightResult:
-    """Read-only eligibility check for entering maintenance on a server."""
+    """Evaluate every maintenance admission predicate against one transaction snapshot."""
     denial_reasons: list[MaintenanceReason] = []
     blocking: list[SoleSurvivorBlock] = []
     limit = 1
     current_slots = 0
-    active_window: Optional[TeeUpgradeWindow] = None
 
     if not server.is_tee:
         denial_reasons.append(MaintenanceReason(reason="not_tee"))
 
-    if not denial_reasons:
-        active_window = await get_active_upgrade_window(db)
-        if active_window is None:
-            denial_reasons.append(MaintenanceReason(reason="no_active_window"))
+    if not denial_reasons and active_window is None:
+        denial_reasons.append(MaintenanceReason(reason="no_active_window"))
 
     if active_window is not None:
         limit = active_window.max_concurrent_per_miner
@@ -2601,8 +2772,14 @@ async def preflight_maintenance(
             denial_reasons.append(
                 MaintenanceReason(
                     reason="sole_survivor",
-                    blocking=[b.model_dump() for b in blocking],
+                    blocking=[item.model_dump() for item in blocking],
                 )
+            )
+
+        storage_blocks = await _find_storage_durability_blocks(db, server)
+        if storage_blocks:
+            denial_reasons.append(
+                MaintenanceReason(reason="storage_durability", blocking=storage_blocks)
             )
 
     return PreflightResult(
@@ -2614,24 +2791,49 @@ async def preflight_maintenance(
     )
 
 
+async def preflight_maintenance(
+    db: AsyncSession, server: Server, miner_hotkey: str
+) -> PreflightResult:
+    """Read-only eligibility check for entering maintenance on a server."""
+    active_window = await get_active_upgrade_window(db) if server.is_tee else None
+    return await _evaluate_maintenance(db, server, miner_hotkey, active_window)
+
+
 async def confirm_maintenance(
     db: AsyncSession, server: Server, miner_hotkey: str
 ) -> ConfirmMaintenanceResult:
-    """Enter maintenance: re-validate, set pending window, and auto-purge instances.
+    """Atomically admit maintenance, then auto-purge the server's instances.
 
     Raises HTTPException (409/403) on failure.
     """
-    preflight = await preflight_maintenance(db, server, miner_hotkey)
+    active_window = await _lock_active_upgrade_window(db)
+    server = await _lock_maintenance_server(db, server.server_id, miner_hotkey)
+    preflight = await _evaluate_maintenance(db, server, miner_hotkey, active_window)
     if not preflight.eligible:
         reason_codes = {r.reason for r in preflight.denial_reasons}
-        conflict_reasons = {"sole_survivor", "concurrency_cap", "maintenance_pending"}
+        conflict_reasons = {
+            "sole_survivor",
+            "storage_durability",
+            "concurrency_cap",
+            "maintenance_pending",
+        }
         if reason_codes & conflict_reasons:
             status_code = status.HTTP_409_CONFLICT
         else:
             status_code = status.HTTP_403_FORBIDDEN
-        raise HTTPException(status_code=status_code, detail=preflight.model_dump())
+        detail = preflight.model_dump()
+        await db.rollback()
+        raise HTTPException(status_code=status_code, detail=detail)
 
-    active_window = await get_active_upgrade_window(db)
+    if active_window is None:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=PreflightResult(
+                eligible=False,
+                denial_reasons=[MaintenanceReason(reason="no_active_window")],
+            ).model_dump(),
+        )
     server.maintenance_pending_window_id = active_window.id
     await db.commit()
     await db.refresh(server)

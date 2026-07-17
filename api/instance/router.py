@@ -6,7 +6,6 @@ import csv
 from io import StringIO
 import os
 import uuid
-import pybase64 as base64
 import ctypes
 import traceback
 import random
@@ -29,7 +28,11 @@ from sqlalchemy.dialects.postgresql import insert
 from api.gpu import SUPPORTED_GPUS, COMPUTE_MULTIPLIER
 from api.database import get_db_session, generate_uuid, get_session
 from api.config import settings
-from api.metrics.warmup import track_warmup_seconds, track_warmup_seconds_since, WarmupTrigger
+from api.metrics.warmup import (
+    track_warmup_seconds,
+    track_warmup_seconds_since,
+    WarmupTrigger,
+)
 from api.constants import (
     TEE_BONUS,
     HOTKEY_HEADER,
@@ -51,6 +54,7 @@ from api.secret.schemas import Secret
 from api.image.schemas import Image  # noqa
 from api.instance.schemas import (
     LaunchConfigArgs,
+    LaunchConfigResponse,
     LegacyTeeLaunchConfigArgs,
     TeeLaunchConfigArgs,
     Instance,
@@ -65,7 +69,6 @@ from api.instance.util import (
     get_instance_by_chute_and_id,
     get_server_for_gpus,
     get_cpu_server_for_host,
-    create_launch_jwt,
     create_job_jwt,
     load_launch_config_from_jwt,
     invalidate_instance_cache,
@@ -354,7 +357,10 @@ def _verify_e2e_pubkey_sig(
 
 
 def _validate_tls_cert(
-    tls_cert_pem: str, tls_cert_sig_hex: str, rint_commitment_hex: str, nonce: str | None = None
+    tls_cert_pem: str,
+    tls_cert_sig_hex: str,
+    rint_commitment_hex: str,
+    nonce: str | None = None,
 ) -> bool:
     """Validate TLS cert signature against the aegis Ed25519 key from rint_commitment.
 
@@ -788,8 +794,7 @@ async def _check_scalable_private(db, chute, miner):
                 inventory_history = [{"total_count": int(r["total_count"])} for r in rows]
         if not inventory_history:
             logger.warning(
-                f"PRIVATE_GATE: miner {miner.hotkey} denied private chute {chute_id}: "
-                f"no inventory history found"
+                f"PRIVATE_GATE: miner {miner.hotkey} denied private chute {chute_id}: no inventory history found"
             )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1020,8 +1025,7 @@ def _require_non_cpu_tee_claim_fields(chute: Chute, args: LaunchConfigArgs) -> N
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                f"Missing required field(s) for a non-CPU-TEE launch config claim: "
-                f"{', '.join(missing)}"
+                f"Missing required field(s) for a non-CPU-TEE launch config claim: {', '.join(missing)}"
             ),
         )
 
@@ -1038,14 +1042,8 @@ async def _validate_launch_config_env(
     # Verify, decrypt, parse the envdump payload. CPU-TEE chutes send no envdump (no aegis), so there
     # is nothing to decrypt -- their integrity is anchored by TD attestation + cosign image verification.
     if "ENVDUMP_UNLOCK" in os.environ and args.env:
-        code = None
         try:
             dump = await asyncio.to_thread(DUMPER.decrypt, launch_config.env_key, args.env)
-            if semcomp(chute.chutes_version or "0.0.0", "0.3.61") < 0:
-                code_data = await asyncio.to_thread(
-                    DUMPER.decrypt, launch_config.env_key, args.code
-                )
-                code = base64.b64decode(code_data["content"]).decode()
         except Exception as exc:
             logger.error(
                 f"Attempt to claim {launch_config.config_id=} failed, invalid envdump payload received: {exc}"
@@ -1065,9 +1063,6 @@ async def _validate_launch_config_env(
                 chute,
                 miner_hotkey=launch_config.miner_hotkey,
             )
-            if semcomp(chute.chutes_version or "0.0.0", "0.3.61") < 0:
-                if code != chute.code:
-                    raise AssertionError("Incorrect code supplied")
         except AssertionError as exc:
             logger.error(
                 f"Attempt to claim {launch_config.config_id=} failed, invalid command: {exc}"
@@ -1082,7 +1077,10 @@ async def _validate_launch_config_env(
 
         # K8S check.
         if not is_kubernetes_env(
-            chute, dump, log_prefix=log_prefix, standard_template=chute.standard_template
+            chute,
+            dump,
+            log_prefix=log_prefix,
+            standard_template=chute.standard_template,
         ):
             logger.error(f"{log_prefix} is not running a valid kubernetes environment")
             launch_config.failed_at = func.now()
@@ -1557,7 +1555,10 @@ async def _validate_launch_config_instance(
         if cpu_e2e_pubkey:
             cpu_e2e_pubkey_sig = getattr(args, "e2e_pubkey_sig", None)
             if not cpu_e2e_pubkey_sig or not _verify_e2e_pubkey_sig(
-                attested_cert, cpu_e2e_pubkey, cpu_e2e_pubkey_sig, launch_config.config_id
+                attested_cert,
+                cpu_e2e_pubkey,
+                cpu_e2e_pubkey_sig,
+                launch_config.config_id,
             ):
                 logger.error(f"{log_prefix} CPU-TEE e2e_pubkey attestation-binding failed")
                 launch_config.failed_at = func.now()
@@ -1810,8 +1811,7 @@ async def _validate_launch_config_instance(
                 )
             instance.rint_session_key = session_key
             logger.info(
-                f"Derived session key for {instance.instance_id} "
-                f"validator_pubkey={validator_pubkey[:16]}..."
+                f"Derived session key for {instance.instance_id} validator_pubkey={validator_pubkey[:16]}..."
             )
         except Exception as exc:
             logger.error(f"Session key derivation failed: {exc}")
@@ -1862,7 +1862,10 @@ async def _validate_launch_config_instance(
                 if cllmv_session_key:
                     if instance.extra is None:
                         instance.extra = {}
-                    instance.extra = {**instance.extra, "cllmv_session_key": cllmv_session_key}
+                    instance.extra = {
+                        **instance.extra,
+                        "cllmv_session_key": cllmv_session_key,
+                    }
                     logger.info(f"CLLMV V2 session key decrypted for {instance.instance_id}")
             except Exception as exc:
                 logger.warning(f"CLLMV V2 session key decryption error (pre-0.5.5): {exc}")
@@ -1880,6 +1883,7 @@ async def _validate_graval_launch_config_instance(
     token = authorization.strip().split(" ")[-1]
     launch_config = await load_launch_config_from_jwt(db, config_id, token)
     chute = await _load_chute(db, launch_config.chute_id)
+    _require_secure_source_delivery(chute)
     log_prefix = f"ENVDUMP: {launch_config.config_id=} {chute.chute_id=}"
 
     if chute.disabled:
@@ -1917,6 +1921,7 @@ async def _validate_tee_launch_config_instance(
     token = authorization.strip().split(" ")[-1]
     launch_config = await load_launch_config_from_jwt(db, config_id, token)
     chute = await _load_chute(db, launch_config.chute_id)
+    _require_secure_source_delivery(chute)
     log_prefix = f"ENVDUMP: {launch_config.config_id=} {chute.chute_id=}"
 
     if chute.disabled:
@@ -1948,9 +1953,12 @@ async def _validate_tee_launch_config_instance(
             detail=f"Server {server.name} is in TEE maintenance mode and cannot accept new instances.",
         )
 
-    launch_config, nodes, instance, validator_pubkey = await _validate_launch_config_instance(
-        db, request, args, launch_config, chute, log_prefix
-    )
+    (
+        launch_config,
+        nodes,
+        instance,
+        validator_pubkey,
+    ) = await _validate_launch_config_instance(db, request, args, launch_config, chute, log_prefix)
 
     # Reject new chutes (>= 0.6.0) on old VMs (latest boot attestation measurement_version < 0.2.0).
     # Newer 0.2.0+ VMs can run both old and new chutes.
@@ -2023,7 +2031,23 @@ async def _verify_tee_version_support(db: AsyncSession, chute: Chute, hotkey: st
         )
 
 
-@router.get("/launch_config")
+MIN_SECURE_SOURCE_RUNTIME_VERSION = "0.3.61"
+
+
+def _require_secure_source_delivery(chute: Chute) -> None:
+    version = chute.chutes_version
+    if not version or semcomp(version, MIN_SECURE_SOURCE_RUNTIME_VERSION) < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported chutes runtime version {version!r} for chute {chute.chute_id}; "
+                f"minimum supported version is {MIN_SECURE_SOURCE_RUNTIME_VERSION}. "
+                "Legacy miner-mounted source delivery has been removed; rebuild the chute image."
+            ),
+        )
+
+
+@router.get("/launch_config", response_model=LaunchConfigResponse)
 async def get_launch_config(
     chute_id: str,
     server_id: Optional[str] = None,
@@ -2038,6 +2062,7 @@ async def get_launch_config(
 
     # Load the chute and check if it's scalable.
     chute = await _load_chute(db, chute_id)
+    _require_secure_source_delivery(chute)
 
     # CPU chutes are validator-scheduled: the cpu_scheduler mints their launch configs directly
     # (stamped with the target server_id). A miner-minted config could never claim (no attested
@@ -2159,18 +2184,14 @@ async def get_launch_config(
         ...
 
     # Generate the JWT.
-    token = None
-    if semcomp(chute.chutes_version or "0.0.0", "0.3.61") >= 0:
-        token = create_launch_jwt_v2(
-            launch_config,
-            egress=chute.allow_external_egress,
-            lock_modules=True
-            if chute.standard_template
-            else (chute.lock_modules if chute.lock_modules is not None else False),
-            disk_gb=disk_gb,
-        )
-    else:
-        token = create_launch_jwt(launch_config, disk_gb=disk_gb)
+    token = create_launch_jwt_v2(
+        launch_config,
+        egress=chute.allow_external_egress,
+        lock_modules=True
+        if chute.standard_template
+        else (chute.lock_modules if chute.lock_modules is not None else False),
+        disk_gb=disk_gb,
+    )
 
     return {
         "token": token,
@@ -2248,9 +2269,12 @@ async def claim_tee_launch_config(
     expected_nonce: str = Depends(validate_request_nonce(NoncePurpose.INSTANCE_VERIFICATION)),
 ):
     """Claim a TEE launch config, verify attestation, and receive symmetric key."""
-    launch_config, nodes, instance, validator_pubkey = await _validate_tee_launch_config_instance(
-        config_id, args, request, db, authorization
-    )
+    (
+        launch_config,
+        nodes,
+        instance,
+        validator_pubkey,
+    ) = await _validate_tee_launch_config_instance(config_id, args, request, db, authorization)
 
     _validate_launch_config_not_expired(launch_config)
 
@@ -2344,9 +2368,12 @@ async def validate_tee_launch_config_instance(
 ):
     # TODO: Remove endpoint once all TEE VMs are upgraded to 0.2.0
     # and once all TEE chutes are upgraded to 0.6.0
-    launch_config, nodes, instance, validator_pubkey = await _validate_tee_launch_config_instance(
-        config_id, args, request, db, authorization
-    )
+    (
+        launch_config,
+        nodes,
+        instance,
+        validator_pubkey,
+    ) = await _validate_tee_launch_config_instance(config_id, args, request, db, authorization)
     _reject_cpu_tee_on_legacy_endpoint(instance)
 
     _validate_launch_config_not_expired(launch_config)
@@ -2902,16 +2929,16 @@ async def _mark_instance_verified(
 async def _build_launch_config_verified_response(
     db: AsyncSession, instance: Instance, launch_config: LaunchConfig
 ):
+    _require_secure_source_delivery(instance.chute)
     return_value = {
         "chute_id": launch_config.chute_id,
         "instance_id": instance.instance_id,
         "verified_at": launch_config.verified_at.isoformat(),
+        "code": instance.chute.code,
+        "fs_key": generate_fs_key(launch_config),
     }
-    if semcomp(instance.chutes_version or "0.0.0", "0.3.61") >= 0:
-        return_value["code"] = instance.chute.code
-        return_value["fs_key"] = generate_fs_key(launch_config)
-        if instance.chute.encrypted_fs:
-            return_value["efs"] = True
+    if instance.chute.encrypted_fs:
+        return_value["efs"] = True
     if instance.job:
         job_token = create_job_jwt(instance.job.job_id)
         return_value.update(
@@ -3174,7 +3201,8 @@ async def get_instance_nonce(request: Request):
     except Exception as e:
         logger.error(f"Failed to generate instance nonce: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to generate nonce"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate nonce",
         )
 
 

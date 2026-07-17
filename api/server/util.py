@@ -64,7 +64,6 @@ from api.server.schemas import (
     LuksVolumeGenerationLease,
     LuksVolumeRotation,
 )
-from api.util import semcomp
 
 
 def generate_nonce() -> str:
@@ -511,18 +510,6 @@ def _resolve_tdx_tcb_via_module_identity(
         status=status_value,
         advisory_ids=advisory_ids,
     )
-
-
-def get_latest_measurement_version() -> str:
-    """Return the highest semver version string across all accepted TEE measurement configs."""
-    versions = [m.version for m in settings.tee_measurements if m.version]
-    if not versions:
-        return "0.0.0"
-    latest = versions[0]
-    for v in versions[1:]:
-        if semcomp(v, latest) > 0:
-            latest = v
-    return latest
 
 
 def get_matching_measurement_config(quote: TdxQuote) -> TeeMeasurementConfig:

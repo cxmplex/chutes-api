@@ -1,5 +1,5 @@
 """
-Stale-inventory sweep for TEE servers.
+Endpoint-health sweep for TEE servers.
 
 Probes each TEE server that has a role-specific health endpoint. Legacy GPU rows use
 the attestation proxy; CPU/storage rows are skipped unless they explicitly advertise one.
@@ -30,8 +30,8 @@ PROBE_TIMEOUT = _httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
 
 async def probe(server: Server) -> bool:
     """
-    Hit the represented role-specific health endpoint. Legacy GPU/CPU attestation
-    endpoints report {"status": "healthy"}; ChuteFS storage reports {"status": "ok"}.
+    Hit the represented health endpoint. Legacy GPU attestation proxies and explicit
+    CPU endpoints report {"status": "healthy"}; ChuteFS storage reports {"status": "ok"}.
     The endpoint certificate is self-signed, so TLS verification is disabled.
     """
     if not server.health_check_url:
@@ -52,7 +52,7 @@ async def probe(server: Server) -> bool:
 
 async def sweep(max_concurrent: int = None):
     """
-    Probe all TEE servers concurrently and bulk-update their health columns.
+    Probe represented TEE endpoints concurrently and bulk-update last-success timestamps.
     """
     install_asyncio_exception_handler()
     max_concurrent = max_concurrent or settings.server_health_max_concurrent

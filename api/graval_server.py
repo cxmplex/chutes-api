@@ -17,7 +17,20 @@ from pydantic import BaseModel
 from graval import Validator
 from bittensor_wallet.keypair import Keypair
 from fastapi import FastAPI, Request, status, HTTPException
+from fastapi.responses import ORJSONResponse
 from api.client_ip import resolve_client_ip
+
+
+async def resolved_ip_middleware(request: Request, call_next):
+    try:
+        request.state.client_ip, request.state.has_resolved_ip = resolve_client_ip(request)
+    except HTTPException as exc:
+        return ORJSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers,
+        )
+    return await call_next(request)
 
 
 class Cipher(BaseModel):
@@ -54,10 +67,7 @@ def main():
     )
     gpu_lock = asyncio.Lock()
 
-    @app.middleware("http")
-    async def resolved_ip_middleware(request: Request, call_next):
-        request.state.client_ip, request.state.has_resolved_ip = resolve_client_ip(request)
-        return await call_next(request)
+    app.middleware("http")(resolved_ip_middleware)
 
     def verify_request(request: Request, whitelist: list[str], extra_key: str = "graval") -> None:
         """

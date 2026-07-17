@@ -148,6 +148,24 @@ db-access: "true"
 redis-access: "true"
 {{- end }}
 
+{{/*
+Client-IP boundary for every external ingress that routes directly to the API.
+Cloudflare's header is trusted only when the ingress itself is source-restricted.
+*/}}
+{{- define "chutes.apiIngressClientIpAnnotations" -}}
+{{- if and .Values.ingress.cloudflareClientIp.enabled (empty (trim .Values.ingress.whitelistSourceRange)) -}}
+{{- fail "ingress.cloudflareClientIp.enabled requires a non-empty ingress.whitelistSourceRange" -}}
+{{- end -}}
+{{- if .Values.ingress.cloudflareClientIp.enabled }}
+nginx.ingress.kubernetes.io/server-snippet: "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;"
+{{- else }}
+nginx.ingress.kubernetes.io/server-snippet: "proxy_set_header X-Resolved-IP $remote_addr;"
+{{- end }}
+{{- with .Values.ingress.whitelistSourceRange }}
+nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
+{{- end }}
+{{- end }}
+
 {{- define "chutes.sensitiveEnv" -}}
 - name: CLLMV_X25519_PRIVATE_KEY
   valueFrom:

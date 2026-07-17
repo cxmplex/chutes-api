@@ -1,59 +1,45 @@
-import base64
-import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 
+from api.instance.schemas import LaunchConfigArgs, LaunchConfigResponse
+
 
 with patch("ctypes.CDLL", return_value=MagicMock()):
-    from api.instance.router import _validate_launch_config_env
-
-
-@pytest.mark.asyncio
-async def test_legacy_launch_mismatch_does_not_disclose_hidden_source(monkeypatch):
-    secret_source = "print('private chute source: do not disclose')"
-    submitted_source = "print('different source')"
-    encoded_submission = base64.b64encode(submitted_source.encode()).decode()
-
-    monkeypatch.setenv("ENVDUMP_UNLOCK", "test-key")
-
-    db = AsyncMock()
-    launch_config = MagicMock(
-        config_id="config-id",
-        env_key="env-key",
-        miner_hotkey="miner-hotkey",
+    from api.instance.router import (
+        MIN_SECURE_SOURCE_RUNTIME_VERSION,
+        _require_secure_source_delivery,
     )
-    chute = MagicMock(
-        chutes_version="0.3.60",
-        code=secret_source,
+
+
+def _chute(version):
+    return SimpleNamespace(chute_id="chute-id", chutes_version=version)
+
+
+def test_launch_config_schemas_have_no_miner_source_submission_field():
+    assert "code" not in LaunchConfigArgs.model_fields
+    assert "run_code" not in LaunchConfigArgs.model_fields
+    assert set(LaunchConfigResponse.model_fields) == {"token", "config_id"}
+
+
+@pytest.mark.parametrize(
+    "version",
+    [None, "", "garbage", "0.3.60", "0.3.60.rc1"],
+)
+def test_legacy_source_delivery_versions_fail_closed(version):
+    with pytest.raises(HTTPException) as exc_info:
+        _require_secure_source_delivery(_chute(version))
+
+    assert exc_info.value.status_code == 400
+    assert "Unsupported chutes runtime version" in exc_info.value.detail
+    assert (
+        f"minimum supported version is {MIN_SECURE_SOURCE_RUNTIME_VERSION}" in exc_info.value.detail
     )
-    args = MagicMock(env="encrypted-env", code="encrypted-code")
+    assert "Legacy miner-mounted source delivery has been removed" in exc_info.value.detail
 
-    with (
-        patch.dict(sys.modules, {"chutes.envdump": MagicMock()}),
-        patch(
-            "api.instance.router.asyncio.to_thread",
-            new=AsyncMock(
-                side_effect=[
-                    {"env": {}},
-                    {"content": encoded_submission},
-                ]
-            ),
-        ),
-        patch("api.instance.router.verify_expected_command", new_callable=AsyncMock),
-    ):
-        with pytest.raises(HTTPException) as exc_info:
-            await _validate_launch_config_env(
-                db,
-                launch_config,
-                chute,
-                args,
-                "ENVDUMP: test",
-            )
 
-    assert exc_info.value.status_code == 403
-    assert "Incorrect code supplied" in exc_info.value.detail
-    assert secret_source not in exc_info.value.detail
-    assert secret_source not in launch_config.verification_error
-    db.commit.assert_awaited_once()
+@pytest.mark.parametrize("version", ["0.3.61", "0.3.61.rc1", "0.3.62"])
+def test_secure_launch_delivery_boundary_is_supported(version):
+    _require_secure_source_delivery(_chute(version))
