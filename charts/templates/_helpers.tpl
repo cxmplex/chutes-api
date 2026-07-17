@@ -151,16 +151,21 @@ redis-access: "true"
 {{/*
 Client-IP boundary for every external ingress that routes directly to the API.
 Cloudflare's header is trusted only when the ingress itself is source-restricted.
+The proxy header configuration must be included in a location-scoped
+configuration-snippet because generated ingress locations set proxy headers.
 */}}
+{{- define "chutes.apiIngressClientIpConfiguration" -}}
+{{- if .Values.ingress.cloudflareClientIp.enabled -}}
+proxy_set_header X-Resolved-IP $http_cf_connecting_ip;
+{{- else -}}
+proxy_set_header X-Resolved-IP $remote_addr;
+{{- end -}}
+{{- end }}
+
 {{- define "chutes.apiIngressClientIpAnnotations" -}}
 {{- if and .Values.ingress.cloudflareClientIp.enabled (empty (trim .Values.ingress.whitelistSourceRange)) -}}
 {{- fail "ingress.cloudflareClientIp.enabled requires a non-empty ingress.whitelistSourceRange" -}}
 {{- end -}}
-{{- if .Values.ingress.cloudflareClientIp.enabled }}
-nginx.ingress.kubernetes.io/server-snippet: "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;"
-{{- else }}
-nginx.ingress.kubernetes.io/server-snippet: "proxy_set_header X-Resolved-IP $remote_addr;"
-{{- end }}
 {{- with .Values.ingress.whitelistSourceRange }}
 nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
 {{- end }}

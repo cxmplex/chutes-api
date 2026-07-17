@@ -5,6 +5,7 @@ metadata:
   name: proxy-ingress
   annotations:
     nginx.ingress.kubernetes.io/configuration-snippet: |
+      {{- include "chutes.apiIngressClientIpConfiguration" . | nindent 6 }}
       if ($request_method !~ "^(GET|PUT)$") {
         return 405;
       }

@@ -156,6 +156,9 @@ def test_all_direct_api_ingresses_use_shared_client_ip_boundary():
     for path in DIRECT_API_INGRESS_TEMPLATES:
         template = path.read_text()
         assert 'include "chutes.apiIngressClientIpAnnotations"' in template
+        assert 'include "chutes.apiIngressClientIpConfiguration"' in template
+        assert "nginx.ingress.kubernetes.io/configuration-snippet" in template
+        assert "nginx.ingress.kubernetes.io/server-snippet" not in template
         assert "proxy_set_header X-Resolved-IP" not in template
 
 
@@ -167,6 +170,7 @@ def test_direct_api_ingress_client_ip_helper_defaults_to_direct_peer():
     assert "proxy_set_header X-Resolved-IP $remote_addr;" in template
     assert "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;" in template
     assert template.count("proxy_set_header X-Resolved-IP") == 2
+    assert "nginx.ingress.kubernetes.io/server-snippet" not in template
 
 
 def test_direct_api_ingress_cloudflare_mode_requires_whitelist():
@@ -201,10 +205,11 @@ def test_direct_api_ingress_helm_rendering_enforces_client_ip_modes(template_pat
     assert default.returncode == 0, default.stderr
     default_ingress = next(yaml.safe_load_all(default.stdout))
     default_annotations = default_ingress["metadata"]["annotations"]
-    assert (
-        default_annotations["nginx.ingress.kubernetes.io/server-snippet"]
-        == "proxy_set_header X-Resolved-IP $remote_addr;"
-    )
+    assert "nginx.ingress.kubernetes.io/server-snippet" not in default_annotations
+    default_configuration = default_annotations["nginx.ingress.kubernetes.io/configuration-snippet"]
+    assert default_configuration.count("proxy_set_header X-Resolved-IP") == 1
+    assert "proxy_set_header X-Resolved-IP $remote_addr;" in default_configuration
+    assert "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;" not in default_configuration
     assert "nginx.ingress.kubernetes.io/whitelist-source-range" not in default_annotations
 
     unsafe = subprocess.run(
@@ -234,10 +239,11 @@ def test_direct_api_ingress_helm_rendering_enforces_client_ip_modes(template_pat
     assert trusted.returncode == 0, trusted.stderr
     trusted_ingress = next(yaml.safe_load_all(trusted.stdout))
     trusted_annotations = trusted_ingress["metadata"]["annotations"]
-    assert (
-        trusted_annotations["nginx.ingress.kubernetes.io/server-snippet"]
-        == "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;"
-    )
+    assert "nginx.ingress.kubernetes.io/server-snippet" not in trusted_annotations
+    trusted_configuration = trusted_annotations["nginx.ingress.kubernetes.io/configuration-snippet"]
+    assert trusted_configuration.count("proxy_set_header X-Resolved-IP") == 1
+    assert "proxy_set_header X-Resolved-IP $http_cf_connecting_ip;" in trusted_configuration
+    assert "proxy_set_header X-Resolved-IP $remote_addr;" not in trusted_configuration
     assert (
         trusted_annotations["nginx.ingress.kubernetes.io/whitelist-source-range"]
         == "173.245.48.0/20"
