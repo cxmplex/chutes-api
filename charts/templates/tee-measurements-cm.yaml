@@ -8,9 +8,8 @@ data:
   tee_measurements.yaml: |
     # TEE Measurement Configuration
     # Managed via Helm values (teeMeasurements.measurements).
-    # Each item is one canonical exact hardware/provider/role pin. TDX uses flat mrtd,
-    # rtmr0, rtmr1, rtmr2, and runtime_rtmr3 fields; boot RTMR3 defaults to all-zero
-    # and may be pinned with boot_rtmr3 when the guest extends it before its boot quote.
+    # Strict nested groups hold shared TEE/image fields and a non-empty hardware list.
+    # TDX hardware variants contain rtmr0; SEV-SNP variants contain measurement.
     # Set rc: true for an attestable release candidate excluded from the public list.
     measurements:
 {{ .Values.teeMeasurements.measurements | toYaml | indent 6 }}

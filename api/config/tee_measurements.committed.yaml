@@ -1,500 +1,487 @@
-# Versioned, git-tracked TEE-measurement artifact (H9).
+# Versioned, git-tracked TEE measurement trust source.
 #
-# This file is loaded by api.config.Settings._load_tee_measurements ALONGSIDE the environment-
-# specific ConfigMap mounted at /etc/config/tee_measurements.yaml. Entries are keyed by `name`;
-# an entry in the mounted file OVERRIDES a same-named entry here. It ships inside the api image
-# (under api/config/) and is committed (see the negation in chutes-api/.gitignore), so a validator
-# rebuilt from source has the ChuteFS storage-role measurements without hand-appending live state.
+# Strict nested schema: each group holds fields shared by its hardware variants, while `hardware`
+# holds the variant name, optional description, CPU/GPU inventory, and exactly `rtmr0` (TDX) or
+# `measurement` (SEV-SNP). The loader expands each variant into the scalar runtime trust model.
+# Mounted variants override committed variants atomically by normalized hardware name.
 #
-# Populate the entries below from the storage-image build outputs (sek8s handoff §6.3):
-#   - Intel TDX: one flat per-hardware entry with `mrtd`, `rtmr0`, `rtmr1`, `rtmr2`, and
-#     `runtime_rtmr3`. Boot RTMR3 defaults to all-zero; set `boot_rtmr3` when a bare-metal
-#     initramfs extends it before the boot quote. RTMR0-2 are shared by boot/runtime.
-#   - AMD SEV-SNP: the 48B/96-hex launch `measurement` (sev-snp-measure --vcpus 4), `policy`,
-#     `min_tcb`, `processor_model`.
-# Every storage entry MUST be named `storage-*` (the validator gates the storage_role registration
-# and per-volume key release on that prefix) and MUST set `gpu_count: 0`. Every entry also declares
-# its debug posture and binds the full measurement-name set to the source qcow2 digest. Managed
-# production releases additionally carry canonical detached-cosign provenance whose measurement
-# values are checked against these pins. Leave a real entry out rather than inventing a placeholder.
-# See tee_measurements.yaml.example and
-# charts/templates/tee-measurements-cm.yaml for the full schema.
-#
-# IMPORTANT: every currently committed entry below comes from the known
-# snp-1.6.2-debug.qcow2 or storage-1.6.1-debug.qcow2 dev artifact. There are no invented
-# hardened/production measurements in this file.
+# Every committed pin binds the exact image digest and ordered complete measurement-name set.
+# Values come from measured build artifacts; do not add placeholders or inferred measurements.
 measurements:
-  # 1.6.1 ChuteFS storage-TD, AMD SEV-SNP bare-metal EPYC Genoa, 4 vCPU direct-kernel boot.
-  # Offline launch digest from the 2026-07-03 build (sev-snp-measure --vcpus 4 --vcpu-type EPYC-v4);
-  # verified end-to-end on the live chi/fra/lax fleet (registration + LUKS key release + v3 rf=3
-  # round-trip). expected_vmpl: 0 -- the fleet's guests request attestation at VMPL 0 (verified from
-  # live registration quotes; a VMPL-1 pin was rejected by all three boxes).
-  - version: "1.6.1-storage-snp-4vcpu"
-    name: "storage-baremetal-snp-genoa-1.6.1-4vcpu"
-    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image (TEE remediation: v3 at-rest AEAD + tracker-anchored salt, anti-rollback epoch, H2 reformat guard, replication enforcement); bare-metal EPYC Genoa, 4 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da"
-    image_measurement_names: &storage_161_image_measurements
-      - "storage-baremetal-snp-genoa-1.6.1-1vcpu"
-      - "storage-baremetal-snp-genoa-1.6.1-2vcpu"
-      - "storage-baremetal-snp-genoa-1.6.1-4vcpu"
-      - "storage-baremetal-snp-genoa-1.6.1-8vcpu"
-    measurement: "40D9E24D9A3B5A378BDCA090A56739BF219DF589FEF6A6FF89C5FEFD9730872FF96B49B75F92E2286E481FCE7D898FDF"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.1-storage-snp-4vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da
+  image_measurement_names: &id002
+  - storage-baremetal-snp-genoa-1.6.1-1vcpu
+  - storage-baremetal-snp-genoa-1.6.1-2vcpu
+  - storage-baremetal-snp-genoa-1.6.1-4vcpu
+  - storage-baremetal-snp-genoa-1.6.1-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.6.1-4vcpu
+    description: '1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image (TEE remediation: v3 at-rest AEAD + tracker-anchored
+      salt, anti-rollback epoch, H2 reformat guard, replication enforcement); bare-metal EPYC Genoa, 4 vCPU.'
+    measurement: 40D9E24D9A3B5A378BDCA090A56739BF219DF589FEF6A6FF89C5FEFD9730872FF96B49B75F92E2286E481FCE7D898FDF
     expected_gpus: []
     gpu_count: 0
-  # 1.6.2 per-chute CPU-TEE guest image, AMD SEV-SNP bare-metal EPYC Genoa: one image, one launch
-  # digest per vCPU size class (the count only changes the VMSA). Offline sev-snp-measure matrix from
-  # the 2026-07-05 build; fleet-verified via the release system. The scheduler places a chute at its
-  # node_selector cpu_cores, so all four classes are pinned. expected_vmpl: 0 (bare-metal fleet).
-  - version: "1.6.2-snp-1vcpu"
-    name: "cpu-baremetal-snp-genoa-1.6.2-1vcpu"
-    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 1 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3"
-    image_measurement_names: &cpu_162_image_measurements
-      - "cpu-baremetal-snp-genoa-1.6.2-1vcpu"
-      - "cpu-baremetal-snp-genoa-1.6.2-2vcpu"
-      - "cpu-baremetal-snp-genoa-1.6.2-4vcpu"
-      - "cpu-baremetal-snp-genoa-1.6.2-8vcpu"
-    measurement: "6526040584B4598423A6FA16736B15190F1256D970EAB3569E9E4C1291E0605AE7E8ED760ABDF8F69DA70F8B65D18A59"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.2-snp-1vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3
+  image_measurement_names: &id001
+  - cpu-baremetal-snp-genoa-1.6.2-1vcpu
+  - cpu-baremetal-snp-genoa-1.6.2-2vcpu
+  - cpu-baremetal-snp-genoa-1.6.2-4vcpu
+  - cpu-baremetal-snp-genoa-1.6.2-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.6.2-1vcpu
+    description: 1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 1 vCPU.
+    measurement: 6526040584B4598423A6FA16736B15190F1256D970EAB3569E9E4C1291E0605AE7E8ED760ABDF8F69DA70F8B65D18A59
     expected_gpus: []
     gpu_count: 0
-  - version: "1.6.2-snp-2vcpu"
-    name: "cpu-baremetal-snp-genoa-1.6.2-2vcpu"
-    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 2 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3"
-    image_measurement_names: *cpu_162_image_measurements
-    measurement: "F2469732561B6BABDDD0C6982EFCB11C65E6E796DBE1B3145C31F68A568979C06391536215B610B1D04AA5C754E05F4E"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.2-snp-2vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3
+  image_measurement_names: *id001
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.6.2-2vcpu
+    description: 1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 2 vCPU.
+    measurement: F2469732561B6BABDDD0C6982EFCB11C65E6E796DBE1B3145C31F68A568979C06391536215B610B1D04AA5C754E05F4E
     expected_gpus: []
     gpu_count: 0
-  - version: "1.6.2-snp-4vcpu"
-    name: "cpu-baremetal-snp-genoa-1.6.2-4vcpu"
-    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 4 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3"
-    image_measurement_names: *cpu_162_image_measurements
-    measurement: "092B08A07CE088BAC9A4233AC9719B96B30577DB033AA2843F785D4B69731D5A4B5DB2ABAA415E3E2C7A8A1AFE30FBE8"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.2-snp-4vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3
+  image_measurement_names: *id001
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.6.2-4vcpu
+    description: 1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 4 vCPU.
+    measurement: 092B08A07CE088BAC9A4233AC9719B96B30577DB033AA2843F785D4B69731D5A4B5DB2ABAA415E3E2C7A8A1AFE30FBE8
     expected_gpus: []
     gpu_count: 0
-  - version: "1.6.2-snp-8vcpu"
-    name: "cpu-baremetal-snp-genoa-1.6.2-8vcpu"
-    description: "1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 8 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3"
-    image_measurement_names: *cpu_162_image_measurements
-    measurement: "3F1F54730318E180E14EDD32DA07536BA8C25EF3C58030CB5A0670C0902E31047F7124DE72646A1655530B9161173284"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.2-snp-8vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3
+  image_measurement_names: *id001
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.6.2-8vcpu
+    description: 1.6.2 CPU-TEE chute AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 8 vCPU.
+    measurement: 3F1F54730318E180E14EDD32DA07536BA8C25EF3C58030CB5A0670C0902E31047F7124DE72646A1655530B9161173284
     expected_gpus: []
     gpu_count: 0
-  # Hardened 1.7.0 CPU-TEE chute image, signed provenance and complete Genoa matrix.
-  - version: "1.7.0-snp-1vcpu"
-    name: "cpu-baremetal-snp-genoa-1.7.0-1vcpu"
-    description: "1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c"
-    image_measurement_names:
-      - "cpu-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "1147BE145281C93EE0B3ADA83F3FE8C66EDDB6AF03B12D2DA276A9CE5CED4882542100A4F8AE69A3B65CC81ECFE00E23"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-snp-1vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c
+  image_measurement_names:
+  - cpu-baremetal-snp-genoa-1.7.0-1vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-2vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-4vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.7.0-1vcpu
+    description: 1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image
+    measurement: 1147BE145281C93EE0B3ADA83F3FE8C66EDDB6AF03B12D2DA276A9CE5CED4882542100A4F8AE69A3B65CC81ECFE00E23
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.0-snp-2vcpu"
-    name: "cpu-baremetal-snp-genoa-1.7.0-2vcpu"
-    description: "1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c"
-    image_measurement_names:
-      - "cpu-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "A50B66BF79D74960C8B0BC3FFBB819211D3427277A99DE22B525F80FF9512EAC976C856B0A6C2EBFFB3F22FE5AC02CD1"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-snp-2vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c
+  image_measurement_names:
+  - cpu-baremetal-snp-genoa-1.7.0-1vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-2vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-4vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.7.0-2vcpu
+    description: 1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image
+    measurement: A50B66BF79D74960C8B0BC3FFBB819211D3427277A99DE22B525F80FF9512EAC976C856B0A6C2EBFFB3F22FE5AC02CD1
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.0-snp-4vcpu"
-    name: "cpu-baremetal-snp-genoa-1.7.0-4vcpu"
-    description: "1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c"
-    image_measurement_names:
-      - "cpu-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "BCCCFEA389AA8614DD7640F5912C63C1B81C279A55C332C61D9E90F80A041C2713C003DC2EC31939DA35833EACA45855"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-snp-4vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c
+  image_measurement_names:
+  - cpu-baremetal-snp-genoa-1.7.0-1vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-2vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-4vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.7.0-4vcpu
+    description: 1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image
+    measurement: BCCCFEA389AA8614DD7640F5912C63C1B81C279A55C332C61D9E90F80A041C2713C003DC2EC31939DA35833EACA45855
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.0-snp-8vcpu"
-    name: "cpu-baremetal-snp-genoa-1.7.0-8vcpu"
-    description: "1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c"
-    image_measurement_names:
-      - "cpu-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "cpu-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "F1FE016E25F77AA8CBC84AF8462228FC008E5F7275E8B97271C2B2D136486F0BBCCCF85F504C5173F4800A1F5C667456"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-snp-8vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c
+  image_measurement_names:
+  - cpu-baremetal-snp-genoa-1.7.0-1vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-2vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-4vcpu
+  - cpu-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: cpu-baremetal-snp-genoa-1.7.0-8vcpu
+    description: 1.7.0 CPU-TEE chute AMD SEV-SNP dm-verity image
+    measurement: F1FE016E25F77AA8CBC84AF8462228FC008E5F7275E8B97271C2B2D136486F0BBCCCF85F504C5173F4800A1F5C667456
     expected_gpus: []
     gpu_count: 0
-  # Hardened 1.7.0 storage image retained as the canary rollback trust set.
-  - version: "1.7.0-storage-snp-1vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.0-1vcpu"
-    description: "1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "1B63CB36FB69BBE087A827FD888E65D9EC258C38DABD6F2CD7F839F578915FB8C34D93263C9A430695A401914A8F9E95"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-storage-snp-1vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.0-1vcpu
+  - storage-baremetal-snp-genoa-1.7.0-2vcpu
+  - storage-baremetal-snp-genoa-1.7.0-4vcpu
+  - storage-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.0-1vcpu
+    description: 1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: 1B63CB36FB69BBE087A827FD888E65D9EC258C38DABD6F2CD7F839F578915FB8C34D93263C9A430695A401914A8F9E95
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.0-storage-snp-2vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.0-2vcpu"
-    description: "1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "9A1AA99748A2BBD5881C7272E4BD7BF07A6E4635F583654D8B757762B949523901F868F878FB9F83319FB4C4397A35BA"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-storage-snp-2vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.0-1vcpu
+  - storage-baremetal-snp-genoa-1.7.0-2vcpu
+  - storage-baremetal-snp-genoa-1.7.0-4vcpu
+  - storage-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.0-2vcpu
+    description: 1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: 9A1AA99748A2BBD5881C7272E4BD7BF07A6E4635F583654D8B757762B949523901F868F878FB9F83319FB4C4397A35BA
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.0-storage-snp-4vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.0-4vcpu"
-    description: "1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "EC427BC1AD6048A290EBA100B3068C76B91AF561FDA943F2A0D6DDEB01E94A88FB47D3A449C1467442CAE64EB177A0DF"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-storage-snp-4vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.0-1vcpu
+  - storage-baremetal-snp-genoa-1.7.0-2vcpu
+  - storage-baremetal-snp-genoa-1.7.0-4vcpu
+  - storage-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.0-4vcpu
+    description: 1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: EC427BC1AD6048A290EBA100B3068C76B91AF561FDA943F2A0D6DDEB01E94A88FB47D3A449C1467442CAE64EB177A0DF
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.0-storage-snp-8vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.0-8vcpu"
-    description: "1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.0-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.0-8vcpu"
-    measurement: "46858EAE6E4A7BC6D9CE50BBDF1D545EA4CDC06E3400626E950D5E967FEC40D41194A30CFFAA0FA6A19DDA4BF3CCB1C5"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.0-storage-snp-8vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.0-1vcpu
+  - storage-baremetal-snp-genoa-1.7.0-2vcpu
+  - storage-baremetal-snp-genoa-1.7.0-4vcpu
+  - storage-baremetal-snp-genoa-1.7.0-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.0-8vcpu
+    description: 1.7.0 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: 46858EAE6E4A7BC6D9CE50BBDF1D545EA4CDC06E3400626E950D5E967FEC40D41194A30CFFAA0FA6A19DDA4BF3CCB1C5
     expected_gpus: []
     gpu_count: 0
-  # Hardened 1.7.1 storage image with explicit validator mTLS client-certificate presentation.
-  - version: "1.7.1-storage-snp-1vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.1-1vcpu"
-    description: "1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.1-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-8vcpu"
-    measurement: "52C3E6F99D6CBB4A088B84739BD4EFC206B1A34206E43363E3097093A7FF1A9457A5E763D093929D5A6F1D6F6887546D"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.1-storage-snp-1vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.1-1vcpu
+  - storage-baremetal-snp-genoa-1.7.1-2vcpu
+  - storage-baremetal-snp-genoa-1.7.1-4vcpu
+  - storage-baremetal-snp-genoa-1.7.1-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.1-1vcpu
+    description: 1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: 52C3E6F99D6CBB4A088B84739BD4EFC206B1A34206E43363E3097093A7FF1A9457A5E763D093929D5A6F1D6F6887546D
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.1-storage-snp-2vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.1-2vcpu"
-    description: "1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.1-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-8vcpu"
-    measurement: "9C5A83B8644233B6AFA7FC4DFD40CA420D17C2CE14FC79CC2C7AEE9D04FF7E0167AF40BCC8F4F5FFE3AEDE27C6B9C6F6"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.1-storage-snp-2vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.1-1vcpu
+  - storage-baremetal-snp-genoa-1.7.1-2vcpu
+  - storage-baremetal-snp-genoa-1.7.1-4vcpu
+  - storage-baremetal-snp-genoa-1.7.1-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.1-2vcpu
+    description: 1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: 9C5A83B8644233B6AFA7FC4DFD40CA420D17C2CE14FC79CC2C7AEE9D04FF7E0167AF40BCC8F4F5FFE3AEDE27C6B9C6F6
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.1-storage-snp-4vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.1-4vcpu"
-    description: "1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.1-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-8vcpu"
-    measurement: "7307A04953BC5C9B3A5F41C7B26902FBD82C37EBF123F89A0080BCFF3949D337C1780076834D7B32795DB64F8950C1AE"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.1-storage-snp-4vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.1-1vcpu
+  - storage-baremetal-snp-genoa-1.7.1-2vcpu
+  - storage-baremetal-snp-genoa-1.7.1-4vcpu
+  - storage-baremetal-snp-genoa-1.7.1-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.1-4vcpu
+    description: 1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: 7307A04953BC5C9B3A5F41C7B26902FBD82C37EBF123F89A0080BCFF3949D337C1780076834D7B32795DB64F8950C1AE
     expected_gpus: []
     gpu_count: 0
-  - version: "1.7.1-storage-snp-8vcpu"
-    name: "storage-baremetal-snp-genoa-1.7.1-8vcpu"
-    description: "1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image"
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: false
-    image_sha256: "71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6"
-    image_measurement_names:
-      - "storage-baremetal-snp-genoa-1.7.1-1vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-2vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-4vcpu"
-      - "storage-baremetal-snp-genoa-1.7.1-8vcpu"
-    measurement: "184CD98A1A236A407B5163AB45D67E444210EC74ABDADE757E2514FC8C2847635AFA00731A5E3DB190F18E42CB66B764"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.7.1-storage-snp-8vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: false
+  image_sha256: 71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6
+  image_measurement_names:
+  - storage-baremetal-snp-genoa-1.7.1-1vcpu
+  - storage-baremetal-snp-genoa-1.7.1-2vcpu
+  - storage-baremetal-snp-genoa-1.7.1-4vcpu
+  - storage-baremetal-snp-genoa-1.7.1-8vcpu
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.7.1-8vcpu
+    description: 1.7.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image
+    measurement: 184CD98A1A236A407B5163AB45D67E444210EC74ABDADE757E2514FC8C2847635AFA00731A5E3DB190F18E42CB66B764
     expected_gpus: []
     gpu_count: 0
-  # 1.6.1 storage-TD size-class matrix (1/2/4/8 vCPU) so the storage-TD size knob
-  # (CHUTES_STORAGE_TD_VCPUS) can select any class. The 4-vCPU entry above is the live default;
-  # these are the other classes from the same 1.6.1 storage build artifacts (no rebuild).
-  - version: "1.6.1-storage-snp-1vcpu"
-    name: "storage-baremetal-snp-genoa-1.6.1-1vcpu"
-    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 1 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da"
-    image_measurement_names: *storage_161_image_measurements
-    measurement: "77AA058D07FABAFCA8A71D6D3CD098715D885811BA55C1F37EC09F3F32FB74EAA23B3A7553B2D27528B93D5319B8B726"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.1-storage-snp-1vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da
+  image_measurement_names: *id002
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.6.1-1vcpu
+    description: 1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 1 vCPU.
+    measurement: 77AA058D07FABAFCA8A71D6D3CD098715D885811BA55C1F37EC09F3F32FB74EAA23B3A7553B2D27528B93D5319B8B726
     expected_gpus: []
     gpu_count: 0
-  - version: "1.6.1-storage-snp-2vcpu"
-    name: "storage-baremetal-snp-genoa-1.6.1-2vcpu"
-    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 2 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da"
-    image_measurement_names: *storage_161_image_measurements
-    measurement: "D2B22A7C69576F8582383ABCE127D517D4123C693829D9FEDA9144BFB33C14137454C93964575B1CBDC5D593FC3DDF63"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.1-storage-snp-2vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da
+  image_measurement_names: *id002
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.6.1-2vcpu
+    description: 1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 2 vCPU.
+    measurement: D2B22A7C69576F8582383ABCE127D517D4123C693829D9FEDA9144BFB33C14137454C93964575B1CBDC5D593FC3DDF63
     expected_gpus: []
     gpu_count: 0
-  - version: "1.6.1-storage-snp-8vcpu"
-    name: "storage-baremetal-snp-genoa-1.6.1-8vcpu"
-    description: "1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 8 vCPU."
-    provider: "bare-metal"
-    tee_type: "sev-snp"
-    processor_model: "Genoa"
-    debug: true
-    image_sha256: "3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da"
-    image_measurement_names: *storage_161_image_measurements
-    measurement: "CCB4476CF1144E2C9510958493693276FBE3D196797B0E361001D3895B6B7D2211F82D172BC8208C03CCE019546916C8"
-    policy: "0x30000"
-    min_tcb:
-      bootloader: 7
-      tee: 0
-      snp: 23
-      microcode: 72
-    expected_vmpl: 0
+- version: 1.6.1-storage-snp-8vcpu
+  provider: bare-metal
+  tee_type: sev-snp
+  processor_model: Genoa
+  debug: true
+  image_sha256: 3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da
+  image_measurement_names: *id002
+  policy: '0x30000'
+  min_tcb:
+    bootloader: 7
+    tee: 0
+    snp: 23
+    microcode: 72
+  expected_vmpl: 0
+  hardware:
+  - name: storage-baremetal-snp-genoa-1.6.1-8vcpu
+    description: 1.6.1 ChuteFS storage-TD AMD SEV-SNP dm-verity image; bare-metal EPYC Genoa, 8 vCPU.
+    measurement: CCB4476CF1144E2C9510958493693276FBE3D196797B0E361001D3895B6B7D2211F82D172BC8208C03CCE019546916C8
     expected_gpus: []
     gpu_count: 0
-  # 1.6.0 ChuteFS storage-TD, Intel TDX bare-metal PhoenixNAP, 4 vCPU. Captured from the
-  # successfully generated 5243-byte live quote after QGS/PCCS provisioning; MRTD/RTMRs matched
-  # validator verification before the provider platform was rejected for its obsolete hardware TCB.
-  # This bare-metal guest extends RTMR3 in the initramfs before registration, so its boot quote
-  # carries the same measured value rather than the default all-zero RTMR3.
-  - version: "1.6.0-storage-tdx-4vcpu"
-    name: "storage-baremetal-tdx-1.6.0-4vcpu"
-    description: "1.6.0 ChuteFS storage-TD Intel TDX dm-verity debug image; bare-metal PhoenixNAP, 4 vCPU."
-    provider: "bare-metal"
-    tee_type: "tdx"
-    debug: true
-    rc: false
-    image_sha256: "a20879377cb717f708fa62060bb6a0b4d5f8857c7d0185a925ba6674cd7748c5"
-    image_measurement_names:
-      - "storage-baremetal-tdx-1.6.0-4vcpu"
-    mrtd: "DDC6EFCDD2309E10837F8A7F64B71272B7EF003B129460410FE715BDFFFEC38C7C0C1686DDDB2A23D4FD623D145E8455"
-    rtmr0: "F395F83731A46650BCB5D373EC476E6E216D46D08201A33E3E60A1C8979FB952BAC448A6050A3C17DB0402E33B2124CF"
-    rtmr1: "35DFCD2098EB2E0BF30FBDBDD82D2292738B2A11FB58581198E7C87E6495EEEF070DCFEBC4D06B9ABFDD12E7DB2E1A47"
-    rtmr2: "10FD86D69C808D538ED2D861282B5DCC07CD569A90B1637FB7E2DFA34BF6A148F25983BA5262C440F0961F1A75C4C378"
-    boot_rtmr3: "67EFA77CC84940144610D4E3315C35EB3E501025B91B3C148281DDE97A0DDB72A0E6FC6179C0C08C59A86D9227034554"
-    runtime_rtmr3: "67EFA77CC84940144610D4E3315C35EB3E501025B91B3C148281DDE97A0DDB72A0E6FC6179C0C08C59A86D9227034554"
+- version: 1.6.0-storage-tdx-4vcpu
+  provider: bare-metal
+  tee_type: tdx
+  debug: true
+  rc: false
+  image_sha256: a20879377cb717f708fa62060bb6a0b4d5f8857c7d0185a925ba6674cd7748c5
+  image_measurement_names:
+  - storage-baremetal-tdx-1.6.0-4vcpu
+  mrtd: DDC6EFCDD2309E10837F8A7F64B71272B7EF003B129460410FE715BDFFFEC38C7C0C1686DDDB2A23D4FD623D145E8455
+  rtmr1: 35DFCD2098EB2E0BF30FBDBDD82D2292738B2A11FB58581198E7C87E6495EEEF070DCFEBC4D06B9ABFDD12E7DB2E1A47
+  rtmr2: 10FD86D69C808D538ED2D861282B5DCC07CD569A90B1637FB7E2DFA34BF6A148F25983BA5262C440F0961F1A75C4C378
+  boot_rtmr3: 67EFA77CC84940144610D4E3315C35EB3E501025B91B3C148281DDE97A0DDB72A0E6FC6179C0C08C59A86D9227034554
+  runtime_rtmr3: 67EFA77CC84940144610D4E3315C35EB3E501025B91B3C148281DDE97A0DDB72A0E6FC6179C0C08C59A86D9227034554
+  hardware:
+  - name: storage-baremetal-tdx-1.6.0-4vcpu
+    description: 1.6.0 ChuteFS storage-TD Intel TDX dm-verity debug image; bare-metal PhoenixNAP, 4 vCPU.
+    rtmr0: F395F83731A46650BCB5D373EC476E6E216D46D08201A33E3E60A1C8979FB952BAC448A6050A3C17DB0402E33B2124CF
     expected_gpus: []
     gpu_count: 0
+revoked_measurements: []

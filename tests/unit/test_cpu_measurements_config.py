@@ -1,8 +1,6 @@
-"""
-Unit tests for CPU (gpu_count: 0) TEE measurement config loading in api.config.
-"""
+"""Strict nested TEE measurement source parsing and runtime identity tests."""
 
-import textwrap
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -22,62 +20,212 @@ HEX96_RTMR0 = "B" * 96
 HEX96_RTMR1 = "C" * 96
 HEX96_RTMR2 = "D" * 96
 HEX96_RTMR3 = "E" * 96
+HEX96_SNP = "F" * 96
+HEX64_PCR = "1" * 64
+TRUST_FINGERPRINT = "eadf05c46cc7758c943c10f78fb65633f93f9b780f6e0b301136ff919b99cef9"
+COMMITTED_TDX_FINGERPRINT = "22a6a665bb44323d386849ccb9890ebbc879b017f278e1e74af30721a516a1dd"
+_ABSENT = object()
+
+
+def _document(*groups: dict, revoked: list[str] | None = None) -> dict:
+    return {
+        "measurements": list(groups),
+        "revoked_measurements": list(revoked or []),
+    }
 
 
 def _settings_for_yaml(tmp_path: Path, yaml_text: str) -> Settings:
     config_path = tmp_path / "tee_measurements.yaml"
-    config_path.write_text(textwrap.dedent(yaml_text))
+    config_path.write_text(yaml_text)
     settings = Settings()
     settings.tee_measurement_config_path = config_path
     settings.tee_committed_measurement_config_path = tmp_path / "no-committed-measurements.yaml"
     return settings
 
 
-def test_loads_cpu_measurement_gpu_count_zero(tmp_path):
-    yaml_text = f"""
-    measurements:
-      - version: "1"
-        mrtd: "{HEX96_MRTD}"
-        name: "cpu-gcp"
-        provider: "gcp"
-        debug: false
-        rtmr0: "{HEX96_RTMR0}"
-        rtmr1: "{HEX96_RTMR1}"
-        rtmr2: "{HEX96_RTMR2}"
-        runtime_rtmr3: "{HEX96_RTMR3}"
-        expected_gpus: []
-        gpu_count: 0
-    """
-    settings = _settings_for_yaml(tmp_path, yaml_text)
-    measurements = settings._load_tee_measurements()
-    assert len(measurements) == 1
-    cpu = measurements[0]
-    assert cpu.gpu_count == 0
-    assert cpu.expected_gpus == []
-    assert cpu.provider == "gcp"
-    assert cpu.mrtd == HEX96_MRTD
-    assert cpu.boot_rtmrs["RTMR3"] == "0" * 96
+def _settings_for_document(tmp_path: Path, document: dict) -> Settings:
+    return _settings_for_yaml(tmp_path, yaml.safe_dump(document, sort_keys=False))
 
 
-def test_canonical_tdx_accepts_explicit_nonzero_boot_rtmr3(tmp_path):
-    settings = _settings_for_yaml(
+def _settings_for_committed_document(tmp_path: Path, document: dict) -> Settings:
+    committed_path = tmp_path / "tee_measurements.committed.yaml"
+    committed_path.write_text(yaml.safe_dump(document, sort_keys=False))
+    settings = Settings()
+    settings.tee_committed_measurement_config_path = committed_path
+    settings.tee_measurement_config_path = tmp_path / "no-mounted-measurements.yaml"
+    return settings
+
+
+def _tdx_group(
+    *,
+    version: str = "1",
+    name: str = "cpu-gcp",
+    provider: str | None = "gcp",
+    debug: bool = False,
+    rc: bool = False,
+    rtmr0: object = HEX96_RTMR0,
+    expected_gpus: object = None,
+    gpu_count: object = 0,
+    boot_rtmr3: object = _ABSENT,
+    image_sha256: object = _ABSENT,
+    image_measurement_names: object = _ABSENT,
+) -> dict:
+    group = {
+        "version": version,
+        "tee_type": "tdx",
+        "debug": debug,
+        "rc": rc,
+        "mrtd": HEX96_MRTD,
+        "rtmr1": HEX96_RTMR1,
+        "rtmr2": HEX96_RTMR2,
+        "runtime_rtmr3": HEX96_RTMR3,
+        "hardware": [
+            {
+                "name": name,
+                "rtmr0": rtmr0,
+                "expected_gpus": [] if expected_gpus is None else expected_gpus,
+                "gpu_count": gpu_count,
+            }
+        ],
+    }
+    if provider is not None:
+        group["provider"] = provider
+    if boot_rtmr3 is not _ABSENT:
+        group["boot_rtmr3"] = boot_rtmr3
+    if image_sha256 is not _ABSENT:
+        group["image_sha256"] = image_sha256
+    if image_measurement_names is not _ABSENT:
+        group["image_measurement_names"] = image_measurement_names
+    return group
+
+
+def _snp_group(
+    *,
+    version: str = "1",
+    name: str = "cpu-snp",
+    provider: str = "bare-metal",
+    debug: bool = False,
+    rc: bool = False,
+    measurement: object = HEX96_SNP,
+    policy: object = "0x30000",
+    min_tcb: object = None,
+    expected_vmpl: object = 0,
+    processor_model: object = "Genoa",
+    id_key_digest: object = _ABSENT,
+    expected_gpus: object = None,
+    gpu_count: object = 0,
+    image_sha256: object = _ABSENT,
+    image_measurement_names: object = _ABSENT,
+) -> dict:
+    group = {
+        "version": version,
+        "tee_type": "sev-snp",
+        "provider": provider,
+        "processor_model": processor_model,
+        "debug": debug,
+        "rc": rc,
+        "policy": policy,
+        "min_tcb": (
+            {
+                "bootloader": 7,
+                "tee": 0,
+                "snp": 23,
+                "microcode": 72,
+            }
+            if min_tcb is None
+            else min_tcb
+        ),
+        "expected_vmpl": expected_vmpl,
+        "hardware": [
+            {
+                "name": name,
+                "measurement": measurement,
+                "expected_gpus": [] if expected_gpus is None else expected_gpus,
+                "gpu_count": gpu_count,
+            }
+        ],
+    }
+    if provider == "gcp":
+        group["vtpm_pcrs"] = {"8": HEX64_PCR, "9": HEX64_PCR}
+        group["vtpm_security_flags"] = {
+            "2": True,
+            "3": False,
+            "4": False,
+            "5": False,
+        }
+    if id_key_digest is not _ABSENT:
+        group["id_key_digest"] = id_key_digest
+    if image_sha256 is not _ABSENT:
+        group["image_sha256"] = image_sha256
+    if image_measurement_names is not _ABSENT:
+        group["image_measurement_names"] = image_measurement_names
+    return group
+
+
+def _committed_snp_group(
+    *,
+    name: str = "cpu-snp",
+    measurement: str = HEX96_SNP,
+    image_names: list[str] | None = None,
+) -> dict:
+    names = image_names or [name]
+    return _snp_group(
+        name=name,
+        measurement=measurement,
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+
+
+def _committed_snp_matrix_document() -> dict:
+    names = [f"cpu-baremetal-snp-genoa-2.0.0-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)]
+    groups = [
+        _snp_group(
+            version=f"2.0.0-snp-{vcpus}vcpu",
+            name=name,
+            measurement=f"{index:X}" * 96,
+            image_sha256="a" * 64,
+            image_measurement_names=names,
+        )
+        for index, (name, vcpus) in enumerate(zip(names, (1, 2, 4, 8), strict=True), start=1)
+    ]
+    return _document(*groups)
+
+
+def test_nested_tdx_flattens_hardware_into_scalar_runtime_model(tmp_path):
+    group = _tdx_group()
+    group["hardware"].append(
+        {
+            "name": "cpu-gcp-second",
+            "description": "second topology",
+            "rtmr0": "9" * 96,
+            "expected_gpus": [],
+            "gpu_count": 0,
+        }
+    )
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    first, second = settings._load_tee_measurements()
+
+    assert first.name == "cpu-gcp"
+    assert first.mrtd == HEX96_MRTD
+    assert first.rtmr0 == HEX96_RTMR0
+    assert second.name == "cpu-gcp-second"
+    assert second.rtmr0 == "9" * 96
+    assert first.boot_rtmrs["RTMR3"] == "0" * 96
+    assert first.runtime_rtmrs["RTMR3"] == HEX96_RTMR3
+
+
+def test_nested_tdx_accepts_explicit_nonzero_boot_rtmr3(tmp_path):
+    settings = _settings_for_document(
         tmp_path,
-        f"""
-        measurements:
-          - version: "1"
-            name: "cpu-baremetal"
-            provider: "bare-metal"
-            tee_type: "tdx"
-            debug: false
-            mrtd: "{HEX96_MRTD}"
-            rtmr0: "{HEX96_RTMR0}"
-            rtmr1: "{HEX96_RTMR1}"
-            rtmr2: "{HEX96_RTMR2}"
-            boot_rtmr3: "{HEX96_RTMR3}"
-            runtime_rtmr3: "{HEX96_RTMR3}"
-            expected_gpus: []
-            gpu_count: 0
-        """,
+        _document(
+            _tdx_group(
+                name="cpu-baremetal",
+                provider="bare-metal",
+                boot_rtmr3=HEX96_RTMR3,
+            )
+        ),
     )
 
     (measurement,) = settings._load_tee_measurements()
@@ -86,56 +234,205 @@ def test_canonical_tdx_accepts_explicit_nonzero_boot_rtmr3(tmp_path):
     assert measurement.runtime_rtmrs["RTMR3"] == HEX96_RTMR3
 
 
-def test_rejects_legacy_nested_tdx_schema_instead_of_dual_parsing(tmp_path):
-    settings = _settings_for_yaml(
-        tmp_path,
-        f"""
-        measurements:
-          - version: "1"
-            name: "cpu-gcp"
-            provider: "gcp"
-            tee_type: "tdx"
-            debug: false
-            mrtd: "{HEX96_MRTD}"
-            boot_rtmrs:
-              rtmr0: "{HEX96_RTMR0}"
-            runtime_rtmrs:
-              rtmr3: "{HEX96_RTMR3}"
-            expected_gpus: []
-            gpu_count: 0
-        """,
-    )
-    with pytest.raises(ValueError, match="Unsupported field.*boot_rtmrs"):
+def test_rejects_current_flat_scalar_source_without_dual_parsing(tmp_path):
+    flat = {
+        "version": "1",
+        "name": "cpu-gcp",
+        "provider": "gcp",
+        "tee_type": "tdx",
+        "debug": False,
+        "mrtd": HEX96_MRTD,
+        "rtmr0": HEX96_RTMR0,
+        "rtmr1": HEX96_RTMR1,
+        "rtmr2": HEX96_RTMR2,
+        "runtime_rtmr3": HEX96_RTMR3,
+        "expected_gpus": [],
+        "gpu_count": 0,
+    }
+    settings = _settings_for_document(tmp_path, _document(flat))
+
+    with pytest.raises(ValueError, match="flat scalar"):
         settings._load_tee_measurements()
 
 
-def test_release_candidate_is_attestable_but_not_minimum_version(tmp_path):
-    entries = []
-    for version, name, rc in (
-        ("1.3.0", "cpu-gcp-stable", False),
-        ("9.0.0", "cpu-gcp-rc", True),
-    ):
-        entries.append(
-            {
-                "version": version,
-                "name": name,
-                "provider": "gcp",
-                "tee_type": "tdx",
-                "debug": False,
-                "rc": rc,
-                "mrtd": HEX96_MRTD,
-                "rtmr0": HEX96_RTMR0,
-                "rtmr1": HEX96_RTMR1,
-                "rtmr2": HEX96_RTMR2,
-                "runtime_rtmr3": HEX96_RTMR3,
-                "expected_gpus": [],
-                "gpu_count": 0,
-            }
-        )
+@pytest.mark.parametrize("legacy_key", ["boot_rtmrs", "runtime_rtmrs"])
+def test_rejects_old_boot_runtime_map_format(tmp_path, legacy_key):
+    group = _tdx_group()
+    group[legacy_key] = {"rtmr0": HEX96_RTMR0}
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="old boot/runtime map"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    "yaml_text",
+    [
+        "measurements: []\n",
+        "revoked_measurements: []\n",
+        "measurements: []\nrevoked_measurements: []\nextra: true\n",
+        "null\n",
+    ],
+)
+def test_root_requires_exact_document_shape(tmp_path, yaml_text):
+    settings = _settings_for_yaml(tmp_path, yaml_text)
+
+    with pytest.raises(ValueError, match="document"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"measurements": {}, "revoked_measurements": []},
+        {"measurements": [], "revoked_measurements": None},
+        {"measurements": [1], "revoked_measurements": []},
+    ],
+)
+def test_root_members_require_explicit_types(tmp_path, document):
+    settings = _settings_for_document(tmp_path, document)
+
+    with pytest.raises(ValueError):
+        settings._load_tee_measurements()
+
+
+def test_duplicate_yaml_keys_are_rejected_before_overwrite(tmp_path):
     settings = _settings_for_yaml(
         tmp_path,
-        yaml.safe_dump({"measurements": entries}, sort_keys=False),
+        "measurements: []\nmeasurements: []\nrevoked_measurements: []\n",
     )
+
+    with pytest.raises(ValueError, match="duplicate YAML key 'measurements'"):
+        settings._load_tee_measurements()
+
+
+def test_empty_hardware_list_rejected(tmp_path):
+    group = _tdx_group()
+    group["hardware"] = []
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="non-empty 'hardware'"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize("alias", ["snp", "amd-snp", "SEV-SNP", "sgx"])
+def test_tee_type_aliases_and_unknown_values_rejected(tmp_path, alias):
+    group = _snp_group()
+    group["tee_type"] = alias
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="exactly 'tdx' or 'sev-snp'"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("version",), 1, "version"),
+        (("tee_type",), None, "tee_type"),
+        (("provider",), "GCP", "provider"),
+        (("debug",), "false", "debug"),
+        (("rc",), 0, "rc"),
+        (("mrtd",), 1, "mrtd"),
+        (("hardware", 0, "rtmr0"), 1, "rtmr0"),
+        (("hardware", 0, "expected_gpus"), "h200", "expected_gpus"),
+        (("hardware", 0, "gpu_count"), False, "gpu_count"),
+    ],
+)
+def test_tdx_explicit_values_use_strict_yaml_types(tmp_path, path, value, message):
+    group = _tdx_group()
+    target = group
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match=message):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"policy": True}, "policy"),
+        ({"policy": 3.0}, "policy"),
+        ({"processor_model": 1}, "processor_model"),
+        ({"expected_vmpl": "0"}, "expected_vmpl"),
+        ({"id_key_digest": None}, "id_key_digest"),
+    ],
+)
+def test_snp_explicit_values_use_strict_yaml_types(tmp_path, mutation, message):
+    group = _snp_group()
+    group.update(mutation)
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match=message):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    ("tee_type", "wrong_field"),
+    [
+        ("tdx", "measurement"),
+        ("sev-snp", "rtmr0"),
+    ],
+)
+def test_hardware_variant_rejects_other_tee_measurement_field(tmp_path, tee_type, wrong_field):
+    group = _tdx_group() if tee_type == "tdx" else _snp_group()
+    group["hardware"][0][wrong_field] = HEX96_RTMR0
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="unsupported"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize("field", ["name", "expected_gpus", "gpu_count", "rtmr0"])
+def test_tdx_hardware_requires_every_canonical_field(tmp_path, field):
+    group = _tdx_group()
+    del group["hardware"][0][field]
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="missing required"):
+        settings._load_tee_measurements()
+
+
+def test_normalized_duplicate_hardware_names_rejected_across_groups(tmp_path):
+    first = _tdx_group(name="cpu-gcp")
+    second = _tdx_group(name=" cpu-gcp ", version="2")
+    settings = _settings_for_document(tmp_path, _document(first, second))
+
+    with pytest.raises(ValueError, match="duplicate normalized measurement name"):
+        settings._load_tee_measurements()
+
+
+def test_duplicate_normalized_revocations_rejected_within_source(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(revoked=["future-pin", " future-pin "]),
+    )
+
+    with pytest.raises(ValueError, match="duplicate normalized revocation"):
+        settings._load_tee_measurements()
+
+
+def test_unknown_revocation_tombstone_is_preserved_without_error(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_tdx_group(), revoked=["not-loaded-yet"]),
+    )
+
+    assert [config.name for config in settings._load_tee_measurements()] == ["cpu-gcp"]
+
+
+def test_release_candidate_is_attestable_but_not_minimum_version(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(
+            _tdx_group(version="1.3.0", name="cpu-stable", rc=False),
+            _tdx_group(version="9.0.0", name="cpu-rc", rc=True),
+        ),
+    )
+
     assert [entry.rc for entry in settings.tee_measurements] == [False, True]
     assert settings.tee_minimum_boot_version == "1.3.0"
 
@@ -164,234 +461,81 @@ def test_release_candidate_promotion_does_not_change_trust_identity():
     )
 
 
-def test_one_image_measurement_set_requires_consistent_rc_posture(tmp_path):
-    names = ["cpu-gcp-a", "cpu-gcp-b"]
-    entries = []
-    for name, rc in zip(names, (False, True), strict=True):
-        entries.append(
-            {
-                "version": "1.3.0",
-                "name": name,
-                "provider": "gcp",
-                "tee_type": "tdx",
-                "debug": False,
-                "rc": rc,
-                "image_sha256": "a" * 64,
-                "image_measurement_names": names,
-                "mrtd": HEX96_MRTD,
-                "rtmr0": HEX96_RTMR0,
-                "rtmr1": HEX96_RTMR1,
-                "rtmr2": HEX96_RTMR2,
-                "runtime_rtmr3": HEX96_RTMR3,
-                "expected_gpus": [],
-                "gpu_count": 0,
-            }
-        )
-    settings = _settings_for_yaml(
+def test_gpu_tdx_group_may_omit_provider(tmp_path):
+    settings = _settings_for_document(
         tmp_path,
-        yaml.safe_dump({"measurements": entries}, sort_keys=False),
+        _document(
+            _tdx_group(
+                provider=None,
+                name="8xh200",
+                expected_gpus=["H200"],
+                gpu_count=8,
+            )
+        ),
     )
 
-    with pytest.raises(ValueError, match="Inconsistent image provenance"):
-        settings._load_tee_measurements()
+    (gpu,) = settings._load_tee_measurements()
 
-
-def test_measurement_absent_gpu_count_rejected(tmp_path):
-    """A config omitting gpu_count must hard-fail at load: silently treating it as a CPU
-    config would skip GPU evidence verification for a GPU image. CPU-ness is explicit
-    (gpu_count: 0)."""
-    yaml_text = f"""
-    measurements:
-      - version: "1"
-        mrtd: "{HEX96_MRTD}"
-        name: "cpu-baremetal"
-        provider: "bare-metal"
-        debug: false
-        rtmr0: "{HEX96_RTMR0}"
-        rtmr1: "{HEX96_RTMR1}"
-        rtmr2: "{HEX96_RTMR2}"
-        runtime_rtmr3: "{HEX96_RTMR3}"
-        expected_gpus: []
-    """
-    settings = _settings_for_yaml(tmp_path, yaml_text)
-    with pytest.raises(ValueError, match="Missing 'gpu_count'"):
-        settings._load_tee_measurements()
-
-
-@pytest.mark.parametrize("gpu_count", [False, True, "0", -1])
-def test_measurement_gpu_count_requires_nonnegative_integer(tmp_path, gpu_count):
-    document = yaml.safe_load(
-        textwrap.dedent(
-            f"""
-            measurements:
-              - version: "1"
-                mrtd: "{HEX96_MRTD}"
-                name: "cpu-gcp"
-                provider: "gcp"
-                debug: false
-                rtmr0: "{HEX96_RTMR0}"
-                rtmr1: "{HEX96_RTMR1}"
-                rtmr2: "{HEX96_RTMR2}"
-                runtime_rtmr3: "{HEX96_RTMR3}"
-                expected_gpus: []
-                gpu_count: 0
-            """
-        )
-    )
-    document["measurements"][0]["gpu_count"] = gpu_count
-    settings = _settings_for_yaml(tmp_path, yaml.safe_dump(document))
-    with pytest.raises(ValueError, match="gpu_count"):
-        settings._load_tee_measurements()
-
-
-def test_gpu_measurement_still_loads_with_provider_none(tmp_path):
-    yaml_text = f"""
-    measurements:
-      - version: "2"
-        mrtd: "{HEX96_MRTD}"
-        name: "8xh200"
-        debug: false
-        rtmr0: "{HEX96_RTMR0}"
-        rtmr1: "{HEX96_RTMR1}"
-        rtmr2: "{HEX96_RTMR2}"
-        runtime_rtmr3: "{HEX96_RTMR3}"
-        expected_gpus:
-          - "h200"
-        gpu_count: 8
-    """
-    settings = _settings_for_yaml(tmp_path, yaml_text)
-    measurements = settings._load_tee_measurements()
-    assert len(measurements) == 1
-    gpu = measurements[0]
-    assert gpu.gpu_count == 8
-    assert gpu.expected_gpus == ["h200"]
     assert gpu.provider is None
+    assert gpu.expected_gpus == ["h200"]
+    assert gpu.gpu_count == 8
 
 
-def test_provider_is_normalized_lowercase(tmp_path):
-    yaml_text = f"""
-    measurements:
-      - version: "1"
-        mrtd: "{HEX96_MRTD}"
-        name: "cpu-gcp"
-        provider: "GCP"
-        debug: false
-        rtmr0: "{HEX96_RTMR0}"
-        rtmr1: "{HEX96_RTMR1}"
-        rtmr2: "{HEX96_RTMR2}"
-        runtime_rtmr3: "{HEX96_RTMR3}"
-        expected_gpus: []
-        gpu_count: 0
-    """
-    settings = _settings_for_yaml(tmp_path, yaml_text)
-    measurements = settings._load_tee_measurements()
-    assert measurements[0].provider == "gcp"
+def test_cpu_group_requires_provider(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_tdx_group(provider=None)),
+    )
 
-
-def test_invalid_rtmr0_length_still_raises(tmp_path):
-    yaml_text = f"""
-    measurements:
-      - version: "1"
-        mrtd: "{HEX96_MRTD}"
-        name: "cpu-bad"
-        provider: "bare-metal"
-        debug: false
-        rtmr0: "TOOSHORT"
-        rtmr1: "{HEX96_RTMR1}"
-        rtmr2: "{HEX96_RTMR2}"
-        runtime_rtmr3: "{HEX96_RTMR3}"
-        expected_gpus: []
-        gpu_count: 0
-    """
-    settings = _settings_for_yaml(tmp_path, yaml_text)
-    with pytest.raises(ValueError, match="Invalid rtmr0"):
+    with pytest.raises(ValueError, match="must set provider"):
         settings._load_tee_measurements()
 
 
-# --------------------------------------------------------------------------------------------------
-# AMD SEV-SNP configs must fail closed: policy + min_tcb always; vtpm_pcrs for provider gcp.
-# --------------------------------------------------------------------------------------------------
-
-HEX96_SNP = "F" * 96
-HEX64_PCR = "1" * 64
-
-
-def _snp_yaml(
-    *,
-    policy='policy: "0x30000"',
-    min_tcb=True,
-    provider="bare-metal",
-    vtpm=False,
-    vtpm_flags=True,
-    expected_vmpl="expected_vmpl: 0",
-):
-    min_tcb_block = (
-        min_tcb
-        if isinstance(min_tcb, str)
-        else """
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72"""
-        if min_tcb
-        else ""
+@pytest.mark.parametrize(
+    ("gpu_count", "expected_gpus"),
+    [
+        (-1, []),
+        ("0", []),
+        (0, ["h200"]),
+        (8, []),
+        (8, ["h200", "H200"]),
+    ],
+)
+def test_gpu_inventory_is_explicit_and_consistent(tmp_path, gpu_count, expected_gpus):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(
+            _tdx_group(
+                provider=None if gpu_count == 8 else "gcp",
+                gpu_count=gpu_count,
+                expected_gpus=expected_gpus,
+            )
+        ),
     )
-    vtpm_block = (
-        f"""
-        vtpm_pcrs:
-          "8": "{HEX64_PCR}"
-          "9": "{HEX64_PCR}" """
-        if vtpm
-        else ""
-    )
-    vtpm_flags_block = (
-        """
-        vtpm_security_flags:
-          "2": true
-          "3": false
-          "4": false
-          "5": false"""
-        if vtpm and vtpm_flags is True
-        else vtpm_flags
-        if isinstance(vtpm_flags, str)
-        else ""
-    )
-    return f"""
-    measurements:
-      - version: "1"
-        name: "cpu-snp"
-        provider: "{provider}"
-        tee_type: "sev-snp"
-        debug: false
-        measurement: "{HEX96_SNP}"
-        {policy}{min_tcb_block}{vtpm_block}{vtpm_flags_block}
-        {expected_vmpl}
-        expected_gpus: []
-        gpu_count: 0
-    """
+
+    with pytest.raises(ValueError):
+        settings._load_tee_measurements()
 
 
-def test_snp_config_complete_loads(tmp_path):
-    settings = _settings_for_yaml(tmp_path, _snp_yaml())
+def test_snp_complete_group_loads(tmp_path):
+    settings = _settings_for_document(tmp_path, _document(_snp_group()))
+
     (config,) = settings._load_tee_measurements()
+
     assert config.tee_type == "sev-snp"
+    assert config.measurement == HEX96_SNP
     assert config.policy == 0x30000
     assert config.min_tcb == {"bootloader": 7, "tee": 0, "snp": 23, "microcode": 72}
+    assert config.expected_vmpl == 0
 
 
-def test_snp_config_missing_policy_rejected(tmp_path):
-    """The SNP launch measurement does not cover the policy field, so an unpinned policy lets a
-    host flip non-DEBUG policy bits undetected -- the config must hard-fail at load."""
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(policy=""))
-    with pytest.raises(ValueError, match="Missing 'policy'"):
-        settings._load_tee_measurements()
+@pytest.mark.parametrize("field", ["processor_model", "policy", "min_tcb", "expected_vmpl"])
+def test_snp_requires_all_shared_security_fields(tmp_path, field):
+    group = _snp_group()
+    del group[field]
+    settings = _settings_for_document(tmp_path, _document(group))
 
-
-def test_snp_config_missing_min_tcb_rejected(tmp_path):
-    """Without a minimum reported TCB there is no anti-rollback; must hard-fail at load."""
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(min_tcb=False))
-    with pytest.raises(ValueError, match="Missing 'min_tcb'"):
+    with pytest.raises(ValueError, match="missing required"):
         settings._load_tee_measurements()
 
 
@@ -403,10 +547,11 @@ def test_snp_config_missing_min_tcb_rejected(tmp_path):
         for value in (True, False, 7.0, "7", None, -1, 256)
     ],
 )
-def test_snp_config_requires_actual_bounded_integer_for_every_tcb_component(tmp_path, key, value):
-    document = yaml.safe_load(textwrap.dedent(_snp_yaml()))
-    document["measurements"][0]["min_tcb"][key] = value
-    settings = _settings_for_yaml(tmp_path, yaml.safe_dump(document))
+def test_snp_tcb_components_require_bounded_yaml_integers(tmp_path, key, value):
+    group = _snp_group()
+    group["min_tcb"][key] = value
+    settings = _settings_for_document(tmp_path, _document(group))
+
     with pytest.raises(ValueError, match="min_tcb"):
         settings._load_tee_measurements()
 
@@ -415,110 +560,69 @@ def test_snp_config_requires_actual_bounded_integer_for_every_tcb_component(tmp_
     "min_tcb",
     [
         {"bootloader": 7},
-        {
-            "bootloader": 7,
-            "tee": 0,
-            "snp": 23,
-            "microcode": 72,
-            "extra": 1,
-        },
+        {"bootloader": 7, "tee": 0, "snp": 23, "microcode": 72, "extra": 1},
         {1: 7, "tee": 0, "snp": 23, "microcode": 72},
+        {"Bootloader": 7, "tee": 0, "snp": 23, "microcode": 72},
     ],
 )
-def test_snp_config_requires_exact_tcb_key_set(tmp_path, min_tcb):
-    document = yaml.safe_load(textwrap.dedent(_snp_yaml()))
-    document["measurements"][0]["min_tcb"] = min_tcb
-    settings = _settings_for_yaml(tmp_path, yaml.safe_dump(document))
+def test_snp_tcb_requires_exact_lowercase_key_set(tmp_path, min_tcb):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_snp_group(min_tcb=min_tcb)),
+    )
+
     with pytest.raises(ValueError, match="min_tcb"):
         settings._load_tee_measurements()
 
 
-def test_snp_config_accepts_tcb_integer_boundaries(tmp_path):
-    document = yaml.safe_load(textwrap.dedent(_snp_yaml()))
-    document["measurements"][0]["min_tcb"] = {
-        "bootloader": 0,
-        "tee": 255,
-        "snp": 0,
-        "microcode": 255,
-    }
-    settings = _settings_for_yaml(tmp_path, yaml.safe_dump(document))
-    (config,) = settings._load_tee_measurements()
-    assert config.min_tcb == document["measurements"][0]["min_tcb"]
+def test_duplicate_yaml_tcb_key_rejected(tmp_path):
+    source = f"""
+measurements:
+  - version: "1"
+    tee_type: "sev-snp"
+    provider: "bare-metal"
+    processor_model: "Genoa"
+    debug: false
+    policy: "0x30000"
+    min_tcb:
+      bootloader: 7
+      tee: 0
+      snp: 23
+      microcode: 72
+      bootloader: 8
+    expected_vmpl: 0
+    hardware:
+      - name: "cpu-snp"
+        measurement: "{HEX96_SNP}"
+        expected_gpus: []
+        gpu_count: 0
+revoked_measurements: []
+"""
+    settings = _settings_for_yaml(tmp_path, source)
 
-
-def test_snp_config_rejects_exact_duplicate_yaml_tcb_key(tmp_path):
-    duplicate = """
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-          bootloader: 8
-    """
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(min_tcb=duplicate))
     with pytest.raises(ValueError, match="duplicate YAML key 'bootloader'"):
         settings._load_tee_measurements()
 
 
-@pytest.mark.parametrize(
-    "tcb_block",
-    [
-        """
-        min_tcb:
-          Bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-        """,
-        """
-        min_tcb:
-          bootloader: 7
-          Bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-        """,
-        """
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          Microcode: 72
-        """,
-        """
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-          MICROCODE: 72
-        """,
-    ],
-)
-def test_snp_config_rejects_wrong_case_and_case_duplicate_tcb_keys(tmp_path, tcb_block):
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(min_tcb=tcb_block))
-    with pytest.raises(ValueError, match="exactly lowercase"):
-        settings._load_tee_measurements()
+@pytest.mark.parametrize("vmpl", [-1, 4, True, "0"])
+def test_snp_vmpl_requires_observed_bounded_integer(tmp_path, vmpl):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_snp_group(expected_vmpl=vmpl)),
+    )
 
-
-@pytest.mark.parametrize("vmpl", ["", "expected_vmpl: -1", "expected_vmpl: 4"])
-def test_snp_config_requires_observed_vmpl_pin(tmp_path, vmpl):
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(expected_vmpl=vmpl))
     with pytest.raises(ValueError, match="expected_vmpl"):
         settings._load_tee_measurements()
 
 
-def test_gcp_snp_config_without_vtpm_pcrs_rejected(tmp_path):
-    """A provider-gcp SNP config without vtpm_pcrs would match on Google firmware alone and never
-    check image identity; must hard-fail at load (requiring PCR8 and PCR9 specifically)."""
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="gcp", vtpm=False))
-    with pytest.raises(ValueError, match="must pin vtpm_pcrs including PCR8 and PCR9"):
-        settings._load_tee_measurements()
+def test_gcp_snp_exact_vtpm_sets_load(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_snp_group(provider="gcp", processor_model="Milan")),
+    )
 
-
-def test_gcp_snp_config_with_vtpm_pcrs_loads(tmp_path):
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="gcp", vtpm=True))
     (config,) = settings._load_tee_measurements()
+
     assert config.vtpm_pcrs == {"8": HEX64_PCR, "9": HEX64_PCR}
     assert config.vtpm_security_flags == {
         "2": True,
@@ -529,218 +633,382 @@ def test_gcp_snp_config_with_vtpm_pcrs_loads(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "flags",
+    "pcrs",
     [
-        False,
-        """
-        vtpm_security_flags:
-          "2": true
-          "3": false
-          "4": false
-        """,
-        """
-        vtpm_security_flags:
-          "2": true
-          "3": false
-          "4": false
-          "5": false
-          "6": false
-        """,
-        """
-        vtpm_security_flags:
-          "2": true
-          "3": false
-          "4": false
-          "5": "false"
-        """,
+        {"8": HEX64_PCR},
+        {"8": HEX64_PCR, "9": HEX64_PCR, "10": HEX64_PCR},
+        {8: HEX64_PCR, 9: HEX64_PCR},
+        {"8": 1, "9": HEX64_PCR},
+        {"8": "1" * 63, "9": HEX64_PCR},
     ],
 )
-def test_gcp_snp_config_requires_exact_boolean_security_flags(tmp_path, flags):
-    settings = _settings_for_yaml(
-        tmp_path,
-        _snp_yaml(provider="gcp", vtpm=True, vtpm_flags=flags),
-    )
+def test_gcp_snp_requires_exact_string_pcr8_pcr9_set(tmp_path, pcrs):
+    group = _snp_group(provider="gcp")
+    group["vtpm_pcrs"] = pcrs
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="vtpm_pcrs"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"2": True, "3": False, "4": False},
+        {"2": True, "3": False, "4": False, "5": False, "6": False},
+        {2: True, 3: False, 4: False, 5: False},
+        {"2": True, "3": False, "4": False, "5": "false"},
+    ],
+)
+def test_gcp_snp_requires_exact_boolean_string_flag_set(tmp_path, flags):
+    group = _snp_group(provider="gcp")
+    group["vtpm_security_flags"] = flags
+    settings = _settings_for_document(tmp_path, _document(group))
+
     with pytest.raises(ValueError, match="vtpm_security_flags"):
         settings._load_tee_measurements()
 
 
+@pytest.mark.parametrize("field", ["vtpm_pcrs", "vtpm_security_flags"])
+def test_baremetal_snp_rejects_gcp_only_fields(tmp_path, field):
+    group = _snp_group()
+    group[field] = (
+        {"8": HEX64_PCR, "9": HEX64_PCR}
+        if field == "vtpm_pcrs"
+        else {"2": True, "3": False, "4": False, "5": False}
+    )
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="unsupported"):
+        settings._load_tee_measurements()
+
+
 def test_gcp_security_flag_flip_changes_measurement_fingerprint(tmp_path):
-    first_settings = _settings_for_yaml(
+    first_settings = _settings_for_document(
         tmp_path,
-        _snp_yaml(provider="gcp", vtpm=True),
+        _document(_snp_group(provider="gcp")),
     )
     (first,) = first_settings._load_tee_measurements()
-    flipped = """
-        vtpm_security_flags:
-          "2": false
-          "3": false
-          "4": false
-          "5": false
-    """
-    second_settings = _settings_for_yaml(
-        tmp_path,
-        _snp_yaml(provider="gcp", vtpm=True, vtpm_flags=flipped),
-    )
+    second_group = _snp_group(provider="gcp")
+    second_group["vtpm_security_flags"]["2"] = False
+    second_settings = _settings_for_document(tmp_path, _document(second_group))
     (second,) = second_settings._load_tee_measurements()
 
     assert first.config_fingerprint != second.config_fingerprint
     assert first.trust_set_fingerprint != second.trust_set_fingerprint
 
 
-def test_debug_measurement_rejected_without_switch(tmp_path):
-    """A measurement config tagged debug: true is refused at load unless ALLOW_DEBUG_MEASUREMENTS
-    is set -- a debug image forwards user logs to the host console and must not pass as production."""
-    yaml = f"""
-    measurements:
-      - version: "1"
-        name: "cpu-snp-dbg"
-        provider: "bare-metal"
-        tee_type: "sev-snp"
-        debug: true
-        measurement: "{HEX96_SNP}"
-        policy: "0x30000"
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-        expected_vmpl: 0
-        expected_gpus: []
-        gpu_count: 0
-    """
-    settings = _settings_for_yaml(tmp_path, yaml)
+def test_debug_measurement_requires_explicit_dev_opt_in(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_snp_group(debug=True)),
+    )
     settings.allow_debug_measurements = False
+
     with pytest.raises(ValueError, match="ALLOW_DEBUG_MEASUREMENTS"):
         settings._load_tee_measurements()
 
 
-def test_debug_measurement_allowed_with_switch(tmp_path, monkeypatch):
-    """With ALLOW_DEBUG_MEASUREMENTS set (dev), a debug-tagged config loads."""
-    yaml = f"""
-    measurements:
-      - version: "1"
-        name: "cpu-snp-dbg"
-        provider: "bare-metal"
-        tee_type: "sev-snp"
-        debug: true
-        measurement: "{HEX96_SNP}"
-        policy: "0x30000"
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-        expected_vmpl: 0
-        expected_gpus: []
-        gpu_count: 0
-    """
-    settings = _settings_for_yaml(tmp_path, yaml)
-    monkeypatch.setattr(settings, "allow_debug_measurements", True)
+def test_debug_measurement_loads_with_explicit_dev_opt_in(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_snp_group(debug=True)),
+    )
+    settings.allow_debug_measurements = True
+
+    assert settings._load_tee_measurements()[0].debug is True
+
+
+def test_debug_measurement_opt_in_rejected_outside_dev_posture():
+    with pytest.raises(ValueError, match="permitted only in the explicit dev posture"):
+        Settings(
+            allow_debug_measurements=True,
+            skip_metagraph_check=False,
+            require_mtls_client_verify=True,
+        )
+
+
+def test_image_provenance_names_preserve_source_order(tmp_path):
+    names = ["cpu-b", "cpu-a"]
+    groups = [
+        _tdx_group(
+            version=str(index),
+            name=name,
+            rtmr0=str(index) * 96,
+            image_sha256="a" * 64,
+            image_measurement_names=names,
+        )
+        for index, name in enumerate(names, start=1)
+    ]
+    settings = _settings_for_document(tmp_path, _document(*groups))
+
+    assert [config.image_measurement_names for config in settings._load_tee_measurements()] == [
+        names,
+        names,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("debug", True),
+        ("rc", True),
+        ("provider", "bare-metal"),
+    ],
+)
+def test_provenance_set_requires_common_shared_fields_equal(tmp_path, field, replacement):
+    names = ["cpu-a", "cpu-b"]
+    first = _tdx_group(
+        name=names[0],
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    second = _tdx_group(
+        version="2",
+        name=names[1],
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    second[field] = replacement
+    settings = _settings_for_document(tmp_path, _document(first, second))
+    settings.allow_debug_measurements = True
+
+    with pytest.raises(ValueError, match="Inconsistent image provenance"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("mrtd", "1" * 96),
+        ("rtmr1", "2" * 96),
+        ("rtmr2", "3" * 96),
+        ("boot_rtmr3", "4" * 96),
+        ("runtime_rtmr3", "5" * 96),
+    ],
+)
+def test_tdx_provenance_set_requires_all_shared_measurements_equal(tmp_path, field, replacement):
+    names = ["cpu-a", "cpu-b"]
+    first = _tdx_group(
+        name=names[0],
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+        boot_rtmr3=HEX96_RTMR3,
+    )
+    second = _tdx_group(
+        version="2",
+        name=names[1],
+        rtmr0="9" * 96,
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+        boot_rtmr3=HEX96_RTMR3,
+    )
+    second[field] = replacement
+    settings = _settings_for_document(tmp_path, _document(first, second))
+
+    with pytest.raises(ValueError, match="Inconsistent image provenance"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("processor_model", "Milan"),
+        ("policy", "0x30001"),
+        (
+            "min_tcb",
+            {"bootloader": 8, "tee": 0, "snp": 23, "microcode": 72},
+        ),
+        ("expected_vmpl", 1),
+        ("id_key_digest", "1" * 96),
+    ],
+)
+def test_snp_provenance_set_requires_all_shared_measurements_equal(tmp_path, field, replacement):
+    names = ["cpu-a", "cpu-b"]
+    first = _snp_group(
+        name=names[0],
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    second = _snp_group(
+        version="2",
+        name=names[1],
+        measurement="9" * 96,
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    second[field] = replacement
+    settings = _settings_for_document(tmp_path, _document(first, second))
+
+    with pytest.raises(ValueError, match="Inconsistent image provenance"):
+        settings._load_tee_measurements()
+
+
+@pytest.mark.parametrize(
+    ("field", "key", "replacement"),
+    [
+        ("vtpm_pcrs", "8", "2" * 64),
+        ("vtpm_security_flags", "2", False),
+    ],
+)
+def test_gcp_snp_provenance_set_requires_shared_vtpm_fields_equal(
+    tmp_path, field, key, replacement
+):
+    names = ["cpu-a", "cpu-b"]
+    first = _snp_group(
+        provider="gcp",
+        name=names[0],
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    second = _snp_group(
+        provider="gcp",
+        version="2",
+        name=names[1],
+        measurement="9" * 96,
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    second[field][key] = replacement
+    settings = _settings_for_document(tmp_path, _document(first, second))
+
+    with pytest.raises(ValueError, match="Inconsistent image provenance"):
+        settings._load_tee_measurements()
+
+
+def test_provenance_matrix_keeps_distinct_versions_and_variant_measurements(tmp_path):
+    names = ["cpu-a", "cpu-b"]
+    first = _snp_group(
+        version="2.0.0-snp-1vcpu",
+        name=names[0],
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    second = _snp_group(
+        version="2.0.0-snp-2vcpu",
+        name=names[1],
+        measurement="9" * 96,
+        image_sha256="a" * 64,
+        image_measurement_names=names,
+    )
+    settings = _settings_for_document(tmp_path, _document(first, second))
+
+    measurements = settings._load_tee_measurements()
+
+    assert [config.version for config in measurements] == [
+        "2.0.0-snp-1vcpu",
+        "2.0.0-snp-2vcpu",
+    ]
+    assert [config.measurement for config in measurements] == [HEX96_SNP, "9" * 96]
+
+
+def test_mounted_override_replaces_committed_entry_atomically(tmp_path):
+    committed = _committed_snp_group()
+    settings = _settings_for_committed_document(tmp_path, _document(committed))
+    mounted_path = tmp_path / "mounted.yaml"
+    override = _committed_snp_group(measurement="9" * 96)
+    mounted_path.write_text(yaml.safe_dump(_document(override), sort_keys=False))
+    settings.tee_measurement_config_path = mounted_path
+
     (config,) = settings._load_tee_measurements()
-    assert config.name == "cpu-snp-dbg"
+
+    assert config.measurement == "9" * 96
 
 
-def test_snp_config_missing_provider_rejected(tmp_path):
-    """SNP image identity is verified differently per provider; an unset/unknown provider would
-    default the GCP vTPM image-identity check off, so it must fail closed at load."""
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="", vtpm=False))
-    with pytest.raises(ValueError, match="must set provider to 'gcp' or 'bare-metal'"):
+def test_mounted_override_never_inherits_missing_committed_fields(tmp_path):
+    committed = _committed_snp_group()
+    settings = _settings_for_committed_document(tmp_path, _document(committed))
+    mounted_path = tmp_path / "mounted.yaml"
+    override = _committed_snp_group(measurement="9" * 96)
+    del override["min_tcb"]
+    mounted_path.write_text(yaml.safe_dump(_document(override), sort_keys=False))
+    settings.tee_measurement_config_path = mounted_path
+
+    with pytest.raises(ValueError, match="missing required"):
         settings._load_tee_measurements()
 
 
-def test_snp_config_noncanonical_baremetal_provider_rejected(tmp_path):
-    settings = _settings_for_yaml(tmp_path, _snp_yaml(provider="baremetal", vtpm=False))
-    with pytest.raises(ValueError, match="must set provider to 'gcp' or 'bare-metal'"):
+def test_mounted_override_of_committed_pin_requires_complete_provenance(tmp_path):
+    committed = _committed_snp_group()
+    settings = _settings_for_committed_document(tmp_path, _document(committed))
+    mounted_path = tmp_path / "mounted.yaml"
+    mounted_path.write_text(yaml.safe_dump(_document(_snp_group()), sort_keys=False))
+    settings.tee_measurement_config_path = mounted_path
+
+    with pytest.raises(ValueError, match="Missing image provenance for committed"):
         settings._load_tee_measurements()
 
 
-def test_gcp_snp_config_with_only_pcr8_rejected(tmp_path):
-    """A GCP SNP config that pins some PCRs but is missing PCR9 leaves the image unpinned (the
-    listed PCR alone may be image-invariant); must fail closed."""
-    yaml = f"""
-    measurements:
-      - version: "1"
-        name: "cpu-snp"
-        provider: "gcp"
-        tee_type: "sev-snp"
-        debug: false
-        measurement: "{HEX96_SNP}"
-        policy: "0x30000"
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-        expected_vmpl: 0
-        vtpm_pcrs:
-          "8": "{HEX64_PCR}"
-        expected_gpus: []
-        gpu_count: 0
-    """
-    settings = _settings_for_yaml(tmp_path, yaml)
-    with pytest.raises(ValueError, match="must pin vtpm_pcrs including PCR8 and PCR9"):
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ({"image_sha256": "a" * 64}, "Incomplete image provenance"),
+        (
+            {
+                "image_sha256": 1,
+                "image_measurement_names": ["cpu-snp"],
+            },
+            "image_sha256",
+        ),
+        (
+            {
+                "image_sha256": "a" * 64,
+                "image_measurement_names": ["cpu-snp", " cpu-snp "],
+            },
+            "duplicate normalized names",
+        ),
+        (
+            {
+                "image_sha256": "a" * 64,
+                "image_measurement_names": ["cpu-snp", "unknown"],
+            },
+            "every declared entry",
+        ),
+    ],
+)
+def test_malformed_image_provenance_rejected(tmp_path, mutation, message):
+    group = _snp_group()
+    group.update(mutation)
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match=message):
         settings._load_tee_measurements()
 
 
-def _settings_for_committed_yaml(tmp_path: Path, yaml_text: str) -> Settings:
-    committed_path = tmp_path / "tee_measurements.committed.yaml"
-    committed_path.write_text(textwrap.dedent(yaml_text))
+def test_actual_committed_measurements_preserve_count_values_and_fingerprints(tmp_path):
+    committed_path = (
+        Path(__file__).resolve().parents[2] / "api/config/tee_measurements.committed.yaml"
+    )
+    source = yaml.safe_load(committed_path.read_text())
+    assert set(source) == {"measurements", "revoked_measurements"}
+    assert len(source["measurements"]) == 21
+    assert sum(len(group["hardware"]) for group in source["measurements"]) == 21
+    assert source["revoked_measurements"] == []
+
     settings = Settings()
     settings.tee_committed_measurement_config_path = committed_path
     settings.tee_measurement_config_path = tmp_path / "no-mounted-measurements.yaml"
-    return settings
+    settings.allow_debug_measurements = True
 
+    measurements = settings._load_tee_measurements()
+    committed_tdx = next(
+        config for config in measurements if config.name == "storage-baremetal-tdx-1.6.0-4vcpu"
+    )
 
-def _committed_snp_yaml(provenance: str) -> str:
-    provenance_block = textwrap.indent(textwrap.dedent(provenance).strip(), "        ")
-    return f"""
-    measurements:
-      - version: "1"
-        name: "cpu-snp"
-        provider: "bare-metal"
-        tee_type: "sev-snp"
-        debug: false
-{provenance_block}
-        measurement: "{HEX96_SNP}"
-        policy: "0x30000"
-        min_tcb:
-          bootloader: 7
-          tee: 0
-          snp: 23
-          microcode: 72
-        expected_vmpl: 0
-        expected_gpus: []
-        gpu_count: 0
-    """
+    assert len(measurements) == 21
+    assert settings.tee_measurements_fingerprint == TRUST_FINGERPRINT
+    assert committed_tdx.config_fingerprint == COMMITTED_TDX_FINGERPRINT
+    assert committed_tdx.boot_rtmr3 == committed_tdx.runtime_rtmr3
+    assert committed_tdx.boot_rtmr3 != "0" * 96
 
-
-def _committed_snp_matrix_yaml() -> str:
-    names = [f"cpu-baremetal-snp-genoa-2.0.0-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)]
-    measurements = []
-    for index, (name, vcpus) in enumerate(zip(names, (1, 2, 4, 8), strict=True)):
-        measurements.append(
-            {
-                "version": f"2.0.0-snp-{vcpus}vcpu",
-                "name": name,
-                "provider": "bare-metal",
-                "tee_type": "sev-snp",
-                "debug": False,
-                "image_sha256": "a" * 64,
-                "image_measurement_names": names,
-                "measurement": f"{index + 1:X}" * 96,
-                "policy": "0x30000",
-                "min_tcb": {
-                    "bootloader": 7,
-                    "tee": 0,
-                    "snp": 23,
-                    "microcode": 72,
-                },
-                "expected_vmpl": 0,
-                "expected_gpus": [],
-                "gpu_count": 0,
-            }
-        )
-    return yaml.safe_dump({"measurements": measurements}, sort_keys=False)
+    by_digest: dict[str, set[str]] = {}
+    for measurement in measurements:
+        assert measurement.image_sha256
+        assert measurement.image_measurement_names
+        by_digest.setdefault(measurement.image_sha256, set()).add(measurement.name)
+    for measurement in measurements:
+        assert list(measurement.image_measurement_names or [])
+        assert set(measurement.image_measurement_names or []) == by_digest[measurement.image_sha256]
 
 
 def test_actual_committed_debug_measurements_rejected_in_production(tmp_path):
@@ -755,153 +1023,50 @@ def test_actual_committed_debug_measurements_rejected_in_production(tmp_path):
         settings._load_tee_measurements()
 
 
-def test_debug_measurement_opt_in_is_rejected_outside_dev_posture():
-    with pytest.raises(ValueError, match="permitted only in the explicit dev posture"):
-        Settings(
-            allow_debug_measurements=True,
-            skip_metagraph_check=False,
-            require_mtls_client_verify=True,
-        )
-
-
-def test_actual_committed_measurements_have_bound_debug_provenance(tmp_path):
-    settings = Settings()
-    settings.tee_committed_measurement_config_path = (
-        Path(__file__).resolve().parents[2] / "api/config/tee_measurements.committed.yaml"
-    )
-    settings.tee_measurement_config_path = tmp_path / "no-mounted-measurements.yaml"
-    settings.allow_debug_measurements = True
-
-    measurements = settings._load_tee_measurements()
-    committed_tdx = next(
-        measurement
-        for measurement in measurements
-        if measurement.name == "storage-baremetal-tdx-1.6.0-4vcpu"
-    )
-    assert committed_tdx.boot_rtmrs["RTMR3"] == committed_tdx.runtime_rtmrs["RTMR3"]
-    assert committed_tdx.boot_rtmrs["RTMR3"] != "0" * 96
-
-    by_digest = {}
-    debug_by_digest = {}
-    for measurement in measurements:
-        assert measurement.image_sha256
-        assert measurement.image_measurement_names
-        by_digest.setdefault(measurement.image_sha256, set()).add(measurement.name)
-        debug_by_digest.setdefault(measurement.image_sha256, set()).add(measurement.debug)
-
-    assert by_digest == {
-        "688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3": {
-            f"cpu-baremetal-snp-genoa-1.6.2-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)
-        },
-        "3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da": {
-            f"storage-baremetal-snp-genoa-1.6.1-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)
-        },
-        "a20879377cb717f708fa62060bb6a0b4d5f8857c7d0185a925ba6674cd7748c5": {
-            "storage-baremetal-tdx-1.6.0-4vcpu"
-        },
-        "2f8995ab4481e752b5ccfd10d70b311799288e6fd2a5c3a4c2fb84900b169c3c": {
-            f"cpu-baremetal-snp-genoa-1.7.0-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)
-        },
-        "7fb6d2bbfd2d3344618bd37b56c012e4713a9a4ebaad10b6947c6ce4f4585bb5": {
-            f"storage-baremetal-snp-genoa-1.7.0-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)
-        },
-        "71e26326c5a0d19060fd8fcf25f54c807f9473b44fb34667742a6d6c816854d6": {
-            f"storage-baremetal-snp-genoa-1.7.1-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)
-        },
-    }
-    assert debug_by_digest == {
-        digest: {
-            digest
-            in {
-                "688d24a5ab1af8e2174ffada8d8ea669c38280b4b0fdd6936729fe697b5930e3",
-                "3121af4af5446f1dacc4a3290eba8605aa3c2a32a319d31c958c61faca5dd2da",
-                "a20879377cb717f708fa62060bb6a0b4d5f8857c7d0185a925ba6674cd7748c5",
-            }
-        }
-        for digest in by_digest
-    }
-    for measurement in measurements:
-        assert set(measurement.image_measurement_names) == by_digest[measurement.image_sha256]
-
-
-@pytest.mark.parametrize("debug_value", ["false", 0, None])
-def test_debug_posture_requires_explicit_yaml_boolean(tmp_path, debug_value):
-    yaml = _snp_yaml().replace("debug: false", f"debug: {debug_value!r}")
-    settings = _settings_for_yaml(tmp_path, yaml)
-    with pytest.raises(ValueError, match="Missing or invalid 'debug' posture"):
-        settings._load_tee_measurements()
-
-
-def test_missing_debug_posture_rejected(tmp_path):
-    settings = _settings_for_yaml(tmp_path, _snp_yaml().replace("        debug: false\n", ""))
-    with pytest.raises(ValueError, match="Missing or invalid 'debug' posture"):
-        settings._load_tee_measurements()
-
-
-def test_missing_committed_image_provenance_rejected(tmp_path):
-    settings = _settings_for_committed_yaml(tmp_path, _committed_snp_yaml(""))
-    with pytest.raises(ValueError, match="Missing image provenance for committed"):
-        settings._load_tee_measurements()
-
-
 def test_malformed_measurement_source_fails_closed(tmp_path):
-    settings = Settings()
-    malformed_path = tmp_path / "tee_measurements.committed.yaml"
-    malformed_path.write_text("measurements:\n  - image_sha256: [")
-    settings.tee_committed_measurement_config_path = malformed_path
-    settings.tee_measurement_config_path = tmp_path / "no-mounted-measurements.yaml"
+    settings = _settings_for_yaml(
+        tmp_path,
+        "measurements:\n  - image_sha256: [\nrevoked_measurements: []\n",
+    )
+
     with pytest.raises(ValueError, match="Failed to load TEE measurement config"):
         settings._load_tee_measurements()
 
 
 def test_required_mounted_source_cannot_silently_disappear(tmp_path):
-    settings = _settings_for_committed_yaml(
+    settings = _settings_for_committed_document(
         tmp_path,
-        _committed_snp_yaml(
-            f"""
-            image_sha256: "{"a" * 64}"
-            image_measurement_names: ["cpu-snp"]
-            """
-        ),
+        _document(_committed_snp_group()),
     )
     settings.tee_measurement_config_required = True
+
     with pytest.raises(ValueError, match="Required TEE measurement config"):
         settings._load_tee_measurements()
 
 
 def test_revocation_tombstone_survives_failed_reload_via_last_known_good(tmp_path):
-    settings = _settings_for_committed_yaml(
+    settings = _settings_for_committed_document(
         tmp_path,
-        _committed_snp_yaml(
-            f"""
-            image_sha256: "{"a" * 64}"
-            image_measurement_names: ["cpu-snp"]
-            """
-        ),
+        _document(_committed_snp_group()),
     )
     mounted = tmp_path / "mounted.yaml"
-    mounted.write_text("measurements: []\nrevoked_measurements:\n  - cpu-snp\n")
+    mounted.write_text(yaml.safe_dump(_document(revoked=["cpu-snp"]), sort_keys=False))
     settings.tee_measurement_config_path = mounted
 
     assert settings._load_tee_measurements() == []
 
-    mounted.write_text("measurements:\n  - invalid: [")
+    mounted.write_text("measurements:\n  - invalid: [\nrevoked_measurements: []\n")
     assert settings._load_tee_measurements() == []
     assert settings._tee_measurements_last_error
 
 
 def test_runtime_missing_expected_source_retains_last_good_and_degrades(tmp_path):
-    settings = _settings_for_committed_yaml(
+    settings = _settings_for_committed_document(
         tmp_path,
-        _committed_snp_yaml(
-            f"""
-            image_sha256: "{"a" * 64}"
-            image_measurement_names: ["cpu-snp"]
-            """
-        ),
+        _document(_committed_snp_group()),
     )
     mounted = tmp_path / "mounted.yaml"
-    mounted.write_text("measurements: []\n")
+    mounted.write_text(yaml.safe_dump(_document(), sort_keys=False))
     settings.tee_measurement_config_path = mounted
     settings.tee_measurement_config_required = True
 
@@ -919,18 +1084,9 @@ def test_runtime_missing_expected_source_retains_last_good_and_degrades(tmp_path
 
 def test_restart_with_required_malformed_source_fails_closed(tmp_path):
     committed = tmp_path / "committed.yaml"
-    committed.write_text(
-        textwrap.dedent(
-            _committed_snp_yaml(
-                f"""
-                image_sha256: "{"a" * 64}"
-                image_measurement_names: ["cpu-snp"]
-                """
-            )
-        )
-    )
+    committed.write_text(yaml.safe_dump(_document(_committed_snp_group()), sort_keys=False))
     mounted = tmp_path / "mounted.yaml"
-    mounted.write_text("measurements:\n  - malformed: [")
+    mounted.write_text("measurements:\n  - malformed: [\nrevoked_measurements: []\n")
 
     with pytest.raises(ValueError, match="Failed to load TEE measurement config"):
         Settings(
@@ -959,17 +1115,12 @@ def test_operator_metrics_expose_trust_health_error_and_fingerprint():
 
 
 def test_revocation_changes_trust_fingerprint_and_invalidates_config(tmp_path):
-    settings = _settings_for_committed_yaml(
+    settings = _settings_for_committed_document(
         tmp_path,
-        _committed_snp_yaml(
-            f"""
-            image_sha256: "{"a" * 64}"
-            image_measurement_names: ["cpu-snp"]
-            """
-        ),
+        _document(_committed_snp_group()),
     )
     mounted = tmp_path / "mounted.yaml"
-    mounted.write_text("measurements: []\n")
+    mounted.write_text(yaml.safe_dump(_document(), sort_keys=False))
     settings.tee_measurement_config_path = mounted
     settings.tee_measurement_config_required = True
 
@@ -978,71 +1129,41 @@ def test_revocation_changes_trust_fingerprint_and_invalidates_config(tmp_path):
     assert config.config_fingerprint
     assert config.trust_set_fingerprint == before
 
-    mounted.write_text("measurements: []\nrevoked_measurements:\n  - cpu-snp\n")
+    mounted.write_text(yaml.safe_dump(_document(revoked=["cpu-snp"]), sort_keys=False))
     assert settings._load_tee_measurements() == []
-    after = settings.tee_measurements_fingerprint
-    assert after != before
+    assert settings.tee_measurements_fingerprint != before
     assert settings.tee_measurement_health()["status"] == "healthy"
 
 
-def test_one_matrix_tombstone_atomically_retires_real_1_2_4_8_set(tmp_path):
-    settings = _settings_for_committed_yaml(tmp_path, _committed_snp_matrix_yaml())
+def test_one_matrix_tombstone_atomically_retires_complete_set(tmp_path):
+    settings = _settings_for_committed_document(
+        tmp_path,
+        _committed_snp_matrix_document(),
+    )
     mounted = tmp_path / "mounted.yaml"
-    mounted.write_text("measurements: []\n")
+    mounted.write_text(yaml.safe_dump(_document(), sort_keys=False))
     settings.tee_measurement_config_path = mounted
     settings.tee_measurement_config_required = True
 
     before_configs = settings._load_tee_measurements()
     before_fingerprint = settings.tee_measurements_fingerprint
-    assert [config.name for config in before_configs] == [
-        f"cpu-baremetal-snp-genoa-2.0.0-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)
-    ]
+    expected_names = [f"cpu-baremetal-snp-genoa-2.0.0-{vcpus}vcpu" for vcpus in (1, 2, 4, 8)]
+    assert [config.name for config in before_configs] == expected_names
 
-    mounted.write_text(
-        "measurements: []\nrevoked_measurements:\n  - cpu-baremetal-snp-genoa-2.0.0-2vcpu\n"
-    )
+    mounted.write_text(yaml.safe_dump(_document(revoked=[expected_names[1]]), sort_keys=False))
     assert settings._load_tee_measurements() == []
     retired_fingerprint = settings.tee_measurements_fingerprint
     assert retired_fingerprint != before_fingerprint
-    assert settings.tee_measurement_health()["status"] == "healthy"
 
-    mounted.write_text("measurements:\n  - malformed: [")
+    mounted.write_text("measurements:\n  - malformed: [\nrevoked_measurements: []\n")
     assert settings._load_tee_measurements() == []
     assert settings.tee_measurements_fingerprint == retired_fingerprint
     assert settings._tee_measurements_last_error
 
 
-@pytest.mark.parametrize(
-    ("provenance", "message"),
-    [
-        (
-            'image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
-            "Incomplete image provenance",
-        ),
-        (
-            """
-            image_sha256: "not-a-sha"
-            image_measurement_names: ["cpu-snp"]
-            """,
-            "Invalid image_sha256",
-        ),
-        (
-            """
-            image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            image_measurement_names: ["cpu-snp", "cpu-snp"]
-            """,
-            "duplicate names",
-        ),
-        (
-            """
-            image_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            image_measurement_names: ["cpu-snp", "cpu-unknown"]
-            """,
-            "every declared entry",
-        ),
-    ],
-)
-def test_malformed_committed_image_provenance_rejected(tmp_path, provenance, message):
-    settings = _settings_for_committed_yaml(tmp_path, _committed_snp_yaml(provenance))
-    with pytest.raises(ValueError, match=message):
-        settings._load_tee_measurements()
+def test_test_helpers_do_not_share_mutable_groups():
+    first = _snp_group()
+    second = _snp_group()
+    first["min_tcb"]["bootloader"] = 99
+
+    assert second == deepcopy(_snp_group())

@@ -961,23 +961,24 @@ gmp:
   interval: "30s"
 
 teeMeasurements:
-    # # One item per exact hardware/provider/role pin. TDX uses flat mrtd, rtmr0, rtmr1,
-    # # rtmr2, and runtime_rtmr3 fields. boot_rtmr3 defaults to all-zero and may be
-    # # set explicitly for guests that extend it before their boot quote. Set rc: true for
-    # # an attestable release candidate excluded from the public endpoint and minimum-version fallback.
+    # # Strict nested format: each group contains shared image/TEE fields and a required non-empty
+    # # hardware list. Each hardware item contains name, optional description, expected_gpus,
+    # # gpu_count, and exactly rtmr0 (TDX) or measurement (SEV-SNP). Set rc: true for an
+    # # attestable release candidate excluded from the public endpoint and minimum-version fallback.
     # measurements:
     #   - version: "1.3.0"
-    #     name: "8xh200"
     #     tee_type: "tdx"
     #     debug: false
     #     rc: false
     #     mrtd: "PLACEHOLDER_MRTD_96_HEX_CHARS"
-    #     rtmr0: "PLACEHOLDER_H200_RTMR0_96_HEX_CHARS"
     #     rtmr1: "PLACEHOLDER_RTMR1_96_HEX_CHARS"
     #     rtmr2: "PLACEHOLDER_RTMR2_96_HEX_CHARS"
     #     runtime_rtmr3: "PLACEHOLDER_RUNTIME_RTMR3_96_HEX_CHARS"
-    #     expected_gpus:
-    #       - "h200"
-    #     gpu_count: 8
+    #     hardware:
+    #       - name: "8xh200"
+    #         rtmr0: "PLACEHOLDER_H200_RTMR0_96_HEX_CHARS"
+    #         expected_gpus:
+    #           - "h200"
+    #         gpu_count: 8
   measurements: []
   revokedMeasurements: []

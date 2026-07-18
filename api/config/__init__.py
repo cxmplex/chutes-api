@@ -211,6 +211,188 @@ def measurement_trust_set_fingerprint(
     ).hexdigest()
 
 
+_MEASUREMENT_DOCUMENT_KEYS = {"measurements", "revoked_measurements"}
+_NESTED_COMMON_GROUP_KEYS = {
+    "version",
+    "tee_type",
+    "provider",
+    "debug",
+    "rc",
+    "image_sha256",
+    "image_measurement_names",
+    "hardware",
+}
+_NESTED_TDX_GROUP_KEYS = {
+    "mrtd",
+    "rtmr1",
+    "rtmr2",
+    "boot_rtmr3",
+    "runtime_rtmr3",
+}
+_NESTED_SNP_GROUP_KEYS = {
+    "processor_model",
+    "policy",
+    "min_tcb",
+    "expected_vmpl",
+    "id_key_digest",
+}
+_NESTED_GCP_SNP_GROUP_KEYS = {"vtpm_pcrs", "vtpm_security_flags"}
+_NESTED_HARDWARE_KEYS = {"name", "description", "expected_gpus", "gpu_count"}
+
+
+def _field_names(values: set[object]) -> List[str]:
+    """Render possibly non-string mapping keys without relying on mixed-type sorting."""
+    return sorted(repr(value) for value in values)
+
+
+def _expand_nested_measurement_group(group: dict, source: object) -> List[dict]:
+    """Flatten one strict source group into scalar per-hardware runtime entries."""
+    legacy_maps = {"boot_rtmrs", "runtime_rtmrs"}.intersection(group)
+    if legacy_maps:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: old boot/runtime map field(s) "
+            f"{_field_names(legacy_maps)} are not accepted; use the strict nested scalar format."
+        )
+
+    flat_variant_fields = {
+        "name",
+        "description",
+        "expected_gpus",
+        "gpu_count",
+        "rtmr0",
+        "measurement",
+    }.intersection(group)
+    if flat_variant_fields:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: current flat scalar field(s) "
+            f"{_field_names(flat_variant_fields)} must be nested under a non-empty 'hardware' list."
+        )
+
+    if "tee_type" not in group:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: every measurement group must explicitly "
+            "set tee_type to 'tdx' or 'sev-snp'."
+        )
+    tee_type = group["tee_type"]
+    if not isinstance(tee_type, str):
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: tee_type must be an actual YAML string."
+        )
+    if tee_type not in {"tdx", "sev-snp"}:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: tee_type must be exactly 'tdx' or "
+            f"'sev-snp', got {tee_type!r}; SNP aliases are not accepted."
+        )
+
+    provider = group.get("provider")
+    if "provider" in group:
+        if not isinstance(provider, str):
+            raise ValueError(
+                f"Invalid TEE measurement config {source}: provider must be an actual YAML string."
+            )
+        if provider not in {"gcp", "bare-metal"}:
+            raise ValueError(
+                f"Invalid TEE measurement config {source}: provider must be exactly 'gcp' or "
+                f"'bare-metal', got {provider!r}."
+            )
+    if tee_type == "sev-snp" and provider not in {"gcp", "bare-metal"}:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: every sev-snp group must explicitly set "
+            "provider to 'gcp' or 'bare-metal'."
+        )
+
+    allowed_group_keys = _NESTED_COMMON_GROUP_KEYS | (
+        _NESTED_TDX_GROUP_KEYS
+        if tee_type == "tdx"
+        else _NESTED_SNP_GROUP_KEYS | (_NESTED_GCP_SNP_GROUP_KEYS if provider == "gcp" else set())
+    )
+    unexpected_group_keys = set(group) - allowed_group_keys
+    if unexpected_group_keys:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: unsupported {tee_type}/{provider or 'generic'} "
+            f"group field(s) {_field_names(unexpected_group_keys)}."
+        )
+
+    required_group_keys = {"version", "tee_type", "debug", "hardware"} | (
+        {"mrtd", "rtmr1", "rtmr2", "runtime_rtmr3"}
+        if tee_type == "tdx"
+        else {"provider", "processor_model", "policy", "min_tcb", "expected_vmpl"}
+        | (_NESTED_GCP_SNP_GROUP_KEYS if provider == "gcp" else set())
+    )
+    missing_group_keys = required_group_keys - set(group)
+    if missing_group_keys:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: {tee_type} group is missing required "
+            f"field(s) {_field_names(missing_group_keys)}."
+        )
+
+    version = group["version"]
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: version must be a non-empty YAML string."
+        )
+    if not isinstance(group["debug"], bool):
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: debug must be an actual YAML boolean."
+        )
+    if "rc" in group and not isinstance(group["rc"], bool):
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: rc must be an actual YAML boolean."
+        )
+
+    hardware = group["hardware"]
+    if not isinstance(hardware, list) or not hardware:
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: measurement group {version!r} must define "
+            "a non-empty 'hardware' list."
+        )
+
+    variant_key = "rtmr0" if tee_type == "tdx" else "measurement"
+    allowed_hardware_keys = _NESTED_HARDWARE_KEYS | {variant_key}
+    required_hardware_keys = {"name", "expected_gpus", "gpu_count", variant_key}
+    flattened: List[dict] = []
+    for index, variant in enumerate(hardware):
+        if not isinstance(variant, dict):
+            raise ValueError(
+                f"Invalid TEE measurement config {source}: hardware item {index} in group "
+                f"{version!r} must be a mapping."
+            )
+        unexpected_variant_keys = set(variant) - allowed_hardware_keys
+        if unexpected_variant_keys:
+            raise ValueError(
+                f"Invalid TEE measurement config {source}: hardware item {index} in group "
+                f"{version!r} has unsupported {tee_type} field(s) "
+                f"{_field_names(unexpected_variant_keys)}."
+            )
+        missing_variant_keys = required_hardware_keys - set(variant)
+        if missing_variant_keys:
+            raise ValueError(
+                f"Invalid TEE measurement config {source}: hardware item {index} in group "
+                f"{version!r} is missing required field(s) {_field_names(missing_variant_keys)}."
+            )
+
+        raw_name = variant["name"]
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            raise ValueError(
+                f"Invalid TEE measurement config {source}: every hardware variant requires "
+                "a non-empty string name."
+            )
+        if "description" in variant and (
+            not isinstance(variant["description"], str) or not variant["description"].strip()
+        ):
+            raise ValueError(
+                f"Invalid TEE measurement config {source}: hardware variant {raw_name!r} "
+                "description must be a non-empty YAML string."
+            )
+
+        flat = {key: value for key, value in group.items() if key != "hardware"}
+        flat.update(variant)
+        flat["version"] = version.strip()
+        flat["name"] = raw_name.strip()
+        flattened.append(flat)
+    return flattened
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(arbitrary_types_allowed=True)
     _validator_keypair: Optional[Keypair] = None
@@ -833,7 +1015,7 @@ class Settings(BaseSettings):
             names_in_source: set[str] = set()
             try:
                 with open(path) as f:
-                    doc = yaml.load(f, Loader=_UniqueKeySafeLoader) or {}
+                    doc = yaml.load(f, Loader=_UniqueKeySafeLoader)
             except Exception as e:
                 error_msg = f"Failed to load TEE measurement config {path}: {e}"
                 logger.error(error_msg)
@@ -842,49 +1024,66 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"Invalid TEE measurement config {path}: document root must be a mapping."
                 )
-            unknown_document_fields = sorted(set(doc) - {"measurements", "revoked_measurements"})
-            if unknown_document_fields:
+            document_fields = set(doc)
+            if document_fields != _MEASUREMENT_DOCUMENT_KEYS:
+                missing_document_fields = _MEASUREMENT_DOCUMENT_KEYS - document_fields
+                unknown_document_fields = document_fields - _MEASUREMENT_DOCUMENT_KEYS
                 raise ValueError(
-                    f"Invalid TEE measurement config {path}: unsupported document field(s) "
-                    f"{unknown_document_fields}."
+                    f"Invalid TEE measurement config {path}: document keys must be exactly "
+                    "'measurements' and 'revoked_measurements' "
+                    f"(missing={_field_names(missing_document_fields)}, "
+                    f"unsupported={_field_names(unknown_document_fields)})."
                 )
-            raw_measurements = doc.get("measurements") or []
+            raw_measurements = doc["measurements"]
             if not isinstance(raw_measurements, list):
                 raise ValueError(
                     f"Invalid TEE measurement config {path}: 'measurements' must be a list."
                 )
-            for measurement_config in raw_measurements:
-                if not isinstance(measurement_config, dict):
+            for group in raw_measurements:
+                if not isinstance(group, dict):
                     raise ValueError(
-                        f"Invalid TEE measurement config {path}: each measurement must be a mapping."
+                        f"Invalid TEE measurement config {path}: each measurement group must be "
+                        "a mapping."
                     )
-                name = measurement_config.get("name")
-                if not isinstance(name, str) or not name.strip():
-                    raise ValueError(
-                        f"Invalid TEE measurement config {path}: every measurement requires "
-                        "a non-empty string name."
-                    )
-                name = name.strip()
-                if name in names_in_source:
-                    raise ValueError(
-                        f"Invalid TEE measurement config {path}: duplicate measurement name "
-                        f"{name!r} in one source."
-                    )
-                names_in_source.add(name)
-                if name not in raw_by_name:
-                    ordered_names.append(name)
-                raw_by_name[name] = measurement_config
-                if is_committed:
-                    committed_names.add(name)
-            raw_revocations = doc.get("revoked_measurements") or []
-            if not isinstance(raw_revocations, list) or any(
-                not isinstance(name, str) or not name.strip() for name in raw_revocations
-            ):
+                for measurement_config in _expand_nested_measurement_group(group, path):
+                    name = measurement_config["name"]
+                    if name in names_in_source:
+                        raise ValueError(
+                            f"Invalid TEE measurement config {path}: duplicate normalized "
+                            f"measurement name {name!r} in one source."
+                        )
+                    names_in_source.add(name)
+                    if name not in raw_by_name:
+                        ordered_names.append(name)
+                    # Mounted variants replace committed variants atomically by normalized name.
+                    # Fields are never merged between the two source entries.
+                    raw_by_name[name] = measurement_config
+                    if is_committed:
+                        committed_names.add(name)
+
+            raw_revocations = doc["revoked_measurements"]
+            if not isinstance(raw_revocations, list):
                 raise ValueError(
                     f"Invalid TEE measurement config {path}: "
                     "'revoked_measurements' must be a list of non-empty names."
                 )
-            revoked_names.update(name.strip() for name in raw_revocations)
+            revocations_in_source: set[str] = set()
+            for raw_name in raw_revocations:
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    raise ValueError(
+                        f"Invalid TEE measurement config {path}: "
+                        "'revoked_measurements' must be a list of non-empty names."
+                    )
+                name = raw_name.strip()
+                if name in revocations_in_source:
+                    raise ValueError(
+                        f"Invalid TEE measurement config {path}: duplicate normalized revocation "
+                        f"{name!r} in one source."
+                    )
+                revocations_in_source.add(name)
+            # Unknown tombstones are intentionally retained: a mounted source may revoke a pin
+            # before that pin appears in another source or a later deployment.
+            revoked_names.update(revocations_in_source)
 
         if revoked_names:
             # A provenance-bound image is one atomic trust object even when it has one launch
@@ -921,13 +1120,14 @@ class Settings(BaseSettings):
         for config_name in ordered_names:
             measurement_config = raw_by_name[config_name]
             version = measurement_config.get("version")
-            if not version or not str(version).strip():
+            if not isinstance(version, str) or not version.strip():
                 error_msg = (
-                    f"Missing or empty 'version' for measurement config '{config_name}'. "
-                    "Each measurement configuration must have a version."
+                    f"Missing or invalid 'version' for measurement config '{config_name}'. "
+                    "Each measurement group must use a non-empty YAML string."
                 )
                 logger.error(error_msg)
                 raise ValueError(error_msg)
+            version = version.strip()
 
             # Never infer "hardened" from an absent or loosely typed value. A YAML string such as
             # "false" is truthy in Python, so only a real YAML boolean is accepted.
@@ -968,7 +1168,13 @@ class Settings(BaseSettings):
             image_sha256 = None
             image_measurement_names = None
             if has_image_sha:
-                image_sha256 = str(measurement_config["image_sha256"] or "").strip().lower()
+                raw_image_sha256 = measurement_config["image_sha256"]
+                if not isinstance(raw_image_sha256, str):
+                    raise ValueError(
+                        f"Invalid image_sha256 for measurement config '{config_name}': "
+                        "expected an actual YAML string."
+                    )
+                image_sha256 = raw_image_sha256.strip().lower()
                 if len(image_sha256) != 64 or any(
                     c not in "0123456789abcdef" for c in image_sha256
                 ):
@@ -991,7 +1197,7 @@ class Settings(BaseSettings):
                 if len(set(image_measurement_names)) != len(image_measurement_names):
                     raise ValueError(
                         f"Invalid image_measurement_names for measurement config '{config_name}': "
-                        "duplicate names are not allowed."
+                        "duplicate normalized names are not allowed."
                     )
                 if config_name not in image_measurement_names:
                     raise ValueError(
@@ -1000,7 +1206,12 @@ class Settings(BaseSettings):
                     )
 
             def _require_hex96(value: object, field: str) -> str:
-                text = str(value if value is not None else "").upper().strip()
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"Invalid {field} for measurement config '{config_name}': "
+                        "expected an actual YAML string containing 96 hex characters."
+                    )
+                text = value.upper().strip()
                 if len(text) != 96 or any(c not in "0123456789ABCDEF" for c in text):
                     raise ValueError(
                         f"Invalid {field} for measurement config '{config_name}': "
@@ -1030,8 +1241,13 @@ class Settings(BaseSettings):
                 )
             # Optional infrastructure provider hint ("gcp" | "bare-metal").
             provider = measurement_config.get("provider")
-            if provider is not None:
-                provider = str(provider).strip().lower() or None
+            if provider is not None and (
+                not isinstance(provider, str) or provider not in {"gcp", "bare-metal"}
+            ):
+                raise ValueError(
+                    f"Invalid provider for measurement config '{config_name}': "
+                    "expected exactly 'gcp' or 'bare-metal'."
+                )
             raw_expected_gpus = measurement_config.get("expected_gpus")
             if not isinstance(raw_expected_gpus, list) or any(
                 not isinstance(gpu, str) or not gpu.strip() for gpu in raw_expected_gpus
@@ -1054,8 +1270,8 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"GPU measurement config '{config_name}' must declare expected_gpus."
                 )
-            tee_type = (str(measurement_config.get("tee_type") or "tdx")).strip().lower()
-            if tee_type not in {"tdx", "sev-snp"}:
+            tee_type = measurement_config.get("tee_type")
+            if not isinstance(tee_type, str) or tee_type not in {"tdx", "sev-snp"}:
                 raise ValueError(
                     f"Invalid tee_type for measurement config '{config_name}': "
                     "expected exactly 'tdx' or 'sev-snp'."
@@ -1064,11 +1280,6 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"CPU-only measurement config '{config_name}' must set provider to "
                     "'gcp' or 'bare-metal'."
-                )
-            if provider is not None and provider not in {"gcp", "bare-metal"}:
-                raise ValueError(
-                    f"Invalid provider for measurement config '{config_name}': "
-                    "expected 'gcp' or 'bare-metal'."
                 )
             raw_rc = measurement_config.get("rc", False)
             if not isinstance(raw_rc, bool):
@@ -1130,8 +1341,18 @@ class Settings(BaseSettings):
                         f"Missing 'policy' for SNP measurement config '{config_name}'. SNP configs "
                         "must pin the full guest policy (the launch measurement does not cover it)."
                     )
-                # Accept either an int or a hex string like "0x30000".
-                policy = int(str(raw_policy), 0) if isinstance(raw_policy, str) else int(raw_policy)
+                if isinstance(raw_policy, bool) or not isinstance(raw_policy, (str, int)):
+                    raise ValueError(
+                        f"Invalid 'policy' for SNP measurement config '{config_name}': expected "
+                        "an actual YAML integer or an integer string such as '0x30000'."
+                    )
+                try:
+                    policy = int(raw_policy, 0) if isinstance(raw_policy, str) else raw_policy
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid 'policy' for SNP measurement config '{config_name}': expected "
+                        "an integer string such as '0x30000'."
+                    ) from exc
                 if policy & (1 << 19):
                     raise ValueError(
                         f"SNP measurement config '{config_name}' sets the guest policy DEBUG "
@@ -1193,12 +1414,17 @@ class Settings(BaseSettings):
                             "expected an integer in 0..255."
                         )
                     min_tcb[key] = value
-                id_key_digest = measurement_config.get("id_key_digest")
-                if id_key_digest:
-                    id_key_digest = _require_hex96(id_key_digest, "id_key_digest")
-                processor_model = (
-                    str(measurement_config.get("processor_model") or "Genoa")
-                ).strip()
+                id_key_digest = None
+                if "id_key_digest" in measurement_config:
+                    id_key_digest = _require_hex96(
+                        measurement_config["id_key_digest"], "id_key_digest"
+                    )
+                processor_model = measurement_config.get("processor_model")
+                if not isinstance(processor_model, str):
+                    raise ValueError(
+                        f"Invalid processor_model for SNP measurement config '{config_name}': "
+                        "expected an actual YAML string."
+                    )
                 if processor_model not in {"Genoa", "Milan", "Turin"}:
                     raise ValueError(
                         f"Invalid processor_model for SNP measurement config '{config_name}': "
@@ -1220,73 +1446,60 @@ class Settings(BaseSettings):
                         f"'bare-metal' (got {provider!r}); image identity is verified differently per "
                         "provider, so an unset/unknown provider is rejected (fail closed)."
                     )
-                raw_vtpm = measurement_config.get("vtpm_pcrs")
                 vtpm_pcrs = None
-                if raw_vtpm:
+                vtpm_security_flags = None
+                if provider == "gcp":
+                    raw_vtpm = measurement_config.get("vtpm_pcrs")
+                    if not isinstance(raw_vtpm, dict):
+                        raise ValueError(
+                            f"Invalid vtpm_pcrs for SNP config '{config_name}': expected a mapping "
+                            "containing exactly string keys '8' and '9'."
+                        )
+                    expected_pcrs = {"8", "9"}
+                    if set(raw_vtpm) != expected_pcrs or any(
+                        not isinstance(key, str) for key in raw_vtpm
+                    ):
+                        raise ValueError(
+                            f"Invalid vtpm_pcrs for SNP config '{config_name}': keys must be "
+                            "exactly the strings '8' and '9'."
+                        )
                     vtpm_pcrs = {}
-                    for k, v in dict(raw_vtpm).items():
-                        val = str(v).upper().strip()
+                    for key, value in raw_vtpm.items():
+                        if not isinstance(value, str):
+                            raise ValueError(
+                                f"Invalid vtpm_pcrs[{key}] for SNP config '{config_name}': "
+                                "expected an actual YAML string containing 64 hex characters."
+                            )
+                        val = value.upper().strip()
                         if len(val) != 64 or any(c not in "0123456789ABCDEF" for c in val):
                             raise ValueError(
-                                f"Invalid vtpm_pcrs[{k}] for SNP config '{config_name}': "
+                                f"Invalid vtpm_pcrs[{key}] for SNP config '{config_name}': "
                                 f"expected 64 hex chars (sha256), got {len(val)}."
                             )
-                        vtpm_pcrs[str(k)] = val
-                if provider == "gcp":
-                    # GCP SNP: require the vTPM PCRs, and require PCR8 (grub cmdline carrying
-                    # verity.roothash) AND PCR9 (kernel/initrd) specifically. Without these exact two,
-                    # the image is unpinned even if other (image-invariant) PCR indices are listed --
-                    # so accepting "some PCRs" would not actually constrain WHICH image runs.
-                    missing_pcrs = [p for p in ("8", "9") if not (vtpm_pcrs or {}).get(p)]
-                    if missing_pcrs:
-                        raise ValueError(
-                            f"GCP SNP measurement config '{config_name}' must pin vtpm_pcrs including "
-                            f"PCR8 and PCR9 (missing {missing_pcrs}). On GCP the SNP measurement "
-                            "attests only Google firmware, so image identity MUST be pinned via the "
-                            "GCE vTPM PCR8 (grub cmdline w/ verity.roothash) + PCR9 (kernel/initrd)."
-                        )
-                raw_vtpm_security_flags = measurement_config.get("vtpm_security_flags")
-                vtpm_security_flags = None
-                if raw_vtpm_security_flags is not None:
+                        vtpm_pcrs[key] = val
+
+                    raw_vtpm_security_flags = measurement_config.get("vtpm_security_flags")
                     if not isinstance(raw_vtpm_security_flags, dict):
                         raise ValueError(
                             f"Invalid vtpm_security_flags for SNP config '{config_name}': "
-                            "expected a map containing exactly boolean tags 2, 3, 4, and 5."
+                            "expected a map containing exactly boolean string tags 2, 3, 4, and 5."
+                        )
+                    expected_flag_tags = {"2", "3", "4", "5"}
+                    if set(raw_vtpm_security_flags) != expected_flag_tags or any(
+                        not isinstance(tag, str) for tag in raw_vtpm_security_flags
+                    ):
+                        raise ValueError(
+                            f"Invalid vtpm_security_flags for SNP config '{config_name}': "
+                            "keys must be exactly the string tags 2, 3, 4, and 5."
                         )
                     vtpm_security_flags = {}
-                    for raw_tag, raw_value in raw_vtpm_security_flags.items():
-                        if isinstance(raw_tag, bool) or not isinstance(raw_tag, (str, int)):
-                            raise ValueError(
-                                f"Invalid vtpm_security_flags tag {raw_tag!r} for SNP config "
-                                f"'{config_name}': expected tags 2, 3, 4, and 5."
-                            )
-                        tag = str(raw_tag)
-                        if tag in vtpm_security_flags:
-                            raise ValueError(
-                                f"Duplicate normalized vtpm_security_flags tag {tag!r} for "
-                                f"SNP config '{config_name}'."
-                            )
+                    for tag, raw_value in raw_vtpm_security_flags.items():
                         if not isinstance(raw_value, bool):
                             raise ValueError(
                                 f"Invalid vtpm_security_flags[{tag}] for SNP config "
                                 f"'{config_name}': expected an actual YAML boolean."
                             )
                         vtpm_security_flags[tag] = raw_value
-                    expected_flag_tags = {"2", "3", "4", "5"}
-                    if set(vtpm_security_flags) != expected_flag_tags:
-                        raise ValueError(
-                            f"Invalid vtpm_security_flags for SNP config '{config_name}': "
-                            "keys must be exactly tags 2, 3, 4, and 5."
-                        )
-                if provider == "gcp" and vtpm_security_flags is None:
-                    raise ValueError(
-                        f"GCP SNP measurement config '{config_name}' must pin "
-                        "vtpm_security_flags with exactly boolean tags 2, 3, 4, and 5."
-                    )
-                if provider != "gcp" and raw_vtpm_security_flags is not None:
-                    raise ValueError(
-                        f"vtpm_security_flags is GCP-only for SNP config '{config_name}'."
-                    )
                 raw_vmpl = measurement_config.get("expected_vmpl")
                 if not isinstance(raw_vmpl, int) or isinstance(raw_vmpl, bool):
                     raise ValueError(
@@ -1302,8 +1515,8 @@ class Settings(BaseSettings):
                     )
                 measurements.append(
                     TeeMeasurementConfig(
-                        version=str(version).strip(),
-                        name=measurement_config["name"],
+                        version=version,
+                        name=config_name,
                         expected_gpus=expected_gpus,
                         gpu_count=gpu_count,
                         provider=provider,
@@ -1312,7 +1525,7 @@ class Settings(BaseSettings):
                         measurement=measurement_hex,
                         policy=policy,
                         min_tcb=min_tcb,
-                        id_key_digest=id_key_digest or None,
+                        id_key_digest=id_key_digest,
                         processor_model=processor_model,
                         expected_vmpl=expected_vmpl,
                         vtpm_pcrs=vtpm_pcrs,
@@ -1338,8 +1551,8 @@ class Settings(BaseSettings):
 
             measurements.append(
                 TeeMeasurementConfig(
-                    version=str(version).strip(),
-                    name=measurement_config["name"],
+                    version=version,
+                    name=config_name,
                     expected_gpus=expected_gpus,
                     gpu_count=gpu_count,
                     provider=provider,
@@ -1359,7 +1572,39 @@ class Settings(BaseSettings):
 
         # Validate the relation as a set after every source has been merged. This catches a mounted
         # override that changes one committed entry but omits/changes the rest of its provenance,
-        # unknown names, mixed debug posture, and partial per-vCPU matrices.
+        # unknown names, mixed shared posture, and partial per-vCPU matrices. Version is deliberately
+        # excluded: existing size-class matrices retain distinct audit versions per hardware variant.
+        def _shared_image_fields(config: TeeMeasurementConfig) -> dict:
+            shared = {
+                "debug": config.debug,
+                "rc": config.rc,
+                "tee_type": config.tee_type,
+                "provider": config.provider,
+            }
+            if config.tee_type == "tdx":
+                shared.update(
+                    {
+                        "mrtd": config.mrtd,
+                        "rtmr1": config.rtmr1,
+                        "rtmr2": config.rtmr2,
+                        "boot_rtmr3": config.boot_rtmr3,
+                        "runtime_rtmr3": config.runtime_rtmr3,
+                    }
+                )
+            else:
+                shared.update(
+                    {
+                        "processor_model": config.processor_model,
+                        "policy": config.policy,
+                        "min_tcb": config.min_tcb,
+                        "expected_vmpl": config.expected_vmpl,
+                        "id_key_digest": config.id_key_digest,
+                        "vtpm_pcrs": config.vtpm_pcrs,
+                        "vtpm_security_flags": config.vtpm_security_flags,
+                    }
+                )
+            return shared
+
         by_name = {config.name: config for config in measurements}
         for config in measurements:
             if not config.image_sha256:
@@ -1372,18 +1617,15 @@ class Settings(BaseSettings):
                     or peer.image_sha256 != config.image_sha256
                     or list(peer.image_measurement_names or [])
                     != list(config.image_measurement_names or [])
-                    or peer.debug != config.debug
-                    or peer.rc != config.rc
-                    or peer.tee_type != config.tee_type
-                    or peer.provider != config.provider
+                    or _shared_image_fields(peer) != _shared_image_fields(config)
                     or peer.gpu_count != config.gpu_count
                     or peer.expected_gpus != config.expected_gpus
                 ):
                     raise ValueError(
                         f"Inconsistent image provenance for measurement set "
                         f"{sorted(declared_names)}: every declared entry must be loaded and bind "
-                        "the same image_sha256, ordered set, debug/RC posture, TEE, provider, and "
-                        "CPU/GPU inventory."
+                        "the same image_sha256, ordered set, shared TEE/provider/attestation fields, "
+                        "and CPU/GPU inventory."
                     )
 
         logger.info(f"Loaded {len(measurements)} TEE measurement configurations")
