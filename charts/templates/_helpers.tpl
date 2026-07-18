@@ -234,7 +234,24 @@ nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
       key: pg-key
 {{- end }}
 
+{{/*
+Trusted client-IP headers require ingress isolation around the API. A non-empty chart trust list
+is valid only when this chart renders a non-empty API ingress policy, or the deployment explicitly
+acknowledges that an equivalent policy is managed outside this chart.
+*/}}
+{{- define "chutes.trustedProxyIsolationValidation" -}}
+{{- $trustedProxyCidrs := .Values.trustedProxyCidrs | default "" -}}
+{{- $apiPolicy := .Values.networkPolicies.api | default dict -}}
+{{- $apiPeers := $apiPolicy.ingressPeers | default list -}}
+{{- $chartPolicyActive := and .Values.networkPolicies.enabled ($apiPolicy.enabled | default false) (gt (len $apiPeers) 0) -}}
+{{- $externalPolicyAcknowledged := $apiPolicy.externalPolicyAcknowledged | default false -}}
+{{- if and (not (empty (trim $trustedProxyCidrs))) (not (or $chartPolicyActive $externalPolicyAcknowledged)) -}}
+{{- fail "trustedProxyCidrs requires networkPolicies.enabled=true with networkPolicies.api.enabled=true and non-empty networkPolicies.api.ingressPeers, or networkPolicies.api.externalPolicyAcknowledged=true" -}}
+{{- end -}}
+{{- end }}
+
 {{- define "chutes.commonEnv" -}}
+{{- include "chutes.trustedProxyIsolationValidation" . -}}
 - name: GRAVAL_URL
   value: https://graval.chutes.ai
 - name: REDIS_PASSWORD
@@ -247,7 +264,7 @@ nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
 - name: REDIS_PORT
   value: {{ .Values.redis.port | quote }}
 - name: TRUSTED_PROXY_CIDRS
-  value: {{ .Values.trustedProxyCidrs | default .Values.networkPolicies.internalCidr | quote }}
+  value: {{ .Values.trustedProxyCidrs | quote }}
 {{- if .Values.redis.cacertSecret }}
 - name: REDIS_CACERT
   value: "/etc/redis-cacert/cacert.pem"

@@ -18,10 +18,10 @@ import redis.asyncio as redis
 from redis.retry import Retry
 from redis.backoff import ConstantBackoff
 from boto3.session import Config
-from typing import Dict, List, Optional
+from typing import Annotated, Dict, List, Optional
 from bittensor_wallet.keypair import Keypair
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from contextlib import asynccontextmanager
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -702,12 +702,18 @@ class Settings(BaseSettings):
         os.getenv("REQUIRE_MTLS_CLIENT_VERIFY", "true").lower() == "true"
     )
     # X-Resolved-IP is proxy-owned and is accepted only from these directly connected networks.
-    # The chart explicitly supplies its internal pod CIDR; direct clients cannot opt themselves in.
-    trusted_proxy_cidrs: List[str] = [
-        value.strip()
-        for value in os.getenv("TRUSTED_PROXY_CIDRS", "127.0.0.0/8,::1/128").split(",")
-        if value.strip()
-    ]
+    # Standalone processes trust loopback by default. The chart always sets this environment variable
+    # explicitly (including an empty value, which parses to []), so chart deployments opt into trust.
+    trusted_proxy_cidrs: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: ["127.0.0.0/8", "::1/128"]
+    )
+
+    @field_validator("trusted_proxy_cidrs", mode="before")
+    @classmethod
+    def _parse_trusted_proxy_cidrs(cls, value):
+        if isinstance(value, str):
+            return [cidr.strip() for cidr in value.split(",") if cidr.strip()]
+        return value
 
     # Database settings.
     db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "16"))

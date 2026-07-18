@@ -1,6 +1,9 @@
 teeMinimumBootVersion: ""
 snpCrlOutageGraceSeconds: 0
-# Comma-separated direct proxy networks. Empty reuses networkPolicies.internalCidr.
+# Comma-separated CIDRs for direct final-hop proxies that overwrite X-Resolved-IP.
+# Empty is rendered explicitly and parses as no trusted proxies; it never inherits an internal CIDR.
+# Trust only sanitizing final hops controlled by this deployment. Do not trust third-party proxy
+# images until their header behavior is verified.
 trustedProxyCidrs: ""
 dbSsl: "require"
 
@@ -37,6 +40,18 @@ networkPolicies:
   # proxyUpstreamCidr = the external upstream the claude/responses proxies are allowed to reach.
   internalCidr: "192.0.2.0/24"
   proxyUpstreamCidr: "192.0.2.4/32"
+  # Optional ingress isolation for API pods. Every peer is an explicit Kubernetes
+  # NetworkPolicyPeer supplied by the deployment overlay for its ingress controllers, monitoring,
+  # node probes, and internal proxies. Enabling with no peers fails rendering; disabling omits the
+  # policy instead of producing a ports-only allow-all rule.
+  api:
+    enabled: false
+    ingressPeers: []
+    # Set only when an equivalent externally managed policy selects
+    # app.kubernetes.io/name=api and limits TCP/8000 to verified, sanitizing final hops.
+    # A non-empty trustedProxyCidrs requires either that external acknowledgement or this chart's
+    # global+API policy to be enabled with non-empty peers.
+    externalPolicyAcknowledged: false
 
 # nginx Ingresses for externally-routed services. Templated from the live cluster state.
 # The prometheus ingress is intentionally excluded (owned by the prometheus/GMP app).

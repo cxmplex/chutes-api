@@ -15,6 +15,8 @@ spec:
       labels:
         {{- include "remoteForge.labels" . | nindent 8 }}
     spec:
+      securityContext:
+        {{- include "chutes.podSecurityContext" . | nindent 8 }}
       containers:
         - name: remote-forge
           image: "{{ .Values.remoteForge.image }}"
@@ -77,11 +79,13 @@ spec:
                 secretKeyRef:
                   name: cosign-signing-key
                   key: cosign.password
-          securityContext: {}
+          securityContext:
+            {{- include "chutes.containerSecurityContext" . | nindent 12 }}
           volumeMounts:
             - name: cosign-key
               mountPath: /etc/cosign
               readOnly: true
+            {{- include "chutes.redisCacertMount" . | nindent 12 }}
           resources:
             {{- toYaml .Values.remoteForge.resources | nindent 12 }}
       volumes:
@@ -92,6 +96,7 @@ spec:
             - key: cosign.key
               path: cosign.key
               mode: 0444
+        {{- include "chutes.redisCacertVolume" . | nindent 8 }}
       {{- with .Values.remoteForge.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
