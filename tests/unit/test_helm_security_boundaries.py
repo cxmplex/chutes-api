@@ -56,6 +56,15 @@ def _environment(container):
     return {entry["name"]: entry for entry in container["env"]}
 
 
+def _selector_peer(namespace_labels=None, pod_labels=None):
+    return {
+        "namespaceSelector": {
+            "matchLabels": namespace_labels or {"kubernetes.io/metadata.name": "ingress-nginx"}
+        },
+        "podSelector": {"matchLabels": pod_labels or {"app.kubernetes.io/component": "controller"}},
+    }
+
+
 def test_remote_forge_omits_redis_ca_cleanly_and_applies_security_contexts(helm_binary, tmp_path):
     rendered = _render_chart(
         helm_binary,
@@ -175,9 +184,7 @@ def test_explicit_trusted_proxy_cidrs_render_unchanged_with_external_policy_ackn
             "enabled": False,
             "api": {
                 "enabled": True,
-                "ingressPeers": [
-                    {"podSelector": {"matchLabels": {"app.kubernetes.io/name": "ingress-nginx"}}}
-                ],
+                "ingressPeers": [_selector_peer()],
             },
         },
     ],
@@ -206,11 +213,11 @@ def test_trusted_proxy_cidrs_without_effective_peer_isolation_are_rejected(
 
 def test_api_network_policy_selects_api_and_only_allows_explicit_peers(helm_binary, tmp_path):
     peers = [
-        {
-            "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ingress-nginx"}},
-            "podSelector": {"matchLabels": {"app.kubernetes.io/component": "controller"}},
-        },
-        {"ipBlock": {"cidr": "10.42.8.0/24", "except": ["10.42.8.128/25"]}},
+        _selector_peer(),
+        _selector_peer(
+            namespace_labels={"kubernetes.io/metadata.name": "monitoring"},
+            pod_labels={"app.kubernetes.io/name": "prometheus"},
+        ),
     ]
     rendered = _render_chart(
         helm_binary,
@@ -267,29 +274,197 @@ def test_enabled_api_network_policy_requires_peers(helm_binary, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "peer",
+    ("network_policy_values", "expected_error"),
     [
-        {},
-        {"podSelector": {}},
-        {"namespaceSelector": {}},
-        {"ipBlock": {"cidr": "0.0.0.0/0"}},
-        {"ipBlock": {"cidr": "::/0"}},
+        ({"enabled": "false"}, "networkPolicies.enabled must be a boolean"),
+        ({"enabled": "true"}, "networkPolicies.enabled must be a boolean"),
+        (
+            {"api": {"enabled": "false"}},
+            "networkPolicies.api.enabled must be a boolean",
+        ),
+        (
+            {"api": {"enabled": "true"}},
+            "networkPolicies.api.enabled must be a boolean",
+        ),
+        (
+            {"api": {"externalPolicyAcknowledged": "false"}},
+            "networkPolicies.api.externalPolicyAcknowledged must be a boolean",
+        ),
+        (
+            {"api": {"externalPolicyAcknowledged": "true"}},
+            "networkPolicies.api.externalPolicyAcknowledged must be a boolean",
+        ),
+    ],
+    ids=[
+        "global-enabled-quoted-false",
+        "global-enabled-quoted-true",
+        "api-enabled-quoted-false",
+        "api-enabled-quoted-true",
+        "external-ack-quoted-false",
+        "external-ack-quoted-true",
     ],
 )
-def test_api_network_policy_rejects_allow_all_peers(helm_binary, tmp_path, peer):
+def test_api_isolation_flags_require_actual_booleans(
+    helm_binary, tmp_path, network_policy_values, expected_error
+):
+    rendered = _render_chart(
+        helm_binary,
+        tmp_path,
+        values={
+            "trustedProxyCidrs": "10.42.0.0/16",
+            "networkPolicies": network_policy_values,
+        },
+    )
+
+    assert rendered.returncode != 0
+    assert expected_error in rendered.stderr
+
+
+@pytest.mark.parametrize(
+    ("ingress_peers", "expected_error"),
+    [
+        (
+            [
+                {"ipBlock": {"cidr": "0.0.0.0/1"}},
+                {"ipBlock": {"cidr": "128.0.0.0/1"}},
+            ],
+            'networkPolicies.api.ingressPeers[0] contains unsupported key "ipBlock"',
+        ),
+        (
+            [
+                {"ipBlock": {"cidr": "0:0:0:0:0:0:0:0/1"}},
+                {"ipBlock": {"cidr": "8000:0:0:0:0:0:0:0/1"}},
+            ],
+            'networkPolicies.api.ingressPeers[0] contains unsupported key "ipBlock"',
+        ),
+        (
+            [{"podSelector": {"matchLabels": {"app": "controller"}}}],
+            "networkPolicies.api.ingressPeers[0] requires namespaceSelector and podSelector",
+        ),
+        (
+            [{"namespaceSelector": {"matchLabels": {"namespace": "ingress"}}}],
+            "networkPolicies.api.ingressPeers[0] requires namespaceSelector and podSelector",
+        ),
+        (
+            [
+                {
+                    "namespaceSelector": {
+                        "matchExpressions": [
+                            {"key": "namespace", "operator": "In", "values": ["ingress"]}
+                        ]
+                    },
+                    "podSelector": {"matchLabels": {"app": "controller"}},
+                }
+            ],
+            (
+                "networkPolicies.api.ingressPeers[0].namespaceSelector contains "
+                'unsupported key "matchExpressions"'
+            ),
+        ),
+        (
+            [
+                {
+                    "namespaceSelector": {"matchLabels": {}},
+                    "podSelector": {"matchLabels": {"app": "controller"}},
+                }
+            ],
+            "networkPolicies.api.ingressPeers[0].namespaceSelector.matchLabels must not be empty",
+        ),
+        (
+            [
+                {
+                    "namespaceSelector": {"matchLabels": {"namespace": "ingress"}},
+                    "podSelector": {"matchLabels": {}},
+                }
+            ],
+            "networkPolicies.api.ingressPeers[0].podSelector.matchLabels must not be empty",
+        ),
+        (
+            [
+                {
+                    **_selector_peer(),
+                    "serviceAccountSelector": {"matchLabels": {"name": "ingress"}},
+                }
+            ],
+            (
+                "networkPolicies.api.ingressPeers[0] contains unsupported key "
+                '"serviceAccountSelector"'
+            ),
+        ),
+        (
+            [
+                {
+                    "namespaceSelector": {
+                        "matchLabels": {"namespace": "ingress"},
+                        "matchExpressions": [],
+                    },
+                    "podSelector": {"matchLabels": {"app": "controller"}},
+                }
+            ],
+            (
+                "networkPolicies.api.ingressPeers[0].namespaceSelector contains "
+                'unsupported key "matchExpressions"'
+            ),
+        ),
+        (
+            {"namespaceSelector": {"matchLabels": {"namespace": "ingress"}}},
+            "networkPolicies.api.ingressPeers must be a list",
+        ),
+        (
+            ["not-a-map"],
+            "networkPolicies.api.ingressPeers[0] must be a map",
+        ),
+        (
+            [
+                {
+                    "namespaceSelector": "not-a-map",
+                    "podSelector": {"matchLabels": {"app": "controller"}},
+                }
+            ],
+            "networkPolicies.api.ingressPeers[0].namespaceSelector must be a map",
+        ),
+        (
+            [
+                {
+                    "namespaceSelector": {"matchLabels": ["not-a-map"]},
+                    "podSelector": {"matchLabels": {"app": "controller"}},
+                }
+            ],
+            "networkPolicies.api.ingressPeers[0].namespaceSelector.matchLabels must be a map",
+        ),
+    ],
+    ids=[
+        "complementary-ipv4-prefixes",
+        "expanded-ipv6-all-space",
+        "missing-namespace-selector",
+        "missing-pod-selector",
+        "match-expressions-only",
+        "empty-namespace-labels",
+        "empty-pod-labels",
+        "unknown-peer-key",
+        "unknown-selector-key",
+        "ingress-peers-not-list",
+        "peer-not-map",
+        "selector-not-map",
+        "match-labels-not-map",
+    ],
+)
+def test_api_network_policy_rejects_non_selector_bound_peers(
+    helm_binary, tmp_path, ingress_peers, expected_error
+):
     rendered = _render_chart(
         helm_binary,
         tmp_path,
         values={
             "networkPolicies": {
                 "enabled": True,
-                "api": {"enabled": True, "ingressPeers": [peer]},
+                "api": {"enabled": True, "ingressPeers": ingress_peers},
             }
         },
     )
 
     assert rendered.returncode != 0
-    assert "networkPolicies.api.ingressPeers[0]" in rendered.stderr
+    assert expected_error in rendered.stderr
 
 
 def test_known_nginx_final_hops_overwrite_resolved_ip(helm_binary, tmp_path):

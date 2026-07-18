@@ -34,21 +34,23 @@ consecutive_failure_limit: 7
 # currently match no pods and enforce nothing (only pg-router-np is active). Kept faithful for a
 # no-op adoption; fixing the selectors is a deliberate, test-gated change (see template warnings).
 networkPolicies:
+  # Boolean values must be YAML booleans, not quoted strings.
   enabled: true
   # Egress CIDRs are environment-specific -- placeholders here (RFC5737 docs net), real ranges
   # set in the overlay. internalCidr = private range for redis/postgres/internal services;
   # proxyUpstreamCidr = the external upstream the claude/responses proxies are allowed to reach.
   internalCidr: "192.0.2.0/24"
   proxyUpstreamCidr: "192.0.2.4/32"
-  # Optional ingress isolation for API pods. Every peer is an explicit Kubernetes
-  # NetworkPolicyPeer supplied by the deployment overlay for its ingress controllers, monitoring,
-  # node probes, and internal proxies. Enabling with no peers fails rendering; disabling omits the
-  # policy instead of producing a ports-only allow-all rule.
+  # Optional ingress isolation for API pods. This chart accepts only pod-bound peers containing
+  # BOTH non-empty namespaceSelector.matchLabels and podSelector.matchLabels maps. It rejects
+  # ipBlock, matchExpressions, empty selectors, and unknown keys. Use this path for ingress
+  # controllers, monitoring, and internal proxy pods.
   api:
     enabled: false
     ingressPeers: []
-    # Set only when an equivalent externally managed policy selects
-    # app.kubernetes.io/name=api and limits TCP/8000 to verified, sanitizing final hops.
+    # Node/CNI sources requiring CIDRs must use an externally managed policy. Set this boolean
+    # acknowledgement only when that policy selects app.kubernetes.io/name=api and limits TCP/8000
+    # to verified, sanitizing final hops. Quoted "true"/"false" values fail rendering.
     # A non-empty trustedProxyCidrs requires either that external acknowledgement or this chart's
     # global+API policy to be enabled with non-empty peers.
     externalPolicyAcknowledged: false

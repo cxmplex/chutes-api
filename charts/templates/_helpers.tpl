@@ -239,19 +239,93 @@ Trusted client-IP headers require ingress isolation around the API. A non-empty 
 is valid only when this chart renders a non-empty API ingress policy, or the deployment explicitly
 acknowledges that an equivalent policy is managed outside this chart.
 */}}
-{{- define "chutes.trustedProxyIsolationValidation" -}}
-{{- $trustedProxyCidrs := .Values.trustedProxyCidrs | default "" -}}
-{{- $apiPolicy := .Values.networkPolicies.api | default dict -}}
-{{- $apiPeers := $apiPolicy.ingressPeers | default list -}}
-{{- $chartPolicyActive := and .Values.networkPolicies.enabled ($apiPolicy.enabled | default false) (gt (len $apiPeers) 0) -}}
-{{- $externalPolicyAcknowledged := $apiPolicy.externalPolicyAcknowledged | default false -}}
+{{- define "chutes.apiIsolationValidation" -}}
+{{- $networkPolicies := .Values.networkPolicies -}}
+{{- if not (kindIs "map" $networkPolicies) -}}
+{{- fail "networkPolicies must be a map" -}}
+{{- end -}}
+{{- $apiPolicy := get $networkPolicies "api" -}}
+{{- if not (kindIs "map" $apiPolicy) -}}
+{{- fail "networkPolicies.api must be a map" -}}
+{{- end -}}
+{{- range $key, $_ := $apiPolicy -}}
+{{- if not (or (eq $key "enabled") (eq $key "ingressPeers") (eq $key "externalPolicyAcknowledged")) -}}
+{{- fail (printf "networkPolicies.api contains unsupported key %q" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- $networkPoliciesEnabled := get $networkPolicies "enabled" -}}
+{{- if not (kindIs "bool" $networkPoliciesEnabled) -}}
+{{- fail "networkPolicies.enabled must be a boolean" -}}
+{{- end -}}
+{{- $apiPolicyEnabled := get $apiPolicy "enabled" -}}
+{{- if not (kindIs "bool" $apiPolicyEnabled) -}}
+{{- fail "networkPolicies.api.enabled must be a boolean" -}}
+{{- end -}}
+{{- $externalPolicyAcknowledged := get $apiPolicy "externalPolicyAcknowledged" -}}
+{{- if not (kindIs "bool" $externalPolicyAcknowledged) -}}
+{{- fail "networkPolicies.api.externalPolicyAcknowledged must be a boolean" -}}
+{{- end -}}
+{{- $apiPeers := get $apiPolicy "ingressPeers" -}}
+{{- if not (kindIs "slice" $apiPeers) -}}
+{{- fail "networkPolicies.api.ingressPeers must be a list" -}}
+{{- end -}}
+{{- range $index, $peer := $apiPeers -}}
+{{- if not (kindIs "map" $peer) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d] must be a map" $index) -}}
+{{- end -}}
+{{- range $key, $_ := $peer -}}
+{{- if not (or (eq $key "namespaceSelector") (eq $key "podSelector")) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d] contains unsupported key %q" $index $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (and (hasKey $peer "namespaceSelector") (hasKey $peer "podSelector")) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d] requires namespaceSelector and podSelector" $index) -}}
+{{- end -}}
+{{- range $selectorName := list "namespaceSelector" "podSelector" -}}
+{{- $selector := get $peer $selectorName -}}
+{{- if not (kindIs "map" $selector) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s must be a map" $index $selectorName) -}}
+{{- end -}}
+{{- range $key, $_ := $selector -}}
+{{- if ne $key "matchLabels" -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s contains unsupported key %q" $index $selectorName $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $selector "matchLabels") -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s requires matchLabels" $index $selectorName) -}}
+{{- end -}}
+{{- $matchLabels := get $selector "matchLabels" -}}
+{{- if not (kindIs "map" $matchLabels) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s.matchLabels must be a map" $index $selectorName) -}}
+{{- end -}}
+{{- if empty $matchLabels -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s.matchLabels must not be empty" $index $selectorName) -}}
+{{- end -}}
+{{- range $labelKey, $labelValue := $matchLabels -}}
+{{- if not (kindIs "string" $labelKey) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s.matchLabels keys must be strings" $index $selectorName) -}}
+{{- end -}}
+{{- if empty (trim $labelKey) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s.matchLabels keys must not be empty" $index $selectorName) -}}
+{{- end -}}
+{{- if not (kindIs "string" $labelValue) -}}
+{{- fail (printf "networkPolicies.api.ingressPeers[%d].%s.matchLabels[%q] must be a string" $index $selectorName $labelKey) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $trustedProxyCidrs := .Values.trustedProxyCidrs -}}
+{{- if not (kindIs "string" $trustedProxyCidrs) -}}
+{{- fail "trustedProxyCidrs must be a string" -}}
+{{- end -}}
+{{- $chartPolicyActive := and $networkPoliciesEnabled $apiPolicyEnabled (gt (len $apiPeers) 0) -}}
 {{- if and (not (empty (trim $trustedProxyCidrs))) (not (or $chartPolicyActive $externalPolicyAcknowledged)) -}}
 {{- fail "trustedProxyCidrs requires networkPolicies.enabled=true with networkPolicies.api.enabled=true and non-empty networkPolicies.api.ingressPeers, or networkPolicies.api.externalPolicyAcknowledged=true" -}}
 {{- end -}}
 {{- end }}
 
 {{- define "chutes.commonEnv" -}}
-{{- include "chutes.trustedProxyIsolationValidation" . -}}
+{{- include "chutes.apiIsolationValidation" . -}}
 - name: GRAVAL_URL
   value: https://graval.chutes.ai
 - name: REDIS_PASSWORD

@@ -1,22 +1,9 @@
-{{- $apiPolicy := .Values.networkPolicies.api | default dict -}}
-{{- $apiPeers := $apiPolicy.ingressPeers | default list -}}
-{{- if and .Values.networkPolicies.enabled ($apiPolicy.enabled | default false) }}
+{{- include "chutes.apiIsolationValidation" . -}}
+{{- $apiPolicy := .Values.networkPolicies.api -}}
+{{- $apiPeers := $apiPolicy.ingressPeers -}}
+{{- if and .Values.networkPolicies.enabled $apiPolicy.enabled }}
 {{- if empty $apiPeers }}
 {{- fail "networkPolicies.api.enabled requires non-empty networkPolicies.api.ingressPeers" }}
-{{- end }}
-{{- range $index, $peer := $apiPeers }}
-{{- $podSelector := get $peer "podSelector" | default dict -}}
-{{- $namespaceSelector := get $peer "namespaceSelector" | default dict -}}
-{{- $ipBlock := get $peer "ipBlock" | default dict -}}
-{{- $podSelectorConstrained := or (not (empty (get $podSelector "matchLabels"))) (not (empty (get $podSelector "matchExpressions"))) -}}
-{{- $namespaceSelectorConstrained := or (not (empty (get $namespaceSelector "matchLabels"))) (not (empty (get $namespaceSelector "matchExpressions"))) -}}
-{{- $ipCidr := get $ipBlock "cidr" | default "" -}}
-{{- if not (or $podSelectorConstrained $namespaceSelectorConstrained (not (empty $ipCidr))) }}
-{{- fail (printf "networkPolicies.api.ingressPeers[%d] must contain a constrained podSelector, namespaceSelector, or ipBlock" $index) }}
-{{- end }}
-{{- if or (eq $ipCidr "0.0.0.0/0") (eq $ipCidr "::/0") }}
-{{- fail (printf "networkPolicies.api.ingressPeers[%d] must not allow all addresses" $index) }}
-{{- end }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
