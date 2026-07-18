@@ -68,6 +68,7 @@ ingress:
   # Client-IP source for every ingress that routes directly to the API. The safe default ignores
   # request headers and forwards nginx's direct peer address. Enable this only when every such
   # request arrives through Cloudflare; rendering then requires a trusted source whitelist.
+  # This map supports only `enabled`, which must be an unquoted YAML boolean.
   cloudflareClientIp:
     enabled: false
   # socket-servers uses its own list (the other ingresses add a trailing ops IP); set in overlay.

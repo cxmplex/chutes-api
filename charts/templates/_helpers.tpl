@@ -154,8 +154,31 @@ Cloudflare's header is trusted only when the ingress itself is source-restricted
 The proxy header configuration must be included in a location-scoped
 configuration-snippet because generated ingress locations set proxy headers.
 */}}
+{{- define "chutes.apiIngressClientIpValidation" -}}
+{{- $ingress := .Values.ingress -}}
+{{- if not (kindIs "map" $ingress) -}}
+{{- fail "ingress must be a map" -}}
+{{- end -}}
+{{- $cloudflareClientIp := get $ingress "cloudflareClientIp" -}}
+{{- if not (kindIs "map" $cloudflareClientIp) -}}
+{{- fail "ingress.cloudflareClientIp must be a map" -}}
+{{- end -}}
+{{- range $key, $_ := $cloudflareClientIp -}}
+{{- if ne $key "enabled" -}}
+{{- fail (printf "ingress.cloudflareClientIp contains unsupported key %q" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $cloudflareClientIp "enabled") -}}
+{{- fail "ingress.cloudflareClientIp.enabled is required" -}}
+{{- end -}}
+{{- if not (kindIs "bool" (get $cloudflareClientIp "enabled")) -}}
+{{- fail "ingress.cloudflareClientIp.enabled must be a boolean" -}}
+{{- end -}}
+{{- end }}
+
 {{- define "chutes.apiIngressClientIpConfiguration" -}}
-{{- if .Values.ingress.cloudflareClientIp.enabled -}}
+{{- include "chutes.apiIngressClientIpValidation" . -}}
+{{- if (get .Values.ingress.cloudflareClientIp "enabled") -}}
 proxy_set_header X-Resolved-IP $http_cf_connecting_ip;
 {{- else -}}
 proxy_set_header X-Resolved-IP $remote_addr;
@@ -163,7 +186,8 @@ proxy_set_header X-Resolved-IP $remote_addr;
 {{- end }}
 
 {{- define "chutes.apiIngressClientIpAnnotations" -}}
-{{- if and .Values.ingress.cloudflareClientIp.enabled (empty (trim .Values.ingress.whitelistSourceRange)) -}}
+{{- include "chutes.apiIngressClientIpValidation" . -}}
+{{- if and (get .Values.ingress.cloudflareClientIp "enabled") (empty (trim .Values.ingress.whitelistSourceRange)) -}}
 {{- fail "ingress.cloudflareClientIp.enabled requires a non-empty ingress.whitelistSourceRange" -}}
 {{- end -}}
 {{- with .Values.ingress.whitelistSourceRange }}

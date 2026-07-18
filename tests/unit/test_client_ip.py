@@ -27,6 +27,14 @@ DIRECT_API_INGRESS_TEMPLATES = tuple(
 )
 
 
+@pytest.fixture(scope="module")
+def helm_binary():
+    helm = os.getenv("HELM_TEST_BINARY") or shutil.which("helm")
+    if not helm:
+        pytest.skip("helm binary is required for render-level chart verification")
+    return helm
+
+
 def _request(peer: str, headers: dict[str, str] | None = None) -> Request:
     raw_headers = [(key.lower().encode(), value.encode()) for key, value in (headers or {}).items()]
     return Request(
@@ -175,11 +183,16 @@ def test_direct_api_ingress_client_ip_helper_defaults_to_direct_peer():
 
 def test_direct_api_ingress_cloudflare_mode_requires_whitelist():
     template = INGRESS_CLIENT_IP_HELPER.read_text()
+    assert 'define "chutes.apiIngressClientIpValidation"' in template
+    assert template.count('include "chutes.apiIngressClientIpValidation"') == 2
+    assert 'fail "ingress.cloudflareClientIp must be a map"' in template
+    assert 'fail "ingress.cloudflareClientIp.enabled must be a boolean"' in template
+    assert "ingress.cloudflareClientIp contains unsupported key %q" in template
     assert (
         'fail "ingress.cloudflareClientIp.enabled requires a non-empty '
         'ingress.whitelistSourceRange"' in template
     )
-    assert ".Values.ingress.cloudflareClientIp.enabled" in template
+    assert 'get .Values.ingress.cloudflareClientIp "enabled"' in template
     assert "(empty (trim .Values.ingress.whitelistSourceRange))" in template
 
 
@@ -248,3 +261,68 @@ def test_direct_api_ingress_helm_rendering_enforces_client_ip_modes(template_pat
         trusted_annotations["nginx.ingress.kubernetes.io/whitelist-source-range"]
         == "173.245.48.0/20"
     )
+
+
+@pytest.mark.parametrize(
+    "template_path",
+    DIRECT_API_INGRESS_TEMPLATES,
+    ids=lambda path: path.name,
+)
+@pytest.mark.parametrize(
+    ("cloudflare_config", "expected_error"),
+    [
+        ({"enabled": "false"}, "ingress.cloudflareClientIp.enabled must be a boolean"),
+        ({"enabled": "true"}, "ingress.cloudflareClientIp.enabled must be a boolean"),
+        ("false", "ingress.cloudflareClientIp must be a map"),
+        (True, "ingress.cloudflareClientIp must be a map"),
+        (None, "ingress.cloudflareClientIp must be a map"),
+        ([{"enabled": False}], "ingress.cloudflareClientIp must be a map"),
+        (
+            {"enabled": {"value": True}},
+            "ingress.cloudflareClientIp.enabled must be a boolean",
+        ),
+        (
+            {"enabled": False, "forwardedHeader": "CF-Connecting-IP"},
+            'ingress.cloudflareClientIp contains unsupported key "forwardedHeader"',
+        ),
+    ],
+    ids=[
+        "quoted-false",
+        "quoted-true",
+        "string-value",
+        "boolean-value",
+        "null-value",
+        "list-value",
+        "enabled-map",
+        "unknown-key",
+    ],
+)
+def test_direct_api_ingress_rejects_malformed_cloudflare_config(
+    helm_binary, tmp_path, template_path, cloudflare_config, expected_error
+):
+    values_path = tmp_path / "values.yaml"
+    values_path.write_text(
+        yaml.safe_dump(
+            {"ingress": {"cloudflareClientIp": cloudflare_config}},
+            sort_keys=False,
+        )
+    )
+    rendered = subprocess.run(
+        [
+            helm_binary,
+            "template",
+            "client-ip-validation-test",
+            str(CHART_DIR),
+            "--show-only",
+            f"templates/{template_path.name}",
+            "--values",
+            str(values_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert rendered.returncode != 0
+    assert expected_error in rendered.stderr
+    assert "proxy_set_header X-Resolved-IP" not in rendered.stdout
