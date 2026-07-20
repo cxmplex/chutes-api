@@ -23,6 +23,7 @@ from api.config import (
 )
 from api.database import generate_uuid
 from api.releases.provenance import (
+    REQUIRED_DIRECT_TDX_PROFILES,
     REQUIRED_RELEASE_VCPU_SIZES,
     ProvenanceError,
     expected_pin_version,
@@ -67,6 +68,35 @@ def _release_measurement_names(release: GuestRelease) -> List[str]:
     return names
 
 
+def _merged_release_images(release: GuestRelease, current_active: Optional[GuestRelease]) -> dict:
+    """Materialize omitted image slots without promoting inherited roles to explicit ones."""
+    if current_active is not None and current_active.release_id == release.release_id:
+        return {
+            role: dict(image) if isinstance(image, dict) else image
+            for role, image in (release.images or {}).items()
+        }
+
+    merged: dict = {}
+    if current_active is not None:
+        for role, image in (current_active.images or {}).items():
+            inherited = dict(image) if isinstance(image, dict) else image
+            if role in {"chute", "storage"} and isinstance(inherited, dict):
+                inherited["_inherited"] = True
+            merged[role] = inherited
+    for role, image in (release.images or {}).items():
+        replacement = dict(image) if isinstance(image, dict) else image
+        if (
+            role in {"chute", "storage"}
+            and isinstance(replacement, dict)
+            and replacement.get("_inherited")
+        ):
+            continue
+        if isinstance(replacement, dict):
+            replacement.pop("_inherited", None)
+        merged[role] = replacement
+    return merged
+
+
 def _image_to_dict(img: Optional[ReleaseImage]) -> Optional[dict]:
     if img is None:
         return None
@@ -76,6 +106,9 @@ def _image_to_dict(img: Optional[ReleaseImage]) -> Optional[dict]:
         "debug": img.debug,
         "version": img.version,
         "measurement_names": list(img.measurement_names or []),
+        "kernel_sha256": img.kernel_sha256,
+        "initrd_sha256": img.initrd_sha256,
+        "cmdline_sha256": img.cmdline_sha256,
         "provenance_payload": img.provenance_payload,
         "provenance_signature": img.provenance_signature,
     }
@@ -83,7 +116,7 @@ def _image_to_dict(img: Optional[ReleaseImage]) -> Optional[dict]:
 
 def _image_from_manifest(images: dict, key: str) -> Optional[ReleaseImage]:
     raw = (images or {}).get(key)
-    if not raw:
+    if not raw or raw.get("_inherited"):
         return None
     return ReleaseImage(
         url=raw["url"],
@@ -91,6 +124,9 @@ def _image_from_manifest(images: dict, key: str) -> Optional[ReleaseImage]:
         debug=raw["debug"],
         version=raw.get("version"),
         measurement_names=raw.get("measurement_names") or [],
+        kernel_sha256=raw.get("kernel_sha256"),
+        initrd_sha256=raw.get("initrd_sha256"),
+        cmdline_sha256=raw.get("cmdline_sha256"),
     )
 
 
@@ -168,16 +204,21 @@ def _validate_image_provenance(
     else:
         name_pattern = re.compile(
             rf"^{re.escape(expected_prefix)}baremetal-tdx-"
-            rf"{re.escape(version)}-(\d+)vcpu$"
+            rf"{re.escape(version)}-(\d+)vcpu(?:-(\d+)g)?$"
         )
-    classes_by_name: dict[str, int] = {}
+    classes_by_name: dict[str, tuple[int, Optional[int]]] = {}
     invalid_names = []
     for name in names:
         match = name_pattern.fullmatch(name)
         if match is None:
             invalid_names.append(name)
         else:
-            classes_by_name[name] = int(match.group(1))
+            memory_mib = (
+                int(match.group(2)) * 1024
+                if release.tee_type == "tdx" and match.lastindex == 2 and match.group(2)
+                else None
+            )
+            classes_by_name[name] = (int(match.group(1)), memory_mib)
     if invalid_names:
         raise ReleaseError(
             f"Refusing to activate {image_role} image: measurement names do not encode the exact "
@@ -185,8 +226,26 @@ def _validate_image_provenance(
         )
 
     required_sizes = list(REQUIRED_RELEASE_VCPU_SIZES)
-    actual_sizes = [classes_by_name[name] for name in names]
-    if actual_sizes != required_sizes:
+    actual_sizes = [classes_by_name[name][0] for name in names]
+    memory_modes = {classes_by_name[name][1] is not None for name in names}
+    if len(memory_modes) != 1:
+        raise ReleaseError(
+            f"Refusing to activate {image_role} image: legacy and RAM-qualified TDX "
+            "measurement names cannot be mixed."
+        )
+    has_memory_profiles = memory_modes == {True}
+    if has_memory_profiles:
+        expected_profiles = [
+            (profile["vcpus"], profile["memory_mib"]) for profile in REQUIRED_DIRECT_TDX_PROFILES
+        ]
+        actual_profiles = [classes_by_name[name] for name in names]
+        if release.tee_type != "tdx" or actual_profiles != expected_profiles:
+            raise ReleaseError(
+                f"Refusing to activate {image_role} image: direct-TDX releases require the "
+                f"complete ordered vCPU/RAM profile matrix {expected_profiles}, got "
+                f"{actual_profiles}."
+            )
+    elif actual_sizes != required_sizes:
         raise ReleaseError(
             f"Refusing to activate {image_role} image: required vCPU matrix is "
             f"{required_sizes}, got {actual_sizes}. Empty, mixed, partial, duplicate, or reordered "
@@ -196,7 +255,13 @@ def _validate_image_provenance(
         config.name
         for config in configs
         if config.version
-        != expected_pin_version(version, image_role, release.tee_type, classes_by_name[config.name])
+        != expected_pin_version(
+            version,
+            image_role,
+            release.tee_type,
+            classes_by_name[config.name][0],
+            classes_by_name[config.name][1],
+        )
     )
     if wrong_pin_versions:
         raise ReleaseError(
@@ -256,6 +321,12 @@ def _validate_image_provenance(
             "use legacy unsigned debug artifacts."
         )
 
+    if release.tee_type == "tdx" and (provenance is None or provenance["schema_version"] != 2):
+        raise ReleaseError(
+            f"Refusing to activate {image_role} image: managed bare-metal TDX releases "
+            "require canonical schema-version 2 direct-boot provenance."
+        )
+
     if provenance is not None:
         expected_document_fields = {
             "role": image_role,
@@ -264,8 +335,28 @@ def _validate_image_provenance(
             "version": version,
             "gpu_count": 0,
             "expected_gpus": [],
-            "required_vcpu_sizes": required_sizes,
         }
+        if provenance["schema_version"] == 1:
+            expected_document_fields["required_vcpu_sizes"] = required_sizes
+        elif provenance["schema_version"] == 2 and not has_memory_profiles:
+            raise ReleaseError(
+                f"Refusing to activate {image_role} image: direct-TDX provenance "
+                "requires RAM-qualified measurement names."
+            )
+        if provenance["schema_version"] == 2:
+            signed_sidecars = {
+                "kernel_sha256": provenance["launch_contract"]["kernel_sha256"],
+                "initrd_sha256": provenance["launch_contract"]["initrd_sha256"],
+                "cmdline_sha256": provenance["launch_contract"]["cmdline_sha256"],
+            }
+            for field, signed_digest in signed_sidecars.items():
+                supplied_digest = image.get(field)
+                if supplied_digest is not None and supplied_digest != signed_digest:
+                    raise ReleaseError(
+                        f"Refusing to activate {image_role} image: {field} does not "
+                        "match signed provenance."
+                    )
+                image[field] = signed_digest
         mismatched = {
             field: {"expected": expected, "actual": provenance.get(field)}
             for field, expected in expected_document_fields.items()
@@ -295,7 +386,19 @@ def _validate_image_provenance(
         value_mismatches = [
             config.name
             for config, entry in zip(configs, provenance["measurements"], strict=True)
-            if entry["vcpus"] != classes_by_name[config.name]
+            if entry["vcpus"] != classes_by_name[config.name][0]
+            or (
+                provenance["schema_version"] == 2
+                and entry["memory_mib"] != classes_by_name[config.name][1]
+            )
+            or (
+                provenance["schema_version"] == 2
+                and (
+                    config.profile_id != entry["profile_id"]
+                    or config.vcpus != entry["vcpus"]
+                    or config.memory_mib != entry["memory_mib"]
+                )
+            )
             or entry["values"] != measurement_values(config)
         ]
         if value_mismatches:
@@ -373,17 +476,32 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
         {"lock_key": f"guest-release:{release.channel}:{release.tee_type}"},
     )
-    required = _release_measurement_names(release)
-    if not required:
-        raise ReleaseError(
-            "Release references no measurement names; refusing to activate (a release must declare "
-            "the pinned measurement its image attests as, or launched TDs cannot be verified)."
-        )
-    loaded_by_name = _loaded_measurements_by_name()
-    for image_role in ("chute", "storage"):
-        image = (release.images or {}).get(image_role)
-        if image:
-            _validate_image_provenance(release, image_role, image, loaded_by_name)
+    current_active = await get_active_release(db, release.tee_type, release.channel, lock=True)
+    if not isinstance(current_active, GuestRelease):
+        current_active = None
+    original_images = release.images
+    release.images = _merged_release_images(release, current_active)
+    try:
+        if release.tee_type == "tdx" and not (release.images or {}).get("chute"):
+            raise ReleaseError(
+                "A managed TDX desired state must include a schema-v2 direct-boot chute image; "
+                "a first or legacy-partial storage-only release is unschedulable."
+            )
+        required = _release_measurement_names(release)
+        if not required:
+            raise ReleaseError(
+                "Release references no measurement names; refusing to activate (a release must "
+                "declare the pinned measurement its image attests as, or launched TDs cannot be "
+                "verified)."
+            )
+        loaded_by_name = _loaded_measurements_by_name()
+        for image_role in ("chute", "storage"):
+            image = (release.images or {}).get(image_role)
+            if image:
+                _validate_image_provenance(release, image_role, image, loaded_by_name)
+    except Exception:
+        release.images = original_images
+        raise
 
     # Re-validate even an already-active row so legacy/malformed manifests cannot bypass newly
     # required provenance through the idempotent activation path.
@@ -453,9 +571,11 @@ def _target_roles_for_host(release: GuestRelease, host: Host) -> List[str]:
     """Release roles this enrolled logical host can actually run."""
     images = release.images or {}
     roles: List[str] = []
-    if images.get("chute") and int(host.capacity or 0) > 0:
+    chute = images.get("chute") or {}
+    storage = images.get("storage") or {}
+    if chute and not chute.get("_inherited") and int(host.capacity or 0) > 0:
         roles.append("chute")
-    if images.get("storage") and bool(getattr(host, "storage_enabled", False)):
+    if storage and not storage.get("_inherited") and bool(getattr(host, "storage_enabled", False)):
         roles.append("storage")
     return roles
 
@@ -468,7 +588,8 @@ def _apply_storage_auto_opt_in(release: GuestRelease, host: Host) -> None:
     longer include the TD that will become the always-on storage role.
     """
 
-    if not (release.images or {}).get("storage"):
+    storage = (release.images or {}).get("storage") or {}
+    if not storage or storage.get("_inherited"):
         return
     if bool(getattr(host, "storage_enabled", False)):
         return
@@ -1001,6 +1122,10 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
 
     chute_img = (release.images or {}).get("chute") or {}
     storage_img = (release.images or {}).get("storage") or {}
+    if chute_img.get("_inherited"):
+        chute_img = {}
+    if storage_img.get("_inherited"):
+        storage_img = {}
     l0_spec = (release.images or {}).get("l0") or {}
     chute_sha = chute_img.get("sha256")
     storage_sha = storage_img.get("sha256")

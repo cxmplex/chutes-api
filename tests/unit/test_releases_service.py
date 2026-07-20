@@ -13,6 +13,7 @@ from api.releases.provenance import canonical_provenance_bytes
 from api.releases.schemas import (
     RELEASE_STATUS_ACTIVE,
     RELEASE_STATUS_DRAFT,
+    RELEASE_STATUS_SUPERSEDED,
     CreateReleaseRequest,
     GuestRelease,
     GuestReleaseTarget,
@@ -201,6 +202,180 @@ async def test_activate_refuses_empty_present_image_matrix():
     release.images["chute"]["measurement_names"] = []
     with pytest.raises(rsvc.ReleaseError, match="no measurement names"):
         await rsvc.activate_release(_db(release), release.release_id)
+
+
+def test_direct_tdx_release_rejects_partial_ram_qualified_matrix():
+    names = [f"cpu-baremetal-tdx-1.9.0-{vcpus}vcpu-8g" for vcpus in VCPU_SIZES]
+    pins = {
+        name: SimpleNamespace(
+            name=name,
+            gpu_count=0,
+            expected_gpus=[],
+            tee_type="tdx",
+            provider="bare-metal",
+        )
+        for name in names
+    }
+    release = GuestRelease(
+        release_id="direct-partial",
+        channel="canary",
+        tee_type="tdx",
+        status=RELEASE_STATUS_DRAFT,
+        images={
+            "chute": _image(
+                version="1.9.0",
+                tee_type="tdx",
+                names=names,
+                debug=False,
+            )
+        },
+    )
+
+    with pytest.raises(rsvc.ReleaseError, match="complete ordered vCPU/RAM"):
+        rsvc._validate_image_provenance(release, "chute", release.images["chute"], pins)
+
+
+def test_partial_release_materializes_omitted_active_image_slots():
+    current = _release(chute=_image(), l0={"version": "l0-old"})
+    current.release_id = "current"
+    current.status = RELEASE_STATUS_ACTIVE
+    candidate = _release(storage=_image("storage"))
+    candidate.release_id = "candidate"
+
+    merged = rsvc._merged_release_images(candidate, current)
+
+    assert {k: v for k, v in merged["chute"].items() if k != "_inherited"} == current.images[
+        "chute"
+    ]
+    assert merged["chute"]["_inherited"] is True
+    assert merged["l0"] == current.images["l0"]
+    assert merged["storage"] == candidate.images["storage"]
+
+
+@pytest.mark.asyncio
+async def test_idempotent_partial_activation_preserves_inherited_role_marker():
+    release = _release(
+        chute={**_image(sha="b" * 64), "_inherited": True},
+        storage=_image("storage", sha="c" * 64),
+    )
+    release.status = RELEASE_STATUS_ACTIVE
+    release.targets_captured_at = datetime.now(timezone.utc)
+    db = _db(release)
+
+    with (
+        patch.object(
+            rsvc,
+            "get_active_release",
+            AsyncMock(return_value=release),
+        ),
+        patch.object(rsvc, "_validate_image_provenance"),
+    ):
+        activated = await rsvc.activate_release(db, release.release_id)
+
+    assert activated.images["chute"]["_inherited"] is True
+    assert rsvc.release_manifest(activated).chute is None
+    assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_enabled=True)) == [
+        "storage"
+    ]
+    assert not db.commit.called
+
+
+@pytest.mark.asyncio
+async def test_rollback_partial_activation_inherits_current_role_without_promoting_it():
+    release = _release(
+        chute={**_image(sha="b" * 64), "_inherited": True},
+        storage=_image("storage", sha="c" * 64),
+    )
+    release.release_id = "rollback"
+    release.status = RELEASE_STATUS_SUPERSEDED
+    release.targets_captured_at = datetime.now(timezone.utc)
+    current = _release(chute=_image(sha="d" * 64))
+    current.release_id = "current"
+    current.status = RELEASE_STATUS_ACTIVE
+    db = _db(release)
+
+    with (
+        patch.object(
+            rsvc,
+            "get_active_release",
+            AsyncMock(return_value=current),
+        ),
+        patch.object(rsvc, "_validate_image_provenance"),
+    ):
+        activated = await rsvc.activate_release(db, release.release_id)
+
+    assert activated.images["chute"]["sha256"] == "d" * 64
+    assert activated.images["chute"]["_inherited"] is True
+    assert activated.images["storage"]["sha256"] == "c" * 64
+    assert "_inherited" not in activated.images["storage"]
+    assert rsvc.release_manifest(activated).chute is None
+    assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_enabled=True)) == [
+        "storage"
+    ]
+    assert db.commit.called
+
+
+@pytest.mark.asyncio
+async def test_storage_only_activation_preserves_active_chute_for_scheduler():
+    current = _release(chute=_image())
+    current.release_id = "current"
+    current.status = RELEASE_STATUS_ACTIVE
+    candidate = _release(storage=_image("storage"))
+    candidate.release_id = "candidate"
+    db = _db(candidate)
+
+    with (
+        patch.object(
+            rsvc,
+            "get_active_release",
+            AsyncMock(return_value=current),
+        ),
+        patch.object(rsvc, "_validate_image_provenance") as validate,
+    ):
+        activated = await rsvc.activate_release(db, candidate.release_id)
+
+    assert activated.images["chute"]["_inherited"] is True
+    assert activated.images["storage"] == candidate.images["storage"]
+    assert {call.args[1] for call in validate.call_args_list} == {
+        "chute",
+        "storage",
+    }
+    host = Host(capacity=2, storage_enabled=True)
+    assert rsvc._target_roles_for_host(activated, host) == ["storage"]
+    manifest = rsvc.release_manifest(activated)
+    assert manifest.chute is None
+    assert manifest.storage is not None
+
+
+@pytest.mark.asyncio
+async def test_first_storage_only_tdx_release_is_rejected_as_unschedulable():
+    candidate = _release(storage=_image("storage"))
+    candidate.release_id = "candidate"
+    candidate.tee_type = "tdx"
+
+    with patch.object(rsvc, "get_active_release", AsyncMock(return_value=None)):
+        with pytest.raises(rsvc.ReleaseError, match="unschedulable"):
+            await rsvc.activate_release(_db(candidate), candidate.release_id)
+
+
+def test_legacy_schema_v1_tdx_release_is_rejected_before_scheduling():
+    measurements = _measurements(tee_type="tdx")
+    image = _image(tee_type="tdx")
+    release = GuestRelease(
+        release_id="legacy-tdx",
+        channel="canary",
+        tee_type="tdx",
+        status=RELEASE_STATUS_DRAFT,
+        images={"chute": image},
+    )
+
+    with pytest.raises(rsvc.ReleaseError, match="schema-version 2"):
+        rsvc._validate_image_provenance(
+            release,
+            "chute",
+            image,
+            {measurement.name: measurement for measurement in measurements},
+        )
 
 
 @pytest.mark.parametrize(

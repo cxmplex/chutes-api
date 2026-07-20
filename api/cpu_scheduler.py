@@ -15,6 +15,7 @@ Run as its own process (e.g. `python -m api.cpu_scheduler`), like chute_autoscal
 
 import api.logging_bootstrap  # noqa: F401  # configure structured logging before imports log
 import asyncio
+import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,15 @@ from api.instance.util import create_launch_jwt_v2, purge_and_notify
 from api.job.schemas import Job
 from api.log import install_asyncio_exception_handler
 from api.metagraph import MetagraphNode
+from api.releases.provenance import (
+    ProvenanceError,
+    load_canonical_provenance,
+    select_direct_tdx_profile,
+)
+from api.releases.schemas import (
+    GuestRelease,
+    RELEASE_STATUS_ACTIVE,
+)
 from api.server.schemas import Host, Server, ServerAttestation
 from api.util import semcomp
 
@@ -61,6 +71,15 @@ MB_LAUNCH_INFLIGHT_TTL = 300
 # container is OOM-killed inside the TD. Size the TD = chute RAM + this overhead (mirrors Model-A
 # single-VM servers, which run ~8G for a 4G chute).
 MB_TD_MEM_OVERHEAD_GB = 4
+_MEMORY_RE = re.compile(r"^([1-9][0-9]*)([GM])$")
+
+
+def _memory_mib(value: str) -> int:
+    match = _MEMORY_RE.fullmatch(str(value).strip().upper())
+    if match is None:
+        raise ValueError("host default memory must be a positive integer with G or M suffix")
+    amount = int(match.group(1))
+    return amount * (1024 if match.group(2) == "G" else 1)
 
 
 def _chute_image_ref(chute: Chute) -> str:
@@ -404,12 +423,62 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
             continue
         if not await is_agent_online(host.host_id):
             continue
-        mem = f"{req_ram + MB_TD_MEM_OVERHEAD_GB}G" if req_ram else (host.default_mem or "8G")
+        requested_memory_mib = (
+            (req_ram + MB_TD_MEM_OVERHEAD_GB) * 1024
+            if req_ram
+            else _memory_mib(host.default_mem or "8G")
+        )
         vcpus = req_cores or host.default_vcpus or 4
+        profile_id = None
+        if host.tee_type == "tdx":
+            active_release = (
+                await session.execute(
+                    select(GuestRelease).where(
+                        GuestRelease.status == RELEASE_STATUS_ACTIVE,
+                        GuestRelease.channel == host.release_channel,
+                        GuestRelease.tee_type == "tdx",
+                    )
+                )
+            ).scalar_one_or_none()
+            image = ((active_release.images or {}).get("chute") if active_release else None) or {}
+            payload = image.get("provenance_payload")
+            if not payload:
+                logger.warning(
+                    f"Skipping TDX host {host.host_id}: active release has no signed "
+                    "direct-boot launch profiles."
+                )
+                continue
+            try:
+                provenance = load_canonical_provenance(payload)
+                selected_profile = select_direct_tdx_profile(
+                    provenance,
+                    requested_vcpus=vcpus,
+                    requested_memory_mib=requested_memory_mib,
+                )
+            except ProvenanceError as exc:
+                logger.warning(
+                    f"Skipping TDX host {host.host_id}: no valid launch profile for "
+                    f"{vcpus} vCPU/{requested_memory_mib} MiB: {exc}"
+                )
+                continue
+            vcpus = selected_profile["vcpus"]
+            mem = f"{selected_profile['memory_mib']}M"
+            profile_id = selected_profile["id"]
+        else:
+            mem = (
+                f"{requested_memory_mib // 1024}G"
+                if requested_memory_mib % 1024 == 0
+                else f"{requested_memory_mib}M"
+            )
         await send_agent_command(
             host.host_id,
             "deploy_chute",
-            {"chute_id": chute.chute_id, "mem": mem, "vcpus": vcpus},
+            {
+                "chute_id": chute.chute_id,
+                "mem": mem,
+                "vcpus": vcpus,
+                **({"profile_id": profile_id} if profile_id else {}),
+            },
         )
         # Mark the (chute, host) launch + bump the host's in-flight count for the boot window.
         await settings.redis_client.set(inflight_key, host.host_id, ex=MB_LAUNCH_INFLIGHT_TTL)

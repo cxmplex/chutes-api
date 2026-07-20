@@ -17,6 +17,7 @@ from api.releases.provenance import (
     ProvenanceError,
     canonical_provenance_bytes,
     load_canonical_provenance,
+    select_direct_tdx_profile,
     verify_provenance_signature,
 )
 from api.releases.schemas import GuestRelease
@@ -111,6 +112,68 @@ def _document():
     }
 
 
+def _direct_document():
+    profiles = [
+        {
+            "id": f"{vcpus}vcpu-{memory_mib // 1024}g",
+            "vcpus": vcpus,
+            "memory_mib": memory_mib,
+        }
+        for vcpus in (1, 2, 4, 8)
+        for memory_mib in (8192, 16384, 32768, 65536)
+    ]
+    measurements = []
+    for index, profile in enumerate(profiles):
+        profile_digest = f"{index:X}" * 96
+        rtmrs = {
+            "RTMR0": profile_digest,
+            "RTMR1": "B" * 96,
+            "RTMR2": "C" * 96,
+            "RTMR3": "D" * 96,
+        }
+        boot_rtmrs = {**rtmrs, "RTMR3": "0" * 96}
+        measurements.append(
+            {
+                "name": f"cpu-baremetal-tdx-1.9.0-{profile['id']}",
+                "profile_id": profile["id"],
+                "vcpus": profile["vcpus"],
+                "memory_mib": profile["memory_mib"],
+                "values": {
+                    "mrtd": "A" * 96,
+                    "boot_rtmrs": boot_rtmrs,
+                    "runtime_rtmrs": dict(rtmrs),
+                },
+            }
+        )
+    return {
+        "schema_version": 2,
+        "image": {"filename": "1.9.0.qcow2", "sha256": "a" * 64},
+        "tee_type": "tdx",
+        "provider": "bare-metal",
+        "role": "chute",
+        "version": "1.9.0",
+        "build_flags": {"debug_build": False, "debug_logging": False},
+        "gpu_count": 0,
+        "expected_gpus": [],
+        "required_profiles": profiles,
+        "launch_contract": {
+            "boot_mode": "direct",
+            "sha256": "1" * 64,
+            "qemu_binary_sha256": "2" * 64,
+            "qemu_package_version": "1:10.1.0+ds-5ubuntu2.7",
+            "machine_type": "pc-q35-10.1",
+            "firmware_sha256": "3" * 64,
+            "image_sha256": "a" * 64,
+            "kernel_sha256": "4" * 64,
+            "initrd_sha256": "5" * 64,
+            "cmdline_sha256": "6" * 64,
+            "verity_roothash": "7" * 64,
+            "kernel_measurement_mode": "qemu-patched",
+        },
+        "measurements": measurements,
+    }
+
+
 def test_canonical_provenance_rejects_reformatted_or_partial_payload():
     payload = canonical_provenance_bytes(_document()).decode()
     assert load_canonical_provenance(payload)["version"] == "1.7.0"
@@ -121,6 +184,157 @@ def test_canonical_provenance_rejects_reformatted_or_partial_payload():
     document["measurements"].pop()
     with pytest.raises(ProvenanceError, match="measurement order/classes"):
         load_canonical_provenance(canonical_provenance_bytes(document).decode())
+
+
+def test_direct_tdx_provenance_selects_bounded_resource_profile():
+    document = load_canonical_provenance(canonical_provenance_bytes(_direct_document()).decode())
+
+    profile = select_direct_tdx_profile(
+        document,
+        requested_vcpus=2,
+        requested_memory_mib=9000,
+    )
+
+    assert profile == {"id": "2vcpu-16g", "vcpus": 2, "memory_mib": 16384}
+
+
+def test_direct_tdx_provenance_rejects_profile_measurement_drift():
+    document = _direct_document()
+    document["measurements"][0]["memory_mib"] = 16384
+
+    with pytest.raises(ProvenanceError, match="does not match required profile"):
+        load_canonical_provenance(canonical_provenance_bytes(document).decode())
+
+
+@pytest.mark.parametrize(
+    ("phase", "register", "value", "error"),
+    [
+        ("boot_rtmrs", "RTMR3", "F" * 96, "initial zero value"),
+        ("runtime_rtmrs", "RTMR3", "0" * 96, "bind the runtime chain"),
+        ("runtime_rtmrs", "RTMR0", "F" * 96, "RTMR0 cannot change"),
+    ],
+)
+def test_direct_tdx_provenance_rejects_invalid_runtime_transition(phase, register, value, error):
+    document = _direct_document()
+    document["measurements"][0]["values"][phase][register] = value
+
+    with pytest.raises(ProvenanceError, match=error):
+        load_canonical_provenance(canonical_provenance_bytes(document).decode())
+
+
+def test_direct_tdx_provenance_rejects_duplicate_measurement_tuple():
+    document = _direct_document()
+    document["measurements"][1]["values"] = copy.deepcopy(document["measurements"][0]["values"])
+
+    with pytest.raises(ProvenanceError, match="duplicates another profile"):
+        load_canonical_provenance(canonical_provenance_bytes(document).decode())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("mrtd", "F" * 96, "share one MRTD"),
+        ("runtime_rtmr3", "E" * 96, "share one runtime RTMR3"),
+    ],
+)
+def test_direct_tdx_provenance_requires_image_wide_measurements(field, value, error):
+    document = _direct_document()
+    if field == "mrtd":
+        document["measurements"][1]["values"]["mrtd"] = value
+    else:
+        document["measurements"][1]["values"]["runtime_rtmrs"]["RTMR3"] = value
+
+    with pytest.raises(ProvenanceError, match=error):
+        load_canonical_provenance(canonical_provenance_bytes(document).decode())
+
+
+def test_direct_tdx_release_accepts_complete_ram_qualified_matrix():
+    document = _direct_document()
+    names = [entry["name"] for entry in document["measurements"]]
+    pins = []
+    for entry in document["measurements"]:
+        values = entry["values"]
+        pins.append(
+            TeeMeasurementConfig(
+                version=f"1.9.0-tdx-{entry['profile_id']}",
+                name=entry["name"],
+                tee_type="tdx",
+                provider="bare-metal",
+                mrtd=values["mrtd"],
+                rtmr0=values["runtime_rtmrs"]["RTMR0"],
+                rtmr1=values["runtime_rtmrs"]["RTMR1"],
+                rtmr2=values["runtime_rtmrs"]["RTMR2"],
+                boot_rtmr3=values["boot_rtmrs"]["RTMR3"],
+                runtime_rtmr3=values["runtime_rtmrs"]["RTMR3"],
+                profile_id=entry["profile_id"],
+                vcpus=entry["vcpus"],
+                memory_mib=entry["memory_mib"],
+                expected_gpus=[],
+                gpu_count=0,
+                image_sha256=document["image"]["sha256"],
+                image_measurement_names=names,
+            )
+        )
+    image = {
+        "url": "https://artifacts.chutes.ai/releases/1.9.0.qcow2",
+        "sha256": document["image"]["sha256"],
+        "debug": False,
+        "version": "1.9.0",
+        "measurement_names": names,
+        "provenance_payload": canonical_provenance_bytes(document).decode(),
+        "provenance_signature": "verified-by-test",
+    }
+    release = GuestRelease(
+        release_id="direct-tdx",
+        channel="canary",
+        tee_type="tdx",
+        status="draft",
+        images={"chute": image},
+    )
+
+    with patch.object(
+        release_service,
+        "verify_provenance_signature",
+        return_value=document,
+    ):
+        release_service._validate_image_provenance(
+            release,
+            "chute",
+            image,
+            {pin.name: pin for pin in pins},
+        )
+
+    assert image["kernel_sha256"] == document["launch_contract"]["kernel_sha256"]
+    assert image["initrd_sha256"] == document["launch_contract"]["initrd_sha256"]
+    assert image["cmdline_sha256"] == document["launch_contract"]["cmdline_sha256"]
+
+    mismatched_image = {**image, "kernel_sha256": "f" * 64}
+    with patch.object(
+        release_service,
+        "verify_provenance_signature",
+        return_value=document,
+    ):
+        with pytest.raises(release_service.ReleaseError, match="kernel_sha256"):
+            release_service._validate_image_provenance(
+                release,
+                "chute",
+                mismatched_image,
+                {pin.name: pin for pin in pins},
+            )
+
+    pins[0].profile_id = "2vcpu-8g"
+    with patch.object(
+        release_service,
+        "verify_provenance_signature",
+        return_value=document,
+    ):
+        with pytest.raises(release_service.ReleaseError, match="loaded pin values"):
+            release_service._validate_image_provenance(
+                release,
+                "chute",
+                image,
+                {pin.name: pin for pin in pins},
+            )
 
 
 def test_gcp_provenance_requires_exact_boolean_security_flag_tags():
@@ -235,47 +449,32 @@ def _sign_document(
 
 
 def _production_tdx_fixture():
-    version = "1.7.0"
-    digest = hashlib.sha256(b"production TDX release activation regression").hexdigest()
-    names = [f"cpu-baremetal-tdx-{version}-{vcpus}vcpu" for vcpus in _VCPU_SIZES]
-    document = {
-        "schema_version": 1,
-        "image": {"filename": f"{version}.qcow2", "sha256": digest},
-        "tee_type": "tdx",
-        "provider": "bare-metal",
-        "role": "chute",
-        "version": version,
-        "build_flags": {"debug_build": False, "debug_logging": False},
-        "gpu_count": 0,
-        "expected_gpus": [],
-        "required_vcpu_sizes": list(_VCPU_SIZES),
-        "measurements": [
-            {
-                "name": name,
-                "vcpus": vcpus,
-                "values": copy.deepcopy(_REAL_BAREMETAL_TDX_CAPTURE),
-            }
-            for name, vcpus in zip(names, _VCPU_SIZES, strict=True)
-        ],
-    }
+    document = _direct_document()
+    version = document["version"]
+    digest = document["image"]["sha256"]
+    names = [entry["name"] for entry in document["measurements"]]
     pins = [
         TeeMeasurementConfig(
-            version=f"{version}-tdx-{vcpus}vcpu",
-            name=name,
+            version=f"{version}-tdx-{entry['profile_id']}",
+            name=entry["name"],
             tee_type="tdx",
             provider="bare-metal",
-            mrtd=_REAL_BAREMETAL_TDX_CAPTURE["mrtd"],
-            rtmr0=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR0"],
-            rtmr1=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR1"],
-            rtmr2=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR2"],
-            runtime_rtmr3=_REAL_BAREMETAL_TDX_CAPTURE["runtime_rtmrs"]["RTMR3"],
+            mrtd=entry["values"]["mrtd"],
+            rtmr0=entry["values"]["runtime_rtmrs"]["RTMR0"],
+            rtmr1=entry["values"]["runtime_rtmrs"]["RTMR1"],
+            rtmr2=entry["values"]["runtime_rtmrs"]["RTMR2"],
+            boot_rtmr3=entry["values"]["boot_rtmrs"]["RTMR3"],
+            runtime_rtmr3=entry["values"]["runtime_rtmrs"]["RTMR3"],
+            profile_id=entry["profile_id"],
+            vcpus=entry["vcpus"],
+            memory_mib=entry["memory_mib"],
             expected_gpus=[],
             gpu_count=0,
             debug=False,
             image_sha256=digest,
             image_measurement_names=list(names),
         )
-        for name, vcpus in zip(names, _VCPU_SIZES, strict=True)
+        for entry in document["measurements"]
     ]
     image = {
         "url": f"https://artifacts.chutes.ai/releases/{version}.qcow2",
@@ -363,10 +562,11 @@ def test_generated_key_production_signed_tdx_activation_binds_real_capture(tmp_p
     }
     assert loaded["gpu_count"] == 0
     assert loaded["expected_gpus"] == []
-    assert loaded["required_vcpu_sizes"] == list(_VCPU_SIZES)
+    assert loaded["schema_version"] == 2
+    assert loaded["required_profiles"] == document["required_profiles"]
     assert loaded["image"]["sha256"] == image["sha256"]
     assert [entry["name"] for entry in loaded["measurements"]] == image["measurement_names"]
-    assert all(entry["values"] == _REAL_BAREMETAL_TDX_CAPTURE for entry in loaded["measurements"])
+    assert loaded["measurements"] == document["measurements"]
 
 
 def test_production_signed_tdx_activation_rejects_tampered_measurement_and_signature(
@@ -387,7 +587,8 @@ def test_production_signed_tdx_activation_rejects_tampered_measurement_and_signa
     )
 
     tampered_document = copy.deepcopy(document)
-    tampered_document["measurements"][0]["values"]["runtime_rtmrs"]["RTMR3"] = "0" * 96
+    for measurement in tampered_document["measurements"]:
+        measurement["values"]["runtime_rtmrs"]["RTMR3"] = "E" * 96
     tampered_payload, tampered_measurement_signature = _sign_document(
         cosign,
         key,
@@ -395,7 +596,7 @@ def test_production_signed_tdx_activation_rejects_tampered_measurement_and_signa
         "tdx-tampered-measurement",
         tampered_document,
     )
-    with pytest.raises(release_service.ReleaseError, match="pin values do not match"):
+    with pytest.raises(release_service.ReleaseError, match="loaded pin values"):
         _validate_production_image(
             release,
             image,

@@ -5,6 +5,7 @@ Application-wide settings.
 import os
 import hashlib
 import ipaddress
+import re
 from pathlib import Path
 import aioboto3
 import json
@@ -122,6 +123,10 @@ class TeeMeasurementConfig:
     rtmr2: str = ""
     boot_rtmr3: str = ZERO_RTMR
     runtime_rtmr3: str = ""
+    # Model-B direct-TDX resource identity. Legacy/GCP/GPU entries leave these unset.
+    profile_id: Optional[str] = None
+    vcpus: Optional[int] = None
+    memory_mib: Optional[int] = None
     # --- AMD SEV-SNP fields (only set when tee_type == "sev-snp") ---
     measurement: Optional[str] = None  # 96 hex (48B SHA-384 launch digest)
     policy: Optional[int] = None  # guest policy bits (DEBUG bit must be off)
@@ -188,6 +193,9 @@ def measurement_config_fingerprint(config: TeeMeasurementConfig) -> str:
     # rc controls publication and minimum-version selection, not attestation identity.
     # Promoting an identical candidate must not invalidate persisted exact-pin fingerprints.
     payload.pop("rc", None)
+    for profile_field in ("profile_id", "vcpus", "memory_mib"):
+        if payload.get(profile_field) is None:
+            payload.pop(profile_field, None)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -237,7 +245,21 @@ _NESTED_SNP_GROUP_KEYS = {
     "id_key_digest",
 }
 _NESTED_GCP_SNP_GROUP_KEYS = {"vtpm_pcrs", "vtpm_security_flags"}
-_NESTED_HARDWARE_KEYS = {"name", "description", "expected_gpus", "gpu_count"}
+_NESTED_HARDWARE_KEYS = {
+    "name",
+    "description",
+    "expected_gpus",
+    "gpu_count",
+}
+_NESTED_DIRECT_TDX_HARDWARE_KEYS = {
+    "profile_id",
+    "vcpus",
+    "memory_mib",
+    "rtmr1",
+    "rtmr2",
+    "boot_rtmr3",
+    "runtime_rtmr3",
+}
 
 
 def _field_names(values: set[object]) -> List[str]:
@@ -300,6 +322,19 @@ def _expand_nested_measurement_group(group: dict, source: object) -> List[dict]:
             f"Invalid TEE measurement config {source}: every sev-snp group must explicitly set "
             "provider to 'gcp' or 'bare-metal'."
         )
+    hardware_preview = group.get("hardware")
+    direct_tdx_profiles = bool(
+        tee_type == "tdx"
+        and isinstance(hardware_preview, list)
+        and any(
+            isinstance(variant, dict) and "profile_id" in variant for variant in hardware_preview
+        )
+    )
+    if direct_tdx_profiles and provider != "bare-metal":
+        raise ValueError(
+            f"Invalid TEE measurement config {source}: direct TDX launch profiles "
+            "require provider: bare-metal."
+        )
 
     allowed_group_keys = _NESTED_COMMON_GROUP_KEYS | (
         _NESTED_TDX_GROUP_KEYS
@@ -314,7 +349,11 @@ def _expand_nested_measurement_group(group: dict, source: object) -> List[dict]:
         )
 
     required_group_keys = {"version", "tee_type", "debug", "hardware"} | (
-        {"mrtd", "rtmr1", "rtmr2", "runtime_rtmr3"}
+        (
+            {"provider", "mrtd", "runtime_rtmr3"}
+            if direct_tdx_profiles
+            else {"mrtd", "rtmr1", "rtmr2", "runtime_rtmr3"}
+        )
         if tee_type == "tdx"
         else {"provider", "processor_model", "policy", "min_tcb", "expected_vmpl"}
         | (_NESTED_GCP_SNP_GROUP_KEYS if provider == "gcp" else set())
@@ -349,8 +388,21 @@ def _expand_nested_measurement_group(group: dict, source: object) -> List[dict]:
 
     variant_key = "rtmr0" if tee_type == "tdx" else "measurement"
     allowed_hardware_keys = _NESTED_HARDWARE_KEYS | {variant_key}
+    if direct_tdx_profiles:
+        allowed_hardware_keys |= _NESTED_DIRECT_TDX_HARDWARE_KEYS
     required_hardware_keys = {"name", "expected_gpus", "gpu_count", variant_key}
+    if direct_tdx_profiles:
+        required_hardware_keys |= {
+            "profile_id",
+            "vcpus",
+            "memory_mib",
+            "rtmr1",
+            "rtmr2",
+        }
     flattened: List[dict] = []
+    seen_direct_names: set[str] = set()
+    seen_direct_profiles: set[str] = set()
+    seen_direct_shapes: set[tuple[int, int]] = set()
     for index, variant in enumerate(hardware):
         if not isinstance(variant, dict):
             raise ValueError(
@@ -377,6 +429,49 @@ def _expand_nested_measurement_group(group: dict, source: object) -> List[dict]:
                 f"Invalid TEE measurement config {source}: every hardware variant requires "
                 "a non-empty string name."
             )
+        if direct_tdx_profiles:
+            profile_id = variant["profile_id"]
+            vcpus = variant["vcpus"]
+            memory_mib = variant["memory_mib"]
+            normalized_name = raw_name.strip()
+            if (
+                not isinstance(profile_id, str)
+                or not re.fullmatch(r"[1-9][0-9]*vcpu-[1-9][0-9]*g", profile_id)
+                or not isinstance(vcpus, int)
+                or isinstance(vcpus, bool)
+                or vcpus <= 0
+                or not isinstance(memory_mib, int)
+                or isinstance(memory_mib, bool)
+                or memory_mib <= 0
+                or memory_mib % 1024
+                or profile_id != f"{vcpus}vcpu-{memory_mib // 1024}g"
+            ):
+                raise ValueError(
+                    f"Invalid TEE measurement config {source}: hardware variant "
+                    f"{raw_name!r} has an invalid direct-TDX launch profile."
+                )
+            expected_names = {
+                f"cpu-baremetal-tdx-{version.strip()}-{profile_id}",
+                f"storage-baremetal-tdx-{version.strip()}-{profile_id}",
+            }
+            if normalized_name not in expected_names:
+                raise ValueError(
+                    f"Invalid TEE measurement config {source}: direct-TDX name "
+                    f"{normalized_name!r} contradicts profile {profile_id!r}."
+                )
+            shape = (vcpus, memory_mib)
+            if (
+                normalized_name in seen_direct_names
+                or profile_id in seen_direct_profiles
+                or shape in seen_direct_shapes
+            ):
+                raise ValueError(
+                    f"Invalid TEE measurement config {source}: duplicate direct-TDX "
+                    f"name/profile/shape for {normalized_name!r}."
+                )
+            seen_direct_names.add(normalized_name)
+            seen_direct_profiles.add(profile_id)
+            seen_direct_shapes.add(shape)
         if "description" in variant and (
             not isinstance(variant["description"], str) or not variant["description"].strip()
         ):
@@ -387,7 +482,19 @@ def _expand_nested_measurement_group(group: dict, source: object) -> List[dict]:
 
         flat = {key: value for key, value in group.items() if key != "hardware"}
         flat.update(variant)
-        flat["version"] = version.strip()
+        if direct_tdx_profiles:
+            if raw_name.startswith("storage-"):
+                role_segment = "storage-"
+            elif raw_name.startswith("cpu-"):
+                role_segment = ""
+            else:
+                raise ValueError(
+                    f"Invalid TEE measurement config {source}: direct-TDX hardware variant "
+                    f"{raw_name!r} must use a cpu-* or storage-* measurement name."
+                )
+            flat["version"] = f"{version.strip()}-{role_segment}tdx-{variant['profile_id']}"
+        else:
+            flat["version"] = version.strip()
         flat["name"] = raw_name.strip()
         flattened.append(flat)
     return flattened
@@ -1314,6 +1421,9 @@ class Settings(BaseSettings):
                 "rtmr2",
                 "boot_rtmr3",
                 "runtime_rtmr3",
+                "profile_id",
+                "vcpus",
+                "memory_mib",
             }
             snp_fields = {
                 "measurement",
@@ -1571,6 +1681,9 @@ class Settings(BaseSettings):
                     rtmr2=rtmr2,
                     boot_rtmr3=boot_rtmr3,
                     runtime_rtmr3=runtime_rtmr3,
+                    profile_id=measurement_config.get("profile_id"),
+                    vcpus=measurement_config.get("vcpus"),
+                    memory_mib=measurement_config.get("memory_mib"),
                     image_sha256=image_sha256,
                     image_measurement_names=image_measurement_names,
                 )
@@ -1591,12 +1704,17 @@ class Settings(BaseSettings):
                 shared.update(
                     {
                         "mrtd": config.mrtd,
-                        "rtmr1": config.rtmr1,
-                        "rtmr2": config.rtmr2,
                         "boot_rtmr3": config.boot_rtmr3,
                         "runtime_rtmr3": config.runtime_rtmr3,
                     }
                 )
+                if config.profile_id is None:
+                    shared.update(
+                        {
+                            "rtmr1": config.rtmr1,
+                            "rtmr2": config.rtmr2,
+                        }
+                    )
             else:
                 shared.update(
                     {

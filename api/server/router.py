@@ -315,6 +315,14 @@ def _manifest_for_server(server: Server) -> dict | None:
         "config_fingerprint": config_fingerprint,
         "trust_set_fingerprint": trust_set_fingerprint,
     }
+    if getattr(measurement, "profile_id", None) is not None:
+        exact_pin.update(
+            {
+                "profile_id": measurement.profile_id,
+                "vcpus": measurement.vcpus,
+                "memory_mib": measurement.memory_mib,
+            }
+        )
     manifest = {
         "schema_version": 1,
         "image": (
@@ -713,6 +721,9 @@ async def get_tee_measurements():
             mrtd=m.mrtd,
             boot_rtmrs=m.boot_rtmrs,
             runtime_rtmrs=m.runtime_rtmrs,
+            profile_id=getattr(m, "profile_id", None),
+            vcpus=getattr(m, "vcpus", None),
+            memory_mib=getattr(m, "memory_mib", None),
             expected_gpus=m.expected_gpus,
             gpu_count=m.gpu_count,
             measurement=getattr(m, "measurement", None),

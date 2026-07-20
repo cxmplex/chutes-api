@@ -333,7 +333,19 @@ class ReleaseImage(BaseModel):
     measurement_names: List[str] = Field(
         ...,
         min_length=1,
-        description=("Complete 1/2/4/8-vCPU pinned measurement-name matrix this image attests as."),
+        description=(
+            "Complete pinned measurement-name matrix this image attests as "
+            "(direct TDX requires all 16 vCPU/RAM profiles)."
+        ),
+    )
+    kernel_sha256: Optional[str] = Field(
+        None, description="Signed direct-boot kernel sidecar sha256."
+    )
+    initrd_sha256: Optional[str] = Field(
+        None, description="Signed direct-boot initrd sidecar sha256."
+    )
+    cmdline_sha256: Optional[str] = Field(
+        None, description="Signed direct-boot command-line sidecar sha256."
     )
     provenance_payload: Optional[str] = Field(
         None,
@@ -356,6 +368,18 @@ class ReleaseImage(BaseModel):
         if len(v) != 64 or any(c not in "0123456789abcdef" for c in v):
             raise ValueError("sha256 must be 64 hex chars")
         return v
+
+    @field_validator("kernel_sha256", "initrd_sha256", "cmdline_sha256")
+    @classmethod
+    def _valid_optional_sha(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        normalized = v.strip().lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("direct-boot sidecar sha256 must be 64 hex chars")
+        return normalized
 
     @field_validator("url")
     @classmethod

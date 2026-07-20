@@ -6,8 +6,8 @@ services:
       REQUIRE_MTLS_CLIENT_VERIFY: "true"
       SKIP_METAGRAPH_CHECK: "true"
       TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
-      # No verified sanitizing proxy is the final hop in this override.
-      TRUSTED_PROXY_CIDRS: ""
+      # chutes-tls is the verified final hop and overwrites X-Resolved-IP with its direct peer.
+      TRUSTED_PROXY_CIDRS: "172.18.0.10/32"
       TRUSTED_PROVENANCE_PUBLIC_KEY_PATH: /etc/chutes/provenance/cosign.pub
     volumes: &validator_dev_trust_mounts
       - /etc/chutes/provenance/cosign.pub:/etc/chutes/provenance/cosign.pub:ro

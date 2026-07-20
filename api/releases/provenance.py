@@ -12,7 +12,17 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+DIRECT_TDX_SCHEMA_VERSION = 2
 REQUIRED_RELEASE_VCPU_SIZES = (1, 2, 4, 8)
+REQUIRED_DIRECT_TDX_PROFILES = tuple(
+    {
+        "id": f"{vcpus}vcpu-{memory_mib // 1024}g",
+        "vcpus": vcpus,
+        "memory_mib": memory_mib,
+    }
+    for vcpus in (1, 2, 4, 8)
+    for memory_mib in (8192, 16384, 32768, 65536)
+)
 MAX_PROVENANCE_BYTES = 64 * 1024
 MAX_SIGNATURE_BYTES = 16 * 1024
 _HEX96_RE = re.compile(r"^[0-9A-F]{96}$")
@@ -81,6 +91,47 @@ def load_canonical_provenance(payload: str) -> dict[str, Any]:
     return document
 
 
+def select_direct_tdx_profile(
+    document: dict[str, Any],
+    *,
+    requested_vcpus: int,
+    requested_memory_mib: int,
+) -> dict[str, Any]:
+    """Round a request to the least over-provisioned signed direct-TDX profile."""
+
+    validate_provenance_document(document)
+    if document["schema_version"] != DIRECT_TDX_SCHEMA_VERSION:
+        raise ProvenanceError("provenance does not contain direct-TDX launch profiles")
+    if (
+        not isinstance(requested_vcpus, int)
+        or isinstance(requested_vcpus, bool)
+        or requested_vcpus <= 0
+        or not isinstance(requested_memory_mib, int)
+        or isinstance(requested_memory_mib, bool)
+        or requested_memory_mib <= 0
+    ):
+        raise ProvenanceError("requested TDX resources must be positive integers")
+    candidates = [
+        profile
+        for profile in document["required_profiles"]
+        if profile["vcpus"] >= requested_vcpus and profile["memory_mib"] >= requested_memory_mib
+    ]
+    if not candidates:
+        raise ProvenanceError(
+            "no signed direct-TDX launch profile satisfies "
+            f"{requested_vcpus} vCPU/{requested_memory_mib} MiB"
+        )
+    return min(
+        candidates,
+        key=lambda profile: (
+            profile["vcpus"] - requested_vcpus,
+            profile["memory_mib"] - requested_memory_mib,
+            profile["vcpus"],
+            profile["memory_mib"],
+        ),
+    )
+
+
 def _require_exact_keys(value: dict[str, Any], expected: set[str], path: str) -> None:
     actual = set(value)
     if actual != expected:
@@ -140,8 +191,217 @@ def _validate_measurement_values(values: Any, *, tee_type: str, provider: str, p
             raise ProvenanceError(f"{path}.vtpm_security_flags values must be JSON booleans")
 
 
+def _validate_direct_tdx_provenance(document: dict[str, Any]) -> None:
+    _require_exact_keys(
+        document,
+        {
+            "schema_version",
+            "image",
+            "tee_type",
+            "provider",
+            "role",
+            "version",
+            "build_flags",
+            "gpu_count",
+            "expected_gpus",
+            "required_profiles",
+            "launch_contract",
+            "measurements",
+        },
+        "provenance",
+    )
+    if document["tee_type"] != "tdx" or document["provider"] != "bare-metal":
+        raise ProvenanceError("schema_version 2 is reserved for bare-metal direct-boot TDX")
+    if document["role"] not in {"chute", "storage"}:
+        raise ProvenanceError("provenance role must be chute or storage")
+    if not isinstance(document["version"], str) or not _VERSION_RE.fullmatch(document["version"]):
+        raise ProvenanceError("provenance version is missing or invalid")
+    if document["gpu_count"] != 0 or isinstance(document["gpu_count"], bool):
+        raise ProvenanceError("managed guest provenance must declare gpu_count=0")
+    if document["expected_gpus"] != []:
+        raise ProvenanceError("managed guest provenance must declare expected_gpus=[]")
+
+    image = document["image"]
+    if not isinstance(image, dict):
+        raise ProvenanceError("provenance image must be an object")
+    _require_exact_keys(image, {"filename", "sha256"}, "provenance.image")
+    if not isinstance(image["filename"], str) or not re.fullmatch(
+        r"[A-Za-z0-9._+-]+\.qcow2", image["filename"]
+    ):
+        raise ProvenanceError("provenance image.filename must name a simple qcow2 file")
+    if not isinstance(image["sha256"], str) or not _SHA256_RE.fullmatch(image["sha256"]):
+        raise ProvenanceError("provenance image.sha256 must be 64 lowercase hex characters")
+
+    flags = document["build_flags"]
+    if not isinstance(flags, dict):
+        raise ProvenanceError("provenance build_flags must be an object")
+    _require_exact_keys(flags, {"debug_build", "debug_logging"}, "provenance.build_flags")
+    if not all(isinstance(flags[key], bool) for key in flags):
+        raise ProvenanceError("provenance debug flags must be JSON booleans")
+    if flags["debug_logging"] and not flags["debug_build"]:
+        raise ProvenanceError("debug_logging=true requires debug_build=true")
+    if image["filename"].endswith("-debug.qcow2") != flags["debug_build"]:
+        raise ProvenanceError("image filename and debug_build posture disagree")
+
+    launch_contract = document["launch_contract"]
+    contract_keys = {
+        "boot_mode",
+        "sha256",
+        "qemu_binary_sha256",
+        "qemu_package_version",
+        "machine_type",
+        "firmware_sha256",
+        "image_sha256",
+        "kernel_sha256",
+        "initrd_sha256",
+        "cmdline_sha256",
+        "verity_roothash",
+        "kernel_measurement_mode",
+    }
+    if not isinstance(launch_contract, dict):
+        raise ProvenanceError("provenance launch_contract must be an object")
+    _require_exact_keys(launch_contract, contract_keys, "provenance.launch_contract")
+    if launch_contract["boot_mode"] != "direct":
+        raise ProvenanceError("provenance launch_contract.boot_mode must be direct")
+    if launch_contract["image_sha256"] != image["sha256"]:
+        raise ProvenanceError("launch_contract image_sha256 must match provenance image")
+    for key in (
+        "sha256",
+        "qemu_binary_sha256",
+        "firmware_sha256",
+        "image_sha256",
+        "kernel_sha256",
+        "initrd_sha256",
+        "cmdline_sha256",
+        "verity_roothash",
+    ):
+        if not isinstance(launch_contract[key], str) or not _SHA256_RE.fullmatch(
+            launch_contract[key]
+        ):
+            raise ProvenanceError(
+                f"provenance.launch_contract.{key} must be 64 lowercase hex characters"
+            )
+    for key in ("qemu_package_version", "machine_type"):
+        if not isinstance(launch_contract[key], str) or not launch_contract[key]:
+            raise ProvenanceError(f"provenance.launch_contract.{key} must be non-empty")
+    if launch_contract["kernel_measurement_mode"] not in {
+        "qemu-patched",
+        "efi-image-as-is",
+    }:
+        raise ProvenanceError("provenance launch_contract kernel mode is invalid")
+
+    required_profiles = document["required_profiles"]
+    measurements = document["measurements"]
+    if (
+        not isinstance(required_profiles, list)
+        or not required_profiles
+        or not isinstance(measurements, list)
+        or len(measurements) != len(required_profiles)
+    ):
+        raise ProvenanceError("required_profiles and measurements must be equal non-empty lists")
+    if required_profiles != list(REQUIRED_DIRECT_TDX_PROFILES):
+        raise ProvenanceError(
+            "direct-TDX provenance must contain the complete ordered 1/2/4/8-vCPU "
+            "by 8/16/32/64-GiB launch-profile matrix"
+        )
+    seen_profiles: set[str] = set()
+    seen_names: set[str] = set()
+    seen_shapes: set[tuple[int, int]] = set()
+    seen_measurement_tuples: set[tuple[str, ...]] = set()
+    mrtd_values: set[str] = set()
+    runtime_rtmr3_values: set[str] = set()
+    normalized_profiles = []
+    for index, (profile, entry) in enumerate(zip(required_profiles, measurements, strict=True)):
+        profile_path = f"provenance.required_profiles[{index}]"
+        entry_path = f"provenance.measurements[{index}]"
+        if not isinstance(profile, dict):
+            raise ProvenanceError(f"{profile_path} must be an object")
+        _require_exact_keys(profile, {"id", "vcpus", "memory_mib"}, profile_path)
+        if not isinstance(entry, dict):
+            raise ProvenanceError(f"{entry_path} must be an object")
+        _require_exact_keys(
+            entry,
+            {"name", "profile_id", "vcpus", "memory_mib", "values"},
+            entry_path,
+        )
+        profile_id = profile["id"]
+        vcpus = profile["vcpus"]
+        memory_mib = profile["memory_mib"]
+        if (
+            not isinstance(profile_id, str)
+            or not re.fullmatch(r"[1-9][0-9]*vcpu-[1-9][0-9]*g", profile_id)
+            or profile_id in seen_profiles
+            or not isinstance(vcpus, int)
+            or isinstance(vcpus, bool)
+            or vcpus <= 0
+            or not isinstance(memory_mib, int)
+            or isinstance(memory_mib, bool)
+            or memory_mib <= 0
+            or memory_mib % 1024
+            or (vcpus, memory_mib) in seen_shapes
+            or profile_id != f"{vcpus}vcpu-{memory_mib // 1024}g"
+        ):
+            raise ProvenanceError(f"{profile_path} is invalid or duplicated")
+        if (
+            entry["profile_id"] != profile_id
+            or entry["vcpus"] != vcpus
+            or entry["memory_mib"] != memory_mib
+        ):
+            raise ProvenanceError(f"{entry_path} does not match required profile")
+        name = entry["name"]
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,255}", name)
+            or name in seen_names
+        ):
+            raise ProvenanceError(f"{entry_path}.name is invalid or duplicated")
+        _validate_measurement_values(
+            entry["values"],
+            tee_type="tdx",
+            provider="bare-metal",
+            path=f"{entry_path}.values",
+        )
+        boot_rtmrs = entry["values"]["boot_rtmrs"]
+        runtime_rtmrs = entry["values"]["runtime_rtmrs"]
+        if boot_rtmrs["RTMR3"] != "0" * 96:
+            raise ProvenanceError(
+                f"{entry_path}.values.boot_rtmrs.RTMR3 must be the initial zero value"
+            )
+        if runtime_rtmrs["RTMR3"] == "0" * 96:
+            raise ProvenanceError(
+                f"{entry_path}.values.runtime_rtmrs.RTMR3 must bind the runtime chain"
+            )
+        for register in ("RTMR0", "RTMR1", "RTMR2"):
+            if boot_rtmrs[register] != runtime_rtmrs[register]:
+                raise ProvenanceError(f"{entry_path}.values {register} cannot change after boot")
+        measurement_tuple = (
+            entry["values"]["mrtd"],
+            *(runtime_rtmrs[register] for register in ("RTMR0", "RTMR1", "RTMR2", "RTMR3")),
+        )
+        if measurement_tuple in seen_measurement_tuples:
+            raise ProvenanceError(
+                f"{entry_path}.values duplicates another profile's complete TDX measurement tuple"
+            )
+        seen_measurement_tuples.add(measurement_tuple)
+        mrtd_values.add(entry["values"]["mrtd"])
+        runtime_rtmr3_values.add(runtime_rtmrs["RTMR3"])
+        seen_profiles.add(profile_id)
+        seen_names.add(name)
+        seen_shapes.add((vcpus, memory_mib))
+        normalized_profiles.append((vcpus, memory_mib))
+    if normalized_profiles != sorted(normalized_profiles):
+        raise ProvenanceError("direct-TDX profiles must be ordered by vCPU then memory")
+    if len(mrtd_values) != 1:
+        raise ProvenanceError("direct-TDX profiles for one image must share one MRTD")
+    if len(runtime_rtmr3_values) != 1:
+        raise ProvenanceError("direct-TDX profiles for one image must share one runtime RTMR3")
+
+
 def validate_provenance_document(document: dict[str, Any]) -> None:
     """Validate the canonical schema independently of release policy."""
+    if document.get("schema_version") == DIRECT_TDX_SCHEMA_VERSION:
+        _validate_direct_tdx_provenance(document)
+        return
     _require_exact_keys(
         document,
         {
@@ -351,7 +611,14 @@ def normalize_provider(value: Any) -> str | None:
     return str(value).strip().lower() or None
 
 
-def expected_pin_version(image_version: str, image_role: str, tee_type: str, vcpus: int) -> str:
+def expected_pin_version(
+    image_version: str,
+    image_role: str,
+    tee_type: str,
+    vcpus: int,
+    memory_mib: int | None = None,
+) -> str:
     tee_slug = "snp" if tee_type == "sev-snp" else "tdx"
     role_segment = "storage-" if image_role == "storage" else ""
-    return f"{image_version}-{role_segment}{tee_slug}-{vcpus}vcpu"
+    memory_segment = f"-{memory_mib // 1024}g" if memory_mib is not None else ""
+    return f"{image_version}-{role_segment}{tee_slug}-{vcpus}vcpu{memory_segment}"

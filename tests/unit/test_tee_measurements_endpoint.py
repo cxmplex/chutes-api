@@ -256,6 +256,35 @@ def test_connection_manifest_uses_persisted_exact_name_and_fingerprints(
 
 
 @patch("api.server.router.settings")
+def test_connection_manifest_serializes_direct_tdx_profile_identity(mock_settings):
+    measurement = _make_measurement(
+        name="cpu-baremetal-tdx-1.9.0-2vcpu-16g",
+        version="1.9.0-tdx-2vcpu-16g",
+        expected_gpus=[],
+        gpu_count=0,
+        profile_id="2vcpu-16g",
+        vcpus=2,
+        memory_mib=16384,
+    )
+    config_fingerprint = measurement_config_fingerprint(measurement)
+    trust_set_fingerprint = measurement_trust_set_fingerprint([measurement])
+    server = SimpleNamespace(
+        version=measurement.version,
+        measurement_name=measurement.name,
+        measurement_config_fingerprint=config_fingerprint,
+        trust_set_fingerprint=trust_set_fingerprint,
+    )
+    mock_settings.tee_measurements = [measurement]
+
+    exact_pin = _manifest_for_server(server)["exact_pin"]
+
+    assert exact_pin["profile_id"] == "2vcpu-16g"
+    assert exact_pin["vcpus"] == 2
+    assert exact_pin["memory_mib"] == 16384
+    assert exact_pin["config_fingerprint"] == config_fingerprint
+
+
+@patch("api.server.router.settings")
 def test_connection_manifest_rejects_retired_or_full_trust_mismatch(
     mock_settings,
 ):

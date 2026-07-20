@@ -114,7 +114,7 @@ RUN chmod +x /usr/local/bin/*.sh
 ADD --chown=root api /forge/api
 ADD --chown=root metasync /forge/metasync
 ADD --chown=root tokenizer /app/tokenizer
-ADD --chown=chutes watchtower.py /forge/watchtower.py
+ADD --chown=root watchtower.py /forge/watchtower.py
 
 # Set environment for buildah
 ENV BUILDAH_ISOLATION=chroot

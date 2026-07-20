@@ -803,12 +803,22 @@ class TestLaunchOnHost:
             ],
         }
 
-    def _host(self, host_id="host-1", capacity=2, default_mem="8G", default_vcpus=4):
+    def _host(
+        self,
+        host_id="host-1",
+        capacity=2,
+        default_mem="8G",
+        default_vcpus=4,
+        tee_type="sev-snp",
+        release_channel="stable",
+    ):
         return SimpleNamespace(
             host_id=host_id,
             capacity=capacity,
             default_mem=default_mem,
             default_vcpus=default_vcpus,
+            tee_type=tee_type,
+            release_channel=release_channel,
         )
 
     async def _run(self, handlers, online=True):
@@ -836,6 +846,38 @@ class TestLaunchOnHost:
         }
         assert "mb:launch:chute-1:host-1" in fake_redis.store
         assert fake_redis.store["mb:host_inflight:host-1"] == "1"
+
+    @pytest.mark.asyncio
+    async def test_tdx_launch_uses_signed_ram_qualified_profile(self, mock_settings, fake_redis):
+        host = self._host(tee_type="tdx", release_channel="canary")
+        active_release = SimpleNamespace(
+            images={"chute": {"provenance_payload": "signed-direct-provenance"}}
+        )
+        handlers = self._handlers([host])
+        handlers["GuestRelease.GuestRelease"] = FakeResult(items=[active_release])
+        session = FakeSession(handlers)
+        send = AsyncMock(return_value="cmd-1")
+        with (
+            patch("api.cpu_scheduler.send_agent_command", send),
+            patch("api.cpu_scheduler.is_agent_online", AsyncMock(return_value=True)),
+            patch(
+                "api.cpu_scheduler.load_canonical_provenance",
+                return_value={"schema_version": 2},
+            ),
+            patch(
+                "api.cpu_scheduler.select_direct_tdx_profile",
+                return_value={"id": "2vcpu-16g", "vcpus": 2, "memory_mib": 16384},
+            ),
+        ):
+            launched = await cs._launch_on_host(session, _chute(cpu_cores=2, ram_gb=4), 2, 4)
+
+        assert launched
+        assert send.await_args.args[2] == {
+            "chute_id": "chute-1",
+            "mem": "16384M",
+            "vcpus": 2,
+            "profile_id": "2vcpu-16g",
+        }
 
     @pytest.mark.asyncio
     async def test_skips_host_already_running_chute(self, mock_settings):

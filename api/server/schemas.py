@@ -724,6 +724,9 @@ class TeeMeasurementResponse(BaseModel):
     mrtd: str
     boot_rtmrs: Dict[str, str]
     runtime_rtmrs: Dict[str, str]
+    profile_id: Optional[str] = None
+    vcpus: Optional[int] = None
+    memory_mib: Optional[int] = None
     expected_gpus: List[str]
     gpu_count: int
     # AMD SEV-SNP fields (null for TDX configs).

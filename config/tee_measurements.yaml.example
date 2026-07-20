@@ -46,6 +46,28 @@ measurements:
         expected_gpus: []
         gpu_count: 0
 
+  # Model-B direct TDX: MRTD/RTMR3 are image-wide, while each signed vCPU+RAM profile carries
+  # every launch-shape-dependent RTMR. Profile identity is part of release provenance; the loader
+  # derives each pin version as 1.9.0[-storage]-tdx-<profile_id> from this image version + name.
+  - version: "1.9.0"
+    tee_type: "tdx"
+    provider: "bare-metal"
+    debug: false
+    rc: true
+    mrtd: "REPLACE_WITH_DIRECT_TDX_MRTD_96_HEX"
+    runtime_rtmr3: "REPLACE_WITH_DIRECT_TDX_RUNTIME_RTMR3_96_HEX"
+    hardware:
+      - name: "cpu-baremetal-tdx-1.9.0-1vcpu-8g"
+        description: "Model-B direct-boot TDX, 1 vCPU / 8 GiB"
+        profile_id: "1vcpu-8g"
+        vcpus: 1
+        memory_mib: 8192
+        rtmr0: "REPLACE_WITH_PROFILE_RTMR0_96_HEX"
+        rtmr1: "REPLACE_WITH_PROFILE_RTMR1_96_HEX"
+        rtmr2: "REPLACE_WITH_PROFILE_RTMR2_96_HEX"
+        expected_gpus: []
+        gpu_count: 0
+
   # AMD SEV-SNP: policy, minimum TCB, processor model, VMPL, and optional id-key digest are shared.
   # Bare-metal image identity is folded into each per-variant launch measurement.
   - version: "1.3.0-snp-4vcpu"

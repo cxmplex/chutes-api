@@ -99,6 +99,38 @@ def _tdx_group(
     return group
 
 
+def _direct_tdx_group(*hardware: dict) -> dict:
+    return {
+        "version": "1.9.1",
+        "tee_type": "tdx",
+        "provider": "bare-metal",
+        "debug": False,
+        "mrtd": HEX96_MRTD,
+        "runtime_rtmr3": HEX96_RTMR3,
+        "hardware": list(hardware),
+    }
+
+
+def _direct_tdx_variant(
+    *,
+    name: str = "cpu-baremetal-tdx-1.9.1-1vcpu-8g",
+    profile_id: str = "1vcpu-8g",
+    vcpus: int = 1,
+    memory_mib: int = 8192,
+) -> dict:
+    return {
+        "name": name,
+        "profile_id": profile_id,
+        "vcpus": vcpus,
+        "memory_mib": memory_mib,
+        "rtmr0": HEX96_RTMR0,
+        "rtmr1": HEX96_RTMR1,
+        "rtmr2": HEX96_RTMR2,
+        "expected_gpus": [],
+        "gpu_count": 0,
+    }
+
+
 def _snp_group(
     *,
     version: str = "1",
@@ -214,6 +246,104 @@ def test_nested_tdx_flattens_hardware_into_scalar_runtime_model(tmp_path):
     assert second.rtmr0 == "9" * 96
     assert first.boot_rtmrs["RTMR3"] == "0" * 96
     assert first.runtime_rtmrs["RTMR3"] == HEX96_RTMR3
+
+
+def test_nested_direct_tdx_profiles_bind_vcpu_ram_and_variant_rtmrs(tmp_path):
+    group = {
+        "version": "1.9.0",
+        "tee_type": "tdx",
+        "provider": "bare-metal",
+        "debug": False,
+        "mrtd": HEX96_MRTD,
+        "runtime_rtmr3": HEX96_RTMR3,
+        "hardware": [
+            {
+                "name": "cpu-baremetal-tdx-1.9.0-1vcpu-8g",
+                "profile_id": "1vcpu-8g",
+                "vcpus": 1,
+                "memory_mib": 8192,
+                "rtmr0": HEX96_RTMR0,
+                "rtmr1": HEX96_RTMR1,
+                "rtmr2": HEX96_RTMR2,
+                "expected_gpus": [],
+                "gpu_count": 0,
+            },
+            {
+                "name": "cpu-baremetal-tdx-1.9.0-2vcpu-16g",
+                "profile_id": "2vcpu-16g",
+                "vcpus": 2,
+                "memory_mib": 16384,
+                "rtmr0": "8" * 96,
+                "rtmr1": "9" * 96,
+                "rtmr2": "A" * 96,
+                "expected_gpus": [],
+                "gpu_count": 0,
+            },
+        ],
+    }
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    first, second = settings._load_tee_measurements()
+
+    assert (first.profile_id, first.vcpus, first.memory_mib) == (
+        "1vcpu-8g",
+        1,
+        8192,
+    )
+    assert (second.profile_id, second.vcpus, second.memory_mib) == (
+        "2vcpu-16g",
+        2,
+        16384,
+    )
+    assert first.version == "1.9.0-tdx-1vcpu-8g"
+    assert second.version == "1.9.0-tdx-2vcpu-16g"
+    assert first.rtmr1 != second.rtmr1
+
+
+def test_nested_direct_tdx_storage_profile_gets_role_qualified_version(tmp_path):
+    group = {
+        "version": "1.9.0",
+        "tee_type": "tdx",
+        "provider": "bare-metal",
+        "debug": False,
+        "mrtd": HEX96_MRTD,
+        "runtime_rtmr3": HEX96_RTMR3,
+        "hardware": [
+            {
+                "name": "storage-baremetal-tdx-1.9.0-2vcpu-8g",
+                "profile_id": "2vcpu-8g",
+                "vcpus": 2,
+                "memory_mib": 8192,
+                "rtmr0": HEX96_RTMR0,
+                "rtmr1": HEX96_RTMR1,
+                "rtmr2": HEX96_RTMR2,
+                "expected_gpus": [],
+                "gpu_count": 0,
+            }
+        ],
+    }
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    (measurement,) = settings._load_tee_measurements()
+
+    assert measurement.version == "1.9.0-storage-tdx-2vcpu-8g"
+
+
+def test_nested_direct_tdx_rejects_name_profile_contradiction(tmp_path):
+    group = _direct_tdx_group(_direct_tdx_variant(name="cpu-baremetal-tdx-1.9.1-2vcpu-16g"))
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="contradicts profile"):
+        settings._load_tee_measurements()
+
+
+def test_nested_direct_tdx_rejects_duplicate_profile_identity(tmp_path):
+    variant = _direct_tdx_variant()
+    group = _direct_tdx_group(variant, deepcopy(variant))
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError, match="duplicate direct-TDX"):
+        settings._load_tee_measurements()
 
 
 def test_nested_tdx_accepts_explicit_nonzero_boot_rtmr3(tmp_path):
