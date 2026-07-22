@@ -1,12 +1,10 @@
 """Seedless Model-B logical-host enrollment and scoped control-plane routes."""
 
-import hashlib
-from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from loguru import logger
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
@@ -15,7 +13,7 @@ from api.database import get_db_session
 from api.host import service as host_service
 from api.host.reservations import (
     LaunchReservationError,
-    create_launch_reservation,
+    claim_storage_launch_intent,
 )
 from api.host.schemas import (
     EnrollmentKeyChallengeRequestV1,
@@ -26,13 +24,15 @@ from api.host.schemas import (
     HostEnrollmentRedemptionV1,
     HostEnrollmentResponseV1,
     HostEnrollmentStatusV1,
+    HostIdentityDurabilityAckV1,
     HostKeyGeneration,
+    HostProvisioningHeartbeatV1,
+    HostProvisioningStatusV1,
     HostRevocationRequestV1,
     LaunchReservationResponseV1,
     PcsMailboxAckV1,
     PcsMailboxEnvelopeV1,
-    StorageLaunchReservationRequestV1,
-    TdLaunchReservation,
+    StorageLaunchIntentClaimV1,
 )
 from api.miner.util import is_miner_blacklisted
 from api.server.exceptions import ServerRegistrationError
@@ -110,6 +110,56 @@ async def redeem_enrollment_voucher_endpoint(
         return await host_service.redeem_enrollment_voucher(db, body)
     except host_service.HostAuthError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/identity-durable",
+    response_model=HostProvisioningStatusV1,
+)
+async def acknowledge_identity_durability_endpoint(
+    host_id: str,
+    body: HostIdentityDurabilityAckV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_current_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the durability path.",
+        )
+    try:
+        return await host_service.acknowledge_identity_durability(
+            db,
+            current_host,
+            body,
+        )
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/provisioning-heartbeat",
+    response_model=HostProvisioningStatusV1,
+)
+async def provisioning_heartbeat_endpoint(
+    host_id: str,
+    body: HostProvisioningHeartbeatV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_current_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the provisioning path.",
+        )
+    try:
+        return await host_service.record_provisioning_heartbeat(
+            db,
+            current_host,
+            body,
+        )
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
 @router.get("/enrollment-status", response_model=HostEnrollmentStatusV1)
@@ -228,51 +278,29 @@ async def acknowledge_pcs_mailbox_endpoint(
 @router.post(
     "/{host_id}/launch-reservations/storage",
     response_model=LaunchReservationResponseV1,
+    response_model_exclude_none=True,
 )
 async def create_storage_launch_reservation_endpoint(
     host_id: str,
-    body: StorageLaunchReservationRequestV1,
+    body: StorageLaunchIntentClaimV1,
     db: AsyncSession = Depends(get_db_session),
-    current_host: Host = Depends(host_service.get_current_host),
+    current_host: Host = Depends(host_service.get_ready_host),
 ):
     if current_host.host_id != host_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Authenticated host does not match the reservation path.",
         )
-    expected_incarnation = "stor" + hashlib.sha256(host_id.encode()).hexdigest()[:8]
-    if (
-        body.process_incarnation != expected_incarnation
-        or body.server_id != f"chute-{expected_incarnation}"
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Storage reservation identity is not the deterministic host storage role.",
-        )
-    now = datetime.now(timezone.utc)
-    await db.execute(
-        update(TdLaunchReservation)
-        .where(
-            TdLaunchReservation.host_id == host_id,
-            TdLaunchReservation.role == "storage",
-            TdLaunchReservation.consumed_at.is_(None),
-            TdLaunchReservation.invalidated_at.is_(None),
-        )
-        .values(invalidated_at=now)
-    )
     try:
-        reservation, token = await create_launch_reservation(
+        reservation, token = await claim_storage_launch_intent(
             db,
             current_host,
-            role="storage",
-            server_id=body.server_id,
-            process_incarnation=body.process_incarnation,
-            profile_id=body.profile_id,
         )
         await db.commit()
         return LaunchReservationResponseV1(
             token=token,
             claims=reservation.claims,
+            claims_sha256=reservation.claims_sha256,
         )
     except LaunchReservationError as exc:
         await db.rollback()
@@ -307,7 +335,7 @@ async def revoke_host_endpoint(
 async def register_host_endpoint(
     args: HostRegistrationArgs,
     db: AsyncSession = Depends(get_db_session),
-    current_host: Host = Depends(host_service.get_current_host),
+    current_host: Host = Depends(host_service.get_ready_host),
 ):
     """Refresh untrusted launcher telemetry under its scoped persistent host key."""
     try:

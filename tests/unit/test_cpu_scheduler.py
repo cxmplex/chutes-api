@@ -880,7 +880,10 @@ class TestLaunchOnHost:
                 "issued_at": NOW.isoformat(),
                 "expires_at": (NOW + timedelta(minutes=10)).isoformat(),
             }
-            return SimpleNamespace(claims=claims), "reservation.secret"
+            return (
+                SimpleNamespace(claims=claims, claims_sha256="3" * 64),
+                "reservation.secret",
+            )
 
         with (
             patch("api.cpu_scheduler.send_agent_command", send),
@@ -912,6 +915,7 @@ class TestLaunchOnHost:
         assert payload["launch_reservation"] == "reservation.secret"
         assert payload["server_id"] == f"chute-{payload['process_incarnation']}"
         assert payload["reservation_claims"]["server_id"] == payload["server_id"]
+        assert payload["reservation_claims_sha256"] == "3" * 64
 
     @pytest.mark.asyncio
     async def test_tdx_launch_uses_signed_ram_qualified_profile(self, mock_settings, fake_redis):
@@ -951,7 +955,10 @@ class TestLaunchOnHost:
                 "api.cpu_scheduler.create_launch_reservation",
                 AsyncMock(
                     return_value=(
-                        SimpleNamespace(claims={"reservation_id": "reservation-1"}),
+                        SimpleNamespace(
+                            claims={"reservation_id": "reservation-1"},
+                            claims_sha256="3" * 64,
+                        ),
                         "reservation.secret",
                     )
                 ),
@@ -1019,7 +1026,10 @@ class TestLaunchOnHost:
                 "api.cpu_scheduler.create_launch_reservation",
                 AsyncMock(
                     return_value=(
-                        SimpleNamespace(claims={"reservation_id": "reservation-1"}),
+                        SimpleNamespace(
+                            claims={"reservation_id": "reservation-1"},
+                            claims_sha256="3" * 64,
+                        ),
                         "reservation.secret",
                     )
                 ),

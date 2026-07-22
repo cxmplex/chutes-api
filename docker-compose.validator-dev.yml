@@ -12,7 +12,7 @@ services:
       TRUSTED_L0_PUBLISHER_KEYS_PATH: /etc/chutes/l0-publisher/keys.json
     volumes: &validator_dev_trust_mounts
       - /etc/chutes/provenance/cosign.pub:/etc/chutes/provenance/cosign.pub:ro
-      - /etc/chutes/l0-publisher/keys.json:/etc/chutes/l0-publisher/keys.json:ro
+      - ./config/l0-publisher-keys.json:/etc/chutes/l0-publisher/keys.json:ro
       - ./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro
 
   socket:

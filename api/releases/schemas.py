@@ -257,6 +257,60 @@ class GuestRelease(Base):
     l0_manifest_key_epoch = Column(Integer, nullable=True)
 
 
+class L0BootstrapPublication(Base):
+    """One admitted publisher-signed L0 generation for a TEE/channel slot."""
+
+    __tablename__ = "l0_bootstrap_publications"
+
+    tee_type = Column(String, primary_key=True)
+    channel = Column(String, primary_key=True)
+    generation = Column(Integer, primary_key=True)
+    manifest_digest = Column(String(64), nullable=False)
+    key_id = Column(String, nullable=False)
+    key_epoch = Column(Integer, nullable=False)
+    l0_version = Column(String, nullable=False)
+    squashfs_sha256 = Column(String(64), nullable=False)
+    signed_manifest = Column(JSONB, nullable=False)
+    source_release_id = Column(
+        String,
+        ForeignKey("guest_releases.release_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    admission_status = Column(
+        String,
+        nullable=False,
+        default="staged",
+        server_default="staged",
+    )
+    admitted_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tee_type",
+            "channel",
+            "manifest_digest",
+            name="uq_l0_bootstrap_slot_digest",
+        ),
+        CheckConstraint("tee_type IN ('sev-snp', 'tdx')", name="ck_l0_publication_tee"),
+        CheckConstraint("generation > 0 AND key_epoch > 0", name="ck_l0_publication_generation"),
+        CheckConstraint(
+            "manifest_digest ~ '^[0-9a-f]{64}$' AND squashfs_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_l0_publication_digests",
+        ),
+        CheckConstraint(
+            "admission_status IN ('staged', 'active')",
+            name="ck_l0_publication_status",
+        ),
+        Index(
+            "idx_l0_publication_slot_latest",
+            "tee_type",
+            "channel",
+            "generation",
+        ),
+    )
+
+
 class GuestReleaseTarget(Base):
     """One role on one enrolled logical L0 target captured for a release rollout.
 
@@ -555,6 +609,8 @@ class L0BootstrapManifestV1(BaseModel):
 
     @model_validator(mode="after")
     def _valid_contract(self):
+        if "release_id" in self.model_fields_set and self.release_id is None:
+            raise ValueError("release_id must be omitted rather than null")
         if self.expires_at <= self.issued_at:
             raise ValueError("manifest expiry must be after issuance")
         urls = [

@@ -137,7 +137,11 @@ async def list_releases_endpoint(
     return [service.to_response(r) for r in rows]
 
 
-@router.get("/l0-bootstrap", response_model=SignedL0BootstrapManifestV1)
+@router.get(
+    "/l0-bootstrap",
+    response_model=SignedL0BootstrapManifestV1,
+    response_model_exclude_none=True,
+)
 async def l0_bootstrap_endpoint(
     tee_type: str = Query(..., description="Target Model-B TEE type."),
     channel: str = Query("stable"),
@@ -178,7 +182,7 @@ async def current_release_endpoint(
     channel: str = Query("stable"),
     host_id: str = Query(..., description="Enrolled logical L0 launcher requesting its tokens"),
     db: AsyncSession = Depends(get_db_session),
-    current_host: Host = Depends(host_service.get_current_host),
+    current_host: Host = Depends(host_service.get_ready_host),
 ):
     """The active manifest an enrolled L0 node-agent should converge to.
 

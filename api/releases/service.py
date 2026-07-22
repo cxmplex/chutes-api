@@ -6,6 +6,7 @@ provenance, exact image/pin identity, and complete CPU-only size matrices before
 change. Unsigned provenance exists only for explicit debug artifacts in explicit dev posture.
 """
 
+import hashlib
 import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from api.config import (
 )
 from api.database import generate_uuid
 from api.host.schemas import HostKeyGeneration
+from api.host.schemas import StorageLaunchIntent
 from api.host.schemas import TdLaunchReservation
 from api.releases.bootstrap import (
     L0BootstrapVerificationError,
@@ -44,6 +46,7 @@ from api.releases.schemas import (
     CreateReleaseRequest,
     GuestRelease,
     GuestReleaseTarget,
+    L0BootstrapPublication,
     SignedL0BootstrapManifestV1,
     ReleaseImage,
     ReleaseL0,
@@ -85,7 +88,7 @@ def _merged_release_images(release: GuestRelease, current_active: Optional[Guest
     if current_active is not None:
         for role, image in (current_active.images or {}).items():
             inherited = dict(image) if isinstance(image, dict) else image
-            if role in {"chute", "storage"} and isinstance(inherited, dict):
+            if role in {"chute", "storage", "l0"} and isinstance(inherited, dict):
                 inherited["_inherited"] = True
             merged[role] = inherited
     for role, image in (release.images or {}).items():
@@ -442,9 +445,10 @@ def _l0_from_manifest(images: dict) -> Optional[ReleaseL0]:
     )
 
 
-async def _validate_l0_bootstrap(db: AsyncSession, release: GuestRelease) -> None:
-    """Verify and audit the exact publisher-signed L0 contract before activation."""
-
+def _verify_l0_release_contract(
+    release: GuestRelease, *, allow_expired: bool = False
+) -> tuple[SignedL0BootstrapManifestV1, str]:
+    """Purely verify one release wrapper against its publisher-signed L0 contract."""
     raw = (release.images or {}).get("l0")
     if raw is None:
         raise ReleaseError(
@@ -452,14 +456,22 @@ async def _validate_l0_bootstrap(db: AsyncSession, release: GuestRelease) -> Non
         )
     try:
         signed = SignedL0BootstrapManifestV1.model_validate(raw.get("bootstrap"))
-        digest = verify_signed_l0_manifest(signed, settings.trusted_l0_publisher_keys_path)
+        digest = verify_signed_l0_manifest(
+            signed,
+            settings.trusted_l0_publisher_keys_path,
+            allow_expired=allow_expired,
+        )
     except (L0BootstrapVerificationError, ValueError, TypeError) as exc:
-        raise ReleaseError(f"Refusing to activate untrusted L0 bootstrap manifest: {exc}") from exc
+        raise ReleaseError(f"Untrusted L0 bootstrap manifest: {exc}") from exc
 
     manifest = signed.manifest
     if manifest.tee_type != release.tee_type or manifest.channel != release.channel:
         raise ReleaseError("L0 bootstrap manifest TEE/channel does not match the guest release.")
-    if manifest.release_id is not None and manifest.release_id != release.release_id:
+    if (
+        manifest.release_id is not None
+        and manifest.release_id != release.release_id
+        and not raw.get("_inherited")
+    ):
         raise ReleaseError("L0 bootstrap manifest release correlation does not match this release.")
     if raw.get("version") != manifest.l0_version:
         raise ReleaseError("L0 version does not match the signed bootstrap manifest.")
@@ -467,37 +479,114 @@ async def _validate_l0_bootstrap(db: AsyncSession, release: GuestRelease) -> Non
         raise ReleaseError(
             "Required L0 squashfs digest does not match the signed bootstrap manifest."
         )
+    return signed, digest
 
-    latest_generation = (
-        await db.execute(
-            select(func.max(GuestRelease.l0_manifest_generation)).where(
-                GuestRelease.tee_type == release.tee_type,
-                GuestRelease.channel == release.channel,
-                GuestRelease.release_id != release.release_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if latest_generation is not None and manifest.generation <= int(latest_generation):
-        raise ReleaseError(
-            "L0 bootstrap generation is stale; generations must increase monotonically."
-        )
-    latest_key_epoch = (
-        await db.execute(
-            select(func.max(GuestRelease.l0_manifest_key_epoch)).where(
-                GuestRelease.tee_type == release.tee_type,
-                GuestRelease.channel == release.channel,
-                GuestRelease.release_id != release.release_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if latest_key_epoch is not None and manifest.key_epoch < int(latest_key_epoch):
-        raise ReleaseError("L0 publisher key epoch cannot move backwards.")
 
+def _stamp_release_l0_audit(
+    release: GuestRelease,
+    signed: SignedL0BootstrapManifestV1,
+    digest: str,
+) -> None:
+    manifest = signed.manifest
     release.l0_manifest = manifest.model_dump(mode="json", exclude_none=True)
     release.l0_manifest_digest = digest
     release.l0_manifest_generation = manifest.generation
     release.l0_manifest_key_id = manifest.key_id
     release.l0_manifest_key_epoch = manifest.key_epoch
+
+
+async def _admit_l0_bootstrap(
+    db: AsyncSession,
+    release: GuestRelease,
+) -> L0BootstrapPublication:
+    """Transactionally admit one monotonic publisher generation without GET-side mutation."""
+
+    signed, digest = _verify_l0_release_contract(release)
+    manifest = signed.manifest
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": f"l0-bootstrap:{release.tee_type}:{release.channel}"},
+    )
+    existing = await db.get(
+        L0BootstrapPublication,
+        (release.tee_type, release.channel, manifest.generation),
+    )
+    latest = (
+        await db.execute(
+            select(L0BootstrapPublication)
+            .where(
+                L0BootstrapPublication.tee_type == release.tee_type,
+                L0BootstrapPublication.channel == release.channel,
+            )
+            .order_by(L0BootstrapPublication.generation.desc())
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        if existing.manifest_digest != digest:
+            raise ReleaseError(
+                "L0 bootstrap generation equivocation: the generation already names other bytes."
+            )
+        if latest is not None and manifest.generation < latest.generation:
+            raise ReleaseError(
+                "L0 bootstrap generation is stale; an older admitted generation cannot be reactivated."
+            )
+        if latest is not None and manifest.key_epoch < latest.key_epoch:
+            raise ReleaseError("L0 publisher key epoch cannot move backwards.")
+        publication = existing
+    else:
+        if latest is not None and manifest.generation <= latest.generation:
+            raise ReleaseError(
+                "L0 bootstrap generation is stale; new admissions must increase monotonically."
+            )
+        if latest is not None and manifest.key_epoch < latest.key_epoch:
+            raise ReleaseError("L0 publisher key epoch cannot move backwards.")
+        publication = L0BootstrapPublication(
+            tee_type=release.tee_type,
+            channel=release.channel,
+            generation=manifest.generation,
+            manifest_digest=digest,
+            key_id=manifest.key_id,
+            key_epoch=manifest.key_epoch,
+            l0_version=manifest.l0_version,
+            squashfs_sha256=manifest.squashfs.sha256,
+            signed_manifest=signed.model_dump(mode="json", exclude_none=True),
+            source_release_id=release.release_id,
+            admission_status="staged",
+        )
+        db.add(publication)
+        await db.flush()
+    _stamp_release_l0_audit(release, signed, digest)
+    return publication
+
+
+async def _validate_l0_bootstrap(db: AsyncSession, release: GuestRelease) -> L0BootstrapPublication:
+    """Compatibility name for activation/tests; admission is explicit and idempotent."""
+
+    return await _admit_l0_bootstrap(db, release)
+
+
+async def _mark_l0_publication_active(
+    db: AsyncSession,
+    release: GuestRelease,
+    publication: L0BootstrapPublication,
+) -> None:
+    """Make the release's admitted L0 generation the active publication audit row."""
+
+    await db.execute(
+        update(L0BootstrapPublication)
+        .where(
+            L0BootstrapPublication.tee_type == release.tee_type,
+            L0BootstrapPublication.channel == release.channel,
+            L0BootstrapPublication.admission_status == "active",
+            L0BootstrapPublication.generation != publication.generation,
+        )
+        .values(admission_status="staged")
+    )
+    publication.admission_status = "active"
+    if publication.activated_at is None:
+        publication.activated_at = datetime.now(timezone.utc)
 
 
 async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRelease:
@@ -517,7 +606,14 @@ async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRe
         notes=req.notes,
     )
     db.add(release)
-    await db.commit()
+    try:
+        await db.flush()
+        if req.l0 is not None:
+            await _admit_l0_bootstrap(db, release)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     await db.refresh(release)
     logger.success(
         f"Created draft guest release {release.release_id} (channel={release.channel} "
@@ -553,7 +649,6 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     original_images = release.images
     release.images = _merged_release_images(release, current_active)
     try:
-        await _validate_l0_bootstrap(db, release)
         if release.tee_type == "tdx" and not (release.images or {}).get("chute"):
             raise ReleaseError(
                 "A managed TDX desired state must include a schema-v2 direct-boot chute image; "
@@ -571,6 +666,8 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
             image = (release.images or {}).get(image_role)
             if image:
                 _validate_image_provenance(release, image_role, image, loaded_by_name)
+        publication = await _validate_l0_bootstrap(db, release)
+        await _mark_l0_publication_active(db, release, publication)
     except Exception:
         release.images = original_images
         raise
@@ -580,8 +677,8 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     if release.status == RELEASE_STATUS_ACTIVE:
         if release.targets_captured_at is None:
             await _capture_release_targets(db, release)
-            await db.commit()
-            await db.refresh(release)
+        await db.commit()
+        await db.refresh(release)
         return release
 
     # Supersede the current active release for this (channel, tee_type).
@@ -629,45 +726,45 @@ async def active_l0_bootstrap(
     tee_type: str,
     channel: str,
 ) -> Optional[SignedL0BootstrapManifestV1]:
-    """Return the newest verified bootstrap, including a pre-activation draft.
+    """Return the newest transactionally admitted bootstrap without mutating state."""
 
-    Miner tooling must be able to enroll the initial ready host set before guest-release activation
-    captures immutable rollout targets.
-    """
-
-    releases = (
-        (
-            await db.execute(
-                select(GuestRelease).where(
-                    GuestRelease.tee_type == tee_type.strip().lower(),
-                    GuestRelease.channel == channel,
-                    GuestRelease.status.in_([RELEASE_STATUS_ACTIVE, RELEASE_STATUS_DRAFT]),
-                )
+    normalized_tee = tee_type.strip().lower()
+    publication = (
+        await db.execute(
+            select(L0BootstrapPublication)
+            .where(
+                L0BootstrapPublication.tee_type == normalized_tee,
+                L0BootstrapPublication.channel == channel,
             )
+            .order_by(L0BootstrapPublication.generation.desc())
+            .limit(1)
         )
-        .scalars()
-        .all()
-    )
-    candidates: list[tuple[int, GuestRelease, SignedL0BootstrapManifestV1]] = []
-    for release in releases:
-        raw = ((release.images or {}).get("l0") or {}).get("bootstrap")
-        if raw is None:
-            continue
-        await _validate_l0_bootstrap(db, release)
-        signed = SignedL0BootstrapManifestV1.model_validate(raw)
-        candidates.append((signed.manifest.generation, release, signed))
-    if not candidates:
+    ).scalar_one_or_none()
+    if publication is None:
         return None
-    _generation, _release, signed = max(
-        candidates,
-        key=lambda item: (item[0], item[1].created_at or datetime.min.replace(tzinfo=timezone.utc)),
-    )
-    if signed.manifest.tee_type != tee_type.strip().lower() or signed.manifest.channel != channel:
-        raise ReleaseError("Draft L0 bootstrap targets another release slot.")
-    verify_signed_l0_manifest(
-        signed,
-        settings.trusted_l0_publisher_keys_path,
-    )
+
+    try:
+        signed = SignedL0BootstrapManifestV1.model_validate(publication.signed_manifest)
+        digest = verify_signed_l0_manifest(
+            signed,
+            settings.trusted_l0_publisher_keys_path,
+        )
+    except (L0BootstrapVerificationError, ValueError, TypeError) as exc:
+        raise ReleaseError(f"Admitted L0 bootstrap is no longer trusted: {exc}") from exc
+    manifest = signed.manifest
+    if (
+        manifest.tee_type != normalized_tee
+        or manifest.channel != channel
+        or publication.tee_type != normalized_tee
+        or publication.channel != channel
+        or publication.generation != manifest.generation
+        or publication.manifest_digest != digest
+        or publication.key_id != manifest.key_id
+        or publication.key_epoch != manifest.key_epoch
+        or publication.l0_version != manifest.l0_version
+        or publication.squashfs_sha256 != manifest.squashfs.sha256
+    ):
+        raise ReleaseError("Admitted L0 bootstrap audit fields do not match its signed manifest.")
     return signed
 
 
@@ -714,13 +811,272 @@ def _apply_storage_auto_opt_in(release: GuestRelease, host: Host) -> None:
     host.capacity = max(0, current - 1)
 
 
+def _storage_profile_for_host(release: GuestRelease, host: Host) -> str:
+    image = (release.images or {}).get("storage") or {}
+    names = list(image.get("measurement_names") or [])
+    vcpus = getattr(host, "storage_td_vcpus", None)
+    memory = getattr(host, "storage_td_mem", None)
+    if not isinstance(vcpus, int) or isinstance(vcpus, bool) or vcpus < 1:
+        raise ReleaseError(
+            f"Storage target {host.host_id} has no validator-recorded storage vCPU shape."
+        )
+    if not isinstance(memory, str) or not re.fullmatch(r"[1-9][0-9]*(?:G|M)", memory):
+        raise ReleaseError(
+            f"Storage target {host.host_id} has no validator-recorded storage memory shape."
+        )
+    if release.tee_type == "tdx":
+        amount = int(memory[:-1])
+        memory_mib = amount * 1024 if memory.endswith("G") else amount
+        if memory_mib % 1024:
+            raise ReleaseError(
+                f"Storage target {host.host_id} memory does not map to a signed TDX profile."
+            )
+        suffix = f"-{vcpus}vcpu-{memory_mib // 1024}g"
+    else:
+        suffix = f"-{vcpus}vcpu"
+    matches = [name for name in names if name.endswith(suffix)]
+    if len(matches) != 1:
+        raise ReleaseError(
+            f"Storage target {host.host_id} has no unique server-selected profile for "
+            f"{vcpus} vCPU/{memory}."
+        )
+    return matches[0]
+
+
+async def _ensure_storage_launch_intents(
+    db: AsyncSession,
+    release: GuestRelease,
+    targets: List[GuestReleaseTarget],
+) -> None:
+    """Materialize immutable, server-selected launch authority for storage targets."""
+
+    image = (release.images or {}).get("storage") or {}
+    if not image or image.get("_inherited"):
+        return
+    await db.execute(
+        update(StorageLaunchIntent)
+        .where(
+            StorageLaunchIntent.tee_type == release.tee_type,
+            StorageLaunchIntent.channel == release.channel,
+            StorageLaunchIntent.release_id != release.release_id,
+            StorageLaunchIntent.state == "active",
+        )
+        .values(state="superseded")
+    )
+    for target in [item for item in targets if item.role == "storage"]:
+        process_incarnation = "stor" + hashlib.sha256(target.host_id.encode()).hexdigest()[:8]
+        existing = (
+            await db.execute(
+                select(StorageLaunchIntent)
+                .where(StorageLaunchIntent.target_id == target.target_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            immutable_expected = {
+                "release_id": release.release_id,
+                "tee_type": release.tee_type,
+                "channel": release.channel,
+                "host_id": target.host_id,
+                "owner_hotkey": target.miner_hotkey,
+                "server_id": f"chute-{process_incarnation}",
+                "process_incarnation": process_incarnation,
+                "image_sha256": image["sha256"],
+                "image_version": image["version"],
+            }
+            mismatched = {
+                name: (getattr(existing, name), value)
+                for name, value in immutable_expected.items()
+                if getattr(existing, name) != value
+            }
+            if mismatched or existing.profile_id not in (image.get("measurement_names") or []):
+                raise ReleaseError(
+                    f"Stored storage launch intent conflicts with immutable target: {mismatched}."
+                )
+            existing.state = "active"
+            continue
+        host = await db.get(Host, target.host_id)
+        if (
+            host is None
+            or host.miner_hotkey != target.miner_hotkey
+            or host.tee_type != release.tee_type
+            or host.release_channel != release.channel
+            or host.provisioning_state != "ready"
+            or host.identity_durable_at is None
+            or not host.storage_enabled
+        ):
+            raise ReleaseError(
+                f"Storage target {target.host_id} is no longer eligible for launch intent."
+            )
+        profile_id = _storage_profile_for_host(release, host)
+        expected = {
+            "release_id": release.release_id,
+            "tee_type": release.tee_type,
+            "channel": release.channel,
+            "host_id": host.host_id,
+            "owner_hotkey": host.miner_hotkey,
+            "server_id": f"chute-{process_incarnation}",
+            "process_incarnation": process_incarnation,
+            "profile_id": profile_id,
+            "image_sha256": image["sha256"],
+            "image_version": image["version"],
+        }
+        db.add(
+            StorageLaunchIntent(
+                intent_id=generate_uuid(),
+                target_id=target.target_id,
+                state="active",
+                **expected,
+            )
+        )
+    await db.flush()
+
+
+async def _ensure_storage_launch_intent_for_host(
+    db: AsyncSession,
+    release: GuestRelease,
+    host: Host,
+) -> Optional[StorageLaunchIntent]:
+    """Repair one returning host without coupling registration to sibling targets."""
+
+    image = (release.images or {}).get("storage") or {}
+    if not image:
+        return None
+    inherited_storage = bool(image.get("_inherited"))
+    if (
+        host.miner_hotkey is None
+        or host.tee_type != release.tee_type
+        or host.release_channel != release.channel
+        or host.provisioning_state != "ready"
+        or host.identity_durable_at is None
+        or not host.storage_enabled
+    ):
+        raise ReleaseError(f"Storage host {host.host_id} is not eligible for launch-intent repair.")
+    active = (
+        await db.execute(
+            select(StorageLaunchIntent)
+            .where(
+                StorageLaunchIntent.tee_type == release.tee_type,
+                StorageLaunchIntent.channel == release.channel,
+                StorageLaunchIntent.host_id == host.host_id,
+                StorageLaunchIntent.owner_hotkey == host.miner_hotkey,
+                StorageLaunchIntent.state == "active",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        active is not None
+        and active.image_sha256 == image.get("sha256")
+        and active.image_version == image.get("version")
+        and active.profile_id in (image.get("measurement_names") or [])
+        and (inherited_storage or active.release_id == release.release_id)
+    ):
+        return active
+    if active is not None and not inherited_storage:
+        active.state = "superseded"
+
+    candidates = (
+        (
+            await db.execute(
+                select(GuestReleaseTarget)
+                .where(
+                    GuestReleaseTarget.host_id == host.host_id,
+                    GuestReleaseTarget.miner_hotkey == host.miner_hotkey,
+                    GuestReleaseTarget.tee_type == release.tee_type,
+                    GuestReleaseTarget.role == "storage",
+                )
+                .order_by(
+                    GuestReleaseTarget.issued_at.desc(),
+                    GuestReleaseTarget.target_id.desc(),
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    target = None
+    for candidate in candidates:
+        if not inherited_storage and candidate.release_id != release.release_id:
+            continue
+        source = await db.get(GuestRelease, candidate.release_id)
+        source_image = (source.images or {}).get("storage") if source is not None else None
+        if (
+            source is not None
+            and source.tee_type == release.tee_type
+            and source.channel == release.channel
+            and isinstance(source_image, dict)
+            and source_image.get("sha256") == image.get("sha256")
+            and source_image.get("version") == image.get("version")
+        ):
+            target = candidate
+            break
+    if target is None:
+        await db.flush()
+        return None
+
+    profile_id = _storage_profile_for_host(release, host)
+    process_incarnation = "stor" + hashlib.sha256(host.host_id.encode()).hexdigest()[:8]
+    expected = {
+        "release_id": target.release_id,
+        "tee_type": release.tee_type,
+        "channel": release.channel,
+        "host_id": host.host_id,
+        "owner_hotkey": host.miner_hotkey,
+        "server_id": f"chute-{process_incarnation}",
+        "process_incarnation": process_incarnation,
+        "profile_id": profile_id,
+        "image_sha256": image["sha256"],
+        "image_version": image["version"],
+    }
+    await db.execute(
+        update(StorageLaunchIntent)
+        .where(
+            StorageLaunchIntent.tee_type == release.tee_type,
+            StorageLaunchIntent.channel == release.channel,
+            StorageLaunchIntent.host_id == host.host_id,
+            StorageLaunchIntent.state == "active",
+        )
+        .values(state="superseded")
+    )
+    stored = (
+        await db.execute(
+            select(StorageLaunchIntent)
+            .where(StorageLaunchIntent.target_id == target.target_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if stored is None:
+        stored = StorageLaunchIntent(
+            intent_id=generate_uuid(),
+            target_id=target.target_id,
+            state="active",
+            **expected,
+        )
+        db.add(stored)
+    else:
+        mismatched = {
+            name: (getattr(stored, name), value)
+            for name, value in expected.items()
+            if getattr(stored, name) != value
+        }
+        if mismatched:
+            raise ReleaseError(
+                f"Stored storage launch intent conflicts with immutable target: {mismatched}."
+            )
+        stored.state = "active"
+    await db.flush()
+    return stored
+
+
 async def _capture_release_targets(
     db: AsyncSession,
     release: GuestRelease,
 ) -> List[GuestReleaseTarget]:
     """Capture an immutable enrolled logical target set exactly once."""
     if release.targets_captured_at is not None:
-        return (
+        targets = (
             (
                 await db.execute(
                     select(GuestReleaseTarget).where(
@@ -731,6 +1087,8 @@ async def _capture_release_targets(
             .scalars()
             .all()
         )
+        await _ensure_storage_launch_intents(db, release, targets)
+        return targets
 
     query = (
         select(Host)
@@ -746,6 +1104,7 @@ async def _capture_release_targets(
             Host.tee_type == release.tee_type,
             Host.release_channel == release.channel,
             Host.provisioning_state == "ready",
+            Host.identity_durable_at.is_not(None),
             Host.active_key_generation.is_not(None),
         )
         .with_for_update()
@@ -787,6 +1146,7 @@ async def _capture_release_targets(
     db.add_all(targets)
     release.targets_captured_at = captured_at
     await db.flush()
+    await _ensure_storage_launch_intents(db, release, targets)
     return targets
 
 
@@ -825,9 +1185,14 @@ def _validate_active_release(release: GuestRelease) -> None:
         if (
             l0_manifest.tee_type != release.tee_type
             or l0_manifest.channel != release.channel
-            or (l0_manifest.release_id is not None and l0_manifest.release_id != release.release_id)
+            or (
+                l0_manifest.release_id is not None
+                and l0_manifest.release_id != release.release_id
+                and not raw_l0.get("_inherited")
+            )
             or raw_l0.get("version") != l0_manifest.l0_version
             or raw_l0.get("squashfs_sha256") != l0_manifest.squashfs.sha256
+            or release.l0_manifest != l0_manifest.model_dump(mode="json", exclude_none=True)
             or release.l0_manifest_digest != l0_digest
             or release.l0_manifest_generation != l0_manifest.generation
             or release.l0_manifest_key_id != l0_manifest.key_id

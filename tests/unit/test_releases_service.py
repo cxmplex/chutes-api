@@ -29,7 +29,15 @@ VCPU_SIZES = (1, 2, 4, 8)
 
 @pytest.fixture(autouse=True)
 def _seedless_l0_gate_is_covered_separately():
-    with patch.object(rsvc, "_validate_l0_bootstrap", AsyncMock()):
+    with (
+        patch.object(
+            rsvc,
+            "_validate_l0_bootstrap",
+            AsyncMock(return_value=Mock()),
+        ),
+        patch.object(rsvc, "_mark_l0_publication_active", AsyncMock()),
+        patch.object(rsvc, "_ensure_storage_launch_intents", AsyncMock()),
+    ):
         yield
 
 
@@ -253,7 +261,8 @@ def test_partial_release_materializes_omitted_active_image_slots():
         "chute"
     ]
     assert merged["chute"]["_inherited"] is True
-    assert merged["l0"] == current.images["l0"]
+    assert {k: v for k, v in merged["l0"].items() if k != "_inherited"} == current.images["l0"]
+    assert merged["l0"]["_inherited"] is True
     assert merged["storage"] == candidate.images["storage"]
 
 
@@ -282,7 +291,7 @@ async def test_idempotent_partial_activation_preserves_inherited_role_marker():
     assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_enabled=True)) == [
         "storage"
     ]
-    assert not db.commit.called
+    assert db.commit.called
 
 
 @pytest.mark.asyncio
@@ -702,4 +711,4 @@ async def test_already_active_is_revalidated_before_idempotent_return():
     with _pinned(*measurements):
         result = await rsvc.activate_release(db, release.release_id)
     assert result is release
-    assert not db.commit.called
+    assert db.commit.called

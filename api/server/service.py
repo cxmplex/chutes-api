@@ -1401,7 +1401,10 @@ async def register_host(
     miner_hotkey = authenticated_host.miner_hotkey
     if args.host_id != authenticated_host.host_id:
         raise ServerRegistrationError("Host telemetry does not match the authenticated host.")
-    if authenticated_host.provisioning_state != "ready":
+    if (
+        authenticated_host.provisioning_state != "ready"
+        or authenticated_host.identity_durable_at is None
+    ):
         raise ServerRegistrationError(
             f"Host {authenticated_host.host_id} is not launch-ready "
             f"(state={authenticated_host.provisioning_state})."
@@ -1442,6 +1445,8 @@ async def register_host(
     host.name = args.name or args.host_id
     host.capacity = capacity
     host.storage_enabled = storage_enabled
+    host.storage_td_vcpus = args.storage_td_vcpus
+    host.storage_td_mem = args.storage_td_mem
     host.default_mem = args.default_mem
     host.default_vcpus = args.default_vcpus
     host.external_host = args.external_host or None
@@ -1464,7 +1469,14 @@ async def register_host(
     # Resolve desired state before committing this refresh. An active storage-carrying manifest is
     # newer operator intent than stale bootstrap CHUTES_STORAGE_NODE=false, so it reserves the
     # storage TD first and a reconnect can never restore impossible chute capacity.
-    from api.releases.service import active_manifest_for_host
+    from api.releases.schemas import (
+        GuestRelease,
+        RELEASE_STATUS_ACTIVE,
+    )
+    from api.releases.service import (
+        _ensure_storage_launch_intent_for_host,
+        active_manifest_for_host,
+    )
 
     await db.flush()
     manifest = await active_manifest_for_host(
@@ -1477,6 +1489,22 @@ async def register_host(
     if manifest is not None and manifest.storage is not None and not host.storage_enabled:
         host.storage_enabled = True
         host.capacity = max(0, int(host.capacity or 0) - 1)
+    if manifest is not None:
+        active_release = (
+            await db.execute(
+                select(GuestRelease).where(
+                    GuestRelease.status == RELEASE_STATUS_ACTIVE,
+                    GuestRelease.channel == host.release_channel,
+                    GuestRelease.tee_type == host.tee_type,
+                )
+            )
+        ).scalar_one_or_none()
+        if active_release is not None and manifest.storage is not None:
+            await _ensure_storage_launch_intent_for_host(
+                db,
+                active_release,
+                host,
+            )
     await db.commit()
     await db.refresh(host)
 

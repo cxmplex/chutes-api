@@ -117,6 +117,16 @@ spec:
               value: /etc/chutes/provenance/cosign.pub
             - name: TRUSTED_L0_PUBLISHER_KEYS_PATH
               value: /etc/chutes/l0-publisher/keys.json
+            - name: DEPOT_REGISTRY
+              valueFrom:
+                secretKeyRef:
+                  name: depot-credentials
+                  key: registry
+            - name: DEPOT_REGISTRY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: depot-credentials
+                  key: registry-token
             - name: SNP_CRL_OUTAGE_GRACE_SECONDS
               value: {{ .Values.snpCrlOutageGraceSeconds | quote }}
             - name: DB_SSL

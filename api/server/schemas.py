@@ -527,9 +527,9 @@ class CpuServerRegistrationResponse(BaseModel):
 class HostRegistrationArgs(BaseModel):
     """Request body for Model-B L0 host registration (POST /hosts/register).
 
-    The node-agent registers its launcher host (hotkey-authed, NOT attested) so the validator can
-    dispatch per-chute TD launches to it. The signed message is "{hotkey}:{nonce}:host_register"
-    with a recent unix-timestamp nonce (the host is not yet known, so there is no server-issued nonce).
+    The enrolled node-agent authenticates with its scoped Ed25519 host key over a server-issued,
+    Redis-backed one-use challenge plus the exact method, path, and body hash. The launcher remains
+    unattested; workload trust comes from each reservation-bound guest quote.
     """
 
     host_id: str = Field(
@@ -548,6 +548,18 @@ class HostRegistrationArgs(BaseModel):
     storage_enabled: bool = Field(
         False,
         description="Whether this enrolled L0 runs the dedicated ChuteFS storage TD.",
+    )
+    storage_td_vcpus: Optional[int] = Field(
+        None,
+        ge=1,
+        le=4096,
+        description="Storage TD vCPU shape used for validator-owned launch-intent selection.",
+    )
+    storage_td_mem: Optional[str] = Field(
+        None,
+        pattern=r"^[1-9][0-9]*(?:G|M)$",
+        max_length=32,
+        description="Storage TD memory shape used for validator-owned launch-intent selection.",
     )
     default_mem: Optional[str] = Field(
         None,
@@ -609,6 +621,8 @@ class HostRegistrationArgs(BaseModel):
     def _validate_zero_capacity_storage_enrollment(self):
         if self.capacity == 0 and not self.storage_enabled:
             raise ValueError("capacity=0 is valid only for an enrolled ChuteFS storage host")
+        if (self.storage_td_vcpus is None) != (self.storage_td_mem is None):
+            raise ValueError("storage_td_vcpus and storage_td_mem must be supplied together")
         if self.default_mem:
             multiplier = 1024**3 if self.default_mem.endswith("G") else 1024**2
             if int(self.default_mem[:-1]) * multiplier > 2**63 - 1:
@@ -1090,6 +1104,8 @@ class Host(Base):
     # Signed L0 enrollment state. Allows a one-slot storage appliance to advertise zero schedulable
     # chute slots without letting ordinary compute hosts misuse capacity=0 registration.
     storage_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    storage_td_vcpus = Column(Integer, nullable=True)
+    storage_td_mem = Column(String, nullable=True)
     # Desired-state channel followed by this logical L0 target. Release activation snapshots only
     # hosts enrolled in the release's channel.
     release_channel = Column(String, nullable=False, default="stable", server_default="stable")
@@ -1125,6 +1141,11 @@ class Host(Base):
     provisioning_state = Column(String, nullable=False, default="legacy", server_default="legacy")
     last_accepted_manifest_generation = Column(Integer, nullable=True)
     enrolled_at = Column(DateTime(timezone=True), nullable=True)
+    identity_durable_at = Column(DateTime(timezone=True), nullable=True)
+    identity_metadata_sha256 = Column(String(64), nullable=True)
+    steady_config_sha256 = Column(String(64), nullable=True)
+    provisioning_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
+    provisioning_status = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -1134,11 +1155,26 @@ class Host(Base):
             "capacity > 0 OR storage_enabled IS TRUE",
             name="ck_hosts_zero_capacity_storage_only",
         ),
+        CheckConstraint(
+            "(storage_td_vcpus IS NULL AND storage_td_mem IS NULL) OR "
+            "(storage_td_vcpus BETWEEN 1 AND 4096 "
+            "AND storage_td_mem ~ '^[1-9][0-9]*(G|M)$')",
+            name="ck_hosts_storage_td_profile",
+        ),
         Index("idx_hosts_miner", "miner_hotkey"),
         Index("idx_hosts_release_targeting", "release_channel", "tee_type"),
         CheckConstraint(
-            "provisioning_state IN ('legacy', 'unclaimed', 'awaiting_pcs', 'ready', 'revoked')",
+            "provisioning_state IN ('legacy', 'unclaimed', 'persisting_identity', "
+            "'awaiting_pcs', 'ready', 'revoked')",
             name="ck_hosts_provisioning_state",
+        ),
+        CheckConstraint(
+            "(identity_durable_at IS NULL AND identity_metadata_sha256 IS NULL "
+            "AND steady_config_sha256 IS NULL) OR "
+            "(identity_durable_at IS NOT NULL "
+            "AND identity_metadata_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND steady_config_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_hosts_identity_durability",
         ),
         CheckConstraint(
             "(enrollment_generation IS NULL AND active_key_generation IS NULL) OR "

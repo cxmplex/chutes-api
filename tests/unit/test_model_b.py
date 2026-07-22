@@ -1,5 +1,6 @@
 """Unit tests for seedless Model-B logical-host control."""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -30,6 +31,9 @@ def _host(host_id="l0-unit-1", channel="stable", owner=HOTKEY):
         provisioning_state="ready",
         enrollment_generation=1,
         active_key_generation=1,
+        identity_durable_at=datetime.now(timezone.utc),
+        identity_metadata_sha256="1" * 64,
+        steady_config_sha256="2" * 64,
     )
 
 
@@ -55,7 +59,7 @@ def _route_auth_dependencies(path: str, method: str) -> list:
 @pytest.mark.parametrize(
     "path,method,dependency",
     [
-        ("/register", "POST", "get_current_host"),
+        ("/register", "POST", "get_ready_host"),
         ("/{host_id}/upgrade-image", "POST", "_authenticate"),
         ("/", "GET", "_authenticate"),
     ],

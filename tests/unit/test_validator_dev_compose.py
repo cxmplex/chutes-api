@@ -18,7 +18,7 @@ def test_settings_importers_share_validator_dev_trust_posture():
     }
     required_mounts = {
         "/etc/chutes/provenance/cosign.pub:/etc/chutes/provenance/cosign.pub:ro",
-        "/etc/chutes/l0-publisher/keys.json:/etc/chutes/l0-publisher/keys.json:ro",
+        "./config/l0-publisher-keys.json:/etc/chutes/l0-publisher/keys.json:ro",
         "./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro",
     }
 

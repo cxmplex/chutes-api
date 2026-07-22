@@ -278,7 +278,7 @@ class HostEnrollmentResponseV1(FrozenWireModel):
     owner_hotkey: str
     enrollment_generation: int = Field(..., ge=1)
     key_generation: int = Field(..., ge=1)
-    provisioning_state: Literal["awaiting_pcs", "ready"]
+    provisioning_state: Literal["persisting_identity", "awaiting_pcs", "ready"]
 
 
 class HostEnrollmentStatusV1(FrozenWireModel):
@@ -290,10 +290,55 @@ class HostEnrollmentStatusV1(FrozenWireModel):
     channel: str
     enrollment_generation: int = Field(..., ge=1)
     key_generation: int = Field(..., ge=1)
-    provisioning_state: Literal["awaiting_pcs", "ready", "revoked"]
+    provisioning_state: Literal[
+        "persisting_identity",
+        "awaiting_pcs",
+        "ready",
+        "revoked",
+    ]
     x25519_public_key: str
     x25519_fingerprint: str
     enrolled_at: datetime
+
+
+class HostIdentityDurabilityAckV1(FrozenWireModel):
+    schema: Literal["chutes.host-identity-durable"] = "chutes.host-identity-durable"
+    version: Literal[1] = 1
+    enrollment_generation: int = Field(..., ge=1)
+    key_generation: int = Field(..., ge=1)
+    identity_metadata_sha256: str
+    steady_config_sha256: str
+
+    @field_validator("identity_metadata_sha256", "steady_config_sha256")
+    @classmethod
+    def _valid_digest(cls, value: str) -> str:
+        value = value.lower()
+        if not _HEX_64_RE.fullmatch(value):
+            raise ValueError("durability digests must be lowercase sha256 values")
+        return value
+
+
+class HostProvisioningHeartbeatV1(FrozenWireModel):
+    schema: Literal["chutes.host-provisioning-heartbeat"] = "chutes.host-provisioning-heartbeat"
+    version: Literal[1] = 1
+    enrollment_generation: int = Field(..., ge=1)
+    key_generation: int = Field(..., ge=1)
+    provisioning_state: Literal["persisting_identity", "awaiting_pcs"]
+    observed_at: datetime
+
+
+class HostProvisioningStatusV1(FrozenWireModel):
+    schema: Literal["chutes.host-provisioning-status"] = "chutes.host-provisioning-status"
+    version: Literal[1] = 1
+    host_id: str
+    enrollment_generation: int = Field(..., ge=1)
+    key_generation: int = Field(..., ge=1)
+    provisioning_state: Literal[
+        "persisting_identity",
+        "awaiting_pcs",
+        "ready",
+    ]
+    accepted_at: datetime
 
 
 class HostRevocationRequestV1(FrozenWireModel):
@@ -446,6 +491,12 @@ class PcsMailboxAadV1(FrozenWireModel):
             raise ValueError("recipient_fingerprint must be a sha256 digest")
         return value
 
+    @model_validator(mode="after")
+    def _valid_time_order(self) -> "PcsMailboxAadV1":
+        if self.expires_at <= self.issued_at:
+            raise ValueError("PCS mailbox expiry must be after issuance")
+        return self
+
 
 class PcsMailboxEnvelopeV1(FrozenWireModel):
     schema: Literal["chutes.pcs-mailbox"] = "chutes.pcs-mailbox"
@@ -508,6 +559,8 @@ class TdLaunchReservationClaimsV1(FrozenWireModel):
     job_id: Optional[str] = None
     container_repository: Optional[str] = None
     container_manifest_digest: Optional[str] = None
+    storage_intent_id: Optional[str] = None
+    storage_intent_generation: Optional[int] = Field(None, ge=1)
     launch_nonce: str
     release_target_sha256: str
     issued_at: datetime
@@ -539,6 +592,10 @@ class TdLaunchReservationClaimsV1(FrozenWireModel):
             not self.chute_id or not self.container_repository or not self.container_manifest_digest
         ):
             raise ValueError("chute reservations require exact chute image intent")
+        if self.role == "chute" and (
+            self.storage_intent_id is not None or self.storage_intent_generation is not None
+        ):
+            raise ValueError("chute reservations must not contain storage launch intent")
         if self.role == "storage" and any(
             value is not None
             for value in (
@@ -549,19 +606,18 @@ class TdLaunchReservationClaimsV1(FrozenWireModel):
             )
         ):
             raise ValueError("storage reservations must not contain chute workload intent")
+        if self.role == "storage" and (
+            not self.storage_intent_id or self.storage_intent_generation is None
+        ):
+            raise ValueError("storage reservations require a validator-owned launch intent")
         if self.expires_at <= self.issued_at:
             raise ValueError("reservation expiry must be after issuance")
         return self
 
 
-class StorageLaunchReservationRequestV1(FrozenWireModel):
-    schema: Literal["chutes.storage-launch-reservation-request"] = (
-        "chutes.storage-launch-reservation-request"
-    )
+class StorageLaunchIntentClaimV1(FrozenWireModel):
+    schema: Literal["chutes.storage-launch-intent-claim"] = "chutes.storage-launch-intent-claim"
     version: Literal[1] = 1
-    server_id: str
-    process_incarnation: str
-    profile_id: str
 
 
 class LaunchReservationResponseV1(FrozenWireModel):
@@ -569,6 +625,15 @@ class LaunchReservationResponseV1(FrozenWireModel):
     version: Literal[1] = 1
     token: str
     claims: TdLaunchReservationClaimsV1
+    claims_sha256: str
+
+    @field_validator("claims_sha256")
+    @classmethod
+    def _valid_claims_digest(cls, value: str) -> str:
+        value = value.lower()
+        if not _HEX_64_RE.fullmatch(value):
+            raise ValueError("claims_sha256 must be a lowercase sha256 digest")
+        return value
 
 
 class TdQuoteCommitmentV1(FrozenWireModel):
@@ -627,6 +692,7 @@ class RegistrySessionClaimsV1(FrozenWireModel):
     repository: str = Field(..., min_length=3, max_length=255)
     actions: List[Literal["pull"]]
     manifest_digest: str
+    descriptor_closure_sha256: str
     issued_at: datetime
     expires_at: datetime
 
@@ -636,6 +702,14 @@ class RegistrySessionClaimsV1(FrozenWireModel):
         value = value.lower()
         if not _HEX_64_RE.fullmatch(value):
             raise ValueError("attested_cert_sha256 must be a sha256 digest")
+        return value
+
+    @field_validator("descriptor_closure_sha256")
+    @classmethod
+    def _valid_closure_hash(cls, value: str) -> str:
+        value = value.lower()
+        if not _HEX_64_RE.fullmatch(value):
+            raise ValueError("descriptor_closure_sha256 must be a sha256 digest")
         return value
 
     @field_validator("repository")
@@ -816,6 +890,76 @@ class HostPcsMailbox(Base):
     )
 
 
+class StorageLaunchIntent(Base):
+    """Validator-owned authorization to launch one immutable storage target."""
+
+    __tablename__ = "storage_launch_intents"
+
+    intent_id = Column(String, primary_key=True, default=generate_uuid)
+    target_id = Column(
+        String,
+        ForeignKey("guest_release_targets.target_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    release_id = Column(
+        String,
+        ForeignKey("guest_releases.release_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    tee_type = Column(String, nullable=False)
+    channel = Column(String, nullable=False)
+    host_id = Column(
+        String,
+        ForeignKey("hosts.host_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    owner_hotkey = Column(String, nullable=False)
+    server_id = Column(String, nullable=False)
+    process_incarnation = Column(String, nullable=False)
+    profile_id = Column(String, nullable=False)
+    image_sha256 = Column(String(64), nullable=False)
+    image_version = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="active", server_default="active")
+    claim_generation = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_claimed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "tee_type IN ('sev-snp', 'tdx')",
+            name="ck_storage_launch_intent_tee",
+        ),
+        CheckConstraint(
+            "state IN ('active', 'superseded')",
+            name="ck_storage_launch_intent_state",
+        ),
+        CheckConstraint(
+            "claim_generation >= 0",
+            name="ck_storage_launch_intent_generation",
+        ),
+        CheckConstraint(
+            "image_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_storage_launch_intent_image_sha",
+        ),
+        Index(
+            "idx_storage_launch_intents_slot",
+            "tee_type",
+            "channel",
+            "state",
+            "host_id",
+        ),
+        Index(
+            "uq_storage_launch_intent_active_host",
+            "tee_type",
+            "channel",
+            "host_id",
+            unique=True,
+            postgresql_where=text("state = 'active'"),
+        ),
+    )
+
+
 class TdLaunchReservation(Base):
     __tablename__ = "td_launch_reservations"
 
@@ -843,9 +987,16 @@ class TdLaunchReservation(Base):
     job_id = Column(String, nullable=True)
     container_repository = Column(String, nullable=True)
     container_manifest_digest = Column(String, nullable=True)
+    storage_intent_id = Column(
+        String,
+        ForeignKey("storage_launch_intents.intent_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    storage_intent_generation = Column(Integer, nullable=True)
     launch_nonce = Column(String, nullable=False)
     release_target_sha256 = Column(String(64), nullable=False)
     claims = Column(JSONB, nullable=False)
+    claims_sha256 = Column(String(64), nullable=True)
     issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
     handed_to_host_at = Column(DateTime(timezone=True), nullable=True)
@@ -879,6 +1030,16 @@ class TdLaunchReservation(Base):
             "AND container_manifest_digest ~ '^sha256:[0-9a-f]{64}$')",
             name="ck_td_reservation_chute_role",
         ),
+        CheckConstraint(
+            "(storage_intent_id IS NULL AND storage_intent_generation IS NULL) OR "
+            "(role = 'storage' AND storage_intent_id IS NOT NULL "
+            "AND storage_intent_generation > 0)",
+            name="ck_td_reservation_storage_intent",
+        ),
+        CheckConstraint(
+            "claims_sha256 IS NULL OR claims_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_td_reservation_claims_sha",
+        ),
         CheckConstraint("expires_at > issued_at", name="ck_td_reservation_expiry"),
         CheckConstraint(
             "(consumed_at IS NULL AND consumed_attestation_id IS NULL "
@@ -893,6 +1054,13 @@ class TdLaunchReservation(Base):
             "role",
             postgresql_where=text("consumed_at IS NULL AND invalidated_at IS NULL"),
         ),
+        Index(
+            "uq_td_reservation_storage_intent_generation",
+            "storage_intent_id",
+            "storage_intent_generation",
+            unique=True,
+            postgresql_where=text("storage_intent_id IS NOT NULL"),
+        ),
     )
 
 
@@ -906,6 +1074,10 @@ class RegistrySession(Base):
     repository = Column(String, nullable=False)
     actions = Column(JSONB, nullable=False)
     manifest_digest = Column(String, nullable=False)
+    allowed_manifests = Column(JSONB, nullable=False, default=list, server_default="[]")
+    allowed_blobs = Column(JSONB, nullable=False, default=list, server_default="[]")
+    allowed_manifest_tags = Column(JSONB, nullable=False, default=list, server_default="[]")
+    descriptor_closure_sha256 = Column(String(64), nullable=True)
     issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
@@ -914,6 +1086,14 @@ class RegistrySession(Base):
     __table_args__ = (
         UniqueConstraint("server_id", name="uq_registry_session_server"),
         CheckConstraint("expires_at > issued_at", name="ck_registry_session_expiry"),
+        CheckConstraint(
+            "jsonb_typeof(allowed_manifests) = 'array' "
+            "AND jsonb_typeof(allowed_blobs) = 'array' "
+            "AND jsonb_typeof(allowed_manifest_tags) = 'array' "
+            "AND (descriptor_closure_sha256 IS NULL "
+            "OR descriptor_closure_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_registry_session_closure",
+        ),
         Index(
             "idx_registry_session_server_active",
             "server_id",

@@ -1,12 +1,18 @@
 import base64
+import importlib
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from api.constants import HOTKEY_HEADER
+from api.database import get_db_session
 from api.host.schemas import (
     HostSigningEnvelopeV1,
     PcsMailboxAadV1,
@@ -23,9 +29,11 @@ from api.releases.schemas import (
     GuestRelease,
     L0ArtifactV1,
     L0BootstrapManifestV1,
+    L0BootstrapPublication,
     SignedL0BootstrapManifestV1,
 )
 from api.releases import service as release_service
+from api.releases.router import router as releases_router
 from api.host.schemas import RegistrySession, RegistrySessionRequestV1
 from api.registry.router import _registry_request_matches
 
@@ -58,7 +66,15 @@ def _publisher_registry(tmp_path, private_key, now):
     return path
 
 
-def _signed_bootstrap(private_key, now):
+def _signed_bootstrap(
+    private_key,
+    now,
+    *,
+    generation=1,
+    key_id="release-1",
+    key_epoch=1,
+    squashfs_digest="4",
+):
     def artifact(name, digest):
         return L0ArtifactV1(
             url=f"https://objects.example.com/l0/1/{name}",
@@ -69,14 +85,14 @@ def _signed_bootstrap(private_key, now):
     manifest = L0BootstrapManifestV1(
         tee_type="tdx",
         channel="stable",
-        generation=1,
-        key_id="release-1",
-        key_epoch=1,
+        generation=generation,
+        key_id=key_id,
+        key_epoch=key_epoch,
         l0_version="1.10.0",
         kernel=artifact("vmlinuz", "1"),
         initrd=artifact("initrd.img", "2"),
         cmdline=artifact("cc-cmdline", "3"),
-        squashfs=artifact("filesystem.squashfs", "4"),
+        squashfs=artifact("filesystem.squashfs", squashfs_digest),
         validator_ca_sha256="5" * 64,
         issued_at=now,
         expires_at=now + timedelta(hours=1),
@@ -117,6 +133,17 @@ def test_l0_bootstrap_expiry_rejected(tmp_path):
         verify_signed_l0_manifest(signed, registry, now=now + timedelta(hours=2))
 
 
+def test_l0_bootstrap_rejects_explicit_null_release_id():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    signed = _signed_bootstrap(private_key, now)
+    document = signed.model_dump(mode="json")
+    document["manifest"]["release_id"] = None
+
+    with pytest.raises(ValueError, match="omitted rather than null"):
+        SignedL0BootstrapManifestV1.model_validate(document)
+
+
 @pytest.mark.asyncio
 async def test_release_activation_gate_persists_verified_l0_audit(tmp_path):
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -131,7 +158,7 @@ async def test_release_activation_gate_persists_verified_l0_audit(tmp_path):
             "l0": {
                 "version": "1.10.0",
                 "squashfs_sha256": "4" * 64,
-                "bootstrap": signed.model_dump(mode="json"),
+                "bootstrap": signed.model_dump(mode="json", exclude_none=True),
             }
         },
     )
@@ -139,6 +166,8 @@ async def test_release_activation_gate_persists_verified_l0_audit(tmp_path):
     empty.scalar_one_or_none.return_value = None
     db = AsyncMock()
     db.execute.return_value = empty
+    db.get.return_value = None
+    db.add = MagicMock()
     with patch.object(
         release_service.settings,
         "trusted_l0_publisher_keys_path",
@@ -150,6 +179,9 @@ async def test_release_activation_gate_persists_verified_l0_audit(tmp_path):
     assert release.l0_manifest_key_id == "release-1"
     assert release.l0_manifest_key_epoch == 1
     assert release.l0_manifest_digest == signed.manifest.digest()
+    publication = db.add.call_args.args[0]
+    assert publication.source_release_id == release.release_id
+    assert publication.admission_status == "staged"
 
 
 @pytest.mark.asyncio
@@ -158,39 +190,192 @@ async def test_verified_draft_bootstrap_is_available_before_activation(tmp_path)
     private_key = Ed25519PrivateKey.generate()
     registry = _publisher_registry(tmp_path, private_key, now)
     signed = _signed_bootstrap(private_key, now)
-    release = GuestRelease(
-        release_id="draft-bootstrap",
+    publication = L0BootstrapPublication(
         tee_type="tdx",
         channel="stable",
-        status="draft",
-        images={
-            "l0": {
-                "version": "1.10.0",
-                "squashfs_sha256": "4" * 64,
-                "bootstrap": signed.model_dump(mode="json"),
-            }
-        },
-        created_at=now,
+        generation=1,
+        manifest_digest=signed.manifest.digest(),
+        key_id="release-1",
+        key_epoch=1,
+        l0_version="1.10.0",
+        squashfs_sha256="4" * 64,
+        signed_manifest=signed.model_dump(mode="json", exclude_none=True),
+        source_release_id="draft-bootstrap",
     )
     result = Mock()
-    result.scalars.return_value.all.return_value = [release]
+    result.scalar_one_or_none.return_value = publication
     db = AsyncMock()
     db.execute.return_value = result
+    db.add = MagicMock()
+    db.flush = AsyncMock()
+    db.commit = AsyncMock()
     with (
         patch.object(
             release_service.settings,
             "trusted_l0_publisher_keys_path",
             registry,
         ),
-        patch.object(
-            release_service,
-            "_validate_l0_bootstrap",
-            AsyncMock(),
-        ),
     ):
         returned = await release_service.active_l0_bootstrap(db, "tdx", "stable")
 
     assert returned == signed
+    db.add.assert_not_called()
+    db.flush.assert_not_awaited()
+    db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_l0_publication_rejects_equivocation_and_backward_key_epoch(tmp_path):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    registry = _publisher_registry(tmp_path, private_key, now)
+    signed = _signed_bootstrap(private_key, now)
+    release = GuestRelease(
+        release_id="release-equivocation",
+        tee_type="tdx",
+        channel="stable",
+        images={
+            "l0": {
+                "version": "1.10.0",
+                "squashfs_sha256": "4" * 64,
+                "bootstrap": signed.model_dump(mode="json", exclude_none=True),
+            }
+        },
+    )
+    existing = L0BootstrapPublication(
+        tee_type="tdx",
+        channel="stable",
+        generation=1,
+        manifest_digest="f" * 64,
+        key_id="release-1",
+        key_epoch=1,
+        l0_version="other",
+        squashfs_sha256="e" * 64,
+        signed_manifest=signed.model_dump(mode="json", exclude_none=True),
+        source_release_id="other-release",
+    )
+    result = Mock()
+    result.scalar_one_or_none.return_value = existing
+    db = AsyncMock()
+    db.get.return_value = existing
+    db.execute.return_value = result
+    with patch.object(
+        release_service.settings,
+        "trusted_l0_publisher_keys_path",
+        registry,
+    ):
+        with pytest.raises(release_service.ReleaseError, match="equivocation"):
+            await release_service._admit_l0_bootstrap(db, release)
+
+    newer = L0BootstrapPublication(
+        tee_type="tdx",
+        channel="stable",
+        generation=2,
+        manifest_digest="d" * 64,
+        key_id="release-2",
+        key_epoch=2,
+        l0_version="newer",
+        squashfs_sha256="c" * 64,
+        signed_manifest=signed.model_dump(mode="json", exclude_none=True),
+        source_release_id="newer-release",
+    )
+    matching_old = L0BootstrapPublication(
+        tee_type="tdx",
+        channel="stable",
+        generation=1,
+        manifest_digest=signed.manifest.digest(),
+        key_id="release-1",
+        key_epoch=1,
+        l0_version="1.10.0",
+        squashfs_sha256="4" * 64,
+        signed_manifest=signed.model_dump(mode="json", exclude_none=True),
+        source_release_id=release.release_id,
+    )
+    db = AsyncMock()
+    db.get.return_value = matching_old
+    result = Mock()
+    result.scalar_one_or_none.return_value = newer
+    db.execute.return_value = result
+    with patch.object(
+        release_service.settings,
+        "trusted_l0_publisher_keys_path",
+        registry,
+    ):
+        with pytest.raises(release_service.ReleaseError, match="cannot be reactivated"):
+            await release_service._admit_l0_bootstrap(db, release)
+
+    backward_signed = _signed_bootstrap(private_key, now, generation=3)
+    release.images = {
+        "l0": {
+            "version": "1.10.0",
+            "squashfs_sha256": "4" * 64,
+            "bootstrap": backward_signed.model_dump(mode="json", exclude_none=True),
+        }
+    }
+    db = AsyncMock()
+    db.get.return_value = None
+    result = Mock()
+    result.scalar_one_or_none.return_value = newer
+    db.execute.return_value = result
+    with patch.object(
+        release_service.settings,
+        "trusted_l0_publisher_keys_path",
+        registry,
+    ):
+        with pytest.raises(release_service.ReleaseError, match="epoch cannot move backwards"):
+            await release_service._admit_l0_bootstrap(db, release)
+
+
+def test_real_asgi_bootstrap_response_verifies_in_miner_cli(tmp_path, monkeypatch):
+    miner_cli_source = (
+        Path(__file__).resolve().parents[3] / "chutes-miner" / "src" / "chutes-miner-cli"
+    )
+    if not miner_cli_source.is_dir():
+        pytest.skip("sibling chutes-miner repository is required")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    registry_path = _publisher_registry(tmp_path, private_key, now)
+    signed = _signed_bootstrap(private_key, now)
+
+    app = FastAPI()
+    app.include_router(releases_router, prefix="/releases")
+    app.dependency_overrides[get_db_session] = lambda: object()
+    bootstrap_route = next(
+        route for route in app.routes if getattr(route, "path", None) == "/releases/l0-bootstrap"
+    )
+    for dependency in bootstrap_route.dependant.dependencies:
+        if dependency.call is not get_db_session:
+            app.dependency_overrides[dependency.call] = lambda: None
+
+    with (
+        patch.object(
+            release_service,
+            "active_l0_bootstrap",
+            AsyncMock(return_value=signed),
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.get(
+            "/releases/l0-bootstrap?tee_type=tdx&channel=stable",
+            headers={HOTKEY_HEADER: "owner"},
+        )
+    assert response.status_code == 200
+    assert "release_id" not in response.json()["manifest"]
+
+    monkeypatch.syspath_prepend(str(miner_cli_source))
+    miner_l0 = importlib.import_module("chutes_miner_cli.l0")
+    monkeypatch.setattr(
+        miner_l0,
+        "_publisher_registry",
+        lambda: json.loads(registry_path.read_text(encoding="utf-8")),
+    )
+    verified = miner_l0.verify_bootstrap(
+        response.json(),
+        tee_type="tdx",
+        channel="stable",
+        now=now,
+    )
+    assert verified["generation"] == 1
 
 
 def test_quote_commitment_binds_every_reservation_dimension():
@@ -277,11 +462,28 @@ def test_registry_session_enforces_repository_action_and_exact_manifest():
         ).repository
         == "owner/my--image__part"
     )
+    manifests = [f"sha256:{'a' * 64}", f"sha256:{'c' * 64}"]
+    blobs = [f"sha256:{'b' * 64}"]
+    tags = [f"sha256-{'a' * 64}.sig"]
     session = RegistrySession(
         repository="owner/image",
         actions=["pull"],
         manifest_digest=f"sha256:{'a' * 64}",
+        allowed_manifests=manifests,
+        allowed_blobs=blobs,
+        allowed_manifest_tags=tags,
+        descriptor_closure_sha256=canonical_sha256(
+            {
+                "schema": "chutes.oci-descriptor-closure",
+                "version": 1,
+                "root_manifest": f"sha256:{'a' * 64}",
+                "manifests": manifests,
+                "blobs": blobs,
+                "manifest_tags": tags,
+            }
+        ),
     )
+    assert _registry_request_matches(session, "GET", "/v2/")
     assert _registry_request_matches(
         session,
         "GET",

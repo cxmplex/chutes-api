@@ -37,8 +37,11 @@ from api.host.schemas import (
     HostEnrollmentRedemptionV1,
     HostEnrollmentResponseV1,
     HostEnrollmentVoucher,
+    HostIdentityDurabilityAckV1,
     HostKeyGeneration,
     HostPcsMailbox,
+    HostProvisioningHeartbeatV1,
+    HostProvisioningStatusV1,
     HostSigningEnvelopeV1,
     HostSocketAuthenticationV1,
     HostSocketChallengeV1,
@@ -381,8 +384,13 @@ async def redeem_enrollment_voucher(
     host.release_channel = voucher.channel
     host.enrollment_generation = voucher.enrollment_generation
     host.active_key_generation = next_key_generation
-    host.provisioning_state = "awaiting_pcs" if voucher.tee_type == "tdx" else "ready"
+    host.provisioning_state = "persisting_identity"
     host.enrolled_at = now
+    host.identity_durable_at = None
+    host.identity_metadata_sha256 = None
+    host.steady_config_sha256 = None
+    host.provisioning_heartbeat_at = None
+    host.provisioning_status = None
     voucher.consumed_at = now
     voucher.consumed_key_generation = next_key_generation
     challenge.consumed_at = now
@@ -432,6 +440,74 @@ async def redeem_enrollment_voucher(
     )
 
 
+def _provisioning_status(host: Host, accepted_at: datetime) -> HostProvisioningStatusV1:
+    return HostProvisioningStatusV1(
+        host_id=host.host_id,
+        enrollment_generation=host.enrollment_generation,
+        key_generation=host.active_key_generation,
+        provisioning_state=host.provisioning_state,
+        accepted_at=accepted_at,
+    )
+
+
+async def acknowledge_identity_durability(
+    db: AsyncSession,
+    host: Host,
+    acknowledgement: HostIdentityDurabilityAckV1,
+) -> HostProvisioningStatusV1:
+    """Advance only after the active identity and steady config are durably persisted."""
+
+    now = _utcnow()
+    if (
+        host.enrollment_generation != acknowledgement.enrollment_generation
+        or host.active_key_generation != acknowledgement.key_generation
+        or host.provisioning_state not in {"persisting_identity", "awaiting_pcs", "ready"}
+    ):
+        raise HostAuthError("Identity durability acknowledgement is stale or ineligible.")
+    if host.identity_durable_at is not None:
+        if (
+            host.identity_metadata_sha256 != acknowledgement.identity_metadata_sha256
+            or host.steady_config_sha256 != acknowledgement.steady_config_sha256
+        ):
+            raise HostAuthError(
+                "Identity durability acknowledgement conflicts with the persisted audit."
+            )
+        return _provisioning_status(host, now)
+    host.identity_durable_at = now
+    host.identity_metadata_sha256 = acknowledgement.identity_metadata_sha256
+    host.steady_config_sha256 = acknowledgement.steady_config_sha256
+    if host.provisioning_state == "persisting_identity":
+        host.provisioning_state = "awaiting_pcs" if host.tee_type == "tdx" else "ready"
+    await db.commit()
+    return _provisioning_status(host, now)
+
+
+async def record_provisioning_heartbeat(
+    db: AsyncSession,
+    host: Host,
+    heartbeat: HostProvisioningHeartbeatV1,
+) -> HostProvisioningStatusV1:
+    """Record visibility while launch/control surfaces remain disabled."""
+
+    now = _utcnow()
+    observed_at = heartbeat.observed_at
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    if (
+        host.provisioning_state not in {"persisting_identity", "awaiting_pcs"}
+        or heartbeat.provisioning_state != host.provisioning_state
+        or heartbeat.enrollment_generation != host.enrollment_generation
+        or heartbeat.key_generation != host.active_key_generation
+        or abs((now - observed_at).total_seconds()) > HOST_SIGNATURE_MAX_SKEW_SECONDS
+        or (host.provisioning_state == "awaiting_pcs" and host.identity_durable_at is None)
+    ):
+        raise HostAuthError("Provisioning heartbeat is stale or does not match host state.")
+    host.provisioning_heartbeat_at = now
+    host.provisioning_status = heartbeat.model_dump(mode="json")
+    await db.commit()
+    return _provisioning_status(host, now)
+
+
 async def create_host_auth_challenge(
     db: AsyncSession, host_id: str, key_generation: int
 ) -> HostAuthChallengeV1:
@@ -477,6 +553,7 @@ async def create_host_socket_challenge(
         host is None
         or key is None
         or host.provisioning_state != "ready"
+        or host.identity_durable_at is None
         or host.active_key_generation != key_generation
         or key.revoked_at is not None
     ):
@@ -550,6 +627,7 @@ async def verify_host_socket_authentication(
         host is None
         or key is None
         or host.provisioning_state != "ready"
+        or host.identity_durable_at is None
         or host.active_key_generation != authentication.key_generation
         or key.revoked_at is not None
     ):
@@ -679,6 +757,36 @@ async def get_current_host(
     return host
 
 
+async def get_ready_host(
+    current_host: Host = Depends(get_current_host),
+) -> Host:
+    """Require the enrolled host to have completed every durability gate."""
+
+    if current_host.provisioning_state != "ready" or current_host.identity_durable_at is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Logical host provisioning is not launch-ready.",
+        )
+    return current_host
+
+
+def _pcs_window_is_valid(
+    issued_at: datetime,
+    expires_at: datetime,
+    now: datetime,
+) -> bool:
+    if issued_at.tzinfo is None:
+        issued_at = issued_at.replace(tzinfo=timezone.utc)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return bool(
+        issued_at < expires_at
+        and issued_at <= now + timedelta(minutes=5)
+        and expires_at > now
+        and (expires_at - issued_at).total_seconds() <= PCS_MAILBOX_MAX_LIFETIME_SECONDS
+    )
+
+
 async def store_pcs_mailbox(
     db: AsyncSession,
     owner_hotkey: str,
@@ -703,9 +811,8 @@ async def store_pcs_mailbox(
         or key.x25519_fingerprint != aad.recipient_fingerprint
         or host.tee_type != "tdx"
         or host.provisioning_state != "awaiting_pcs"
-        or aad.issued_at > now + timedelta(minutes=5)
-        or aad.expires_at <= now
-        or (aad.expires_at - aad.issued_at).total_seconds() > PCS_MAILBOX_MAX_LIFETIME_SECONDS
+        or host.identity_durable_at is None
+        or not _pcs_window_is_valid(aad.issued_at, aad.expires_at, now)
     ):
         raise HostAuthError("PCS mailbox does not match the active enrolled TDX host.")
     try:
@@ -756,6 +863,8 @@ async def store_pcs_mailbox(
 
 
 async def consume_pcs_mailbox(db: AsyncSession, host: Host) -> PcsMailboxEnvelopeV1:
+    if host.provisioning_state != "awaiting_pcs" or host.identity_durable_at is None:
+        raise HostAuthError("PCS mailbox is unavailable before identity durability.")
     row = (
         await db.execute(
             select(HostPcsMailbox)
@@ -772,12 +881,22 @@ async def consume_pcs_mailbox(db: AsyncSession, host: Host) -> PcsMailboxEnvelop
     now = _utcnow()
     if row is None:
         raise HostAuthError("PCS mailbox is unavailable or expired.")
-    if row.expires_at <= now:
+    if not _pcs_window_is_valid(row.issued_at, row.expires_at, now):
         row.invalidated_at = now
         await db.commit()
         raise HostAuthError("PCS mailbox is unavailable or expired.")
     envelope = PcsMailboxEnvelopeV1.model_validate(row.envelope)
-    if row.envelope_sha256 != canonical_sha256(envelope):
+    if (
+        row.envelope_sha256 != canonical_sha256(envelope)
+        or envelope.aad.issued_at != row.issued_at
+        or envelope.aad.expires_at != row.expires_at
+        or envelope.aad.message_id != row.message_id
+        or not _pcs_window_is_valid(
+            envelope.aad.issued_at,
+            envelope.aad.expires_at,
+            now,
+        )
+    ):
         raise HostAuthError("PCS mailbox storage integrity check failed.")
     row.delivered_at = now
     await db.commit()
@@ -799,15 +918,32 @@ async def acknowledge_pcs_mailbox(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    now = _utcnow()
+    if (
+        row is not None
+        and row.invalidated_at is None
+        and row.delivered_at is not None
+        and row.consumed_at is not None
+        and row.envelope_sha256 == acknowledgement.envelope_sha256
+        and host.provisioning_state == "ready"
+        and host.identity_durable_at is not None
+    ):
+        return
     if (
         row is None
         or row.invalidated_at is not None
         or row.delivered_at is None
         or row.envelope_sha256 != acknowledgement.envelope_sha256
+        or host.provisioning_state != "awaiting_pcs"
+        or host.identity_durable_at is None
     ):
         raise HostAuthError("PCS mailbox acknowledgement does not match its delivery.")
+    if not _pcs_window_is_valid(row.issued_at, row.expires_at, now):
+        row.invalidated_at = now
+        await db.commit()
+        raise HostAuthError("PCS mailbox expired before durable acknowledgement.")
     if row.consumed_at is None:
-        row.consumed_at = _utcnow()
+        row.consumed_at = now
     host.provisioning_state = "ready"
     await db.commit()
 

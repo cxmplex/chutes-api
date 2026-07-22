@@ -59,6 +59,7 @@ async def _validate_agent_session(session_id: str) -> bool:
                 host is not None
                 and key is not None
                 and host.provisioning_state == "ready"
+                and host.identity_durable_at is not None
                 and host.active_key_generation == generation
                 and key.revoked_at is None
             )

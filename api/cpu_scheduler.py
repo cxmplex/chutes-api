@@ -664,6 +664,7 @@ async def _launch_on_host(
                 "server_id": server_id,
                 "launch_reservation": reservation_token,
                 "reservation_claims": reservation.claims,
+                "reservation_claims_sha256": reservation.claims_sha256,
             },
         )
         logger.success(
