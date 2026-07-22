@@ -969,6 +969,14 @@ class Settings(BaseSettings):
             "/etc/chutes/provenance/cosign.pub",
         )
     )
+    # Dedicated Ed25519 trust registry for publisher-authenticated L0 bootstrap manifests.
+    # This is intentionally separate from guest provenance and launch-config signing roots.
+    trusted_l0_publisher_keys_path: Path = Path(
+        os.getenv(
+            "TRUSTED_L0_PUBLISHER_KEYS_PATH",
+            "/etc/chutes/l0-publisher/keys.json",
+        )
+    )
     provenance_cosign_binary: str = os.getenv("PROVENANCE_COSIGN_BINARY", "cosign")
     release_attestation_max_age_seconds: int = int(
         os.getenv("RELEASE_ATTESTATION_MAX_AGE_SECONDS", "3600")

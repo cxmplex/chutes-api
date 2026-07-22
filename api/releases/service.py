@@ -6,14 +6,13 @@ provenance, exact image/pin identity, and complete CPU-only size matrices before
 change. Unsigned provenance exists only for explicit debug artifacts in explicit dev posture.
 """
 
-import hashlib
 import re
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
-import jwt
 from loguru import logger
-from sqlalchemy import func, select, text, update
+from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import (
@@ -22,6 +21,12 @@ from api.config import (
     settings,
 )
 from api.database import generate_uuid
+from api.host.schemas import HostKeyGeneration
+from api.host.schemas import TdLaunchReservation
+from api.releases.bootstrap import (
+    L0BootstrapVerificationError,
+    verify_signed_l0_manifest,
+)
 from api.releases.provenance import (
     REQUIRED_DIRECT_TDX_PROFILES,
     REQUIRED_RELEASE_VCPU_SIZES,
@@ -39,7 +44,7 @@ from api.releases.schemas import (
     CreateReleaseRequest,
     GuestRelease,
     GuestReleaseTarget,
-    GuestReleaseTargetTokenGeneration,
+    SignedL0BootstrapManifestV1,
     ReleaseImage,
     ReleaseL0,
     ReleaseManifest,
@@ -116,8 +121,10 @@ def _image_to_dict(img: Optional[ReleaseImage]) -> Optional[dict]:
 
 def _image_from_manifest(images: dict, key: str) -> Optional[ReleaseImage]:
     raw = (images or {}).get(key)
-    if not raw or raw.get("_inherited"):
+    if not raw:
         return None
+    raw = dict(raw)
+    raw.pop("_inherited", None)
     return ReleaseImage(
         url=raw["url"],
         sha256=raw["sha256"],
@@ -415,6 +422,11 @@ def _l0_to_dict(l0: Optional[ReleaseL0]) -> Optional[dict]:
         "version": l0.version,
         "squashfs_sha256": l0.squashfs_sha256,
         "netboot_base_url": l0.netboot_base_url,
+        "bootstrap": (
+            l0.bootstrap.model_dump(mode="json", exclude_none=True)
+            if l0.bootstrap is not None
+            else None
+        ),
     }
 
 
@@ -426,7 +438,66 @@ def _l0_from_manifest(images: dict) -> Optional[ReleaseL0]:
         version=raw["version"],
         squashfs_sha256=raw.get("squashfs_sha256"),
         netboot_base_url=raw.get("netboot_base_url"),
+        bootstrap=raw.get("bootstrap"),
     )
+
+
+async def _validate_l0_bootstrap(db: AsyncSession, release: GuestRelease) -> None:
+    """Verify and audit the exact publisher-signed L0 contract before activation."""
+
+    raw = (release.images or {}).get("l0")
+    if raw is None:
+        raise ReleaseError(
+            "A seedless Model-B release must carry a publisher-signed L0 bootstrap manifest."
+        )
+    try:
+        signed = SignedL0BootstrapManifestV1.model_validate(raw.get("bootstrap"))
+        digest = verify_signed_l0_manifest(signed, settings.trusted_l0_publisher_keys_path)
+    except (L0BootstrapVerificationError, ValueError, TypeError) as exc:
+        raise ReleaseError(f"Refusing to activate untrusted L0 bootstrap manifest: {exc}") from exc
+
+    manifest = signed.manifest
+    if manifest.tee_type != release.tee_type or manifest.channel != release.channel:
+        raise ReleaseError("L0 bootstrap manifest TEE/channel does not match the guest release.")
+    if manifest.release_id is not None and manifest.release_id != release.release_id:
+        raise ReleaseError("L0 bootstrap manifest release correlation does not match this release.")
+    if raw.get("version") != manifest.l0_version:
+        raise ReleaseError("L0 version does not match the signed bootstrap manifest.")
+    if raw.get("squashfs_sha256") != manifest.squashfs.sha256:
+        raise ReleaseError(
+            "Required L0 squashfs digest does not match the signed bootstrap manifest."
+        )
+
+    latest_generation = (
+        await db.execute(
+            select(func.max(GuestRelease.l0_manifest_generation)).where(
+                GuestRelease.tee_type == release.tee_type,
+                GuestRelease.channel == release.channel,
+                GuestRelease.release_id != release.release_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if latest_generation is not None and manifest.generation <= int(latest_generation):
+        raise ReleaseError(
+            "L0 bootstrap generation is stale; generations must increase monotonically."
+        )
+    latest_key_epoch = (
+        await db.execute(
+            select(func.max(GuestRelease.l0_manifest_key_epoch)).where(
+                GuestRelease.tee_type == release.tee_type,
+                GuestRelease.channel == release.channel,
+                GuestRelease.release_id != release.release_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if latest_key_epoch is not None and manifest.key_epoch < int(latest_key_epoch):
+        raise ReleaseError("L0 publisher key epoch cannot move backwards.")
+
+    release.l0_manifest = manifest.model_dump(mode="json", exclude_none=True)
+    release.l0_manifest_digest = digest
+    release.l0_manifest_generation = manifest.generation
+    release.l0_manifest_key_id = manifest.key_id
+    release.l0_manifest_key_epoch = manifest.key_epoch
 
 
 async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRelease:
@@ -482,6 +553,7 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     original_images = release.images
     release.images = _merged_release_images(release, current_active)
     try:
+        await _validate_l0_bootstrap(db, release)
         if release.tee_type == "tdx" and not (release.images or {}).get("chute"):
             raise ReleaseError(
                 "A managed TDX desired state must include a schema-v2 direct-boot chute image; "
@@ -552,10 +624,55 @@ async def get_active_release(
     return (await db.execute(query)).scalar_one_or_none()
 
 
-def release_manifest(
-    release: GuestRelease, target_tokens: Optional[Dict[str, str]] = None
-) -> ReleaseManifest:
-    """The host-facing manifest plus tokens scoped to one enrolled logical target."""
+async def active_l0_bootstrap(
+    db: AsyncSession,
+    tee_type: str,
+    channel: str,
+) -> Optional[SignedL0BootstrapManifestV1]:
+    """Return the newest verified bootstrap, including a pre-activation draft.
+
+    Miner tooling must be able to enroll the initial ready host set before guest-release activation
+    captures immutable rollout targets.
+    """
+
+    releases = (
+        (
+            await db.execute(
+                select(GuestRelease).where(
+                    GuestRelease.tee_type == tee_type.strip().lower(),
+                    GuestRelease.channel == channel,
+                    GuestRelease.status.in_([RELEASE_STATUS_ACTIVE, RELEASE_STATUS_DRAFT]),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    candidates: list[tuple[int, GuestRelease, SignedL0BootstrapManifestV1]] = []
+    for release in releases:
+        raw = ((release.images or {}).get("l0") or {}).get("bootstrap")
+        if raw is None:
+            continue
+        await _validate_l0_bootstrap(db, release)
+        signed = SignedL0BootstrapManifestV1.model_validate(raw)
+        candidates.append((signed.manifest.generation, release, signed))
+    if not candidates:
+        return None
+    _generation, _release, signed = max(
+        candidates,
+        key=lambda item: (item[0], item[1].created_at or datetime.min.replace(tzinfo=timezone.utc)),
+    )
+    if signed.manifest.tee_type != tee_type.strip().lower() or signed.manifest.channel != channel:
+        raise ReleaseError("Draft L0 bootstrap targets another release slot.")
+    verify_signed_l0_manifest(
+        signed,
+        settings.trusted_l0_publisher_keys_path,
+    )
+    return signed
+
+
+def release_manifest(release: GuestRelease) -> ReleaseManifest:
+    """The host-facing desired state; TD launch authorization is separate and one-use."""
     return ReleaseManifest(
         release_id=release.release_id,
         channel=release.channel,
@@ -563,7 +680,6 @@ def release_manifest(
         chute=_image_from_manifest(release.images, "chute"),
         storage=_image_from_manifest(release.images, "storage"),
         l0=_l0_from_manifest(release.images),
-        target_tokens=target_tokens or {},
     )
 
 
@@ -618,21 +734,29 @@ async def _capture_release_targets(
 
     query = (
         select(Host)
+        .join(
+            HostKeyGeneration,
+            and_(
+                HostKeyGeneration.host_id == Host.host_id,
+                HostKeyGeneration.generation == Host.active_key_generation,
+                HostKeyGeneration.revoked_at.is_(None),
+            ),
+        )
         .where(
             Host.tee_type == release.tee_type,
             Host.release_channel == release.channel,
+            Host.provisioning_state == "ready",
+            Host.active_key_generation.is_not(None),
         )
         .with_for_update()
     )
     hosts = (await db.execute(query)).scalars().all()
     captured_at = datetime.now(timezone.utc)
     targets = []
-    token_generations = []
     for host in hosts:
         _apply_storage_auto_opt_in(release, host)
         for role in _target_roles_for_host(release, host):
             target_id = generate_uuid()
-            token_id = generate_uuid()
             targets.append(
                 GuestReleaseTarget(
                     target_id=target_id,
@@ -642,142 +766,28 @@ async def _capture_release_targets(
                     tee_type=release.tee_type,
                     role=role,
                     current_generation=1,
-                    current_token_id=token_id,
+                    current_token_id=f"audit:{target_id}",
                     issued_at=captured_at,
                 )
             )
-            token_generations.append(
-                GuestReleaseTargetTokenGeneration(
-                    target_id=target_id,
-                    generation=1,
-                    token_id=token_id,
-                    issued_at=captured_at,
-                )
-            )
+    explicit_roles = {
+        role
+        for role in ("chute", "storage")
+        if isinstance((release.images or {}).get(role), dict)
+        and not (release.images or {})[role].get("_inherited")
+    }
+    captured_roles = {target.role for target in targets}
+    missing_roles = sorted(explicit_roles - captured_roles)
+    seedless_l0 = bool((((release.images or {}).get("l0") or {}).get("bootstrap")))
+    if missing_roles and seedless_l0:
+        raise ReleaseError(
+            "Refusing activation without an eligible ready logical-host target for roles: "
+            f"{missing_roles}."
+        )
     db.add_all(targets)
-    db.add_all(token_generations)
     release.targets_captured_at = captured_at
     await db.flush()
     return targets
-
-
-def _encode_release_target_token(target: GuestReleaseTarget) -> str:
-    """Mint the signed token for a target's current one-use generation."""
-    issued_at = target.issued_at or datetime.now(timezone.utc)
-    return jwt.encode(
-        {
-            "iss": "chutes",
-            "iat": int(issued_at.timestamp()),
-            "purpose": "guest_release_target",
-            "jti": target.current_token_id,
-            "target_id": target.target_id,
-            "generation": int(target.current_generation),
-            "release_id": target.release_id,
-            "logical_host_id": target.host_id,
-            "miner_hotkey": target.miner_hotkey,
-            "tee_type": target.tee_type,
-            "role": target.role,
-        },
-        settings.launch_config_key,
-        algorithm="HS256",
-    )
-
-
-def _decode_release_target_token(token: str) -> dict:
-    try:
-        payload = jwt.decode(
-            token,
-            settings.launch_config_key,
-            algorithms=["HS256"],
-            issuer="chutes",
-            options={
-                "verify_signature": True,
-                "verify_exp": False,
-                "verify_iat": True,
-                "verify_iss": True,
-                "require": [
-                    "iss",
-                    "iat",
-                    "purpose",
-                    "jti",
-                    "target_id",
-                    "generation",
-                    "release_id",
-                    "logical_host_id",
-                    "miner_hotkey",
-                    "tee_type",
-                    "role",
-                ],
-            },
-        )
-    except jwt.PyJWTError as exc:
-        raise ReleaseError("Invalid guest release target token.") from exc
-    if payload.get("purpose") != "guest_release_target":
-        raise ReleaseError("Invalid guest release target token purpose.")
-    return payload
-
-
-async def _current_release_target_token_generation(
-    db: AsyncSession,
-    target: GuestReleaseTarget,
-    *,
-    lock: bool,
-) -> GuestReleaseTargetTokenGeneration:
-    query = select(GuestReleaseTargetTokenGeneration).where(
-        GuestReleaseTargetTokenGeneration.target_id == target.target_id,
-        GuestReleaseTargetTokenGeneration.generation == target.current_generation,
-    )
-    if lock:
-        query = query.with_for_update()
-    token_generation = (await db.execute(query)).scalar_one_or_none()
-    if token_generation is None:
-        raise ReleaseError(
-            f"Logical release target {target.target_id} has no current token generation."
-        )
-    if token_generation.token_id != target.current_token_id:
-        raise ReleaseError(
-            f"Logical release target {target.target_id} has inconsistent token state."
-        )
-    return token_generation
-
-
-def _rotate_release_target_token(
-    target: GuestReleaseTarget,
-    current: GuestReleaseTargetTokenGeneration,
-) -> GuestReleaseTargetTokenGeneration:
-    """Invalidate the current generation and create a fresh monotonic one-use capability."""
-    now = datetime.now(timezone.utc)
-    current.invalidated_at = now
-    target.current_generation = int(target.current_generation) + 1
-    target.current_token_id = generate_uuid()
-    target.issued_at = now
-    target.consumed_at = None
-    target.consumed_server_id = None
-    target.consumed_attestation_id = None
-    target.consumed_cert_pubkey_hash = None
-    target.consumed_measurement_name = None
-    target.consumed_measurement_version = None
-    target.consumed_measurement_config_fingerprint = None
-    target.consumed_trust_set_fingerprint = None
-    return GuestReleaseTargetTokenGeneration(
-        target_id=target.target_id,
-        generation=target.current_generation,
-        token_id=target.current_token_id,
-        issued_at=now,
-    )
-
-
-def release_bound_attestation_nonce(nonce: str, target_token: Optional[str]) -> str:
-    """Bind the signed logical-target capability into hardware report_data."""
-    if not target_token:
-        return nonce
-    try:
-        nonce_bytes = bytes.fromhex(nonce)
-    except ValueError as exc:
-        raise ReleaseError("Invalid CPU registration nonce.") from exc
-    return hashlib.sha256(
-        nonce_bytes + hashlib.sha256(target_token.encode("utf-8")).digest()
-    ).hexdigest()
 
 
 async def _manifest_for_logical_host(
@@ -787,181 +797,56 @@ async def _manifest_for_logical_host(
     *,
     reissue_roles: Optional[set[str]] = None,
 ) -> ReleaseManifest:
-    """Build one launcher's manifest and optionally rotate explicit role-token generations.
+    """Build desired state only; launch authorization is a separate reservation."""
 
-    A normal desired-state fetch never reissues a consumed token. Reissue is an explicit
-    miner-authenticated operation used immediately before replacing a logical role representative.
-    It still proves no physical placement because any same-miner L0 can claim ``host.host_id``.
-    """
-    requested_reissues = set(reissue_roles or set())
-    targets = (
-        (
-            await db.execute(
-                select(GuestReleaseTarget)
-                .where(
-                    GuestReleaseTarget.release_id == release.release_id,
-                    GuestReleaseTarget.host_id == host.host_id,
-                    GuestReleaseTarget.miner_hotkey == host.miner_hotkey,
-                )
-                .order_by(GuestReleaseTarget.role, GuestReleaseTarget.target_id)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .all()
-    )
-    available_roles = {target.role for target in targets}
-    missing_roles = requested_reissues - available_roles
-    if missing_roles:
+    if reissue_roles:
         raise ReleaseError(
-            f"Logical rollout host {host.host_id} has no captured targets for roles "
-            f"{sorted(missing_roles)} in release {release.release_id}."
+            "Guest release target reissue was removed; request an exact launch reservation."
         )
-
-    tokens = {}
-    for target in targets:
-        token_generation = await _current_release_target_token_generation(db, target, lock=True)
-        if target.role in requested_reissues:
-            token_generation = _rotate_release_target_token(target, token_generation)
-            db.add(token_generation)
-            await db.flush()
-        if token_generation.invalidated_at is None and token_generation.consumed_at is None:
-            tokens[target.role] = _encode_release_target_token(target)
-    return release_manifest(release, tokens)
-
-
-async def resolve_release_target_token(
-    db: AsyncSession,
-    token: str,
-    *,
-    host_id: Optional[str],
-    miner_hotkey: str,
-    tee_type: str,
-) -> tuple[
-    GuestReleaseTarget,
-    GuestReleaseTargetTokenGeneration,
-    GuestRelease,
-]:
-    """Validate and lock one token row before registration mutates server identity."""
-    payload = _decode_release_target_token(token)
-    release = (
-        await db.execute(
-            select(GuestRelease)
-            .where(GuestRelease.release_id == payload["release_id"])
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if release is None:
-        raise ReleaseError("Guest release target token references an unknown release.")
-    target = (
-        await db.execute(
-            select(GuestReleaseTarget)
-            .where(GuestReleaseTarget.target_id == payload["target_id"])
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if target is None:
-        raise ReleaseError("Guest release target token is unknown.")
-    expected_claims = {
-        "jti": target.current_token_id,
-        "target_id": target.target_id,
-        "generation": int(target.current_generation),
-        "iat": int(target.issued_at.timestamp()),
-        "release_id": target.release_id,
-        "logical_host_id": target.host_id,
-        "miner_hotkey": target.miner_hotkey,
-        "tee_type": target.tee_type,
-        "role": target.role,
-    }
-    if any(payload.get(key) != value for key, value in expected_claims.items()):
-        raise ReleaseError(
-            "Guest release target token is stale or does not match its durable target generation."
-        )
-    if (
-        host_id != target.host_id
-        or miner_hotkey != target.miner_hotkey
-        or tee_type != target.tee_type
-    ):
-        raise ReleaseError(
-            "Guest release target token does not match this enrolled logical launcher."
-        )
-    token_generation = await _current_release_target_token_generation(db, target, lock=True)
-    if token_generation.invalidated_at is not None:
-        raise ReleaseError("Guest release target token generation has been invalidated.")
-    if token_generation.consumed_at is not None:
-        raise ReleaseError("Guest release target token generation has already been consumed.")
-    return target, token_generation, release
-
-
-def validate_release_target_attestation(
-    target: GuestReleaseTarget,
-    release: GuestRelease,
-    *,
-    storage_role: bool,
-    measurement_name: str,
-    tee_type: str,
-) -> None:
-    """Require the token's exact active release, role, TEE, and measurement identity."""
-    attested_role = "storage" if storage_role else "chute"
-    image = (release.images or {}).get(target.role) or {}
-    if release.status != RELEASE_STATUS_ACTIVE:
-        raise ReleaseError("Guest release target token references a release that is not active.")
-    if target.role != attested_role:
-        raise ReleaseError(
-            f"Guest release target token role {target.role} does not match attested role "
-            f"{attested_role}."
-        )
-    if target.tee_type != tee_type or release.tee_type != tee_type:
-        raise ReleaseError(
-            "Guest release target token TEE does not match the attested release identity."
-        )
-    if measurement_name not in (image.get("measurement_names") or []):
-        raise ReleaseError(
-            "Guest release target token measurement does not match its exact release role."
-        )
-
-
-def consume_release_target(
-    target: GuestReleaseTarget,
-    token_generation: GuestReleaseTargetTokenGeneration,
-    *,
-    server: Server,
-    attestation: ServerAttestation,
-    cert_pubkey_hash: str,
-) -> None:
-    """Atomically bind the current one-use generation to this fresh exact registration."""
-    if (
-        token_generation.target_id != target.target_id
-        or token_generation.generation != target.current_generation
-        or token_generation.token_id != target.current_token_id
-        or token_generation.invalidated_at is not None
-    ):
-        raise ReleaseError("Guest release target token generation is no longer current.")
-    if target.consumed_at is not None or token_generation.consumed_at is not None:
-        raise ReleaseError("Guest release target token generation has already been consumed.")
-    consumed_at = datetime.now(timezone.utc)
-    target.consumed_at = consumed_at
-    target.consumed_server_id = server.server_id
-    target.consumed_attestation_id = attestation.attestation_id
-    target.consumed_cert_pubkey_hash = cert_pubkey_hash.lower()
-    target.consumed_measurement_name = attestation.measurement_name
-    target.consumed_measurement_version = attestation.measurement_version
-    target.consumed_measurement_config_fingerprint = attestation.measurement_config_fingerprint
-    target.consumed_trust_set_fingerprint = attestation.trust_set_fingerprint
-    token_generation.consumed_at = consumed_at
-    token_generation.consumed_server_id = server.server_id
-    token_generation.consumed_attestation_id = attestation.attestation_id
-    token_generation.consumed_cert_pubkey_hash = cert_pubkey_hash.lower()
-    token_generation.consumed_measurement_name = attestation.measurement_name
-    token_generation.consumed_measurement_version = attestation.measurement_version
-    token_generation.consumed_measurement_config_fingerprint = (
-        attestation.measurement_config_fingerprint
-    )
-    token_generation.consumed_trust_set_fingerprint = attestation.trust_set_fingerprint
+    return release_manifest(release)
 
 
 def _validate_active_release(release: GuestRelease) -> None:
     """Revalidate desired state against the current trust set before serving or dispatching it."""
+    raw_l0 = (release.images or {}).get("l0")
+    if raw_l0 is not None:
+        try:
+            signed_l0 = SignedL0BootstrapManifestV1.model_validate(raw_l0.get("bootstrap"))
+            l0_digest = verify_signed_l0_manifest(
+                signed_l0,
+                settings.trusted_l0_publisher_keys_path,
+                allow_expired=True,
+            )
+        except (L0BootstrapVerificationError, ValueError, TypeError) as exc:
+            raise ReleaseError(
+                f"Active release {release.release_id} has an untrusted L0 manifest: {exc}"
+            ) from exc
+        l0_manifest = signed_l0.manifest
+        if (
+            l0_manifest.tee_type != release.tee_type
+            or l0_manifest.channel != release.channel
+            or (l0_manifest.release_id is not None and l0_manifest.release_id != release.release_id)
+            or raw_l0.get("version") != l0_manifest.l0_version
+            or raw_l0.get("squashfs_sha256") != l0_manifest.squashfs.sha256
+            or release.l0_manifest_digest != l0_digest
+            or release.l0_manifest_generation != l0_manifest.generation
+            or release.l0_manifest_key_id != l0_manifest.key_id
+            or release.l0_manifest_key_epoch != l0_manifest.key_epoch
+        ):
+            raise ReleaseError(
+                f"Active release {release.release_id} L0 audit fields do not match its signed manifest."
+            )
+    elif any(
+        value is not None
+        for value in (
+            release.l0_manifest,
+            release.l0_manifest_digest,
+            release.l0_manifest_generation,
+            release.l0_manifest_key_id,
+            release.l0_manifest_key_epoch,
+        )
+    ):
+        raise ReleaseError(f"Active release {release.release_id} has partial L0 audit state.")
     loaded_by_name = _loaded_measurements_by_name()
     images = release.images or {}
     if not any(images.get(role) for role in ("chute", "storage")):
@@ -1165,6 +1050,29 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         .scalars()
         .all()
     )
+    reservations = (
+        (
+            await db.execute(
+                select(TdLaunchReservation)
+                .where(
+                    TdLaunchReservation.release_id == release.release_id,
+                    TdLaunchReservation.consumed_at.is_not(None),
+                    TdLaunchReservation.invalidated_at.is_(None),
+                )
+                .order_by(
+                    TdLaunchReservation.host_id,
+                    TdLaunchReservation.role,
+                    TdLaunchReservation.boot_generation,
+                    TdLaunchReservation.issued_at,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    reservation_by_target = {
+        (reservation.host_id, reservation.role): reservation for reservation in reservations
+    }
 
     cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=settings.release_attestation_max_age_seconds
@@ -1330,14 +1238,26 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         if target.role not in logical_target_counts:
             continue
         logical_target_counts[target.role] += 1
-        latest_row = latest_by_server.get(target.consumed_server_id or "")
+        reservation = reservation_by_target.get((target.host_id, target.role))
+        if reservation is None and target.consumed_at is not None:
+            historical_config = loaded_by_name.get(target.consumed_measurement_name)
+            reservation = SimpleNamespace(
+                server_id=target.consumed_server_id,
+                profile_id=target.consumed_measurement_name,
+                image_sha256=getattr(historical_config, "image_sha256", None),
+                boot_generation=int(target.current_generation),
+                consumed_at=target.consumed_at,
+                issued_at=target.issued_at,
+                consumed_cert_pubkey_hash=target.consumed_cert_pubkey_hash,
+            )
+        latest_row = latest_by_server.get(reservation.server_id if reservation is not None else "")
         fresh_exact = False
         running_image_sha256 = None
         running_image_version = None
         running_process_incarnation = None
         running_storage_incarnation = None
         fresh_role_health = False
-        latest_measurement_name = target.consumed_measurement_name
+        latest_measurement_name = None
         if latest_row is not None:
             (
                 server,
@@ -1349,7 +1269,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 verified_at,
             ) = latest_row
             latest_measurement_name = measurement_name
-            consumed_config = loaded_by_name.get(target.consumed_measurement_name)
+            consumed_config = loaded_by_name.get(measurement_name)
             if consumed_config is not None:
                 running_image_sha256 = getattr(consumed_config, "image_sha256", None)
                 running_image_version = ((release.images or {}).get(target.role) or {}).get(
@@ -1360,27 +1280,30 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 getattr(server, "storage_incarnation", None) if target.role == "storage" else None
             )
             consumed_identity_matches = bool(
-                target.consumed_measurement_name in names_by_role.get(target.role, [])
+                reservation is not None
+                and reservation.profile_id == measurement_name
+                and reservation.image_sha256
+                == ((release.images or {}).get(target.role) or {}).get("sha256")
+                and measurement_name in names_by_role.get(target.role, [])
                 and consumed_config is not None
-                and consumed_config.version == target.consumed_measurement_version
                 and (
                     getattr(consumed_config, "config_fingerprint", None)
                     or measurement_config_fingerprint(consumed_config)
                 )
-                == target.consumed_measurement_config_fingerprint
-                and target.consumed_trust_set_fingerprint == current_trust_set_fingerprint
+                == measurement_config_fingerprint_value
+                and trust_set_fingerprint == current_trust_set_fingerprint
                 and consumed_config.tee_type == release.tee_type
             )
             fresh_exact = bool(
-                target.consumed_at is not None
-                and target.issued_at is not None
-                and target.consumed_at >= target.issued_at
+                reservation is not None
+                and reservation.consumed_at is not None
+                and reservation.consumed_at >= reservation.issued_at
                 and verified_at is not None
-                and verified_at >= target.issued_at
+                and verified_at >= reservation.issued_at
                 and consumed_identity_matches
                 and server.miner_hotkey == target.miner_hotkey
                 and (server.attested_cert_pubkey_hash or "").lower()
-                == (target.consumed_cert_pubkey_hash or "").lower()
+                == (reservation.consumed_cert_pubkey_hash or "").lower()
                 and exact_release_identity(
                     server,
                     measurement_name,
@@ -1397,8 +1320,9 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                     and running_process_incarnation
                     and running_storage_incarnation
                     and announced_at is not None
-                    and target.consumed_at is not None
-                    and announced_at >= target.consumed_at
+                    and reservation is not None
+                    and reservation.consumed_at is not None
+                    and announced_at >= reservation.consumed_at
                 )
             else:
                 # A current exact self-registration row is the chute process incarnation. Host-slot
@@ -1441,8 +1365,14 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 "logical_host_id": target.host_id,
                 "role": target.role,
                 "logical_online": logical_online,
-                "token_generation": int(target.current_generation),
-                "token_consumed": target.consumed_at is not None,
+                "launch_boot_generation": (
+                    int(reservation.boot_generation)
+                    if reservation is not None
+                    else int(target.current_generation)
+                ),
+                "launch_reservation_consumed": (
+                    reservation is not None and reservation.consumed_at is not None
+                ),
                 "fresh_exact_attestation": fresh_exact,
                 "fresh_role_health": fresh_role_health,
                 "exact_staged_digest": exact_stage,
@@ -1451,9 +1381,9 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 "running_image_version": running_image_version,
                 "running_process_incarnation": running_process_incarnation,
                 "running_storage_incarnation": running_storage_incarnation,
-                "same_miner_token_transferable": True,
+                "host_credential_cloneable": True,
                 "physical_placement_trusted": False,
-                "server_id": target.consumed_server_id,
+                "server_id": reservation.server_id if reservation is not None else None,
                 "measurement_name": latest_measurement_name,
             }
         )
@@ -1512,7 +1442,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         "all_logical_targets_healthy": all_logical_targets_healthy,
         "logical_rollout_converged": logical_rollout_converged,
         "logical_rollout_telemetry_only": True,
-        "logical_target_tokens_same_miner_transferable": True,
+        "logical_host_credentials_cloneable": True,
         "physical_host_convergence_proven": False,
         # Model-B physical placement is outside the attested evidence. Automatic status must never
         # authorize pin removal; an operator must validate physical failure-domain convergence

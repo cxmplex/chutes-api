@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
-from api.constants import AUTHORIZATION_HEADER, HOTKEY_HEADER, NoncePurpose
+from api.constants import AUTHORIZATION_HEADER, NoncePurpose
 from api.database import get_db_session
 from api.server.exceptions import AttestationError
 from api.server.schemas import Server
@@ -148,35 +148,19 @@ async def require_storage_administrator(
     return current_user
 
 
-def _require_hotkey(hotkey: str | None) -> str:
-    if not hotkey:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing miner hotkey header.",
-        )
-    return hotkey
-
-
-# --- storage-TD ops (owning-miner signature) ---------------------------------------------------
+# --- storage-TD ops (current attested certificate) ----------------------------------------------
 
 
 @router.post("/announce", response_model=AnnounceModelHoldingsResponse)
 async def announce(
     body: AnnounceModelHoldingsRequest,
     db: AsyncSession = Depends(get_db_session),
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User | None = Depends(
-        # Accept v1+v2 (not require_v2): already-deployed storage TDs on the fleet sign v1 until they
-        # are re-imaged with the v2 tracker; a re-imaged TD's v2 announce binds method+path+body.
-        get_current_user(purpose="tee", registered_to=_REGISTERED_TO, raise_not_found=False)
-    ),
     caller: Server = Depends(require_fresh_storage_caller),
 ):
     """A storage TD reports the public model repos it holds + refreshes its free disk (heartbeat)."""
-    miner_hotkey = _require_hotkey(hotkey)
     result = await service.announce_model_holdings(
         db,
-        miner_hotkey,
+        caller.miner_hotkey,
         body.server_id,
         caller.server_id,
         body.snapshot_id,
@@ -193,18 +177,12 @@ async def announce(
 async def announce_replicas(
     body: ReplicaAnnounceRequest,
     db: AsyncSession = Depends(get_db_session),
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User | None = Depends(
-        # Accept v1+v2 (not require_v2): see announce -- deployed storage TDs sign v1 until re-imaged.
-        get_current_user(purpose="tee", registered_to=_REGISTERED_TO, raise_not_found=False)
-    ),
     caller: Server = Depends(require_fresh_storage_caller),
 ):
     """A storage TD reports object replicas it now holds (confirms a replication push)."""
-    miner_hotkey = _require_hotkey(hotkey)
     recorded = await service.announce_replicas(
         db,
-        miner_hotkey,
+        caller.miner_hotkey,
         body.server_id,
         caller.server_id,
         body.storage_incarnation,
@@ -829,7 +807,7 @@ async def release_volume_key(
     volume_id: str,
     body: VolumeKeyRequest,
     db: AsyncSession = Depends(get_db_session),
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    caller: Server = Depends(require_fresh_storage_caller),
     expected_cert_hash: str = Depends(extract_client_cert_hash()),
     validated_nonce: str = Depends(validate_request_nonce(NoncePurpose.STORAGE_KEY)),
 ):
@@ -839,12 +817,16 @@ async def release_volume_key(
     anchors: an operator holding only the miner hotkey can neither complete the handshake nor pass the
     quote. The key never leaves an attested TD whose measurement matches the pinned storage-TD config.
     """
-    miner_hotkey = _require_hotkey(hotkey)
+    if body.server_id != caller.server_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Storage key request names another server.",
+        )
     try:
         key = await service.release_volume_key(
             db,
             volume_id,
-            miner_hotkey,
+            caller.miner_hotkey,
             body.server_id,
             body.quote,
             body.tee_type,

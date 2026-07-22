@@ -18,8 +18,17 @@ import pytest
 
 import api.agent_channel as ac
 import api.socket_server as ss
-from api.constants import ATTEST_SIGNATURE_HEADER, AGENT_COMMAND_CHANNEL, SERVER_ID_HEADER
-from tests.unit.test_cpu_scheduler import FakeRedis, FakeResult, FakeSession, _session_ctx
+from api.constants import (
+    ATTEST_SIGNATURE_HEADER,
+    AGENT_COMMAND_CHANNEL,
+    SERVER_ID_HEADER,
+)
+from tests.unit.test_cpu_scheduler import (
+    FakeRedis,
+    FakeResult,
+    FakeSession,
+    _session_ctx,
+)
 
 NOW = datetime.now(timezone.utc)
 OLD = NOW - timedelta(seconds=ac.SERVER_REAP_GRACE_SECONDS + 60)
@@ -93,7 +102,8 @@ class TestHandleAgentCommandAck:
         session = FakeSession({"text:update_launch_configs": FakeResult(rowcount=1)})
         with patch("api.database.get_session", _session_ctx(session)):
             await ac.handle_agent_command_ack(
-                "srv-1", {"command_id": "cmd-1", "status": "error", "detail": "pull failed"}
+                "srv-1",
+                {"command_id": "cmd-1", "status": "error", "detail": "pull failed"},
             )
         key, params = session.executed[0]
         assert key == "text:update_launch_configs"
@@ -150,7 +160,11 @@ class TestHandleAgentCommandAck:
 
 
 def _server_row(
-    server_id="srv-1", host_id=None, self_registered=True, created_at=OLD, attested_cert=None
+    server_id="srv-1",
+    host_id=None,
+    self_registered=True,
+    created_at=OLD,
+    attested_cert=None,
 ):
     return SimpleNamespace(
         server_id=server_id,
@@ -221,7 +235,11 @@ class TestSendInstanceTeardown:
         assert result == "cmd-1"
         target, command, payload = send.await_args.args
         assert (target, command) == ("srv-1", "stop_instance")
-        assert payload == {"chute_id": "chute-1", "instance_id": "inst-1", "config_id": "cfg-1"}
+        assert payload == {
+            "chute_id": "chute-1",
+            "instance_id": "inst-1",
+            "config_id": "cfg-1",
+        }
 
     @pytest.mark.asyncio
     async def test_model_b_delete_chute_to_host(self, mock_settings):
@@ -229,7 +247,11 @@ class TestSendInstanceTeardown:
         assert result == "cmd-1"
         target, command, payload = send.await_args.args
         assert (target, command) == ("host-9", "delete_chute")
-        assert payload == {"chute_id": "chute-1", "instance_id": "inst-1", "server_id": "srv-1"}
+        assert payload == {
+            "chute_id": "chute-1",
+            "instance_id": "inst-1",
+            "server_id": "srv-1",
+        }
 
     @pytest.mark.asyncio
     async def test_gpu_server_not_dispatched(self, mock_settings):
@@ -252,7 +274,9 @@ class TestSendInstanceTeardown:
         with (
             patch("api.database.get_session", _session_ctx(session)),
             patch.object(
-                ac, "send_agent_command", AsyncMock(side_effect=RuntimeError("redis down"))
+                ac,
+                "send_agent_command",
+                AsyncMock(side_effect=RuntimeError("redis down")),
             ),
         ):
             assert await ac.send_instance_teardown("chute-1", server_id="srv-1") is None
@@ -414,6 +438,7 @@ class TestReconcileHostSlots:
             ),
             "text:update_launch_configs": FakeResult(rowcount=0),
             "text:delete_servers": FakeResult(rowcount=1),
+            "TdLaunchReservation.reservation_id": FakeResult(items=[]),
         }
         if slot_server_exists is not None:
             handlers["Server.server_id"] = FakeResult(
@@ -485,8 +510,8 @@ class TestReconcileHostSlots:
 
     @pytest.mark.asyncio
     async def test_unregistered_td_with_inflight_marker_kept(self, mock_settings, fake_redis):
-        fake_redis.store["mb:launch:chute-1:host-1"] = "host-1"
         handlers = self._handlers([], slot_server_exists=False, slot_chute_exists="chute-1")
+        handlers["TdLaunchReservation.reservation_id"] = FakeResult(items=["reservation-1"])
         _, _, send = await self._run(handlers, [{"server_id": "td-boot", "chute_id": "chute-1"}])
         send.assert_not_awaited()
 
@@ -605,16 +630,16 @@ class TestAgentAuthenticate:
         assert ss.sio.agent_sessions == {}
 
     @pytest.mark.asyncio
-    async def test_model_b_host_fallback(self, clean_sio, pass_auth):
-        """An L0 host (not a Server row) authenticates with its host_id."""
+    async def test_model_b_host_cannot_fallback_to_miner_hotkey(self, clean_sio, pass_auth):
+        """L0 hosts must use the dedicated server-challenge host-key flow."""
         host = SimpleNamespace(host_id="srv-1", miner_hotkey="hk-miner")
         session = _auth_session(server=None, host=host)
         with (
             patch.object(ss, "get_session", _session_ctx(session)),
             patch.object(ss, "mark_agent_online", AsyncMock()),
         ):
-            assert await ss.agent_authenticate("sess-1", dict(AGENT_HEADERS)) is True
-        assert ss.sio.agent_sessions == {"srv-1": "sess-1"}
+            assert await ss.agent_authenticate("sess-1", dict(AGENT_HEADERS)) is False
+        assert ss.sio.agent_sessions == {}
 
     @pytest.mark.asyncio
     async def test_missing_server_id_header_rejected(self, clean_sio, pass_auth):
@@ -642,7 +667,8 @@ class TestAgentAuthenticate:
         factory = MagicMock(
             return_value=AsyncMock(
                 side_effect=HTTPException(
-                    status_code=http_status.HTTP_401_UNAUTHORIZED, detail="bad signature"
+                    status_code=http_status.HTTP_401_UNAUTHORIZED,
+                    detail="bad signature",
                 )
             )
         )

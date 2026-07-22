@@ -9,6 +9,7 @@ servers that are currently connected.
 """
 
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 import orjson as json
@@ -65,11 +66,24 @@ async def send_agent_command(server_id: str, command: str, data: Optional[dict] 
     # correlated back to the launch config -- a failed deploy ack marks it failed immediately
     # instead of waiting out the age-based expiry sweep.
     config_id = (data or {}).get("config_id")
-    if config_id:
+    reservation_id = (
+        ((data or {}).get("reservation_claims") or {}).get("reservation_id")
+        if isinstance((data or {}).get("reservation_claims"), dict)
+        else None
+    )
+    if config_id or reservation_id:
+        context = {
+            "server_id": server_id,
+            "command": command,
+        }
+        if config_id:
+            context["config_id"] = config_id
+        if reservation_id:
+            context["reservation_id"] = reservation_id
         await settings.redis_client.setex(
             _AGENT_COMMAND_KEY.format(command_id=command_id),
             AGENT_COMMAND_TTL_SECONDS,
-            json.dumps({"config_id": config_id, "server_id": server_id, "command": command}),
+            json.dumps(context),
         )
     await settings.redis_client.publish(AGENT_COMMAND_CHANNEL, json.dumps(payload))
     return command_id
@@ -108,17 +122,58 @@ async def handle_agent_command_ack(server_id: str, ack: dict) -> None:
         config_id = context.get("config_id")
         detail = (ack or {}).get("detail") or f"agent ack status={status}"
         from api.database import get_session
+        from api.host.schemas import TdLaunchReservation
+        from api.server.schemas import Server
 
+        teardown = None
         async with get_session() as session:
-            result = await session.execute(
-                text(
-                    "UPDATE launch_configs SET failed_at = NOW(), verification_error = :error "
-                    "WHERE config_id = :config_id AND verified_at IS NULL AND failed_at IS NULL"
-                ),
-                {"config_id": config_id, "error": f"agent deploy failed: {detail}"[:500]},
-            )
+            result = None
+            if config_id:
+                result = await session.execute(
+                    text(
+                        "UPDATE launch_configs SET failed_at = NOW(), verification_error = :error "
+                        "WHERE config_id = :config_id AND verified_at IS NULL AND failed_at IS NULL"
+                    ),
+                    {
+                        "config_id": config_id,
+                        "error": f"agent deploy failed: {detail}"[:500],
+                    },
+                )
+            reservation_id = context.get("reservation_id")
+            if reservation_id:
+                await session.execute(
+                    text(
+                        "UPDATE td_launch_reservations SET invalidated_at = NOW() "
+                        "WHERE reservation_id = :reservation_id "
+                        "AND consumed_at IS NULL AND invalidated_at IS NULL"
+                    ),
+                    {"reservation_id": reservation_id},
+                )
+            if config_id:
+                server = await session.get(Server, server_id)
+                if server is not None and server.host_id and server.launch_reservation_id:
+                    reservation = await session.get(
+                        TdLaunchReservation, server.launch_reservation_id
+                    )
+                    if reservation is not None:
+                        teardown = (
+                            server.host_id,
+                            reservation.chute_id,
+                            server.server_id,
+                        )
             await session.commit()
-        if result.rowcount:
+        if teardown is not None:
+            host_id, chute_id, td_server_id = teardown
+            await send_agent_command(
+                host_id,
+                "delete_chute",
+                {
+                    "chute_id": chute_id,
+                    "server_id": td_server_id,
+                    "reason": "terminal in-TD deploy failure",
+                },
+            )
+        if result is not None and result.rowcount:
             logger.warning(
                 f"Marked launch config {config_id} failed from agent ack "
                 f"(server_id={server_id}, command={context.get('command')}, detail={detail})"
@@ -413,7 +468,22 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
             # No Server row: either the TD is still booting/registering (launch in-flight, keyed
             # per chute+host by the scheduler) or it failed to register within the launch window
             # and will never be schedulable.
-            if await settings.redis_client.exists(f"mb:launch:{slot_chute_id}:{host_id}"):
+            from api.host.schemas import TdLaunchReservation
+
+            async with get_session() as reservation_session:
+                active_reservation = (
+                    await reservation_session.execute(
+                        select(TdLaunchReservation.reservation_id).where(
+                            TdLaunchReservation.host_id == host_id,
+                            TdLaunchReservation.chute_id == slot_chute_id,
+                            TdLaunchReservation.server_id == slot_server_id,
+                            TdLaunchReservation.consumed_at.is_(None),
+                            TdLaunchReservation.invalidated_at.is_(None),
+                            TdLaunchReservation.expires_at > datetime.now(timezone.utc),
+                        )
+                    )
+                ).scalar_one_or_none()
+            if active_reservation is not None:
                 continue
             logger.warning(
                 f"Reconcile: host {host_id} TD {slot_server_id} (chute {slot_chute_id}) never "

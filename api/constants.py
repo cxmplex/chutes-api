@@ -9,10 +9,6 @@ class NoncePurpose(str, Enum):
     INSTANCE_VERIFICATION = "instance_verification"
     # 1-click CPU TEE server self-registration (POST /servers/cpu/register).
     CPU_REGISTER = "cpu_register"
-    # Model B: bare-metal L0 host registration (POST /hosts/register). The host is a launcher only
-    # and is NOT attested -- it registers by miner-hotkey signature over "{hotkey}:{nonce}:host_register".
-    HOST_REGISTER = "host_register"
-
     # Model B: trigger a chute-guest-image refresh on an L0 host (POST /hosts/{id}/upgrade-image).
     # Owning-miner signature over "{hotkey}:{nonce}:host_upgrade"; sends the node-agent upgrade_image.
     HOST_UPGRADE = "host_upgrade"
@@ -22,10 +18,12 @@ class NoncePurpose(str, Enum):
     # "{hotkey}:{nonce}:host_reboot"; sends the node-agent the `reboot` control command.
     HOST_REBOOT = "host_reboot"
 
-    # Fleet image releases: an L0 node-agent polling the active guest-image release manifest for its
-    # tee_type (GET /releases/current). Miner-hotkey signature over "{hotkey}:{nonce}:release_fetch";
-    # the manifest is non-secret (public image URLs + sha256), the signature just scopes it to miners.
-    RELEASE_FETCH = "release_fetch"
+    # Miner-authorized logical-host lifecycle. All three require v2 method/path/body binding.
+    HOST_ENROLLMENT = "host_enrollment"
+    HOST_PCS_MAILBOX = "host_pcs_mailbox"
+    HOST_REVOCATION = "host_revocation"
+
+    L0_BOOTSTRAP = "l0_bootstrap"
 
     # ChuteFS: an attested storage TD requesting a confidential per-user-volume application-layer key.
     # The single-use nonce is bound into a fresh quote whose report_data also commits the TD's

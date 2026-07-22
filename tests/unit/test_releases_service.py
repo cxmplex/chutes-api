@@ -16,7 +16,6 @@ from api.releases.schemas import (
     RELEASE_STATUS_SUPERSEDED,
     CreateReleaseRequest,
     GuestRelease,
-    GuestReleaseTarget,
     ReleaseImage,
 )
 from api.server.schemas import Host
@@ -26,6 +25,12 @@ RELEASE_URL = (
     "http://storage.googleapis.com/ardent-stacker-232906-chutes-tee/l0/guest/snp-1.7.0-debug.qcow2"
 )
 VCPU_SIZES = (1, 2, 4, 8)
+
+
+@pytest.fixture(autouse=True)
+def _seedless_l0_gate_is_covered_separately():
+    with patch.object(rsvc, "_validate_l0_bootstrap", AsyncMock()):
+        yield
 
 
 def _names(role="chute", version="1.7.0", tee_type="sev-snp"):
@@ -273,7 +278,7 @@ async def test_idempotent_partial_activation_preserves_inherited_role_marker():
         activated = await rsvc.activate_release(db, release.release_id)
 
     assert activated.images["chute"]["_inherited"] is True
-    assert rsvc.release_manifest(activated).chute is None
+    assert rsvc.release_manifest(activated).chute is not None
     assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_enabled=True)) == [
         "storage"
     ]
@@ -308,7 +313,7 @@ async def test_rollback_partial_activation_inherits_current_role_without_promoti
     assert activated.images["chute"]["_inherited"] is True
     assert activated.images["storage"]["sha256"] == "c" * 64
     assert "_inherited" not in activated.images["storage"]
-    assert rsvc.release_manifest(activated).chute is None
+    assert rsvc.release_manifest(activated).chute is not None
     assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_enabled=True)) == [
         "storage"
     ]
@@ -343,7 +348,7 @@ async def test_storage_only_activation_preserves_active_chute_for_scheduler():
     host = Host(capacity=2, storage_enabled=True)
     assert rsvc._target_roles_for_host(activated, host) == ["storage"]
     manifest = rsvc.release_manifest(activated)
-    assert manifest.chute is None
+    assert manifest.chute is not None
     assert manifest.storage is not None
 
 
@@ -611,34 +616,11 @@ def test_storage_auto_opt_in_reserves_exactly_once():
     assert rsvc._target_roles_for_host(release, host) == ["chute", "storage"]
 
 
-def test_host_manifest_carries_signed_logical_target_token_without_physical_claim():
-    issued_at = datetime.now(timezone.utc)
-    target = GuestReleaseTarget(
-        target_id="target-1",
-        release_id="rel-1",
-        host_id="logical-host",
-        miner_hotkey="miner",
-        tee_type="sev-snp",
-        role="chute",
-        current_generation=7,
-        current_token_id="target-token-generation-7",
-        issued_at=issued_at,
-    )
-    token = rsvc._encode_release_target_token(target)
-    payload = rsvc._decode_release_target_token(token)
-    assert payload["release_id"] == "rel-1"
-    assert payload["logical_host_id"] == "logical-host"
-    assert payload["generation"] == 7
-    assert "physical" not in payload
-    manifest = rsvc.release_manifest(_release(chute=_image()), {"chute": token})
-    assert manifest.target_tokens == {"chute": token}
-
-
-def test_release_target_token_changes_hardware_attestation_nonce():
-    nonce = "01" * 32
-    token = "header.payload.signature"
-    assert rsvc.release_bound_attestation_nonce(nonce, token) != nonce
-    assert rsvc.release_bound_attestation_nonce(nonce, None) == nonce
+def test_host_manifest_contains_desired_state_but_no_launch_authorization():
+    manifest = rsvc.release_manifest(_release(chute=_image()))
+    assert manifest.chute is not None
+    assert "target_tokens" not in manifest.model_dump()
+    assert "launch_reservation" not in manifest.model_dump_json()
 
 
 def test_release_request_accepts_each_role_matrix_and_rejects_empty():

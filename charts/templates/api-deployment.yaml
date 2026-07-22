@@ -69,6 +69,12 @@ spec:
             items:
               - key: {{ .Values.provenance.publicKeySecretKey | quote }}
                 path: cosign.pub
+        - name: l0-publisher-public-keys
+          secret:
+            secretName: {{ .Values.l0Publisher.publicKeyRegistrySecretName | quote }}
+            items:
+              - key: {{ .Values.l0Publisher.publicKeyRegistrySecretKey | quote }}
+                path: keys.json
         {{- include "chutes.redisCacertVolume" . | nindent 8 }}
         - name: lc-certs
           secret:
@@ -109,6 +115,8 @@ spec:
               value: "true"
             - name: TRUSTED_PROVENANCE_PUBLIC_KEY_PATH
               value: /etc/chutes/provenance/cosign.pub
+            - name: TRUSTED_L0_PUBLISHER_KEYS_PATH
+              value: /etc/chutes/l0-publisher/keys.json
             - name: SNP_CRL_OUTAGE_GRACE_SECONDS
               value: {{ .Values.snpCrlOutageGraceSeconds | quote }}
             - name: DB_SSL
@@ -160,6 +168,9 @@ spec:
               readOnly: true
             - name: guest-provenance-public-key
               mountPath: /etc/chutes/provenance
+              readOnly: true
+            - name: l0-publisher-public-keys
+              mountPath: /etc/chutes/l0-publisher
               readOnly: true
             {{- include "chutes.redisCacertMount" . | nindent 12 }}
             - name: lc-certs

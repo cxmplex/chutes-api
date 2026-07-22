@@ -148,6 +148,19 @@ class AgentCommandListener(RedisListener):
                 agent_sessions = getattr(self.sio, "agent_sessions", {})
                 session_id = agent_sessions.get(server_id) if server_id else None
                 if session_id is not None:
+                    validator = getattr(self.sio, "validate_agent_session", None)
+                    if validator is not None and not await validator(session_id):
+                        logger.warning(
+                            f"Refused command for stale agent session server_id={server_id}"
+                        )
+                        continue
+                    if data.get("command") == "disconnect":
+                        await self.sio.disconnect(session_id)
+                        logger.info(
+                            f"Disconnected agent session for server_id={server_id} "
+                            f"({data.get('command_id')})"
+                        )
+                        continue
                     await self.sio.emit(self.channel, data, room=session_id)
                     logger.info(
                         f"Dispatched agent command to server_id={server_id}: "

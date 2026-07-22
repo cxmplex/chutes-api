@@ -12,11 +12,13 @@ def test_settings_importers_share_validator_dev_trust_posture():
         "REQUIRE_MTLS_CLIENT_VERIFY": "true",
         "SKIP_METAGRAPH_CHECK": "true",
         "TEE_MEASUREMENT_CONFIG_REQUIRED": "true",
-        "TRUSTED_PROXY_CIDRS": "",
+        "TRUSTED_PROXY_CIDRS": "172.18.0.10/32",
         "TRUSTED_PROVENANCE_PUBLIC_KEY_PATH": "/etc/chutes/provenance/cosign.pub",
+        "TRUSTED_L0_PUBLISHER_KEYS_PATH": "/etc/chutes/l0-publisher/keys.json",
     }
     required_mounts = {
         "/etc/chutes/provenance/cosign.pub:/etc/chutes/provenance/cosign.pub:ro",
+        "/etc/chutes/l0-publisher/keys.json:/etc/chutes/l0-publisher/keys.json:ro",
         "./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro",
     }
 

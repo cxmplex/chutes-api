@@ -1,67 +1,317 @@
-"""Model B: bare-metal L0 launcher host registration (the per-chute control plane).
+"""Seedless Model-B logical-host enrollment and scoped control-plane routes."""
 
-An L0 host (the one-click-miner appliance / node-agent) registers here so the CPU scheduler can
-dispatch per-chute TD launches to it over the control channel. The host is a launcher only and is
-NOT attested -- it authenticates purely by the owning miner's hotkey signature. All workload trust
-comes from each launched per-chute TD attesting itself, never from the host.
+import hashlib
+from datetime import datetime, timezone
+from typing import Optional
 
-Auth: the standard `get_current_user` hotkey dependency (signature over
-"{hotkey}:{nonce}:<purpose>" with a recent unix-timestamp nonce + metagraph membership in
-production). Dev (skip_metagraph_check) drops the membership requirement, and with it the
-hard signature requirement: a signed request is still verified, but an unsigned one falls
-through to "no user" and the endpoint trusts the bare hotkey header. Dev-only by
-construction -- settings fail closed if skip_metagraph_check is combined with the
-production mTLS posture.
-"""
-
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from loguru import logger
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
 from api.constants import HOTKEY_HEADER, NoncePurpose
 from api.database import get_db_session
+from api.host import service as host_service
+from api.host.reservations import (
+    LaunchReservationError,
+    create_launch_reservation,
+)
+from api.host.schemas import (
+    EnrollmentKeyChallengeRequestV1,
+    EnrollmentKeyChallengeResponseV1,
+    EnrollmentVoucherMintRequestV1,
+    EnrollmentVoucherResponseV1,
+    HostAuthChallengeV1,
+    HostEnrollmentRedemptionV1,
+    HostEnrollmentResponseV1,
+    HostEnrollmentStatusV1,
+    HostKeyGeneration,
+    HostRevocationRequestV1,
+    LaunchReservationResponseV1,
+    PcsMailboxAckV1,
+    PcsMailboxEnvelopeV1,
+    StorageLaunchReservationRequestV1,
+    TdLaunchReservation,
+)
 from api.miner.util import is_miner_blacklisted
 from api.server.exceptions import ServerRegistrationError
-from api.server.schemas import Host, HostRegistrationArgs, HostRegistrationResponse, Server
-from api.server.service import register_host, request_host_image_upgrade, request_host_reboot
+from api.server.schemas import (
+    Host,
+    HostRegistrationArgs,
+    HostRegistrationResponse,
+    Server,
+)
+from api.server.service import (
+    register_host,
+    request_host_image_upgrade,
+    request_host_reboot,
+)
 from api.user.schemas import User
 from api.user.service import get_current_user
 
 router = APIRouter()
 
-# Dev (skip_metagraph_check): drop the metagraph-membership requirement from the auth dependency;
-# register_host auto-creates a dev metagraph row instead. Signed requests are still verified, but
-# dev does not REQUIRE a signature (see module docstring); production (netuid) does.
 _REGISTERED_TO = None if settings.skip_metagraph_check else settings.netuid
+
+
+def _require_hotkey(hotkey: Optional[str]) -> str:
+    if not hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing miner hotkey header.",
+        )
+    return hotkey
+
+
+@router.post("/enrollment-vouchers", response_model=EnrollmentVoucherResponseV1)
+async def mint_enrollment_voucher_endpoint(
+    body: EnrollmentVoucherMintRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.HOST_ENROLLMENT.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
+    ),
+):
+    owner = _require_hotkey(hotkey)
+    if not settings.skip_metagraph_check:
+        reason = await is_miner_blacklisted(db, owner)
+        if reason:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
+    try:
+        return await host_service.mint_enrollment_voucher(db, owner, body)
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
+@router.post("/enrollment/challenge", response_model=EnrollmentKeyChallengeResponseV1)
+async def enrollment_key_challenge_endpoint(
+    body: EnrollmentKeyChallengeRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await host_service.create_enrollment_key_challenge(db, body)
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
+@router.post("/enroll", response_model=HostEnrollmentResponseV1)
+async def redeem_enrollment_voucher_endpoint(
+    body: HostEnrollmentRedemptionV1,
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await host_service.redeem_enrollment_voucher(db, body)
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
+@router.get("/enrollment-status", response_model=HostEnrollmentStatusV1)
+async def enrollment_status_endpoint(
+    host_id: str = Query(..., min_length=1, max_length=256),
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.HOST_ENROLLMENT.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
+    ),
+):
+    owner = _require_hotkey(hotkey)
+    host = await db.get(Host, host_id)
+    if (
+        host is None
+        or host.miner_hotkey != owner
+        or host.enrollment_generation is None
+        or host.active_key_generation is None
+        or host.enrolled_at is None
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Host not enrolled.")
+    key = await db.get(HostKeyGeneration, (host.host_id, host.active_key_generation))
+    if key is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Host enrollment has no active key generation.",
+        )
+    return HostEnrollmentStatusV1(
+        host_id=host.host_id,
+        owner_hotkey=host.miner_hotkey,
+        tee_type=host.tee_type,
+        channel=host.release_channel,
+        enrollment_generation=host.enrollment_generation,
+        key_generation=host.active_key_generation,
+        provisioning_state=host.provisioning_state,
+        x25519_public_key=key.x25519_public_key,
+        x25519_fingerprint=key.x25519_fingerprint,
+        enrolled_at=host.enrolled_at,
+    )
+
+
+@router.get("/{host_id}/auth/challenge", response_model=HostAuthChallengeV1)
+async def host_auth_challenge_endpoint(
+    host_id: str,
+    key_generation: int = Query(..., ge=1),
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await host_service.create_host_auth_challenge(db, host_id, key_generation)
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
+
+
+@router.post("/pcs-mailbox", status_code=status.HTTP_204_NO_CONTENT)
+async def provision_pcs_mailbox_endpoint(
+    body: PcsMailboxEnvelopeV1,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.HOST_PCS_MAILBOX.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
+    ),
+):
+    try:
+        await host_service.store_pcs_mailbox(db, _require_hotkey(hotkey), body)
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+
+
+@router.post("/{host_id}/pcs-mailbox/consume", response_model=PcsMailboxEnvelopeV1)
+async def consume_pcs_mailbox_endpoint(
+    host_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_current_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the mailbox path.",
+        )
+    try:
+        return await host_service.consume_pcs_mailbox(db, current_host)
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@router.post("/{host_id}/pcs-mailbox/ack", status_code=status.HTTP_204_NO_CONTENT)
+async def acknowledge_pcs_mailbox_endpoint(
+    host_id: str,
+    body: PcsMailboxAckV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_current_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the mailbox path.",
+        )
+    try:
+        await host_service.acknowledge_pcs_mailbox(db, current_host, body)
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/launch-reservations/storage",
+    response_model=LaunchReservationResponseV1,
+)
+async def create_storage_launch_reservation_endpoint(
+    host_id: str,
+    body: StorageLaunchReservationRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_current_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the reservation path.",
+        )
+    expected_incarnation = "stor" + hashlib.sha256(host_id.encode()).hexdigest()[:8]
+    if (
+        body.process_incarnation != expected_incarnation
+        or body.server_id != f"chute-{expected_incarnation}"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Storage reservation identity is not the deterministic host storage role.",
+        )
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(TdLaunchReservation)
+        .where(
+            TdLaunchReservation.host_id == host_id,
+            TdLaunchReservation.role == "storage",
+            TdLaunchReservation.consumed_at.is_(None),
+            TdLaunchReservation.invalidated_at.is_(None),
+        )
+        .values(invalidated_at=now)
+    )
+    try:
+        reservation, token = await create_launch_reservation(
+            db,
+            current_host,
+            role="storage",
+            server_id=body.server_id,
+            process_incarnation=body.process_incarnation,
+            profile_id=body.profile_id,
+        )
+        await db.commit()
+        return LaunchReservationResponseV1(
+            token=token,
+            claims=reservation.claims,
+        )
+    except LaunchReservationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post("/{host_id}/revoke", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_host_endpoint(
+    host_id: str,
+    body: HostRevocationRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.HOST_REVOCATION.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
+    ),
+):
+    try:
+        await host_service.revoke_host_credentials(
+            db, host_id, _require_hotkey(hotkey), body.reason
+        )
+    except host_service.HostAuthError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 
 @router.post("/register", response_model=HostRegistrationResponse)
 async def register_host_endpoint(
     args: HostRegistrationArgs,
     db: AsyncSession = Depends(get_db_session),
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User | None = Depends(
-        get_current_user(
-            purpose=NoncePurpose.HOST_REGISTER.value,
-            registered_to=_REGISTERED_TO,
-            raise_not_found=False,
-        )
-    ),
+    current_host: Host = Depends(host_service.get_current_host),
 ):
-    """Register (or refresh) a Model-B L0 launcher host."""
-    if not hotkey:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing miner hotkey header.",
-        )
+    """Refresh untrusted launcher telemetry under its scoped persistent host key."""
     try:
-        if not settings.skip_metagraph_check:
-            reason = await is_miner_blacklisted(db, hotkey)
-            if reason:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
-        return await register_host(db, args, hotkey)
+        return await register_host(db, args, current_host)
     except ServerRegistrationError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     except HTTPException:
@@ -84,6 +334,8 @@ async def upgrade_host_image_endpoint(
             purpose=NoncePurpose.HOST_UPGRADE.value,
             registered_to=_REGISTERED_TO,
             raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
         )
     ),
 ):
@@ -122,6 +374,8 @@ async def reboot_host_endpoint(
             purpose=NoncePurpose.HOST_REBOOT.value,
             registered_to=_REGISTERED_TO,
             raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
         )
     ),
 ):
@@ -156,7 +410,13 @@ async def list_hosts(
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User | None = Depends(
-        get_current_user(purpose="tee", registered_to=_REGISTERED_TO, raise_not_found=False)
+        get_current_user(
+            purpose="tee",
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
     ),
 ):
     """List the caller miner's registered L0 hosts + their capacity/usage (per-host TD counts)."""

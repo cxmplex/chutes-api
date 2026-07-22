@@ -2,7 +2,7 @@
 ORM definitions for servers and TDX attestations.
 """
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from datetime import datetime, timezone
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -34,6 +34,7 @@ from api.constants import (
     ServerHealthStatus,
 )
 from api.database import Base, generate_uuid
+from api.host.schemas import TdQuoteCommitmentV1
 from api.node.schemas import NodeArgs
 
 
@@ -117,6 +118,7 @@ class RuntimeAttestationResponse(BaseModel):
     verified_at: str
     status: str
     revocation_status: Dict[str, str]
+    luks_quote_nonce: Optional[str] = None
 
 
 class LuksCapabilityPurpose(str, Enum):
@@ -387,6 +389,8 @@ class CpuServerRegistrationArgs(BaseModel):
     nonce || sha256(mTLS client cert pubkey), with the nonce derivation also binding that token.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     server_id: str = Field(..., description="Stable server identifier (e.g. VM instance id)")
     name: Optional[str] = Field(None, description="Server name (defaults to server_id)")
     quote: str = Field(
@@ -396,12 +400,6 @@ class CpuServerRegistrationArgs(BaseModel):
     )
     tee_type: str = Field(
         "tdx", description="TEE provider for the quote: 'tdx' (default) or 'sev-snp'."
-    )
-    host_id: Optional[str] = Field(
-        None,
-        description="Model B: required enrolled L0 launcher host (hosts.host_id) for every bare-metal "
-        "TD; absent only for hostless GCP Model-A self-registrations. Enables per-host capacity "
-        "accounting.",
     )
     external_host: Optional[str] = Field(
         None,
@@ -436,15 +434,26 @@ class CpuServerRegistrationArgs(BaseModel):
         description="ChuteFS: True when this TD is the always-on storage node (excluded from the CPU "
         "scheduler and from host-slot reaping; serves the decentralized storage network).",
     )
-    release_target_token: Optional[str] = Field(
+    launch_reservation: Optional[str] = Field(
         None,
         min_length=1,
         max_length=4096,
         description=(
-            "Validator-signed one-use generation for same-miner-transferable logical rollout "
-            "telemetry. Its hash is bound into the quote and registration signature; it never "
-            "proves physical placement or pin-pruning safety."
+            "Opaque one-use validator-created Model-B launch reservation. Model-A omits it."
         ),
+    )
+    quote_commitment: Optional[TdQuoteCommitmentV1] = Field(
+        None,
+        description=(
+            "Versioned commitment bound into report_data: launch nonce, attested SPKI, "
+            "reservation hash, release target, and boot generation."
+        ),
+    )
+    td_signature: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=2048,
+        description="Base64 signature by the attestation-bound TD serving key.",
     )
     disk_total_gb: Optional[int] = Field(
         None,
@@ -480,11 +489,27 @@ class CpuServerRegistrationArgs(BaseModel):
             raise ValueError("health_path must be a bounded absolute path without whitespace")
         return endpoints
 
+    @model_validator(mode="after")
+    def _complete_model_b_reservation(self):
+        values = (
+            self.launch_reservation,
+            self.quote_commitment,
+            self.td_signature,
+        )
+        if any(value is not None for value in values) and not all(
+            value is not None for value in values
+        ):
+            raise ValueError(
+                "launch_reservation, quote_commitment, and td_signature must be supplied together"
+            )
+        return self
+
 
 class CpuServerRegistrationResponse(BaseModel):
     """Response for a successful CPU TEE server self-registration."""
 
     server_id: str
+    owner_hotkey: str
     measurement_version: Optional[str] = None
     measurement_name: str
     measurement_config_fingerprint: str
@@ -573,6 +598,11 @@ class HostRegistrationArgs(BaseModel):
         max_length=32,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$",
         description="Guest-release channel this host follows from its first registration response.",
+    )
+    manifest_generation: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Last publisher-signed L0 manifest generation accepted by this launcher.",
     )
 
     @model_validator(mode="after")
@@ -828,10 +858,17 @@ class Server(Base):
     # TEE provider for this server's attestation: "tdx" (default) or "sev-snp" (AMD). Stamped at
     # CPU self-registration; selects the verifier (dcap-qvl vs VCEK chain) for re-attestations.
     tee_type = Column(String, nullable=False, default="tdx", server_default="tdx")
-    # Model B (per-chute): the L0 host (hosts.host_id) that launched this per-chute TD, NULL for
-    # standalone single-VM self-registrations. Lets the validator account per-host capacity + tear
-    # down a host's TDs. Set by the in-guest agent from the config-volume CHUTES_HOST_ID at register.
+    # Model B (per-chute): the L0 host derived from the consumed launch reservation, NULL for
+    # standalone Model-A self-registrations. Guest-supplied host identity is not accepted.
     host_id = Column(String, nullable=True)
+    # Seedless Model B: exact durable launch reservation consumed by this attested TD boot.
+    # Model A rows remain NULL because they retain their independent miner-auth architecture.
+    launch_reservation_id = Column(
+        String,
+        ForeignKey("td_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    launch_boot_generation = Column(Integer, nullable=True)
     # Model B (per-chute): the public host + per-TD DNAT'd external ports (e.g. {"primary":31000,...})
     # reported by the in-guest agent from the config volume. The scheduler deploys with these so the
     # chute advertises the externally reachable public_host:<ext> rather than the in-TD :8000 (which
@@ -998,6 +1035,17 @@ class Server(Base):
             postgresql_where=storage_role.is_(True),
         ),
         Index("idx_servers_last_health", "last_health_at"),
+        Index(
+            "uq_servers_launch_reservation",
+            "launch_reservation_id",
+            unique=True,
+            postgresql_where=launch_reservation_id.isnot(None),
+        ),
+        CheckConstraint(
+            "(launch_reservation_id IS NULL AND launch_boot_generation IS NULL) OR "
+            "(launch_reservation_id IS NOT NULL AND launch_boot_generation > 0)",
+            name="ck_servers_launch_reservation_generation",
+        ),
         CheckConstraint(
             "("
             "model_inventory_fresh_at IS NULL "
@@ -1024,11 +1072,9 @@ class Server(Base):
 class Host(Base):
     """Model B: a bare-metal L0 launcher host (the one-click-miner appliance / node-agent).
 
-    A host is NOT attested -- it is a launcher only, registered purely by miner-hotkey signature.
-    The validator records it so the CPU scheduler can dispatch per-chute TD launches to it over the
-    control channel; all workload trust comes from each launched TD's own attestation, never the
-    host. Per-host capacity is the number of concurrent per-chute TDs it can run; usage is the count
-    of self-registered CPU Servers stamped with this host_id.
+    A host is NOT attested -- it is a launcher only. One-use miner enrollment establishes scoped,
+    persistent logical-host keys; those cloneable credentials never prove physical placement.
+    Workload trust comes from each launched TD's reservation-bound attestation.
     """
 
     __tablename__ = "hosts"
@@ -1072,6 +1118,13 @@ class Host(Base):
     # registration + heartbeat) -- lets the validator tell which L0 a box booted and drive re-netboot
     # updates (publish a new squashfs + reboot -> box comes up reporting the new version).
     l0_version = Column(String, nullable=True)
+    # Seedless logical-host enrollment state. These fields describe a cloneable credential, never
+    # a physical host or trusted placement identity.
+    enrollment_generation = Column(Integer, nullable=True)
+    active_key_generation = Column(Integer, nullable=True)
+    provisioning_state = Column(String, nullable=False, default="legacy", server_default="legacy")
+    last_accepted_manifest_generation = Column(Integer, nullable=True)
+    enrolled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -1083,6 +1136,15 @@ class Host(Base):
         ),
         Index("idx_hosts_miner", "miner_hotkey"),
         Index("idx_hosts_release_targeting", "release_channel", "tee_type"),
+        CheckConstraint(
+            "provisioning_state IN ('legacy', 'unclaimed', 'awaiting_pcs', 'ready', 'revoked')",
+            name="ck_hosts_provisioning_state",
+        ),
+        CheckConstraint(
+            "(enrollment_generation IS NULL AND active_key_generation IS NULL) OR "
+            "(enrollment_generation > 0 AND active_key_generation > 0)",
+            name="ck_hosts_enrollment_generations",
+        ),
     )
 
 

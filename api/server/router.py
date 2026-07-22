@@ -212,20 +212,26 @@ async def register_cpu_server_endpoint(
 
     The booted server submits its own runtime TDX quote + CPU benchmark. Trust is established by:
     the single-use attestation nonce (X-Chutes-Nonce, bound into the quote report_data), the mTLS
-    client cert (also bound into report_data), the owning miner's signature over the registration
-    purpose plus server ID, name, cert hash, requested role, and optional logical rollout token hash,
-    and the quote measurements matching the same CPU/storage role.
+    client cert (also bound into report_data), and either a Model-B reservation plus signature from
+    that attested key or the separate Model-A miner signature. Quote measurements must match the
+    exact reserved CPU/storage release profile.
     """
-    if not hotkey or not signature:
+    model_b = bool(args.launch_reservation)
+    if not model_b and (not hotkey or not signature):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing miner hotkey/signature headers.",
+        )
+    if model_b and (hotkey or signature):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Model-B registration derives ownership from its launch reservation.",
         )
     try:
         # In dev (skip_metagraph_check) the self-registering hotkey is not on the metagraph yet;
         # register_cpu_server auto-creates the row + verifies the signature. Mirror that bypass here
         # so the route-level membership/blacklist check does not reject the first registration.
-        if not settings.skip_metagraph_check:
+        if not model_b and not settings.skip_metagraph_check:
             reason = await is_miner_blacklisted(db, hotkey)
             if reason:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
@@ -749,9 +755,7 @@ async def get_tee_measurements():
 async def get_maintenance_policy(
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
-    ),
+    _: User = Depends(get_current_user(purpose="tee", raise_not_found=False, registered_to=None)),
 ):
     """Return the latest upgrade target and whether its maintenance window is open."""
     if not hotkey:
@@ -890,9 +894,7 @@ async def get_maintenance_preflight(
     server_name_or_id: str,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
-    ),
+    _: User = Depends(get_current_user(purpose="tee", raise_not_found=False, registered_to=None)),
 ):
     """Check maintenance eligibility for a server without entering maintenance."""
     server = await get_server_by_name_or_id(db, hotkey, server_name_or_id)
@@ -952,15 +954,14 @@ async def get_runtime_nonce(
     server_id: str,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
-    ),
+    _: User = Depends(get_current_user(purpose="tee", raise_not_found=False, registered_to=None)),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """
     Generate a nonce for runtime attestation.
     """
     try:
-        server = await check_server_ownership(db, server_id, hotkey)
+        server = await check_server_ownership(db, server_id, hotkey, expected_cert_hash)
 
         actual_ip = request.state.client_ip
         if server.ip != actual_ip:
@@ -996,9 +997,7 @@ async def verify_runtime_attestation(
     args: RuntimeAttestationArgs,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(purpose="tee", raise_not_found=False, registered_to=settings.netuid)
-    ),
+    _: User = Depends(get_current_user(purpose="tee", raise_not_found=False, registered_to=None)),
     nonce: str | None = Header(None, alias=NONCE_HEADER),
     expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
@@ -1006,7 +1005,7 @@ async def verify_runtime_attestation(
     Verify runtime attestation with full measurement validation.
     """
     try:
-        server = await check_server_ownership(db, server_id, hotkey)
+        server = await check_server_ownership(db, server_id, hotkey, expected_cert_hash)
         actual_ip = request.state.client_ip
         stored_nonce = await validate_and_consume_nonce(nonce, actual_ip, NoncePurpose.RUNTIME)
         try:
@@ -1033,6 +1032,7 @@ async def verify_runtime_attestation(
             verified_at=result["verified_at"],
             status=result["status"],
             revocation_status=result["revocation_status"],
+            luks_quote_nonce=result.get("luks_quote_nonce"),
         )
 
     except ServerNotFoundError as e:

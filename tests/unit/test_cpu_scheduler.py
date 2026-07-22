@@ -151,6 +151,12 @@ class FakeSession:
     async def refresh(self, obj):
         return None
 
+    async def get(self, model, key):
+        handler = self.handlers.get(f"get:{model.__name__}")
+        if callable(handler):
+            return handler(key)
+        return handler
+
 
 def _session_ctx(session):
     """get_session() replacement returning an async context manager."""
@@ -212,6 +218,7 @@ def _server(
     host_id=None,
     miner_hotkey="hk-miner",
     external_ports=None,
+    launch_reservation_id=None,
 ):
     return SimpleNamespace(
         server_id=server_id,
@@ -221,6 +228,7 @@ def _server(
         host_id=host_id,
         miner_hotkey=miner_hotkey,
         external_ports=external_ports,
+        launch_reservation_id=launch_reservation_id,
     )
 
 
@@ -321,6 +329,7 @@ def _schedule_handlers(
         "LaunchConfig.server_id": FakeResult(items=occupied_config_ids or []),
         "Instance.Instance": FakeResult(items=chute_instances or []),
         "LaunchConfig.count": FakeResult(scalar=pending_count),
+        "TdLaunchReservation.count": FakeResult(scalar=0),
         "Job.Job": FakeResult(items=jobs or []),
     }
 
@@ -339,7 +348,13 @@ def mock_settings(fake_redis):
     settings.registry_host = "registry:5000"
     settings.registry_external_host = "registry.example.com:5000"
     settings.registry_insecure = False
-    with patch("api.cpu_scheduler.settings", settings):
+    with (
+        patch("api.cpu_scheduler.settings", settings),
+        patch(
+            "api.image.forge.get_image_digest",
+            AsyncMock(return_value=f"sha256:{'a' * 64}"),
+        ),
+    ):
         yield settings
 
 
@@ -792,15 +807,28 @@ class TestDispatchDeploy:
 
 
 class TestLaunchOnHost:
+    @pytest.fixture(autouse=True)
+    def _container_digest(self, monkeypatch):
+        monkeypatch.setattr(
+            "api.image.forge.get_image_digest",
+            AsyncMock(return_value=f"sha256:{'a' * 64}"),
+        )
+
     def _handlers(self, hosts, used_rows=None, chute_host_ids=(set(), set())):
+        active_release = SimpleNamespace(
+            images={"chute": {"measurement_names": ["cpu-baremetal-snp-genoa-1.10.0-2vcpu"]}}
+        )
         return {
             "Host.Host": FakeResult(items=hosts),
             "Server.host_id|Server.count": FakeResult(rows=used_rows or []),
+            "TdLaunchReservation.host_id|TdLaunchReservation.count": FakeResult(rows=[]),
             # _hosts_running_chute issues two same-shaped queries (instances, launch configs).
             "Server.host_id": [
                 FakeResult(items=list(chute_host_ids[0])),
                 FakeResult(items=list(chute_host_ids[1])),
             ],
+            "TdLaunchReservation.host_id": FakeResult(items=[]),
+            "GuestRelease.GuestRelease": FakeResult(items=[active_release]),
         }
 
     def _host(
@@ -824,9 +852,47 @@ class TestLaunchOnHost:
     async def _run(self, handlers, online=True):
         session = FakeSession(handlers)
         send = AsyncMock(return_value="cmd-1")
+
+        async def reserve(_session, host, **kwargs):
+            claims = {
+                "schema": "chutes.td-launch-reservation",
+                "version": 1,
+                "reservation_id": "reservation-1",
+                "token_id": "token-1",
+                "owner_hotkey": "owner",
+                "host_id": host.host_id,
+                "host_key_generation": 1,
+                "server_id": kwargs["server_id"],
+                "role": kwargs["role"],
+                "compute_type": "cpu",
+                "tee_type": host.tee_type,
+                "process_incarnation": kwargs["process_incarnation"],
+                "boot_generation": 1,
+                "release_id": "release-1",
+                "image_sha256": "1" * 64,
+                "image_version": "1.10.0",
+                "profile_id": kwargs["profile_id"],
+                "chute_id": kwargs["chute_id"],
+                "container_repository": kwargs["container_repository"],
+                "container_manifest_digest": kwargs["container_manifest_digest"],
+                "launch_nonce": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4=",
+                "release_target_sha256": "2" * 64,
+                "issued_at": NOW.isoformat(),
+                "expires_at": (NOW + timedelta(minutes=10)).isoformat(),
+            }
+            return SimpleNamespace(claims=claims), "reservation.secret"
+
         with (
             patch("api.cpu_scheduler.send_agent_command", send),
             patch("api.cpu_scheduler.is_agent_online", AsyncMock(return_value=online)),
+            patch(
+                "api.cpu_scheduler.create_launch_reservation",
+                AsyncMock(side_effect=reserve),
+            ),
+            patch(
+                "api.image.forge.get_image_digest",
+                AsyncMock(return_value=f"sha256:{'a' * 64}"),
+            ),
         ):
             launched = await cs._launch_on_host(session, _chute(cpu_cores=2, ram_gb=4), 2, 4)
         return launched, send
@@ -839,19 +905,24 @@ class TestLaunchOnHost:
         host_id, command, payload = send.await_args.args
         assert (host_id, command) == ("host-1", "deploy_chute")
         # TD is right-sized: chute RAM + guest OS overhead, exact vCPUs.
-        assert payload == {
-            "chute_id": "chute-1",
-            "mem": f"{4 + cs.MB_TD_MEM_OVERHEAD_GB}G",
-            "vcpus": 2,
-        }
-        assert "mb:launch:chute-1:host-1" in fake_redis.store
-        assert fake_redis.store["mb:host_inflight:host-1"] == "1"
+        assert payload["chute_id"] == "chute-1"
+        assert payload["mem"] == f"{4 + cs.MB_TD_MEM_OVERHEAD_GB}G"
+        assert payload["vcpus"] == 2
+        assert payload["profile_id"].endswith("-2vcpu")
+        assert payload["launch_reservation"] == "reservation.secret"
+        assert payload["server_id"] == f"chute-{payload['process_incarnation']}"
+        assert payload["reservation_claims"]["server_id"] == payload["server_id"]
 
     @pytest.mark.asyncio
     async def test_tdx_launch_uses_signed_ram_qualified_profile(self, mock_settings, fake_redis):
         host = self._host(tee_type="tdx", release_channel="canary")
         active_release = SimpleNamespace(
-            images={"chute": {"provenance_payload": "signed-direct-provenance"}}
+            images={
+                "chute": {
+                    "provenance_payload": "signed-direct-provenance",
+                    "measurement_names": ["cpu-baremetal-tdx-1.10.0-2vcpu-16g"],
+                }
+            }
         )
         handlers = self._handlers([host])
         handlers["GuestRelease.GuestRelease"] = FakeResult(items=[active_release])
@@ -862,22 +933,39 @@ class TestLaunchOnHost:
             patch("api.cpu_scheduler.is_agent_online", AsyncMock(return_value=True)),
             patch(
                 "api.cpu_scheduler.load_canonical_provenance",
-                return_value={"schema_version": 2},
+                return_value={
+                    "schema_version": 2,
+                    "measurements": [
+                        {
+                            "profile_id": "2vcpu-16g",
+                            "name": "cpu-baremetal-tdx-1.10.0-2vcpu-16g",
+                        }
+                    ],
+                },
             ),
             patch(
                 "api.cpu_scheduler.select_direct_tdx_profile",
                 return_value={"id": "2vcpu-16g", "vcpus": 2, "memory_mib": 16384},
             ),
+            patch(
+                "api.cpu_scheduler.create_launch_reservation",
+                AsyncMock(
+                    return_value=(
+                        SimpleNamespace(claims={"reservation_id": "reservation-1"}),
+                        "reservation.secret",
+                    )
+                ),
+            ),
         ):
             launched = await cs._launch_on_host(session, _chute(cpu_cores=2, ram_gb=4), 2, 4)
 
         assert launched
-        assert send.await_args.args[2] == {
-            "chute_id": "chute-1",
-            "mem": "16384M",
-            "vcpus": 2,
-            "profile_id": "2vcpu-16g",
-        }
+        payload = send.await_args.args[2]
+        assert payload["chute_id"] == "chute-1"
+        assert payload["mem"] == "16384M"
+        assert payload["vcpus"] == 2
+        assert payload["profile_id"] == "cpu-baremetal-tdx-1.10.0-2vcpu-16g"
+        assert payload["launch_reservation"] == "reservation.secret"
 
     @pytest.mark.asyncio
     async def test_skips_host_already_running_chute(self, mock_settings):
@@ -902,16 +990,18 @@ class TestLaunchOnHost:
 
     @pytest.mark.asyncio
     async def test_inflight_launches_count_against_capacity(self, mock_settings, fake_redis):
-        fake_redis.store["mb:host_inflight:host-1"] = "2"
         handlers = self._handlers([self._host(capacity=2)])
+        handlers["TdLaunchReservation.host_id|TdLaunchReservation.count"] = FakeResult(
+            rows=[("host-1", 2)]
+        )
         launched, send = await self._run(handlers)
         assert not launched
         send.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_inflight_same_chute_not_relaunched(self, mock_settings, fake_redis):
-        fake_redis.store["mb:launch:chute-1:host-1"] = "host-1"
         handlers = self._handlers([self._host()])
+        handlers["TdLaunchReservation.host_id"] = FakeResult(items=["host-1"])
         launched, send = await self._run(handlers)
         assert not launched
         send.assert_not_awaited()
@@ -925,6 +1015,15 @@ class TestLaunchOnHost:
         with (
             patch("api.cpu_scheduler.send_agent_command", send),
             patch("api.cpu_scheduler.is_agent_online", online),
+            patch(
+                "api.cpu_scheduler.create_launch_reservation",
+                AsyncMock(
+                    return_value=(
+                        SimpleNamespace(claims={"reservation_id": "reservation-1"}),
+                        "reservation.secret",
+                    )
+                ),
+            ),
         ):
             launched = await cs._launch_on_host(session, _chute(), 2, 4)
         assert launched

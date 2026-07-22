@@ -3,7 +3,6 @@ Core server management and TDX attestation logic.
 """
 
 import asyncio
-import hashlib
 import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
@@ -15,7 +14,9 @@ from pydantic import ValidationError
 from sqlalchemy import and_, delete, exists, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
-from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
 from api.config import (
     measurement_config_fingerprint,
@@ -31,6 +32,13 @@ from api.constants import (
 from api.cpu import validate_cpu_benchmark
 from api.gpu import SUPPORTED_GPUS
 from api.metagraph import MetagraphNode
+from api.host.reservations import (
+    LaunchReservationError,
+    consume_launch_reservation,
+    reservation_bound_attestation_nonce,
+    resolve_launch_reservation,
+)
+from api.host.schemas import TdRegistrationSignatureV1
 from bittensor_wallet.keypair import Keypair
 from api.node.util import _track_nodes
 from api.server.client import TeeServerClient
@@ -294,7 +302,7 @@ async def issue_boot_attestation_nonce(
 
     # Ownership and role are checked before any quote nonce is created. A miner naming another
     # miner's server receives the same not-found result as an unknown server.
-    server = await check_server_ownership(db, server_id, miner_hotkey)
+    server = await check_server_ownership(db, server_id, miner_hotkey, expected_cert_hash)
     if not server.is_tee:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -973,7 +981,7 @@ async def _validate_cpu_registration_host(
         if measurement_provider == "gcp":
             return None
         raise ServerRegistrationError(
-            "Bare-metal CPU TEE self-registration requires the enrolled launcher host_id."
+            "Bare-metal CPU TEE self-registration requires a validator-created launch reservation."
         )
 
     # A Host row represents the bare-metal Model-B launcher. A GCP Model-A VM is hostless and may
@@ -998,13 +1006,35 @@ async def _validate_cpu_registration_host(
     return host
 
 
+def _verify_td_registration_signature(
+    cert_pem: str,
+    signed: TdRegistrationSignatureV1,
+    signature_b64: str,
+) -> None:
+    try:
+        certificate = x509.load_pem_x509_certificate(cert_pem.encode("ascii"))
+        public_key = certificate.public_key()
+        signature = base64.b64decode(signature_b64, validate=True)
+        message = signed.signing_bytes()
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+        elif isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+        else:
+            raise ValueError("unsupported attested serving key type")
+    except Exception as exc:
+        raise ServerRegistrationError(
+            "TD registration signature from the attested serving key is invalid."
+        ) from exc
+
+
 async def register_cpu_server(
     db: AsyncSession,
     server_ip: str,
     args: CpuServerRegistrationArgs,
-    miner_hotkey: str,
+    miner_hotkey: Optional[str],
     nonce: str,
-    signature: str,
+    signature: Optional[str],
     expected_cert_hash: str,
     cert_pem: str,
 ) -> Dict[str, Any]:
@@ -1014,19 +1044,73 @@ async def register_cpu_server(
     Unlike register_server (which the validator drives by dialing the server's :30443 proxy),
     here the booted server submits its own runtime TDX quote + CPU benchmark over an outbound
     request. The validator verifies:
-      1. the owning miner is registered on the subnet and signed this registration,
-      2. the TDX quote: report_data == release-bound nonce || sha256(mTLS client cert pubkey), a
+      1. Model B's durable launch reservation and attested-key signature (or Model A's miner signature),
+      2. the quote: report_data binds the request nonce, launch commitment, and mTLS cert pubkey, a
          valid Intel signature, and MRTD/RTMRs matching a CPU-only measurement config, and
       3. the CPU benchmark shape (never trusted from the server),
     then upserts a self-registered CPU Server row (idempotent across reboots by server_id) and
     writes a ServerAttestation audit record. Returns a dict for CpuServerRegistrationResponse.
     """
-    # 1. Miner must have signed this registration over the single-use attestation nonce and, in
-    # production, be registered on the subnet. In dev (skip_metagraph_check) the metagraph
-    # membership requirement is bypassed and a metagraph_nodes row is auto-created so the servers
-    # foreign key is satisfied. The signature is verified in both cases.
     name = args.name or args.server_id
-    storage_role = bool(getattr(args, "storage_role", False))
+    requested_storage_role = bool(getattr(args, "storage_role", False))
+    reservation = None
+    reservation_claims = None
+    commitment = getattr(args, "quote_commitment", None)
+    reservation_token = getattr(args, "launch_reservation", None)
+    if reservation_token:
+        try:
+            reservation, reservation_claims = await resolve_launch_reservation(
+                db, reservation_token, commitment
+            )
+        except LaunchReservationError as exc:
+            raise ServerRegistrationError(str(exc)) from exc
+        if (
+            args.server_id != reservation_claims.server_id
+            or args.tee_type != reservation_claims.tee_type
+            or requested_storage_role != (reservation_claims.role == "storage")
+            or commitment.attested_spki_sha256 != expected_cert_hash.lower()
+        ):
+            raise ServerRegistrationError(
+                "TD registration identity does not match its launch reservation."
+            )
+        miner_hotkey = reservation_claims.owner_hotkey
+        host_id = reservation_claims.host_id
+        storage_role = reservation_claims.role == "storage"
+        signed_registration = TdRegistrationSignatureV1(
+            server_id=args.server_id,
+            request_nonce=nonce,
+            tee_type=reservation_claims.tee_type,
+            storage_role=storage_role,
+            quote_commitment=commitment,
+        )
+        _verify_td_registration_signature(cert_pem, signed_registration, args.td_signature)
+    else:
+        # Model A retains its miner-signature architecture until that separate design changes.
+        if not miner_hotkey or not signature:
+            raise ServerRegistrationError(
+                "Hostless Model-A registration requires miner hotkey authentication."
+            )
+        host_id = None
+        storage_role = requested_storage_role
+        registration_purpose = (
+            f"{NoncePurpose.CPU_REGISTER.value}:{args.server_id}:{name}:"
+            f"{expected_cert_hash.lower()}:{'storage' if storage_role else 'compute'}"
+        )
+        signing_message = get_signing_message(
+            miner_hotkey, nonce, payload_str=None, purpose=registration_purpose
+        )
+        try:
+            if not Keypair(ss58_address=miner_hotkey).verify(
+                signing_message, bytes.fromhex(signature)
+            ):
+                raise ServerRegistrationError("Invalid miner signature for CPU server registration")
+        except ServerRegistrationError:
+            raise
+        except Exception as exc:
+            raise ServerRegistrationError(f"Invalid miner signature: {exc}") from exc
+
+    # The owner is derived from the reservation for Model B and from the authenticated Model-A
+    # hotkey otherwise. Production subnet membership is checked only after that derivation.
     if settings.skip_metagraph_check:
         existing_node = await db.get(MetagraphNode, (miner_hotkey, settings.netuid))
         if existing_node is None:
@@ -1057,25 +1141,6 @@ async def register_cpu_server(
             raise ServerRegistrationError(
                 f"Miner hotkey {miner_hotkey} is not registered on netuid {settings.netuid}"
             )
-    release_target_token = getattr(args, "release_target_token", None)
-    registration_purpose = (
-        f"{NoncePurpose.CPU_REGISTER.value}:{args.server_id}:{name}:"
-        f"{expected_cert_hash.lower()}:{'storage' if storage_role else 'compute'}"
-    )
-    if release_target_token:
-        registration_purpose += (
-            f":{hashlib.sha256(release_target_token.encode('utf-8')).hexdigest()}"
-        )
-    signing_message = get_signing_message(
-        miner_hotkey, nonce, payload_str=None, purpose=registration_purpose
-    )
-    try:
-        if not Keypair(ss58_address=miner_hotkey).verify(signing_message, bytes.fromhex(signature)):
-            raise ServerRegistrationError("Invalid miner signature for CPU server registration")
-    except ServerRegistrationError:
-        raise
-    except Exception as exc:
-        raise ServerRegistrationError(f"Invalid miner signature: {exc}")
 
     # 2. Verify the runtime attestation (Intel TDX quote or AMD SEV-SNP report) + match a CPU config.
     tee_type = (getattr(args, "tee_type", None) or "tdx").strip().lower()
@@ -1099,11 +1164,13 @@ async def register_cpu_server(
             f"mrtd={quote.mrtd} rtmr0={quote.rtmrs.get('rtmr0')} rtmr1={quote.rtmrs.get('rtmr1')} "
             f"rtmr2={quote.rtmrs.get('rtmr2')} rtmr3={quote.rtmrs.get('rtmr3')}"
         )
-    from api.releases.service import ReleaseError, release_bound_attestation_nonce
-
     try:
-        quote_nonce = release_bound_attestation_nonce(nonce, release_target_token)
-    except ReleaseError as exc:
+        quote_nonce = (
+            reservation_bound_attestation_nonce(nonce, commitment)
+            if reservation is not None
+            else nonce
+        )
+    except LaunchReservationError as exc:
         raise ServerRegistrationError(str(exc)) from exc
     expected_gcp_identity = _expected_gcp_identity(args.server_id)
     verification_result = await verify_quote(
@@ -1137,10 +1204,7 @@ async def register_cpu_server(
             "A storage-TD measurement may register only with storage_role enabled."
         )
 
-    # Model-B host identity affects scheduler capacity and teardown routing. Validate the exact
-    # enrolled host owner, TEE type, and bare-metal provider before benchmark/capacity accounting
-    # or any Server row mutation. A standalone Model-A registration must omit host_id.
-    host_id = (getattr(args, "host_id", None) or "").strip() or None
+    # Model-B host identity comes only from the locked reservation, never a guest header.
     await _validate_cpu_registration_host(
         db,
         host_id,
@@ -1148,37 +1212,14 @@ async def register_cpu_server(
         tee_type,
         measurement_config,
     )
-    release_target = None
-    release_target_token_generation = None
-    release_target_release = None
-    if release_target_token:
-        from api.releases.service import (
-            ReleaseError,
-            resolve_release_target_token,
-            validate_release_target_attestation,
-        )
-
-        try:
-            (
-                release_target,
-                release_target_token_generation,
-                release_target_release,
-            ) = await resolve_release_target_token(
-                db,
-                release_target_token,
-                host_id=host_id,
-                miner_hotkey=miner_hotkey,
-                tee_type=tee_type,
+    if reservation_claims is not None:
+        if (
+            measurement_config.name != reservation_claims.profile_id
+            or getattr(measurement_config, "image_sha256", None) != reservation_claims.image_sha256
+        ):
+            raise MeasurementMismatchError(
+                "Attested measurement does not match the exact launch reservation profile."
             )
-            validate_release_target_attestation(
-                release_target,
-                release_target_release,
-                storage_role=storage_role,
-                measurement_name=measurement_config.name,
-                tee_type=tee_type,
-            )
-        except ReleaseError as exc:
-            raise ServerRegistrationError(str(exc)) from exc
 
     # 3. Validate the benchmark shape (the validator never trusts the raw value).
     try:
@@ -1229,8 +1270,10 @@ async def register_cpu_server(
     server.self_registered = True
     server.compute_type = "cpu"
     server.tee_type = tee_type
-    # Model B: stamp the launching L0 host (per-host capacity accounting + teardown), if provided.
+    # Model B identity is derived exclusively from the consumed reservation.
     server.host_id = host_id
+    server.launch_reservation_id = reservation.reservation_id if reservation is not None else None
+    server.launch_boot_generation = reservation.boot_generation if reservation is not None else None
     # Model B: record the per-TD public host + DNAT external ports so the scheduler advertises the
     # externally reachable endpoint (public_host:<ext>) when it deploys a chute onto this TD.
     server.external_host = getattr(args, "external_host", None) or None
@@ -1280,33 +1323,17 @@ async def register_cpu_server(
     )
     db.add(attestation)
     await db.flush()
-    if (
-        release_target is not None
-        and release_target_token_generation is not None
-        and release_target_release is not None
-    ):
-        from api.releases.service import ReleaseError, consume_release_target
-
+    if reservation is not None:
         try:
-            consume_release_target(
-                release_target,
-                release_target_token_generation,
-                server=server,
-                attestation=attestation,
+            consume_launch_reservation(
+                reservation,
+                attestation_id=attestation.attestation_id,
                 cert_pubkey_hash=expected_cert_hash,
             )
-        except ReleaseError as exc:
+        except LaunchReservationError as exc:
             raise ServerRegistrationError(str(exc)) from exc
     await db.commit()
     await db.refresh(attestation)
-
-    # Model B: a TD launched by an L0 host has registered -> release that host's in-flight slot count
-    # (best-effort; the durable per-host usage is now this Server row's host_id).
-    if server.host_id:
-        try:
-            await settings.redis_client.decr(f"mb:host_inflight:{server.host_id}")
-        except Exception:  # noqa: BLE001 - inflight counter is a best-effort hint
-            pass
 
     # ChuteFS: a storage TD then calls POST /{server_id}/luks/attest to obtain its persistent
     # data-volume passphrase. That endpoint is gated on a single-use luks_quote_nonce which, for the
@@ -1329,6 +1356,7 @@ async def register_cpu_server(
     verified_at = attestation.verified_at
     return {
         "server_id": args.server_id,
+        "owner_hotkey": miner_hotkey,
         "measurement_version": measurement_config.version,
         "measurement_name": measurement_config.name,
         "measurement_config_fingerprint": config_fingerprint,
@@ -1362,18 +1390,29 @@ def _sum_disk_gb(disks: Any) -> Optional[int]:
 async def register_host(
     db: AsyncSession,
     args: HostRegistrationArgs,
-    miner_hotkey: str,
+    authenticated_host: Host,
 ) -> Dict[str, Any]:
     """Model B: register (or refresh) a bare-metal L0 launcher host.
 
-    The host is NOT attested -- it is a launcher only. Authentication (signature over
-    "{hotkey}:{nonce}:host_register" with a fresh unix-timestamp nonce + production metagraph
-    membership) is enforced by the router's `get_current_user` dependency; this service only
-    owns the host-specific logic. The validator records the host + its capacity so the CPU
-    scheduler can dispatch per-chute TD launches to it; every launched TD attests itself.
+    The host is NOT attested -- it is a launcher only. The router authenticates a persistent,
+    scoped Ed25519 host-key generation. This service records only untrusted telemetry and never
+    lets the host change its owner, TEE type, desired-state channel, or enrollment generation.
     """
-    if not miner_hotkey:
-        raise ServerRegistrationError("Missing miner hotkey for host registration")
+    miner_hotkey = authenticated_host.miner_hotkey
+    if args.host_id != authenticated_host.host_id:
+        raise ServerRegistrationError("Host telemetry does not match the authenticated host.")
+    if authenticated_host.provisioning_state != "ready":
+        raise ServerRegistrationError(
+            f"Host {authenticated_host.host_id} is not launch-ready "
+            f"(state={authenticated_host.provisioning_state})."
+        )
+    if (
+        (args.tee_type or "tdx").strip().lower() != authenticated_host.tee_type
+        or args.release_channel != authenticated_host.release_channel
+    ):
+        raise ServerRegistrationError(
+            "Host telemetry cannot change the enrolled TEE type or release channel."
+        )
     capacity = int(args.capacity)
     storage_enabled = bool(getattr(args, "storage_enabled", False))
     if capacity < 0 or capacity > 64:
@@ -1398,22 +1437,11 @@ async def register_host(
             )
             await db.commit()
 
-    # Upsert the host (idempotent across reboots by host_id; ownership pinned to the first miner).
-    host = await db.get(Host, args.host_id)
-    if host is not None and host.miner_hotkey != miner_hotkey:
-        raise ServerRegistrationError(
-            f"Host {args.host_id} is already registered to a different miner."
-        )
-    if host is None:
-        host = Host(host_id=args.host_id, netuid=args.netuid or settings.netuid)
-        db.add(host)
+    # Enrollment creates the host row. Registration is telemetry-only and may never upsert identity.
+    host = authenticated_host
     host.name = args.name or args.host_id
-    host.miner_hotkey = miner_hotkey
-    host.netuid = args.netuid or settings.netuid
-    host.tee_type = (args.tee_type or "tdx").strip().lower()
     host.capacity = capacity
     host.storage_enabled = storage_enabled
-    host.release_channel = args.release_channel
     host.default_mem = args.default_mem
     host.default_vcpus = args.default_vcpus
     host.external_host = args.external_host or None
@@ -1431,6 +1459,8 @@ async def register_host(
     # L0 image identity (re-netboot update tracking); tolerate older agents that don't report it.
     if getattr(args, "l0_version", None):
         host.l0_version = args.l0_version
+    if getattr(args, "manifest_generation", None):
+        host.last_accepted_manifest_generation = args.manifest_generation
     # Resolve desired state before committing this refresh. An active storage-carrying manifest is
     # newer operator intent than stale bootstrap CHUTES_STORAGE_NODE=false, so it reserves the
     # storage TD first and a reconnect can never restore impossible chute capacity.
@@ -1687,7 +1717,12 @@ async def verify_server(
                 raise
 
 
-async def check_server_ownership(db: AsyncSession, server_id: str, miner_hotkey: str) -> Server:
+async def check_server_ownership(
+    db: AsyncSession,
+    server_id: str,
+    miner_hotkey: Optional[str],
+    expected_cert_hash: Optional[str] = None,
+) -> Server:
     """
     Get a server by ID, ensuring it belongs to the authenticated miner.
 
@@ -1702,13 +1737,32 @@ async def check_server_ownership(db: AsyncSession, server_id: str, miner_hotkey:
     Raises:
         ServerNotFoundError: If server not found or doesn't belong to miner
     """
-    query = select(Server).where(Server.server_id == server_id, Server.miner_hotkey == miner_hotkey)
-
-    result = await db.execute(query)
-    server = result.scalar_one_or_none()
-
-    if not server:
+    server = (
+        await db.execute(select(Server).where(Server.server_id == server_id))
+    ).scalar_one_or_none()
+    if server is None:
         raise ServerNotFoundError(server_id)
+    if getattr(server, "launch_reservation_id", None) is not None:
+        if (
+            miner_hotkey is not None
+            or not expected_cert_hash
+            or not secrets.compare_digest(_registered_cert_hash(server), expected_cert_hash.lower())
+        ):
+            raise ServerNotFoundError(server_id)
+    elif not miner_hotkey or server.miner_hotkey != miner_hotkey:
+        raise ServerNotFoundError(server_id)
+    elif not getattr(settings, "skip_metagraph_check", True):
+        membership = (
+            await db.execute(
+                select(
+                    exists()
+                    .where(MetagraphNode.hotkey == miner_hotkey)
+                    .where(MetagraphNode.netuid == settings.netuid)
+                )
+            )
+        ).scalar()
+        if not membership:
+            raise ServerNotFoundError(server_id)
 
     return server
 
@@ -1809,7 +1863,7 @@ async def process_runtime_attestation(
     server_id: str,
     actual_ip: str,
     args: RuntimeAttestationArgs,
-    miner_hotkey: str,
+    miner_hotkey: Optional[str],
     expected_nonce: str,
     expected_cert_hash: str,
     nonce_context: RuntimeAttestationNonceContext,
@@ -1835,7 +1889,7 @@ async def process_runtime_attestation(
     logger.info(f"Processing runtime attestation for server: {server_id}")
 
     # Get server and verify ownership
-    server = await check_server_ownership(db, server_id, miner_hotkey)
+    server = await check_server_ownership(db, server_id, miner_hotkey, expected_cert_hash)
 
     if server.ip != actual_ip:
         raise MeasurementMismatchError(
@@ -1921,11 +1975,20 @@ async def process_runtime_attestation(
 
         logger.success(f"Runtime attestation successful: {attestation.attestation_id}")
 
+        luks_quote_nonce = None
+        if server.storage_role:
+            capability = _luks_capability_for_measurement(
+                server,
+                measurement_config,
+                LuksCapabilityPurpose.STORAGE,
+            )
+            luks_quote_nonce = await generate_luks_quote_nonce(capability)
         return {
             "attestation_id": attestation.attestation_id,
             "verified_at": attestation.verified_at.isoformat(),
             "status": "verified",
             "revocation_status": revocation_status,
+            "luks_quote_nonce": luks_quote_nonce,
         }
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
@@ -2042,12 +2105,7 @@ async def _validate_luks_capability_identity(
     requested_volumes: list[str],
 ) -> Server:
     """Validate owner, server, cert, role, measurement version, and volume namespace."""
-    if not hotkey:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Miner hotkey is required.",
-        )
-    if server_id != capability.server_id or hotkey != capability.miner_hotkey:
+    if server_id != capability.server_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Request identity does not match the issued LUKS capability.",
@@ -2082,6 +2140,17 @@ async def _validate_luks_capability_identity(
     server = server_result.scalar_one_or_none()
     if server is None:
         raise ServerNotFoundError(capability.server_id)
+    if server.launch_reservation_id is not None:
+        if hotkey is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Model-B LUKS ownership is derived from the attested server.",
+            )
+    elif not hotkey or hotkey != capability.miner_hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Model-A LUKS request does not match the issued owner.",
+        )
     if (
         not server.is_tee
         or server.miner_hotkey != capability.miner_hotkey

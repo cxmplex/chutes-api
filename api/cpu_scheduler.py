@@ -35,6 +35,11 @@ from api.config import (
 from api.database import get_session
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2, purge_and_notify
+from api.host.reservations import (
+    LaunchReservationError,
+    create_launch_reservation,
+)
+from api.host.schemas import TdLaunchReservation
 from api.job.schemas import Job
 from api.log import install_asyncio_exception_handler
 from api.metagraph import MetagraphNode
@@ -63,9 +68,6 @@ SCHEDULER_LOCK_TTL = 120
 # Generous enough for a cold TD boot + multi-GB image pull; failures normally resolve much
 # sooner via the agent's deploy ack (see api.agent_channel.handle_agent_command_ack).
 LAUNCH_CONFIG_EXPIRY_SECONDS = 900
-# Model B: how long to consider a per-chute TD launch "in flight" (boot + self-register window),
-# so the scheduler does not re-launch the same chute on another host while its TD comes up.
-MB_LAUNCH_INFLIGHT_TTL = 300
 # Model B: a per-chute TD is a full confidential VM -- the guest OS (systemd, docker/podman, the
 # attestation service + agent) needs headroom ON TOP of the chute's own RAM request, or the chute
 # container is OOM-killed inside the TD. Size the TD = chute RAM + this overhead (mirrors Model-A
@@ -97,6 +99,29 @@ async def _target_count(chute_id: str) -> int:
     return max(target, 1)
 
 
+async def _active_reservation_count(session, chute_id: str, job_id: str | None = None) -> int:
+    job_condition = (
+        TdLaunchReservation.job_id == job_id
+        if job_id is not None
+        else TdLaunchReservation.job_id.is_(None)
+    )
+    return int(
+        (
+            await session.execute(
+                select(func.count(TdLaunchReservation.reservation_id)).where(
+                    TdLaunchReservation.chute_id == chute_id,
+                    job_condition,
+                    TdLaunchReservation.role == "chute",
+                    TdLaunchReservation.consumed_at.is_(None),
+                    TdLaunchReservation.invalidated_at.is_(None),
+                    TdLaunchReservation.expires_at > func.now(),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+
+
 def _server_fits(server: Server, req_cores: int, req_ram: int) -> bool:
     """Whether a CPU server satisfies a chute's cores/RAM request.
 
@@ -114,6 +139,57 @@ def _server_fits(server: Server, req_cores: int, req_ram: int) -> bool:
     elif cores < req_cores:
         return False
     return (server.ram_gb or 0) >= req_ram
+
+
+async def _server_matches_reserved_workload(
+    session,
+    server: Server,
+    chute_id: str,
+    job_id: str | None,
+    container_repository: str,
+    container_manifest_digest: str,
+) -> bool:
+    if server.host_id is None:
+        return True
+    if not server.launch_reservation_id:
+        return False
+    reservation = await session.get(TdLaunchReservation, server.launch_reservation_id)
+    matches = bool(
+        reservation is not None
+        and reservation.consumed_at is not None
+        and reservation.invalidated_at is None
+        and reservation.server_id == server.server_id
+        and reservation.chute_id == chute_id
+        and reservation.job_id == job_id
+        and reservation.container_repository == container_repository
+        and reservation.container_manifest_digest == container_manifest_digest
+    )
+    if reservation is not None and not matches:
+        reservation.invalidated_at = datetime.now(timezone.utc)
+        await send_agent_command(
+            server.host_id,
+            "delete_chute",
+            {
+                "chute_id": reservation.chute_id,
+                "server_id": server.server_id,
+                "reason": "reserved container intent is stale",
+            },
+        )
+    return matches
+
+
+async def _container_intent(chute: Chute) -> tuple[str, str] | None:
+    repository = _chute_image_ref(chute).rsplit(":", 1)[0]
+    try:
+        from api.image.forge import get_image_digest
+
+        digest = await get_image_digest(f"{settings.registry_host}/{_chute_image_ref(chute)}")
+    except Exception as exc:
+        logger.warning(
+            f"Could not resolve exact container intent for chute {chute.chute_id}: {exc}"
+        )
+        return None
+    return repository, digest
 
 
 async def _current_attested_servers(session, servers: list[Server]) -> list[Server]:
@@ -274,12 +350,19 @@ async def _dispatch_deploy(session, chute: Chute, server: Server, job: "Job" = N
     # forge signed it) so the agent pulls + cosign-verifies BY DIGEST -- a tag/registry swap then
     # cannot substitute a different image between schedule and run.
     image_digest = None
-    try:
-        from api.image.forge import get_image_digest
+    if server.host_id is not None and server.launch_reservation_id:
+        reservation = await session.get(TdLaunchReservation, server.launch_reservation_id)
+        if reservation is not None:
+            image_digest = reservation.container_manifest_digest
+    else:
+        try:
+            from api.image.forge import get_image_digest
 
-        image_digest = await get_image_digest(f"{settings.registry_host}/{_chute_image_ref(chute)}")
-    except Exception as exc:
-        logger.warning(f"Could not resolve image digest for chute {chute.chute_id}: {exc}")
+            image_digest = await get_image_digest(
+                f"{settings.registry_host}/{_chute_image_ref(chute)}"
+            )
+        except Exception as exc:
+            logger.warning(f"Could not resolve image digest for chute {chute.chute_id}: {exc}")
 
     # TEE chutes MUST be digest-pinned: confidentiality relies on running exactly the measured/signed
     # image, so refuse to dispatch a TEE deploy we cannot pin (the agent also rejects an unpinned TEE
@@ -368,10 +451,33 @@ async def _hosts_running_chute(session, chute_id: str) -> set:
         .scalars()
         .all()
     )
+    assigned |= set(
+        (
+            await session.execute(
+                select(TdLaunchReservation.host_id).where(
+                    TdLaunchReservation.chute_id == chute_id,
+                    TdLaunchReservation.role == "chute",
+                    TdLaunchReservation.consumed_at.is_(None),
+                    TdLaunchReservation.invalidated_at.is_(None),
+                    TdLaunchReservation.expires_at > func.now(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
     return assigned
 
 
-async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -> bool:
+async def _launch_on_host(
+    session,
+    chute: Chute,
+    req_cores: int,
+    req_ram: int,
+    *,
+    job: Job | None = None,
+    container_intent: tuple[str, str] | None = None,
+) -> bool:
     """Model B: ask an online L0 host with free capacity to launch a per-chute TD for ``chute``.
 
     The host's node-agent launches a fresh confidential VM; that TD self-registers as a CPU server
@@ -390,6 +496,10 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
     hosts = (await session.execute(select(Host).where(Host.capacity > 0))).scalars().all()
     if not hosts:
         return False
+    container_intent = container_intent or await _container_intent(chute)
+    if container_intent is None:
+        return False
+    container_repository, container_manifest_digest = container_intent
 
     # Self-registered TDs already attributed to each host (durable per-host usage).
     used_rows = (
@@ -407,18 +517,32 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
         )
     ).all()
     used_by_host = {hid: cnt for hid, cnt in used_rows}
+    reserved_rows = (
+        await session.execute(
+            select(
+                TdLaunchReservation.host_id,
+                func.count(TdLaunchReservation.reservation_id),
+            )
+            .where(
+                TdLaunchReservation.role == "chute",
+                TdLaunchReservation.consumed_at.is_(None),
+                TdLaunchReservation.invalidated_at.is_(None),
+                TdLaunchReservation.expires_at > func.now(),
+            )
+            .group_by(TdLaunchReservation.host_id)
+        )
+    ).all()
+    reserved_by_host = {host_id: count for host_id, count in reserved_rows}
     hosts_with_chute = await _hosts_running_chute(session, chute.chute_id)
 
     for host in hosts:
         if host.host_id in hosts_with_chute:
             continue
-        inflight_key = f"mb:launch:{chute.chute_id}:{host.host_id}"
-        if await settings.redis_client.exists(inflight_key):
-            continue  # a TD for this chute is already booting on this host
-        host_inflight = int(
-            await settings.redis_client.get(f"mb:host_inflight:{host.host_id}") or 0
+        available = (
+            (host.capacity or 0)
+            - used_by_host.get(host.host_id, 0)
+            - reserved_by_host.get(host.host_id, 0)
         )
-        available = (host.capacity or 0) - used_by_host.get(host.host_id, 0) - host_inflight
         if available <= 0:
             continue
         if not await is_agent_online(host.host_id):
@@ -463,13 +587,71 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
                 continue
             vcpus = selected_profile["vcpus"]
             mem = f"{selected_profile['memory_mib']}M"
-            profile_id = selected_profile["id"]
+            profile_id = next(
+                (
+                    measurement["name"]
+                    for measurement in provenance["measurements"]
+                    if measurement.get("profile_id") == selected_profile["id"]
+                ),
+                None,
+            )
+            if profile_id is None:
+                logger.warning(
+                    f"Skipping TDX host {host.host_id}: selected launch profile has no "
+                    "exact measurement identity."
+                )
+                continue
         else:
             mem = (
                 f"{requested_memory_mib // 1024}G"
                 if requested_memory_mib % 1024 == 0
                 else f"{requested_memory_mib}M"
             )
+            active_release = (
+                await session.execute(
+                    select(GuestRelease).where(
+                        GuestRelease.status == RELEASE_STATUS_ACTIVE,
+                        GuestRelease.channel == host.release_channel,
+                        GuestRelease.tee_type == "sev-snp",
+                    )
+                )
+            ).scalar_one_or_none()
+            names = (
+                (((active_release.images or {}).get("chute") or {}).get("measurement_names") or [])
+                if active_release
+                else []
+            )
+            suffix = f"-{vcpus}vcpu"
+            matching_names = [name for name in names if name.endswith(suffix)]
+            if len(matching_names) != 1:
+                logger.warning(
+                    f"Skipping SNP host {host.host_id}: release has no unique {vcpus}-vCPU "
+                    "measurement profile."
+                )
+                continue
+            profile_id = matching_names[0]
+        process_incarnation = uuid.uuid4().hex
+        server_id = f"chute-{process_incarnation}"
+        try:
+            reservation, reservation_token = await create_launch_reservation(
+                session,
+                host,
+                role="chute",
+                server_id=server_id,
+                process_incarnation=process_incarnation,
+                profile_id=profile_id,
+                chute_id=chute.chute_id,
+                job_id=job.job_id if job is not None else None,
+                container_repository=container_repository,
+                container_manifest_digest=container_manifest_digest,
+            )
+            await session.commit()
+        except LaunchReservationError as exc:
+            await session.rollback()
+            logger.warning(
+                f"Skipping host {host.host_id}: could not create exact launch reservation: {exc}"
+            )
+            continue
         await send_agent_command(
             host.host_id,
             "deploy_chute",
@@ -477,14 +659,12 @@ async def _launch_on_host(session, chute: Chute, req_cores: int, req_ram: int) -
                 "chute_id": chute.chute_id,
                 "mem": mem,
                 "vcpus": vcpus,
-                **({"profile_id": profile_id} if profile_id else {}),
+                "profile_id": profile_id,
+                "process_incarnation": process_incarnation,
+                "server_id": server_id,
+                "launch_reservation": reservation_token,
+                "reservation_claims": reservation.claims,
             },
-        )
-        # Mark the (chute, host) launch + bump the host's in-flight count for the boot window.
-        await settings.redis_client.set(inflight_key, host.host_id, ex=MB_LAUNCH_INFLIGHT_TTL)
-        await settings.redis_client.incr(f"mb:host_inflight:{host.host_id}")
-        await settings.redis_client.expire(
-            f"mb:host_inflight:{host.host_id}", MB_LAUNCH_INFLIGHT_TTL
         )
         logger.success(
             f"Model B: dispatched per-chute TD launch for {chute.chute_id} to host {host.host_id} "
@@ -654,17 +834,27 @@ async def schedule_once() -> None:
                     )
                 )
             ).scalar() or 0
-            # Model B in-flight TD launches (host told to boot a TD, but it hasn't self-registered
-            # yet so no LaunchConfig exists) must also count toward target — otherwise the scheduler
-            # keeps launching TDs on every host during the boot window (multiple ticks fire before
-            # the first TD registers). The keys are mb:launch:{chute_id}:{host_id} with a TTL.
-            mb_inflight = len(await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*"))
+            # Durable, unconsumed Model-B launch reservations count during the boot window.
+            mb_inflight = await _active_reservation_count(session, chute.chute_id)
             if current + pending + mb_inflight >= await _target_count(chute.chute_id):
                 continue
 
             placed = False
+            container_intent = await _container_intent(chute)
+            if container_intent is None:
+                continue
+            container_repository, container_manifest_digest = container_intent
             for server in servers:
                 if server.server_id in occupied:
+                    continue
+                if not await _server_matches_reserved_workload(
+                    session,
+                    server,
+                    chute.chute_id,
+                    None,
+                    container_repository,
+                    container_manifest_digest,
+                ):
                     continue
                 if (server.benchmark_score or 0) < min_score:
                     continue
@@ -684,7 +874,13 @@ async def schedule_once() -> None:
             # per-chute TD. It self-registers (stamped with host_id) and a later tick places the chute.
             launched = False
             if not placed:
-                launched = await _launch_on_host(session, chute, req_cores, req_ram)
+                launched = await _launch_on_host(
+                    session,
+                    chute,
+                    req_cores,
+                    req_ram,
+                    container_intent=container_intent,
+                )
 
             # Rolling update with NO spare capacity anywhere: a new version can never place while
             # the stale instance holds the only server/TD. Replace in place, one instance per tick:
@@ -750,8 +946,21 @@ async def schedule_once() -> None:
             req_cores = ns.get("cpu_cores") or 1
             req_ram = ns.get("ram_gb") or 1
             placed = False
+            container_intent = await _container_intent(chute)
+            if container_intent is None:
+                continue
+            container_repository, container_manifest_digest = container_intent
             for server in servers:
                 if server.server_id in occupied:
+                    continue
+                if not await _server_matches_reserved_workload(
+                    session,
+                    server,
+                    chute.chute_id,
+                    job.job_id,
+                    container_repository,
+                    container_manifest_digest,
+                ):
                     continue
                 if (server.benchmark_score or 0) < min_score:
                     continue
@@ -770,9 +979,16 @@ async def schedule_once() -> None:
                 # Only launch a TD if there isn't one already booting for this chute (any host).
                 # Jobs need exactly one TD; without this guard the scheduler launches on every host
                 # during the boot window (same over-launch bug as the cord pass).
-                mb_inflight = len(await settings.redis_client.keys(f"mb:launch:{chute.chute_id}:*"))
+                mb_inflight = await _active_reservation_count(session, chute.chute_id, job.job_id)
                 if mb_inflight == 0:
-                    await _launch_on_host(session, chute, req_cores, req_ram)
+                    await _launch_on_host(
+                        session,
+                        chute,
+                        req_cores,
+                        req_ram,
+                        job=job,
+                        container_intent=container_intent,
+                    )
 
 
 async def _tick_with_lock() -> None:

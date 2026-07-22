@@ -1,5 +1,6 @@
 """Adversarial regression tests for registered-server LUKS capabilities."""
 
+import base64
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -38,6 +39,7 @@ from api.server.service import (
     require_confirm_nonce,
     require_luks_quote_nonce,
 )
+from api.host.schemas import TdQuoteCommitmentV1
 
 
 OWNER = "5FRegisteredOwner"
@@ -255,39 +257,70 @@ async def test_boot_nonce_authorization_replay_cannot_mint_another_nonce():
 
 @pytest.mark.asyncio
 async def test_storage_registration_signature_binds_identity_cert_and_role():
-    """Storage capability issuance is authorized by a signature over its exact identity."""
+    """Storage capability issuance derives owner/role from a quote-bound reservation."""
+    commitment = TdQuoteCommitmentV1(
+        reservation_sha256="1" * 64,
+        launch_nonce=base64.b64encode(b"n" * 32).decode(),
+        attested_spki_sha256=CERT_HASH,
+        release_target_sha256="2" * 64,
+        boot_generation=1,
+    )
     args = CpuServerRegistrationArgs(
         server_id=SERVER_ID,
         name=VM_NAME,
         quote="quote",
         benchmark=_benchmark(),
         storage_role=True,
-        host_id="l0-owner",
+        launch_reservation="reservation.secret",
+        quote_commitment=commitment,
+        td_signature=base64.b64encode(b"s" * 64).decode(),
     )
     db = AsyncMock(spec=AsyncSession)
     db.get.return_value = None
     membership = Mock()
     membership.scalar.return_value = True
-    host_lookup = Mock()
-    host_lookup.scalar_one_or_none.return_value = Host(
-        host_id="l0-owner",
-        name="l0-owner",
-        miner_hotkey=OWNER,
-        tee_type="tdx",
-        capacity=1,
-    )
     server_lookup = Mock()
     server_lookup.scalar_one_or_none.return_value = None
     ip_owners = Mock()
     ip_owners.scalars.return_value.all.return_value = []
-    db.execute.side_effect = [membership, host_lookup, server_lookup, ip_owners]
-
-    keypair = Mock()
-    keypair.verify.return_value = True
+    db.execute.side_effect = [membership, server_lookup, ip_owners]
+    reservation = SimpleNamespace(
+        reservation_id="reservation-1",
+        boot_generation=1,
+        consumed_at=None,
+        invalidated_at=None,
+    )
+    claims = SimpleNamespace(
+        owner_hotkey=OWNER,
+        host_id="l0-owner",
+        server_id=SERVER_ID,
+        tee_type="tdx",
+        role="storage",
+        profile_id="storage-test",
+        image_sha256="d" * 64,
+    )
     attestation_quote = Mock()
+    measurement = _measurement(storage=True)
+    measurement.image_sha256 = "d" * 64
     with (
         patch("api.server.service.settings") as settings,
-        patch("api.server.service.Keypair", return_value=keypair),
+        patch(
+            "api.server.service.resolve_launch_reservation",
+            new_callable=AsyncMock,
+            return_value=(reservation, claims),
+        ),
+        patch("api.server.service._verify_td_registration_signature"),
+        patch(
+            "api.server.service._validate_cpu_registration_host",
+            new_callable=AsyncMock,
+            return_value=Host(
+                host_id="l0-owner",
+                name="l0-owner",
+                miner_hotkey=OWNER,
+                tee_type="tdx",
+                capacity=1,
+            ),
+        ),
         patch("api.server.service.build_runtime_quote", return_value=attestation_quote),
         patch(
             "api.server.service.verify_quote",
@@ -296,7 +329,7 @@ async def test_storage_registration_signature_binds_identity_cert_and_role():
         ),
         patch(
             "api.server.service.get_matching_measurement_config",
-            return_value=_measurement(storage=True),
+            return_value=measurement,
         ),
         patch("api.server.service.validate_cpu_benchmark", return_value=_benchmark()),
         patch(
@@ -311,17 +344,14 @@ async def test_storage_registration_signature_binds_identity_cert_and_role():
             db,
             "203.0.113.10",
             args,
-            OWNER,
+            None,
             QUOTE_NONCE,
-            "00",
+            None,
             CERT_HASH,
             "-----BEGIN CERTIFICATE-----\nregistered\n-----END CERTIFICATE-----",
         )
 
-    signed_message = keypair.verify.call_args.args[0]
-    assert signed_message == (
-        f"{OWNER}:{QUOTE_NONCE}:cpu_register:{SERVER_ID}:{VM_NAME}:{CERT_HASH}:storage"
-    )
+    assert reservation.consumed_at is not None
     capability = generate_capability.await_args.args[0]
     assert capability.purpose == LuksCapabilityPurpose.STORAGE
     assert capability.server_id == SERVER_ID

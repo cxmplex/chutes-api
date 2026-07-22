@@ -11,6 +11,10 @@ provenance:
   publicKeySecretName: guest-provenance-public-key
   publicKeySecretKey: cosign.pub
 
+l0Publisher:
+  publicKeyRegistrySecretName: l0-publisher-public-keys
+  publicKeyRegistrySecretKey: keys.json
+
 squad_enabled: false
 
 chutes_version: "0.6.9"

@@ -55,6 +55,7 @@ def get_current_user(
     raise_not_found: bool = True,
     allow_api_key=False,
     require_v2: bool = False,
+    force_hotkey_auth: bool = False,
 ):
     """
     Authentication dependency builder.
@@ -80,8 +81,8 @@ def get_current_user(
 
         if (hotkey or signature or nonce) and (not hotkey or not signature or not nonce):
             hotkey, signature, nonce = None, None, None
-        use_hotkey_auth = registered_to is not None or (hotkey and signature)
-        if registered_to is not None and raise_not_found:
+        use_hotkey_auth = force_hotkey_auth or registered_to is not None or (hotkey and signature)
+        if (registered_to is not None and raise_not_found) or force_hotkey_auth:
             if not hotkey or not signature or not nonce:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,

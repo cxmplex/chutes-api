@@ -9,8 +9,10 @@ services:
       # chutes-tls is the verified final hop and overwrites X-Resolved-IP with its direct peer.
       TRUSTED_PROXY_CIDRS: "172.18.0.10/32"
       TRUSTED_PROVENANCE_PUBLIC_KEY_PATH: /etc/chutes/provenance/cosign.pub
+      TRUSTED_L0_PUBLISHER_KEYS_PATH: /etc/chutes/l0-publisher/keys.json
     volumes: &validator_dev_trust_mounts
       - /etc/chutes/provenance/cosign.pub:/etc/chutes/provenance/cosign.pub:ro
+      - /etc/chutes/l0-publisher/keys.json:/etc/chutes/l0-publisher/keys.json:ro
       - ./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro
 
   socket:

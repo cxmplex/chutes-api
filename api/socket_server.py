@@ -4,8 +4,11 @@ Socket.IO poowered websocket server for continuous bi-directional vali/miner com
 
 import api.logging_bootstrap  # noqa: F401  # configure structured logging before imports log
 import asyncio
+import base64
+import secrets
 import socketio
 import api.constants as cst
+from datetime import datetime, timedelta, timezone
 from typing import Dict
 from loguru import logger
 from fastapi import FastAPI, HTTPException, status
@@ -13,7 +16,14 @@ from sqlalchemy import select
 import api.database.orms  # noqa
 from api.config import settings
 from api.database import get_session
-from api.server.schemas import Host, Server
+from api.server.schemas import Host, Server, ServerAttestation
+from api.host import service as host_service
+from api.host.schemas import (
+    HostSocketAuthenticationV1,
+    HostKeyGeneration,
+    TdSocketAuthenticationV1,
+    TdSocketChallengeV1,
+)
 from api.user.router import get_current_user
 from api.socket_shared import SyntheticRequest
 from api.redis_pubsub import RedisListener, AgentCommandListener
@@ -33,6 +43,63 @@ sio.reverse_map = {}
 # 1-click CPU TEE agent sessions: server_id -> session_id, and session_id -> {hotkey, server_id}.
 sio.agent_sessions = {}
 sio.agent_meta = {}
+
+
+async def _validate_agent_session(session_id: str) -> bool:
+    meta = sio.agent_meta.get(session_id)
+    if meta is None:
+        return False
+    generation = meta.get("host_key_generation")
+    attested_spki = meta.get("attested_spki_sha256")
+    async with get_session() as session:
+        if generation is not None:
+            host = await session.get(Host, meta["server_id"])
+            key = await session.get(HostKeyGeneration, (meta["server_id"], generation))
+            valid = bool(
+                host is not None
+                and key is not None
+                and host.provisioning_state == "ready"
+                and host.active_key_generation == generation
+                and key.revoked_at is None
+            )
+        elif attested_spki:
+            server = await session.get(Server, meta["server_id"])
+            latest = (
+                await session.execute(
+                    select(ServerAttestation)
+                    .where(ServerAttestation.server_id == meta["server_id"])
+                    .order_by(
+                        ServerAttestation.created_at.desc(),
+                        ServerAttestation.attestation_id.desc(),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                seconds=settings.release_attestation_max_age_seconds
+            )
+            valid = bool(
+                server is not None
+                and server.attested_cert_pubkey_hash == attested_spki
+                and latest is not None
+                and latest.verification_error is None
+                and latest.verified_at is not None
+                and latest.verified_at >= cutoff
+                and latest.measurement_name == server.measurement_name
+                and latest.measurement_config_fingerprint == server.measurement_config_fingerprint
+                and latest.trust_set_fingerprint == server.trust_set_fingerprint
+            )
+        else:
+            valid = True
+    if not valid:
+        sio.agent_meta.pop(session_id, None)
+        if sio.agent_sessions.get(meta["server_id"]) == session_id:
+            sio.agent_sessions.pop(meta["server_id"], None)
+        await sio.disconnect(session_id)
+    return valid
+
+
+sio.validate_agent_session = _validate_agent_session
 
 
 @fastapi_app.on_event("startup")
@@ -159,6 +226,28 @@ def _verify_attested_socket_signature(
         return False
 
 
+def _verify_attested_socket_signature_b64(
+    attested_cert_pem: str, message: bytes, signature_b64: str
+) -> bool:
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+
+        cert = x509.load_pem_x509_certificate(attested_cert_pem.encode())
+        public_key = cert.public_key()
+        signature = base64.b64decode(signature_b64, validate=True)
+        if isinstance(public_key, rsa.RSAPublicKey):
+            public_key.verify(signature, message, padding.PKCS1v15(), hashes.SHA256())
+            return True
+        if isinstance(public_key, ec.EllipticCurvePublicKey):
+            public_key.verify(signature, message, ec.ECDSA(hashes.SHA256()))
+            return True
+        return False
+    except Exception:
+        return False
+
+
 @sio.event
 async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
     """
@@ -183,7 +272,8 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
         nonce = headers.get(cst.NONCE_HEADER)
         if not server_id:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST, detail="Missing server id header"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Missing server id header",
             )
         async with get_session() as session:
             server = (
@@ -195,73 +285,242 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
                     )
                 )
             ).scalar_one_or_none()
-            # Model B: a bare-metal L0 launcher host connects with its host_id to receive per-chute
-            # launch/teardown commands. It is not a Server (it's a launcher, not attested), so accept
-            # the connection when server_id matches a registered Host owned by this miner.
-            if server is None:
-                host = (
-                    await session.execute(
-                        select(Host).where(
-                            Host.host_id == server_id,
-                            Host.miner_hotkey == hotkey,
-                        )
-                    )
-                ).scalar_one_or_none()
-            else:
-                host = None
-        if server is None and host is None:
+        if server is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"{server_id} is not a self-registered server or registered L0 host for {hotkey}",
+                detail=f"{server_id} is not a self-registered server for {hotkey}",
             )
-        if server is not None:
-            # Self-registered CPU-TEE server: the miner-hotkey signature alone does NOT bind this
-            # command channel to the TD, because the untrusted L0 host also holds the miner key and
-            # could authenticate as a co-tenant TD's server_id to capture its deploy JWT (and DoS the
-            # real TD by overwriting the session). Require a signature from the in-TEE
-            # attestation-bound key (committed in the registration quote) over the nonce-bound
-            # challenge, verified against the stored attested cert. Because only the in-TEE key can
-            # produce it, no non-key-holder (incl. the host) can take over the session. Fail closed:
-            # no stored cert, or a missing/invalid attested signature, is rejected.
-            attest_sig = headers.get(cst.ATTEST_SIGNATURE_HEADER)
-            if not server.attested_cert:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=(
-                        f"Server {server_id} has no attestation-bound cert on record; cannot bind "
-                        "its command channel to the attested TD. Re-register (POST /servers/cpu/register)."
-                    ),
-                )
-            if not attest_sig or not _verify_attested_socket_signature(
-                server.attested_cert, f"{server_id}:{nonce}:sockets-attest", attest_sig
-            ):
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=(
-                        "Missing or invalid attestation-bound socket signature for self-registered "
-                        f"server {server_id}; only the in-TEE attested key may hold its command channel."
-                    ),
-                )
+        # Self-registered CPU-TEE server: the miner-hotkey signature alone does NOT bind this
+        # command channel to the TD. Require the registration-bound in-TEE key as well.
+        attest_sig = headers.get(cst.ATTEST_SIGNATURE_HEADER)
+        if not server.attested_cert:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Server {server_id} has no attestation-bound cert on record; cannot bind "
+                    "its command channel to the attested TD. Re-register (POST /servers/cpu/register)."
+                ),
+            )
+        if not attest_sig or not _verify_attested_socket_signature(
+            server.attested_cert, f"{server_id}:{nonce}:sockets-attest", attest_sig
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Missing or invalid attestation-bound socket signature for self-registered "
+                    f"server {server_id}; only the in-TEE attested key may hold its command channel."
+                ),
+            )
         sio.agent_sessions[server_id] = session_id
-        sio.agent_meta[session_id] = {"hotkey": hotkey, "server_id": server_id}
+        agent_meta = {
+            "hotkey": hotkey,
+            "server_id": server_id,
+        }
+        if getattr(server, "attested_cert_pubkey_hash", None):
+            agent_meta["attested_spki_sha256"] = server.attested_cert_pubkey_hash
+        sio.agent_meta[session_id] = agent_meta
         await mark_agent_online(server_id)
         logger.success(
             f"Authenticated 1-click agent: server_id={server_id} hotkey={hotkey} session={session_id}"
         )
         await sio.emit(
-            "auth_success", {"message": "Authenticated", "server_id": server_id}, to=session_id
+            "auth_success",
+            {"message": "Authenticated", "server_id": server_id},
+            to=session_id,
         )
         return True
     except HTTPException as e:
         logger.warning(f"Agent authentication failed: {e.detail}")
         await sio.emit(
-            "auth_failed", {"error": f"Authentication failed: {e.detail}"}, to=session_id
+            "auth_failed",
+            {"error": f"Authentication failed: {e.detail}"},
+            to=session_id,
         )
     except Exception as e:
         logger.error(f"Unexpected error authenticating agent: {e}")
         await sio.emit("auth_failed", {"error": f"Unexpected error: {e}"}, to=session_id)
     await sio.disconnect(session_id)
     return False
+
+
+@sio.event
+async def td_challenge(session_id: str, data: Dict[str, object]) -> bool:
+    """Issue a one-use challenge for a current reservation-attested Model-B TD."""
+
+    try:
+        server_id = str((data or {}).get("server_id") or "")
+        async with get_session() as session:
+            server = (
+                await session.execute(
+                    select(Server).where(
+                        Server.server_id == server_id,
+                        Server.self_registered.is_(True),
+                        Server.launch_reservation_id.is_not(None),
+                    )
+                )
+            ).scalar_one_or_none()
+        if server is None or not server.attested_cert or not server.attested_cert_pubkey_hash:
+            raise ValueError("server has no current reservation-attested identity")
+        now = datetime.now(timezone.utc)
+        challenge = TdSocketChallengeV1(
+            challenge_id=secrets.token_hex(32),
+            session_id=session_id,
+            server_id=server.server_id,
+            attested_spki_sha256=server.attested_cert_pubkey_hash.lower(),
+            challenge=secrets.token_urlsafe(32),
+            expires_at=now + timedelta(seconds=120),
+        )
+        await settings.redis_client.setex(
+            f"td:socket-challenge:{challenge.challenge_id}",
+            120,
+            challenge.model_dump_json(),
+        )
+        await sio.emit("td_challenge", challenge.model_dump(mode="json"), to=session_id)
+        return True
+    except Exception as exc:
+        logger.warning(f"TD socket challenge rejected: {exc}")
+        await sio.emit("auth_failed", {"error": str(exc)}, to=session_id)
+        await sio.disconnect(session_id)
+        return False
+
+
+@sio.event
+async def td_authenticate(session_id: str, data: Dict[str, object]) -> bool:
+    """Bind a control channel to the current reservation-attested serving key."""
+
+    try:
+        authentication = TdSocketAuthenticationV1.model_validate(data)
+        if authentication.session_id != session_id:
+            raise ValueError("TD socket authentication names another session")
+        now = datetime.now(timezone.utc)
+        issued_at = authentication.issued_at
+        if issued_at.tzinfo is None:
+            issued_at = issued_at.replace(tzinfo=timezone.utc)
+        if abs((now - issued_at).total_seconds()) > 120:
+            raise ValueError("TD socket authentication is stale")
+        raw = await settings.redis_client.getdel(
+            f"td:socket-challenge:{authentication.challenge_id}"
+        )
+        if not raw:
+            raise ValueError("TD socket challenge is expired or consumed")
+        challenge = TdSocketChallengeV1.model_validate_json(raw)
+        if (
+            challenge.session_id != session_id
+            or challenge.server_id != authentication.server_id
+            or challenge.attested_spki_sha256 != authentication.attested_spki_sha256
+            or challenge.challenge != authentication.challenge
+            or challenge.expires_at <= now
+        ):
+            raise ValueError("TD socket authentication does not match its challenge")
+        async with get_session() as session:
+            server = (
+                await session.execute(
+                    select(Server).where(
+                        Server.server_id == authentication.server_id,
+                        Server.self_registered.is_(True),
+                        Server.launch_reservation_id.is_not(None),
+                        Server.attested_cert_pubkey_hash == authentication.attested_spki_sha256,
+                    )
+                )
+            ).scalar_one_or_none()
+        if server is None or not server.attested_cert:
+            raise ValueError("TD attested identity is no longer current")
+        if not _verify_attested_socket_signature_b64(
+            server.attested_cert,
+            authentication.signing_bytes(),
+            authentication.signature,
+        ):
+            raise ValueError("TD socket signature is invalid")
+        previous = sio.agent_sessions.get(server.server_id)
+        if previous is not None and previous != session_id:
+            await sio.disconnect(previous)
+        sio.agent_sessions[server.server_id] = session_id
+        sio.agent_meta[session_id] = {
+            "hotkey": server.miner_hotkey,
+            "server_id": server.server_id,
+            "attested_spki_sha256": authentication.attested_spki_sha256,
+        }
+        await mark_agent_online(server.server_id)
+        await sio.emit(
+            "auth_success",
+            {
+                "message": "Authenticated",
+                "server_id": server.server_id,
+                "attested_spki_sha256": authentication.attested_spki_sha256,
+            },
+            to=session_id,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"TD socket authentication failed: {exc}")
+        await sio.emit("auth_failed", {"error": str(exc)}, to=session_id)
+        await sio.disconnect(session_id)
+        return False
+
+
+@sio.event
+async def host_challenge(session_id: str, data: Dict[str, object]) -> bool:
+    """Issue a server challenge for one active logical-host key generation."""
+
+    try:
+        host_id = str((data or {}).get("host_id") or "")
+        key_generation = int((data or {}).get("key_generation") or 0)
+        async with get_session() as session:
+            challenge = await host_service.create_host_socket_challenge(
+                session, session_id, host_id, key_generation
+            )
+        await sio.emit(
+            "host_challenge",
+            challenge.model_dump(mode="json"),
+            to=session_id,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"Host socket challenge rejected: {exc}")
+        await sio.emit("auth_failed", {"error": str(exc)}, to=session_id)
+        await sio.disconnect(session_id)
+        return False
+
+
+@sio.event
+async def host_authenticate(session_id: str, data: Dict[str, object]) -> bool:
+    """Authenticate an L0 control channel with its persistent Ed25519 host key."""
+
+    try:
+        authentication = HostSocketAuthenticationV1.model_validate(data)
+        async with get_session() as session:
+            host = await host_service.verify_host_socket_authentication(
+                session, session_id, authentication
+            )
+        previous = sio.agent_sessions.get(host.host_id)
+        if previous is not None and previous != session_id:
+            await sio.disconnect(previous)
+        sio.agent_sessions[host.host_id] = session_id
+        sio.agent_meta[session_id] = {
+            "hotkey": host.miner_hotkey,
+            "server_id": host.host_id,
+            "host_key_generation": authentication.key_generation,
+        }
+        await mark_agent_online(host.host_id)
+        await sio.emit(
+            "auth_success",
+            {
+                "message": "Authenticated",
+                "server_id": host.host_id,
+                "key_generation": authentication.key_generation,
+            },
+            to=session_id,
+        )
+        logger.success(
+            f"Authenticated logical host: host_id={host.host_id} "
+            f"key_generation={authentication.key_generation} session={session_id}"
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"Host socket authentication failed: {exc}")
+        await sio.emit("auth_failed", {"error": str(exc)}, to=session_id)
+        await sio.disconnect(session_id)
+        return False
 
 
 @sio.event
@@ -272,7 +531,7 @@ async def agent_status(session_id: str, data) -> None:
     heartbeat's running-workload inventory (containers for Model A, TD slots for Model B).
     """
     meta = sio.agent_meta.get(session_id)
-    if meta is None:
+    if meta is None or not await _validate_agent_session(session_id):
         logger.warning(f"agent_status from unauthenticated session {session_id}")
         await sio.disconnect(session_id)
         return
@@ -289,7 +548,7 @@ async def agent_command_ack(session_id: str, data) -> None:
     scheduler immediately frees the chute's pending slot + the server's occupancy.
     """
     meta = sio.agent_meta.get(session_id)
-    if meta is None:
+    if meta is None or not await _validate_agent_session(session_id):
         logger.warning(f"agent_command_ack from unauthenticated session {session_id}")
         await sio.disconnect(session_id)
         return

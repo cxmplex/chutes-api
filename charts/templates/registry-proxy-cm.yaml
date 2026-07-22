@@ -34,6 +34,7 @@ data:
             ssl_certificate     /etc/nginx/ssl/tls.crt;
             ssl_certificate_key /etc/nginx/ssl/tls.key;
             ssl_protocols       TLSv1.2 TLSv1.3;
+            ssl_verify_client optional_no_ca;
 
             # Block pulls of intermediate build tags (never externally accessible).
             location ~ "^/v2/.+/manifests/forgebuild-" {
@@ -55,6 +56,7 @@ data:
             }
 
             location /v2/ {
+                auth_request /auth;
                 limit_except GET HEAD {
                     deny all;
                 }
@@ -94,6 +96,11 @@ data:
                 proxy_set_header X-Chutes-Hotkey $http_x_chutes_hotkey;
                 proxy_set_header X-Chutes-Signature $http_x_chutes_signature;
                 proxy_set_header X-Chutes-Nonce $http_x_chutes_nonce;
+                proxy_set_header X-Chutes-Registry-Session $http_x_chutes_registry_session;
+                proxy_set_header X-Chutes-Registry-Method $request_method;
+                proxy_set_header X-Chutes-Registry-Uri $request_uri;
+                proxy_set_header X-Client-Cert $ssl_client_escaped_cert;
+                proxy_set_header X-Client-Verify $ssl_client_verify;
                 # Own the client identity header before this final hop reaches the API.
                 proxy_set_header X-Resolved-IP $remote_addr;
                 proxy_pass_request_body off;
