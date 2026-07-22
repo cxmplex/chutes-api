@@ -99,15 +99,22 @@ class _Resolver:
         session: aiohttp.ClientSession,
         registry: str,
         repository: str,
-        registry_token: str,
+        registry_token: Optional[str],
+        *,
+        scheme: str = "https",
     ):
         self.session = session
         self.registry = registry
         self.repository = repository
-        self.basic_authorization = aiohttp.BasicAuth(
-            "x-token",
-            registry_token,
-        ).encode()
+        self.scheme = scheme
+        self.basic_authorization = (
+            aiohttp.BasicAuth(
+                "x-token",
+                registry_token,
+            ).encode()
+            if registry_token
+            else None
+        )
         self.bearer_token: Optional[str] = None
         self.manifests: set[str] = set()
         self.blobs: set[str] = set()
@@ -128,6 +135,10 @@ class _Resolver:
         return b"".join(chunks)
 
     async def _exchange_bearer_token(self, challenge: str) -> None:
+        if self.basic_authorization is None:
+            raise OciClosureError(
+                "trusted local registry unexpectedly required bearer authentication"
+            )
         try:
             scheme, parameters = challenge.split(" ", 1)
             values = parse_keqv_list(parse_http_list(parameters))
@@ -198,12 +209,12 @@ class _Resolver:
             authorization = (
                 f"Bearer {self.bearer_token}" if self.bearer_token else self.basic_authorization
             )
+            headers = {"Accept": OCI_ACCEPT}
+            if authorization:
+                headers["Authorization"] = authorization
             async with self.session.get(
                 url,
-                headers={
-                    "Accept": OCI_ACCEPT,
-                    "Authorization": authorization,
-                },
+                headers=headers,
                 allow_redirects=False,
             ) as response:
                 if response.status == 401 and attempt == 0:
@@ -237,7 +248,7 @@ class _Resolver:
     ) -> tuple[str, str, Dict[str, Any]]:
         if not (_DIGEST.fullmatch(reference) or _COSIGN_TAG.fullmatch(reference)):
             raise OciClosureError("OCI manifest reference is not canonical")
-        url = f"https://{self.registry}/v2/{self.repository}/manifests/{reference}"
+        url = f"{self.scheme}://{self.registry}/v2/{self.repository}/manifests/{reference}"
         headers, payload = await self._manifest_response(url)
         if not payload:
             raise OciClosureError("OCI manifest has an invalid bounded size")
@@ -344,13 +355,32 @@ async def resolve_oci_descriptor_closure(
 ) -> OciDescriptorClosure:
     """Resolve root/index/image/cosign descriptors using registry read credentials."""
 
-    registry = settings.depot_registry.strip().rstrip("/")
-    token = settings.depot_registry_token
+    depot_registry = settings.depot_registry.strip().rstrip("/")
+    depot_token = settings.depot_registry_token
+    if bool(depot_registry) != bool(depot_token):
+        raise OciClosureError("trusted Depot registry and read token must be configured together")
+    if depot_registry:
+        registry = depot_registry
+        token: Optional[str] = depot_token
+        scheme = "https"
+    else:
+        registry = settings.registry_host.strip().rstrip("/")
+        token = None
+        scheme = "http" if settings.registry_insecure else "https"
+    try:
+        parsed_registry = urlsplit(f"{scheme}://{registry}")
+        registry_port = parsed_registry.port
+    except ValueError as exc:
+        raise OciClosureError("trusted registry authority is invalid") from exc
     if (
         not registry
         or "/" in registry
         or "://" in registry
-        or not token
+        or parsed_registry.hostname is None
+        or parsed_registry.username is not None
+        or parsed_registry.password is not None
+        or registry_port is not None
+        and not 1 <= registry_port <= 65535
         or not _DIGEST.fullmatch(root_digest)
     ):
         raise OciClosureError("trusted internal registry resolver is not configured canonically")
@@ -360,6 +390,7 @@ async def resolve_oci_descriptor_closure(
             registry,
             repository,
             token,
+            scheme=scheme,
         ).resolve(root_digest)
     timeout = aiohttp.ClientTimeout(total=60, connect=15, sock_read=30)
     async with aiohttp.ClientSession(
@@ -371,4 +402,5 @@ async def resolve_oci_descriptor_closure(
             registry,
             repository,
             token,
+            scheme=scheme,
         ).resolve(root_digest)

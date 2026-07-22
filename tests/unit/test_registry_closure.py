@@ -180,6 +180,30 @@ async def test_resolver_bounds_root_index_image_and_cosign_closure(
 
 
 @pytest.mark.asyncio
+async def test_resolver_uses_trusted_internal_registry_without_depot(
+    oci_graph,
+):
+    with (
+        patch.object(registry_router.settings, "depot_registry", ""),
+        patch.object(registry_router.settings, "depot_registry_token", ""),
+        patch.object(
+            registry_router.settings,
+            "registry_host",
+            "registry:5000",
+        ),
+        patch.object(registry_router.settings, "registry_insecure", True),
+    ):
+        closure = await resolve_oci_descriptor_closure(
+            "owner/image",
+            oci_graph["root_digest"],
+            session=oci_graph["session"],
+        )
+
+    assert oci_graph["root_digest"] in closure.manifests
+    assert all(url.startswith("http://registry:5000/") for url in oci_graph["session"].urls)
+
+
+@pytest.mark.asyncio
 async def test_resolver_rejects_registry_digest_mismatch(oci_graph):
     root = oci_graph["root_digest"]
     oci_graph["session"].responses[root].headers["Docker-Content-Digest"] = f"sha256:{'f' * 64}"
