@@ -82,12 +82,39 @@ from api.server.util import (
 )
 from api.server.exceptions import (
     AttestationError,
+    NoClientCertError,
     NonceError,
     ServerNotFoundError,
     ServerRegistrationError,
 )
 from api.miner.util import is_miner_blacklisted
 from api.util import is_valid_host, semcomp
+
+
+async def _runtime_expected_cert_hash(
+    request: Request,
+    db: AsyncSession,
+    server_id: str,
+) -> str:
+    """Resolve the cert binding for a runtime quote.
+
+    Model-B agents may not present their self-signed serving cert on the nonce/quote HTTP request.
+    Their launch registration already bound that cert to a one-use reservation and hardware quote,
+    so runtime freshness can safely bind the new quote to the immutable registered hash. Peer and
+    secret-bearing storage operations continue to require live mTLS certificate possession.
+    """
+
+    try:
+        return await extract_client_cert_hash(require_proxy_verified=True)(request)
+    except NoClientCertError:
+        server = await db.get(Server, server_id)
+        if (
+            server is None
+            or server.launch_reservation_id is None
+            or not server.attested_cert_pubkey_hash
+        ):
+            raise
+        return server.attested_cert_pubkey_hash.lower()
 
 
 router = APIRouter()
@@ -955,12 +982,12 @@ async def get_runtime_nonce(
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User = Depends(get_current_user(purpose="tee", raise_not_found=False, registered_to=None)),
-    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """
     Generate a nonce for runtime attestation.
     """
     try:
+        expected_cert_hash = await _runtime_expected_cert_hash(request, db, server_id)
         server = await check_server_ownership(db, server_id, hotkey, expected_cert_hash)
 
         actual_ip = request.state.client_ip
@@ -999,12 +1026,12 @@ async def verify_runtime_attestation(
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User = Depends(get_current_user(purpose="tee", raise_not_found=False, registered_to=None)),
     nonce: str | None = Header(None, alias=NONCE_HEADER),
-    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
     """
     Verify runtime attestation with full measurement validation.
     """
     try:
+        expected_cert_hash = await _runtime_expected_cert_hash(request, db, server_id)
         server = await check_server_ownership(db, server_id, hotkey, expected_cert_hash)
         actual_ip = request.state.client_ip
         stored_nonce = await validate_and_consume_nonce(nonce, actual_ip, NoncePurpose.RUNTIME)

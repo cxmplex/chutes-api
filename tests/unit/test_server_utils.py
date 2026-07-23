@@ -34,7 +34,9 @@ from api.server.exceptions import (
     InvalidQuoteError,
     InvalidSignatureError,
     MeasurementMismatchError,
+    NoClientCertError,
 )
+from api.server.router import _runtime_expected_cert_hash
 from tests.fixtures.tdx import (
     EXPECTED_MRTD,
     EXPECTED_RMTR0,
@@ -43,6 +45,49 @@ from tests.fixtures.tdx import (
     EXPECTED_RMTR3,
     EXPECTED_USER_DATA,
 )
+
+
+@pytest.mark.asyncio
+async def test_runtime_cert_hash_falls_back_only_for_reservation_backed_server():
+    request = Mock()
+    db = Mock()
+    db.get = AsyncMock(
+        return_value=Mock(
+            launch_reservation_id="reservation",
+            attested_cert_pubkey_hash="A" * 64,
+        )
+    )
+    extractor = AsyncMock(side_effect=NoClientCertError())
+
+    with patch(
+        "api.server.router.extract_client_cert_hash",
+        return_value=extractor,
+    ):
+        result = await _runtime_expected_cert_hash(request, db, "server")
+
+    assert result == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_runtime_cert_hash_does_not_fallback_for_model_a_server():
+    request = Mock()
+    db = Mock()
+    db.get = AsyncMock(
+        return_value=Mock(
+            launch_reservation_id=None,
+            attested_cert_pubkey_hash="a" * 64,
+        )
+    )
+    extractor = AsyncMock(side_effect=NoClientCertError())
+
+    with (
+        patch(
+            "api.server.router.extract_client_cert_hash",
+            return_value=extractor,
+        ),
+        pytest.raises(NoClientCertError),
+    ):
+        await _runtime_expected_cert_hash(request, db, "server")
 
 
 # Test fixtures
