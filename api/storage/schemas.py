@@ -262,6 +262,60 @@ class ModelAccessResponse(ModelEnsureCapabilityIssueResponse):
 # --- confidential per-user volumes -------------------------------------------------------------
 
 
+class LaunchStorageContext(BaseModel):
+    """Authoritative verified launch identity installed before user code imports."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema: Literal["chutes.launch-context"] = "chutes.launch-context"
+    version: Literal[1] = 1
+    user_id: str
+    chute_id: str
+    config_id: str
+    instance_id: str
+    job_id: Optional[str] = None
+    compute_type: Literal["cpu", "gpu"]
+    management_mode: Literal["platform", "miner"]
+    server_id: str
+    default_volume_id: str
+    storage_session_exchange_allowed: Literal[True] = True
+    verified_at: str
+
+
+class LaunchStorageSessionResponse(BaseModel):
+    """Short-lived access plus one-use rotating refresh for one default volume."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema: Literal["chutes.chutefs-launch-session"] = "chutes.chutefs-launch-session"
+    version: Literal[1] = 1
+    access_token: str
+    access_expires_at: str
+    refresh_token: str
+    refresh_expires_at: str
+    allowed_operations: List[Literal["put", "get", "list", "delete"]]
+    generation: int = Field(..., ge=1)
+
+
+class LaunchStorageExchangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    config_id: str = Field(..., min_length=1, max_length=128)
+
+
+class LaunchStorageExchangeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    launch_context: LaunchStorageContext
+    storage_session: LaunchStorageSessionResponse
+
+
+class DefaultGrantRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    op: Literal["put", "get", "list"]
+
+
 class CreateVolumeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -286,6 +340,11 @@ class VolumeResponse(BaseModel):
     aggregate_quota_bytes: int
     used_bytes: int
     created_at: str
+
+
+class DefaultVolumeDiscoveryResponse(BaseModel):
+    launch_context: LaunchStorageContext
+    volume: VolumeResponse
 
 
 class VolumeListResponse(BaseModel):

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+from fastapi import FastAPI
 from pydantic import ValidationError
 
 from api.host.router import router as host_router
@@ -35,6 +36,18 @@ def _host(host_id="l0-unit-1", channel="stable", owner=HOTKEY):
         identity_metadata_sha256="1" * 64,
         steady_config_sha256="2" * 64,
     )
+
+
+def test_host_enrollment_openapi_preserves_v1_and_exposes_gpu_v2():
+    app = FastAPI()
+    app.include_router(host_router, prefix="/hosts")
+    schemas = app.openapi()["components"]["schemas"]
+
+    assert "compute_type" not in schemas["EnrollmentVoucherClaimsV1"]["properties"]
+    assert schemas["EnrollmentVoucherClaimsV1"]["properties"]["version"]["const"] == 1
+    assert schemas["EnrollmentVoucherClaimsV2"]["properties"]["compute_type"]["const"] == "gpu"
+    assert schemas["EnrollmentVoucherClaimsV2"]["properties"]["storage_enabled"]["const"] is True
+    assert schemas["HostEnrollmentStatusV2"]["properties"]["compute_type"]["const"] == "gpu"
 
 
 def _mock_db(existing_host=None, existing_node=object()):
@@ -107,6 +120,7 @@ async def test_register_host_uses_requested_release_channel_on_first_boot():
         db,
         "sev-snp",
         "canary",
+        "cpu",
         host_id="l0-unit-1",
         miner_hotkey=HOTKEY,
     )
@@ -128,6 +142,7 @@ async def test_register_host_propagates_desired_release_lookup_failure():
         db,
         "sev-snp",
         "canary",
+        "cpu",
         host_id="l0-unit-1",
         miner_hotkey=HOTKEY,
     )
@@ -138,7 +153,7 @@ async def test_register_host_rejects_identity_field_changes():
     host = _host()
     with pytest.raises(ServerRegistrationError, match="authenticated host"):
         await svc.register_host(_mock_db(), _args(host_id="other"), host)
-    with pytest.raises(ServerRegistrationError, match="TEE type or release channel"):
+    with pytest.raises(ServerRegistrationError, match="TEE, compute type, or release channel"):
         await svc.register_host(
             _mock_db(),
             _args(release_channel="canary"),
@@ -336,6 +351,58 @@ def test_host_registration_schema_accepts_zero_only_as_nonnegative_input():
         HostRegistrationArgs(host_id="negative", capacity=-1, storage_enabled=True)
     with pytest.raises(ValidationError, match="enrolled ChuteFS storage"):
         HostRegistrationArgs(host_id="zero-compute", capacity=0)
+
+
+def test_gpu_host_registration_requires_tdx_and_storage_posture():
+    gpu = HostRegistrationArgs(
+        host_id="gpu-host",
+        tee_type="tdx",
+        compute_type="gpu",
+        storage_enabled=True,
+        capacity=1,
+        host_boot_id="11111111-1111-1111-1111-111111111111",
+        untrusted_gpu_inventory={
+            "configured_profile": "b200-8gpu",
+            "devices": [],
+            "observed_count": 0,
+            "expected_count": 8,
+            "profile_match": False,
+        },
+        untrusted_gpu_inventory_ready=True,
+    )
+    assert gpu.compute_type == "gpu"
+    with pytest.raises(ValidationError, match="GPU hosts require TDX"):
+        HostRegistrationArgs(
+            host_id="gpu-snp",
+            tee_type="sev-snp",
+            compute_type="gpu",
+            storage_enabled=True,
+            host_boot_id="11111111-1111-1111-1111-111111111111",
+            untrusted_gpu_inventory={
+                "configured_profile": "b200-8gpu",
+                "devices": [],
+                "observed_count": 0,
+                "expected_count": 8,
+                "profile_match": False,
+            },
+            untrusted_gpu_inventory_ready=False,
+        )
+    with pytest.raises(ValidationError, match="storage_enabled"):
+        HostRegistrationArgs(
+            host_id="gpu-no-storage",
+            tee_type="tdx",
+            compute_type="gpu",
+            storage_enabled=False,
+            host_boot_id="11111111-1111-1111-1111-111111111111",
+            untrusted_gpu_inventory={
+                "configured_profile": "b200-8gpu",
+                "devices": [],
+                "observed_count": 0,
+                "expected_count": 8,
+                "profile_match": False,
+            },
+            untrusted_gpu_inventory_ready=False,
+        )
 
 
 @pytest.mark.parametrize(

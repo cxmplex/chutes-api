@@ -2,6 +2,8 @@
 FastAPI routes for server management and TDX attestation.
 """
 
+import secrets
+from datetime import datetime, timezone
 from typing import Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, Request, status, Header, Query
 from sqlalchemy import select
@@ -9,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, DatabaseError
 from loguru import logger
 
+from api.agent_channel import send_agent_command
 from api.database import get_db_session
 from api.config import (
     measurement_config_fingerprint,
@@ -16,6 +19,7 @@ from api.config import (
     settings,
 )
 from api.node.util import check_node_inventory
+from api.host.schemas import canonical_sha256
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.constants import (
@@ -32,7 +36,32 @@ from api.server.schemas import (
     ServerArgs,
     CpuServerRegistrationArgs,
     CpuServerRegistrationResponse,
+    GpuServerRegistrationArgs,
+    GpuServerRegistrationResponse,
+    GpuRuntimeSessionResponse,
+    GpuInfraLeaseRequestV1,
+    GpuInfraLeaseResponseV1,
+    GpuInfraConfirmRequestV1,
+    GpuInfraConfirmResponseV1,
+    GpuInfraAcknowledgeRequestV1,
+    GpuInfraAcknowledgeResponseV1,
+    GpuInfraAbandonRequestV1,
+    GpuInfraAbandonResponseV1,
+    GpuInfraCloseRequestV1,
+    GpuInfraCloseResponseV1,
+    GpuInfraMigrationPromoteRequestV1,
+    GpuInfraMigrationPromoteResponseV1,
+    GpuInfraMigrationRefreshRequestV1,
+    GpuInfraMigrationRefreshResponseV1,
+    GpuInfraRetireRequestV1,
+    GpuInfraRetireResponseV1,
+    GpuInfraMigrationCompleteRequestV1,
+    GpuInfraMigrationCompleteResponseV1,
+    GpuLegacyCloseRequestV1,
+    GpuLegacyCloseResponseV1,
+    GpuLegacyMigration,
     Server,
+    ServerAttestation,
     Host,
     NonceResponse,
     BootAttestationResponse,
@@ -50,6 +79,25 @@ from api.server.schemas import (
     UpgradeWindowInfo,
     TeeMeasurementResponse,
 )
+from api.server.gpu_sessions import (
+    GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
+    GPU_RUNTIME_SESSION_HEADER,
+    GPU_RUNTIME_SESSION_PURPOSES,
+    latest_gpu_runtime_session,
+    validate_gpu_runtime_session,
+)
+from api.server.gpu_infra import (
+    abandon_gpu_infra,
+    acknowledge_gpu_infra_closed,
+    acknowledge_gpu_infra,
+    close_legacy_gpu_sources,
+    complete_gpu_infra_migration,
+    confirm_gpu_infra,
+    lease_gpu_infra,
+    promote_gpu_infra_migration,
+    refresh_gpu_infra_migration,
+    retire_gpu_infra_key,
+)
 from api.server.service import (
     create_nonce,
     validate_and_consume_nonce,
@@ -57,11 +105,12 @@ from api.server.service import (
     process_boot_attestation,
     register_server,
     register_cpu_server,
+    register_gpu_server,
     check_server_ownership,
     get_server_by_name_or_id,
     update_server_name,
     process_runtime_attestation,
-    runtime_attestation_context_for_server,
+    runtime_attestation_context_for_server_db,
     get_server_attestation_status,
     delete_server,
     validate_request_nonce,
@@ -108,9 +157,23 @@ async def _runtime_expected_cert_hash(
         return await extract_client_cert_hash(require_proxy_verified=True)(request)
     except NoClientCertError:
         server = await db.get(Server, server_id)
+        cpu_reservation = (
+            server.launch_reservation_id
+            if server is not None
+            and isinstance(server.launch_reservation_id, str)
+            and server.launch_reservation_id
+            else None
+        )
+        gpu_reservation = (
+            server.gpu_launch_reservation_id
+            if server is not None
+            and isinstance(server.gpu_launch_reservation_id, str)
+            and server.gpu_launch_reservation_id
+            else None
+        )
         if (
             server is None
-            or server.launch_reservation_id is None
+            or (cpu_reservation is None and gpu_reservation is None)
             or not server.attested_cert_pubkey_hash
         ):
             raise
@@ -291,6 +354,468 @@ async def register_cpu_server_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="CPU server registration failed",
         )
+
+
+@router.get("/gpu/nonce", response_model=NonceResponse)
+async def get_gpu_register_nonce(request: Request):
+    nonce_info = await create_nonce(request.state.client_ip, purpose=NoncePurpose.GPU_REGISTER)
+    return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
+
+
+@router.post("/gpu/register", response_model=GpuServerRegistrationResponse)
+async def register_gpu_server_endpoint(
+    request: Request,
+    args: GpuServerRegistrationArgs,
+    db: AsyncSession = Depends(get_db_session),
+    nonce=Depends(validate_request_nonce(NoncePurpose.GPU_REGISTER)),
+    expected_cert_hash=Depends(extract_client_cert_hash()),
+    expected_cert_pem=Depends(extract_client_cert_pem()),
+):
+    try:
+        result = await register_gpu_server(
+            db,
+            request.state.client_ip,
+            args,
+            nonce,
+            expected_cert_hash,
+            expected_cert_pem,
+        )
+        if result["management_mode"] == "miner":
+            from api.host.schemas import GpuLaunchReservation
+
+            reservation = await db.get(
+                GpuLaunchReservation,
+                result["reservation_id"],
+            )
+            if reservation is None:
+                raise RuntimeError(
+                    "registered GPU reservation disappeared before post-attest gates"
+                )
+            migration = (
+                await db.get(
+                    GpuLegacyMigration,
+                    reservation.legacy_migration_id,
+                )
+                if reservation.legacy_migration_id is not None
+                else None
+            )
+            if migration is not None and migration.state in {
+                "ready",
+                "leased",
+                "promoted",
+            }:
+                await send_agent_command(
+                    reservation.host_id,
+                    "hotplug_gpu_legacy",
+                    {
+                        "server_id": reservation.server_id,
+                        "reservation_id": reservation.reservation_id,
+                        "reservation_claims_sha256": reservation.claims_sha256,
+                        "process_incarnation": reservation.process_incarnation,
+                    },
+                )
+        return result
+    except (AttestationError, ServerRegistrationError) as exc:
+        await db.rollback()
+        current = await db.get(Server, args.server_id)
+        try:
+            from api.host.gpu_allocations import (
+                _parse_reservation_token,
+                _validate_row_claims,
+            )
+            from api.host.schemas import GpuLaunchReservation
+            from api.server.service import _gpu_attestation_lineage
+
+            reservation_id, token_hash = _parse_reservation_token(args.launch_reservation)
+            reservation = await db.get(GpuLaunchReservation, reservation_id)
+            gpu_lineage = {}
+            claims = None
+            if (
+                reservation is not None
+                and secrets.compare_digest(reservation.token_hash, token_hash)
+                and reservation.server_id == args.server_id
+                and reservation.claims_sha256 == args.quote_commitment.reservation_sha256
+                and reservation.state in {"launching", "running", "quarantined"}
+            ):
+                claims = _validate_row_claims(reservation)
+            if claims is not None and args.quote_commitment.claims == claims:
+                if current is None:
+                    current = Server(
+                        server_id=claims.server_id,
+                        netuid=settings.netuid,
+                        name=claims.server_id,
+                        ip=request.state.client_ip,
+                        miner_hotkey=claims.owner_hotkey,
+                        is_tee=True,
+                        self_registered=True,
+                        compute_type="gpu",
+                        tee_type="tdx",
+                        host_id=claims.host_id,
+                        storage_role=False,
+                        gpu_launch_reservation_id=reservation.reservation_id,
+                        gpu_allocation_group_id=claims.allocation_group_id,
+                        gpu_allocation_group_generation=(claims.allocation_group_generation),
+                        gpu_management_mode=claims.management_mode,
+                        gpu_process_incarnation=claims.process_incarnation,
+                        gpu_topology_fingerprint=claims.topology_fingerprint,
+                        gpu_retired_at=datetime.now(timezone.utc),
+                        gpu_retirement_reason="initial GPU registration attempt failed",
+                    )
+                    db.add(current)
+                    await db.flush()
+                if (
+                    current.compute_type == "gpu"
+                    and current.gpu_launch_reservation_id == reservation.reservation_id
+                ):
+                    gpu_lineage = _gpu_attestation_lineage(
+                        reservation,
+                        claims,
+                        list(args.gpu_evidence or []),
+                        None,
+                    )
+                    failed_attestation = ServerAttestation(
+                        server_id=current.server_id,
+                        quote_data=args.quote,
+                        verification_error=str(getattr(exc, "detail", exc)),
+                        created_at=datetime.now(timezone.utc),
+                        **gpu_lineage,
+                    )
+                    db.add(failed_attestation)
+                    await db.flush()
+                    from api.host.gpu_allocations import (
+                        quarantine_gpu_reservation_control_plane,
+                    )
+
+                    await quarantine_gpu_reservation_control_plane(
+                        db,
+                        reservation.reservation_id,
+                        code="gpu_registration_attestation_failed",
+                        reason=str(getattr(exc, "detail", exc)),
+                        metadata={"attestation_id": (failed_attestation.attestation_id)},
+                    )
+                    await db.commit()
+        except Exception as audit_exc:  # noqa: BLE001 - never mask attestation rejection
+            await db.rollback()
+            logger.error(
+                f"Could not persist failed GPU attestation attempt for "
+                f"{args.server_id}: {audit_exc}"
+            )
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            f"Unexpected GPU guest registration failure for {args.server_id}: {exc}",
+            exc_info=True,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="GPU guest registration failed",
+        )
+
+
+@router.post(
+    "/gpu/{server_id}/session",
+    response_model=GpuRuntimeSessionResponse,
+)
+async def refresh_gpu_runtime_session(
+    server_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    server = await db.get(Server, server_id)
+    if (
+        server is None
+        or server.compute_type != "gpu"
+        or server.tee_type != "tdx"
+        or server.gpu_management_mode not in {"miner", "platform"}
+        or server.gpu_retired_at is not None
+        or server.attested_cert_pubkey_hash != expected_cert_hash.lower()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Presented attested identity is not the current GPU server.",
+        )
+    token, expires_at, attestation_id = await latest_gpu_runtime_session(db, server)
+    server.gpu_runtime_session_attestation_id = attestation_id
+    server.gpu_runtime_session_expires_at = expires_at
+    await db.commit()
+    return GpuRuntimeSessionResponse(
+        server_id=server.server_id,
+        owner_hotkey=server.miner_hotkey,
+        runtime_session=token,
+        runtime_session_expires_at=expires_at.isoformat(),
+        allowed_purposes=list(
+            GPU_RUNTIME_SESSION_PURPOSES
+            if server.gpu_management_mode == "miner"
+            else GPU_PLATFORM_RUNTIME_SESSION_PURPOSES
+        ),
+    )
+
+
+@router.post(
+    "/gpu/{server_id}/legacy-migration/close",
+    response_model=GpuLegacyCloseResponseV1,
+)
+async def close_legacy_gpu_migration_endpoint(
+    server_id: str,
+    body: GpuLegacyCloseRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    result = await close_legacy_gpu_sources(
+        db,
+        server_id,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+async def _gpu_infra_session(
+    db: AsyncSession,
+    server_id: str,
+    attested_session: str | None,
+) -> tuple[Server, dict]:
+    if not attested_session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="gpu-infra requires an attested GPU runtime session.",
+        )
+    server, payload = await validate_gpu_runtime_session(
+        db,
+        attested_session,
+        required_purpose="gpu-infra",
+    )
+    if server.server_id != server_id or server.gpu_management_mode != "miner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="gpu-infra path does not match the miner runtime session.",
+        )
+    return server, payload
+
+
+@router.post(
+    "/gpu/{server_id}/infra/lease",
+    response_model=GpuInfraLeaseResponseV1,
+)
+async def lease_gpu_infra_endpoint(
+    server_id: str,
+    body: GpuInfraLeaseRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await lease_gpu_infra(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/abandon",
+    response_model=GpuInfraAbandonResponseV1,
+)
+async def abandon_gpu_infra_endpoint(
+    server_id: str,
+    body: GpuInfraAbandonRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await abandon_gpu_infra(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/retire",
+    response_model=GpuInfraRetireResponseV1,
+)
+async def retire_gpu_infra_endpoint(
+    server_id: str,
+    body: GpuInfraRetireRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await retire_gpu_infra_key(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/close",
+    response_model=GpuInfraCloseResponseV1,
+)
+async def close_gpu_infra_endpoint(
+    server_id: str,
+    body: GpuInfraCloseRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    if not attested_session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="gpu-infra close requires an attested GPU runtime session.",
+        )
+    runtime_server, payload = await validate_gpu_runtime_session(
+        db,
+        attested_session,
+        required_purpose="gpu-infra",
+        allow_resetting=True,
+    )
+    if runtime_server.server_id != server_id or runtime_server.gpu_management_mode != "miner":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="gpu-infra close path does not match the miner runtime session.",
+        )
+    result = await acknowledge_gpu_infra_closed(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/migration-refresh",
+    response_model=GpuInfraMigrationRefreshResponseV1,
+)
+async def refresh_gpu_infra_migration_endpoint(
+    server_id: str,
+    body: GpuInfraMigrationRefreshRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await refresh_gpu_infra_migration(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/migration-promote",
+    response_model=GpuInfraMigrationPromoteResponseV1,
+)
+async def promote_gpu_infra_migration_endpoint(
+    server_id: str,
+    body: GpuInfraMigrationPromoteRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await promote_gpu_infra_migration(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/confirm",
+    response_model=GpuInfraConfirmResponseV1,
+)
+async def confirm_gpu_infra_endpoint(
+    server_id: str,
+    body: GpuInfraConfirmRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await confirm_gpu_infra(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/acknowledge",
+    response_model=GpuInfraAcknowledgeResponseV1,
+)
+async def acknowledge_gpu_infra_endpoint(
+    server_id: str,
+    body: GpuInfraAcknowledgeRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await acknowledge_gpu_infra(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/infra/migration-complete",
+    response_model=GpuInfraMigrationCompleteResponseV1,
+)
+async def complete_gpu_infra_migration_endpoint(
+    server_id: str,
+    body: GpuInfraMigrationCompleteRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+):
+    runtime_server, payload = await _gpu_infra_session(db, server_id, attested_session)
+    result = await complete_gpu_infra_migration(
+        db,
+        runtime_server,
+        payload,
+        expected_cert_hash,
+        body,
+    )
+    await db.commit()
+    return result
 
 
 def _manifest_for_server(server: Server) -> dict | None:
@@ -994,14 +1519,18 @@ async def get_runtime_nonce(
         if server.ip != actual_ip:
             raise Exception()
 
-        context = runtime_attestation_context_for_server(server)
+        context = await runtime_attestation_context_for_server_db(db, server)
         nonce_info = await create_nonce(
             server.ip,
             purpose=NoncePurpose.RUNTIME,
             context=context.model_dump(),
         )
 
-        return NonceResponse(nonce=nonce_info["nonce"], expires_at=nonce_info["expires_at"])
+        return NonceResponse(
+            nonce=nonce_info["nonce"],
+            expires_at=nonce_info["expires_at"],
+            context_sha256=(canonical_sha256(context) if server.compute_type == "gpu" else None),
+        )
 
     except ServerNotFoundError as e:
         raise e
@@ -1060,6 +1589,7 @@ async def verify_runtime_attestation(
             status=result["status"],
             revocation_status=result["revocation_status"],
             luks_quote_nonce=result.get("luks_quote_nonce"),
+            gpu_evidence_sha256=result.get("gpu_evidence_sha256"),
         )
 
     except ServerNotFoundError as e:

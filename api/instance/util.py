@@ -29,6 +29,7 @@ from api.instance.schemas import Instance, LaunchConfig
 from api.config import settings
 from api.job.schemas import Job
 from api.database import get_session
+from api.host.locks import acquire_gpu_lifecycle_lock
 from api.util import notify_deleted, notify_job_deleted, semcomp
 from api.log import instance_logger, bound_logger, LifecycleEvent
 from api.bounty.util import (
@@ -188,11 +189,21 @@ async def get_instance_disable_count(instance_id: str) -> int:
 class _InstanceInfo:
     """Simple class to hold instance info for notify_deleted."""
 
-    def __init__(self, instance_id: str, miner_hotkey: str, chute_id: str, config_id: str = None):
+    def __init__(
+        self,
+        instance_id: str,
+        miner_hotkey: str,
+        chute_id: str,
+        config_id: str = None,
+        server_id: str = None,
+        gpu_management_mode: str = None,
+    ):
         self.instance_id = instance_id
         self.miner_hotkey = miner_hotkey
         self.chute_id = chute_id
         self.config_id = config_id
+        self.server_id = server_id
+        self.gpu_management_mode = gpu_management_mode
 
 
 async def cleanup_instance_conn_tracking(chute_id: str, instance_id: str):
@@ -214,6 +225,15 @@ async def _execute_instance_deletion(
 ) -> bool:
     """Actually delete an instance from the database."""
     async with get_session() as session:
+        lineage = (
+            await session.execute(
+                select(
+                    Instance.config_id,
+                    Instance.server_id,
+                    Instance.gpu_management_mode,
+                ).where(Instance.instance_id == instance_id)
+            )
+        ).one_or_none()
         delete_result = await session.execute(
             text("DELETE FROM instances WHERE instance_id = :instance_id"),
             {"instance_id": instance_id},
@@ -233,7 +253,14 @@ async def _execute_instance_deletion(
 
             asyncio.create_task(
                 notify_deleted(
-                    _InstanceInfo(instance_id, miner_hotkey, chute_id, config_id),
+                    _InstanceInfo(
+                        instance_id,
+                        miner_hotkey,
+                        chute_id,
+                        config_id or (lineage.config_id if lineage else None),
+                        lineage.server_id if lineage else None,
+                        lineage.gpu_management_mode if lineage else None,
+                    ),
                     message=f"Instance {instance_id} of miner {miner_hotkey} has been deleted: {reason}",
                 )
             )
@@ -826,6 +853,40 @@ def _decode_chutes_jwt(token: str, *, require_exp: bool) -> dict:
     )
 
 
+def launch_management_mode(launch_config: LaunchConfig) -> str:
+    compute_type = getattr(launch_config, "compute_type", None)
+    if compute_type == "cpu":
+        return "platform"
+    if compute_type == "gpu":
+        return getattr(launch_config, "gpu_management_mode", None) or "miner"
+    raise ValueError("Launch config has no authoritative compute type.")
+
+
+def launch_identity_claims(launch_config: LaunchConfig) -> dict:
+    """Exact durable launch identity copied into every signed launch JWT."""
+    required = {
+        "config_id": getattr(launch_config, "config_id", None),
+        "user_id": getattr(launch_config, "user_id", None),
+        "chute_id": getattr(launch_config, "chute_id", None),
+        "compute_type": getattr(launch_config, "compute_type", None),
+        "default_volume_id": getattr(launch_config, "default_volume_id", None),
+    }
+    missing = [name for name, value in required.items() if not isinstance(value, str) or not value]
+    if missing:
+        raise ValueError(
+            f"Launch config is missing authoritative identity fields: {', '.join(sorted(missing))}."
+        )
+    return {
+        **required,
+        "job_id": getattr(launch_config, "job_id", None),
+        "management_mode": launch_management_mode(launch_config),
+        "server_id": getattr(launch_config, "server_id", None),
+        # The instance does not exist when the launch token is minted. The verified response replaces
+        # this null with the authoritative instance id; callers may never supply one themselves.
+        "instance_id": None,
+    }
+
+
 def create_launch_jwt_v2(
     launch_config: LaunchConfig,
     disk_gb: int = None,
@@ -835,6 +896,8 @@ def create_launch_jwt_v2(
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(hours=3, minutes=30)
     env_type = launch_config.env_type if launch_config.env_type else "graval"
+    identity = launch_identity_claims(launch_config)
+    exchange_allowed = bool(launch_config.storage_session_exchange_allowed)
     payload = {
         "exp": int(expires_at.timestamp()),
         "sub": launch_config.config_id,
@@ -846,6 +909,14 @@ def create_launch_jwt_v2(
         "egress": egress,
         "lock_modules": lock_modules,
         "env_type": env_type,
+        "user_id": identity["user_id"],
+        "compute_type": identity["compute_type"],
+        "management_mode": identity["management_mode"],
+        "server_id": identity["server_id"],
+        "instance_id": identity["instance_id"],
+        "default_volume_id": identity["default_volume_id"],
+        "storage_session_exchange_allowed": exchange_allowed,
+        "permissions": ["storage_session:exchange"] if exchange_allowed else [],
     }
     if launch_config.job_id:
         payload["job_id"] = launch_config.job_id
@@ -913,6 +984,7 @@ def create_job_jwt(job_id, filename: str = None) -> str:
 async def load_launch_config_from_jwt(
     db, config_id: str, token: str, allow_retrieved: bool = False
 ) -> LaunchConfig:
+    await acquire_gpu_lifecycle_lock(db)
     detail = "Missing or invalid launch config JWT"
     try:
         payload = _decode_chutes_jwt(token, require_exp=True)
@@ -923,19 +995,49 @@ async def load_launch_config_from_jwt(
                 .scalar_one_or_none()
             )
             if config:
-                if not config.retrieved_at:
+                expected_identity = launch_identity_claims(config)
+                expected_exchange = bool(config.storage_session_exchange_allowed)
+                token_identity = {
+                    key: payload.get("sub") if key == "config_id" else payload.get(key)
+                    for key in (
+                        "config_id",
+                        "user_id",
+                        "chute_id",
+                        "job_id",
+                        "compute_type",
+                        "management_mode",
+                        "server_id",
+                        "instance_id",
+                        "default_volume_id",
+                    )
+                }
+                if (
+                    token_identity != expected_identity
+                    or payload.get("env_type") != config.env_type
+                    or payload.get("storage_session_exchange_allowed") is not expected_exchange
+                    or payload.get("permissions")
+                    != (["storage_session:exchange"] if expected_exchange else [])
+                ):
+                    detail = f"Launch token identity does not match current config {config_id}."
+                    logger.warning(detail)
+                    config = None
+                elif not config.retrieved_at:
                     config.retrieved_at = func.now()
                     return config
                 elif allow_retrieved:
                     return config
-                detail = f"Launch config {config_id=} has already been retrieved: {token=} {config.retrieved_at=}"
-                logger.warning(detail)
+                elif config is not None:
+                    detail = (
+                        f"Launch config {config_id=} has already been retrieved: "
+                        f"{config.retrieved_at=}"
+                    )
+                    logger.warning(detail)
             else:
                 detail = f"Launch config {config_id} not found in database."
         else:
             detail = f"Launch config {config_id=} does not match token!"
     except jwt.InvalidTokenError:
-        logger.warning(f"Attempted to use invalid token for launch config: {config_id=} {token=}")
+        logger.warning(f"Attempted to use invalid token for launch config: {config_id=}")
     except Exception as exc:
         logger.warning(f"Unhandled exception checking launch config JWT: {exc}")
 
@@ -1068,7 +1170,7 @@ async def verify_tee_chute(
         # (runtime-integrity commitment + TLS cert + e2e pubkey, validated upstream) covers
         # chute-level integrity, so there is no separate per-chute TDX quote to fetch here.
         if getattr(server, "self_registered", False):
-            _require_current_attestation_identity(server)
+            await _require_current_attestation_identity(db, server)
             logger.success(
                 f"Chute deployment {deployment_id} on self-registered server "
                 f"{server.server_id}: trust anchored by server attestation + launch-config "
@@ -1144,11 +1246,14 @@ async def require_attested_client_cert(db, request: Request, instance) -> None:
     if (
         server is None
         or not getattr(server, "self_registered", False)
-        or server.compute_type != "cpu"
+        or (
+            server.compute_type != "cpu"
+            and not (server.compute_type == "gpu" and server.gpu_management_mode == "platform")
+        )
     ):
         return
 
-    _require_current_attestation_identity(server)
+    await _require_current_attestation_identity(db, server)
 
     if not settings.require_mtls_client_verify:
         logger.error(
@@ -1201,12 +1306,22 @@ async def require_attested_client_cert(db, request: Request, instance) -> None:
         )
 
 
-def _require_current_attestation_identity(server: Server) -> None:
+async def _require_current_attestation_identity(db, server: Server) -> None:
     """Fail closed when a previously issued launch/cert outlives its active measurement pin."""
-    from api.server.service import runtime_attestation_context_for_server
+    from api.server.service import runtime_attestation_context_for_server_db
 
     try:
-        runtime_attestation_context_for_server(server)
+        await runtime_attestation_context_for_server_db(db, server)
+        if server.compute_type == "gpu":
+            from api.server.gpu_sessions import (
+                _current_attestation,
+                _latest_attestation_attempt,
+            )
+
+            _current_attestation(
+                server,
+                await _latest_attestation_attempt(db, server.server_id),
+            )
     except MeasurementMismatchError as exc:
         logger.warning(f"Rejecting stale CPU-TEE server identity {server.server_id}: {exc}")
         raise HTTPException(
@@ -1216,6 +1331,8 @@ def _require_current_attestation_identity(server: Server) -> None:
                 "re-register against the current measurement policy."
             ),
         ) from exc
+    except HTTPException:
+        raise
 
 
 async def get_server_for_gpus(db, gpu_uuids: list[str]) -> Server | None:

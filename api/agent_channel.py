@@ -8,8 +8,10 @@ short-TTL redis key refreshed by the agent's heartbeats, so the scheduler only a
 servers that are currently connected.
 """
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Optional
 
 import orjson as json
@@ -24,6 +26,7 @@ AGENT_ONLINE_TTL_SECONDS = 120
 # command_id -> dispatch context (config_id etc.), so an agent's ack can be correlated back to
 # the launch config it was deploying. TTL bounds growth if an agent never acks.
 _AGENT_COMMAND_KEY = "agent:cmd:{command_id}"
+_AGENT_COMMAND_STATUS_KEY = "agent:cmd-status:{command_id}"
 AGENT_COMMAND_TTL_SECONDS = 7200
 # Ack statuses that mean the command terminally failed agent-side (deploy never happened /
 # launch failed / slot rejected), as emitted by chutes-agent/chutes-node-agent handlers.
@@ -49,13 +52,19 @@ async def is_agent_online(server_id: str) -> bool:
     return bool(await settings.redis_client.exists(_online_key(server_id)))
 
 
-async def send_agent_command(server_id: str, command: str, data: Optional[dict] = None) -> str:
+async def send_agent_command(
+    server_id: str,
+    command: str,
+    data: Optional[dict] = None,
+    *,
+    command_id: Optional[str] = None,
+) -> str:
     """Publish an explicit command to a connected agent. Returns the generated command_id.
 
     The command is fanned out via redis pubsub; whichever socket-server replica holds the
     agent's session emits it to that session, others ignore it.
     """
-    command_id = str(uuid.uuid4())
+    command_id = command_id or str(uuid.uuid4())
     payload = {
         "server_id": server_id,
         "command": command,
@@ -66,27 +75,92 @@ async def send_agent_command(server_id: str, command: str, data: Optional[dict] 
     # correlated back to the launch config -- a failed deploy ack marks it failed immediately
     # instead of waiting out the age-based expiry sweep.
     config_id = (data or {}).get("config_id")
-    reservation_id = (
+    reservation_id = (data or {}).get("reservation_id") or (
         ((data or {}).get("reservation_claims") or {}).get("reservation_id")
         if isinstance((data or {}).get("reservation_claims"), dict)
         else None
     )
-    if config_id or reservation_id:
-        context = {
-            "server_id": server_id,
-            "command": command,
-        }
-        if config_id:
-            context["config_id"] = config_id
-        if reservation_id:
-            context["reservation_id"] = reservation_id
+    context = {
+        "server_id": server_id,
+        "command": command,
+    }
+    if config_id:
+        context["config_id"] = config_id
+    if reservation_id:
+        context["reservation_id"] = reservation_id
+    status_key = _AGENT_COMMAND_STATUS_KEY.format(command_id=command_id)
+    existing_status = await settings.redis_client.get(status_key)
+    if existing_status:
+        status_document = json.loads(existing_status)
+        if (
+            status_document.get("command_id") != command_id
+            or status_document.get("server_id") != server_id
+            or status_document.get("command") != command
+        ):
+            raise RuntimeError("agent command id is already bound to another command")
+    else:
         await settings.redis_client.setex(
-            _AGENT_COMMAND_KEY.format(command_id=command_id),
+            status_key,
             AGENT_COMMAND_TTL_SECONDS,
-            json.dumps(context),
+            json.dumps(
+                {
+                    "command_id": command_id,
+                    "server_id": server_id,
+                    "command": command,
+                    "status": "pending",
+                    "detail": None,
+                }
+            ),
         )
+    await settings.redis_client.setex(
+        _AGENT_COMMAND_KEY.format(command_id=command_id),
+        AGENT_COMMAND_TTL_SECONDS,
+        json.dumps(context),
+    )
     await settings.redis_client.publish(AGENT_COMMAND_CHANNEL, json.dumps(payload))
     return command_id
+
+
+async def get_agent_command_status(
+    server_id: str,
+    command: str,
+    command_id: str,
+) -> Optional[dict]:
+    raw = await settings.redis_client.get(_AGENT_COMMAND_STATUS_KEY.format(command_id=command_id))
+    if not raw:
+        return None
+    document = json.loads(raw)
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"command_id", "server_id", "command", "status", "detail"}
+        or document.get("command_id") != command_id
+        or document.get("server_id") != server_id
+        or document.get("command") != command
+        or not isinstance(document.get("status"), str)
+        or not document["status"]
+        or (document.get("detail") is not None and not isinstance(document.get("detail"), str))
+    ):
+        raise RuntimeError("agent command status is malformed or bound to another command")
+    return document
+
+
+async def wait_for_agent_command_ack(
+    server_id: str,
+    command: str,
+    command_id: str,
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 0.25,
+) -> Optional[dict]:
+    deadline = monotonic() + timeout_seconds
+    while True:
+        document = await get_agent_command_status(server_id, command, command_id)
+        if document is not None and document["status"] != "pending":
+            return document
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(poll_interval_seconds, remaining))
 
 
 async def handle_agent_command_ack(server_id: str, ack: dict) -> None:
@@ -115,12 +189,41 @@ async def handle_agent_command_ack(server_id: str, ack: dict) -> None:
                 f"dispatched to {context.get('server_id')}"
             )
             return
-        await settings.redis_client.delete(key)
         status = str((ack or {}).get("status") or "").lower()
+        detail = (ack or {}).get("detail") or f"agent ack status={status}"
+        await settings.redis_client.setex(
+            _AGENT_COMMAND_STATUS_KEY.format(command_id=command_id),
+            AGENT_COMMAND_TTL_SECONDS,
+            json.dumps(
+                {
+                    "command_id": command_id,
+                    "server_id": server_id,
+                    "command": context.get("command"),
+                    "status": status or "unknown",
+                    "detail": str(detail),
+                }
+            ),
+        )
+        await settings.redis_client.delete(key)
+        reservation_id = context.get("reservation_id")
+        if reservation_id and context.get("command") in {"launch_gpu", "delete_gpu"}:
+            from api.database import get_session
+            from api.host.gpu_allocations import record_gpu_command_ack
+
+            async with get_session() as session:
+                await record_gpu_command_ack(
+                    session,
+                    reservation_id,
+                    command=context["command"],
+                    command_id=command_id,
+                    status=status or "unknown",
+                    detail=str(detail),
+                )
+                await session.commit()
+            return
         if status not in FAILED_ACK_STATUSES:
             return
         config_id = context.get("config_id")
-        detail = (ack or {}).get("detail") or f"agent ack status={status}"
         from api.database import get_session
         from api.host.schemas import TdLaunchReservation
         from api.server.schemas import Server
@@ -216,18 +319,39 @@ async def send_instance_teardown(
             ).scalar_one_or_none()
         if server is not None and not getattr(server, "self_registered", False):
             return None
+        if (
+            server is not None
+            and getattr(server, "compute_type", None) == "gpu"
+            and getattr(server, "gpu_management_mode", None) == "platform"
+            and getattr(server, "gpu_launch_reservation_id", None)
+        ):
+            return await send_gpu_reservation_teardown(
+                server.gpu_launch_reservation_id,
+                reason=f"instance teardown: {instance_id or config_id or chute_id}",
+            )
+        if server is not None and getattr(server, "compute_type", None) == "gpu":
+            # Miner-managed GPU workloads retain the existing Gepetto event lifecycle.
+            return None
         host_id = getattr(server, "host_id", None) if server is not None else None
         if host_id:
             command_id = await send_agent_command(
                 host_id,
                 "delete_chute",
-                {"chute_id": chute_id, "instance_id": instance_id, "server_id": server_id},
+                {
+                    "chute_id": chute_id,
+                    "instance_id": instance_id,
+                    "server_id": server_id,
+                },
             )
         else:
             command_id = await send_agent_command(
                 server_id,
                 "stop_instance",
-                {"chute_id": chute_id, "instance_id": instance_id, "config_id": config_id},
+                {
+                    "chute_id": chute_id,
+                    "instance_id": instance_id,
+                    "config_id": config_id,
+                },
             )
         logger.info(
             f"Dispatched teardown for instance {instance_id} of chute {chute_id} "
@@ -239,6 +363,67 @@ async def send_instance_teardown(
             f"Failed to dispatch teardown for instance {instance_id} of chute {chute_id} "
             f"(server_id={server_id}): {exc}"
         )
+        return None
+
+
+async def send_gpu_reservation_teardown(
+    reservation_id: str,
+    *,
+    reason: str,
+) -> Optional[str]:
+    """Request and retry one exact platform GPU reset command safely."""
+
+    try:
+        from api.database import get_session
+        from api.host.gpu_allocations import (
+            record_gpu_command_dispatch,
+            request_gpu_teardown,
+        )
+
+        async with get_session() as session:
+            reservation = await request_gpu_teardown(
+                session,
+                reservation_id,
+                reason=reason,
+            )
+            host_id = reservation.host_id
+            state = reservation.state
+            command_id = reservation.teardown_command_id or str(uuid.uuid4())
+            claims_sha256 = reservation.claims_sha256
+            process_incarnation = reservation.process_incarnation
+            allocation_group_id = reservation.allocation_group_id
+            topology_fingerprint = reservation.topology_fingerprint
+            await session.commit()
+        if state in {"released", "expired"}:
+            return None
+        command_id = await send_agent_command(
+            host_id,
+            "delete_gpu",
+            {
+                "reservation_id": reservation_id,
+                "claims_sha256": claims_sha256,
+                "process_incarnation": process_incarnation,
+                "allocation_group_id": allocation_group_id,
+                "topology_fingerprint": topology_fingerprint,
+                "reason": reason,
+            },
+            command_id=command_id,
+        )
+        async with get_session() as session:
+            await record_gpu_command_dispatch(
+                session,
+                reservation_id,
+                command="delete_gpu",
+                command_id=command_id,
+            )
+            await session.commit()
+        logger.info(
+            f"Dispatched exact GPU teardown reservation={reservation_id} "
+            f"host={host_id} command_id={command_id}"
+        )
+        return command_id
+    except Exception as exc:
+        logger.warning(f"Failed to dispatch GPU reservation teardown {reservation_id}: {exc}")
         return None
 
 
@@ -334,6 +519,7 @@ async def _reconcile_server_containers(server_id: str, containers: list) -> None
                         LaunchConfig.server_id == server_id,
                         LaunchConfig.verified_at.is_(None),
                         LaunchConfig.failed_at.is_(None),
+                        LaunchConfig.completed_at.is_(None),
                     )
                 )
             )
@@ -373,7 +559,7 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
     from api.server.schemas import Server
 
     reported = {
-        str(s.get("server_id")): str(s.get("chute_id") or "")
+        str(s.get("server_id")): dict(s)
         for s in slots
         if isinstance(s, dict) and s.get("server_id")
     }
@@ -389,6 +575,7 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
                         # is NOT a scheduled chute slot, so it never appears in the slot heartbeat.
                         # Exempt it from reaping or the reconcile loop would tear it down every tick.
                         Server.storage_role.is_(False),
+                        Server.gpu_retired_at.is_(None),
                     )
                 )
             )
@@ -400,8 +587,50 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
     # teardown, host reboot, manual stop) would otherwise count against host capacity forever.
     for server in servers:
         if server.server_id in reported:
+            slot = reported[server.server_id]
+            if getattr(server, "compute_type", None) == "gpu" and (
+                slot.get("compute_type") != "gpu"
+                or slot.get("management_mode") != server.gpu_management_mode
+                or slot.get("reservation_id") != server.gpu_launch_reservation_id
+                or slot.get("allocation_group_id") != server.gpu_allocation_group_id
+                or slot.get("allocation_group_generation") != server.gpu_allocation_group_generation
+                or slot.get("process_incarnation") != server.gpu_process_incarnation
+                or slot.get("topology_fingerprint") != server.gpu_topology_fingerprint
+            ):
+                from api.host.gpu_allocations import (
+                    quarantine_gpu_reservation_control_plane,
+                )
+
+                async with get_session() as session:
+                    await quarantine_gpu_reservation_control_plane(
+                        session,
+                        server.gpu_launch_reservation_id,
+                        code="gpu_slot_heartbeat_lineage_mismatch",
+                        reason="GPU slot heartbeat differs from its attested reservation lineage.",
+                        metadata={"slot": slot},
+                    )
+                    await session.commit()
             continue
         if not _older_than(server.created_at, SERVER_REAP_GRACE_SECONDS):
+            continue
+        if getattr(server, "compute_type", None) == "gpu" and getattr(
+            server, "gpu_launch_reservation_id", None
+        ):
+            from api.host.gpu_allocations import (
+                quarantine_gpu_reservation_control_plane,
+            )
+
+            async with get_session() as session:
+                await quarantine_gpu_reservation_control_plane(
+                    session,
+                    server.gpu_launch_reservation_id,
+                    code="gpu_process_missing_without_reset",
+                    reason=(
+                        "GPU host heartbeat omitted a reservation-owned process without "
+                        "exact reset proof."
+                    ),
+                )
+                await session.commit()
             continue
         logger.warning(
             f"Reconcile: host {host_id} no longer runs TD {server.server_id}; reaping its "
@@ -420,26 +649,20 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
             )
         for instance in instances:
             await purge_and_notify(
-                instance, reason="reconcile - backing per-chute TD no longer exists on host"
+                instance,
+                reason="reconcile - backing per-chute TD no longer exists on host",
             )
         async with get_session() as session:
-            await session.execute(
-                text(
-                    "UPDATE launch_configs SET failed_at = NOW(), "
-                    "verification_error = 'reconcile: backing TD no longer exists' "
-                    "WHERE server_id = :server_id AND verified_at IS NULL AND failed_at IS NULL"
-                ),
-                {"server_id": server.server_id},
-            )
-            await session.execute(
-                text("DELETE FROM servers WHERE server_id = :server_id"),
-                {"server_id": server.server_id},
-            )
-            await session.commit()
+            from api.server.service import delete_server
+
+            await delete_server(session, server.server_id, server.miner_hotkey)
 
     # Host -> validator drift: a TD still running for a chute the validator no longer wants
     # (chute deleted while the host was offline / TD never registered within its boot window).
-    for slot_server_id, slot_chute_id in reported.items():
+    for slot_server_id, slot_data in reported.items():
+        slot_chute_id = str(slot_data.get("chute_id") or "")
+        slot_compute_type = slot_data.get("compute_type")
+        slot_reservation_id = slot_data.get("reservation_id")
         async with get_session() as session:
             server_exists = (
                 await session.execute(
@@ -453,36 +676,59 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
                     )
                 ).scalar_one_or_none()
                 if slot_chute_id
+                and not (slot_compute_type == "gpu" and slot_data.get("management_mode") == "miner")
                 else None
             )
+            if slot_compute_type == "gpu" and slot_data.get("management_mode") == "miner":
+                chute_exists = slot_chute_id
         if slot_chute_id and chute_exists is None:
             logger.warning(
                 f"Reconcile: host {host_id} runs TD {slot_server_id} for deleted chute "
                 f"{slot_chute_id}; tearing down"
             )
             await send_agent_command(
-                host_id, "delete_chute", {"chute_id": slot_chute_id, "server_id": slot_server_id}
+                host_id,
+                "delete_gpu" if slot_compute_type == "gpu" else "delete_chute",
+                (
+                    {"reservation_id": slot_reservation_id}
+                    if slot_compute_type == "gpu"
+                    else {"chute_id": slot_chute_id, "server_id": slot_server_id}
+                ),
             )
             continue
         if server_exists is None and slot_chute_id:
             # No Server row: either the TD is still booting/registering (launch in-flight, keyed
             # per chute+host by the scheduler) or it failed to register within the launch window
             # and will never be schedulable.
-            from api.host.schemas import TdLaunchReservation
+            from api.host.schemas import GpuLaunchReservation, TdLaunchReservation
 
             async with get_session() as reservation_session:
-                active_reservation = (
-                    await reservation_session.execute(
-                        select(TdLaunchReservation.reservation_id).where(
-                            TdLaunchReservation.host_id == host_id,
-                            TdLaunchReservation.chute_id == slot_chute_id,
-                            TdLaunchReservation.server_id == slot_server_id,
-                            TdLaunchReservation.consumed_at.is_(None),
-                            TdLaunchReservation.invalidated_at.is_(None),
-                            TdLaunchReservation.expires_at > datetime.now(timezone.utc),
+                if slot_compute_type == "gpu":
+                    active_reservation = (
+                        await reservation_session.execute(
+                            select(GpuLaunchReservation.reservation_id).where(
+                                GpuLaunchReservation.reservation_id == slot_reservation_id,
+                                GpuLaunchReservation.host_id == host_id,
+                                GpuLaunchReservation.server_id == slot_server_id,
+                                GpuLaunchReservation.state.in_(
+                                    {"claimed", "launching", "running", "resetting"}
+                                ),
+                            )
                         )
-                    )
-                ).scalar_one_or_none()
+                    ).scalar_one_or_none()
+                else:
+                    active_reservation = (
+                        await reservation_session.execute(
+                            select(TdLaunchReservation.reservation_id).where(
+                                TdLaunchReservation.host_id == host_id,
+                                TdLaunchReservation.chute_id == slot_chute_id,
+                                TdLaunchReservation.server_id == slot_server_id,
+                                TdLaunchReservation.consumed_at.is_(None),
+                                TdLaunchReservation.invalidated_at.is_(None),
+                                TdLaunchReservation.expires_at > datetime.now(timezone.utc),
+                            )
+                        )
+                    ).scalar_one_or_none()
             if active_reservation is not None:
                 continue
             logger.warning(
@@ -490,7 +736,13 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
                 "self-registered within the launch window; tearing down"
             )
             await send_agent_command(
-                host_id, "delete_chute", {"chute_id": slot_chute_id, "server_id": slot_server_id}
+                host_id,
+                "delete_gpu" if slot_compute_type == "gpu" else "delete_chute",
+                (
+                    {"reservation_id": slot_reservation_id}
+                    if slot_compute_type == "gpu"
+                    else {"chute_id": slot_chute_id, "server_id": slot_server_id}
+                ),
             )
 
 

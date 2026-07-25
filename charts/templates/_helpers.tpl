@@ -72,6 +72,12 @@ redis-access: "true"
 db-access: "true"
 {{- end }}
 
+{{- define "gpuPlatformScheduler.labels" -}}
+app.kubernetes.io/name: gpu-platform-scheduler
+redis-access: "true"
+db-access: "true"
+{{- end }}
+
 {{- define "forge.labels" -}}
 app.kubernetes.io/name: forge
 {{- end }}

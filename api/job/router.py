@@ -10,7 +10,7 @@ import orjson as json
 from loguru import logger
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Response, Form
 from fastapi import File, UploadFile
-from sqlalchemy import text, select, func, case, and_
+from sqlalchemy import text, select, func, case, and_, update
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 from api.config import settings
@@ -24,6 +24,7 @@ from api.job.response import JobResponse
 from api.user.schemas import User, JobQuota
 from api.user.service import get_current_user
 from api.instance.util import load_job_from_jwt, create_job_jwt
+from api.instance.schemas import LaunchConfig
 
 router = APIRouter()
 
@@ -412,6 +413,15 @@ async def complete_job(
 
     job.updated_at = func.now()
     job.finished_at = func.now()
+    await db.execute(
+        update(LaunchConfig)
+        .where(
+            LaunchConfig.job_id == job.job_id,
+            LaunchConfig.failed_at.is_(None),
+            LaunchConfig.completed_at.is_(None),
+        )
+        .values(completed_at=func.now())
+    )
     if job.instance:
         await db.delete(job.instance)
     await db.commit()

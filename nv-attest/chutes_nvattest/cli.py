@@ -19,6 +19,7 @@ def attest_gpu(
     _verifier = NvVerifier()
     result = _verifier.attest(nonce, _evidence)
     if result:
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         sys.exit(0)
     else:
         sys.exit(1)

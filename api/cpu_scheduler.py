@@ -53,6 +53,7 @@ from api.releases.schemas import (
     RELEASE_STATUS_ACTIVE,
 )
 from api.server.schemas import Host, Server, ServerAttestation
+from api.storage.service import ensure_default_volume_binding
 from api.util import semcomp
 
 SCHEDULER_INTERVAL_SECONDS = 15
@@ -309,10 +310,20 @@ async def _dispatch_deploy(session, chute: Chute, server: Server, job: "Job" = N
         rint_nonce = secrets.token_hex(16)
         await settings.redis_client.set(f"rint_nonce:{config_id}", rint_nonce, ex=7200)
 
+    launch_owner_id = job.user_id if job is not None else chute.user_id
+    _, default_volume, _ = await ensure_default_volume_binding(
+        session,
+        launch_owner_id,
+        chute.chute_id,
+    )
     launch_config = LaunchConfig(
         config_id=config_id,
         env_key=secrets.token_bytes(16).hex(),
         chute_id=chute.chute_id,
+        user_id=launch_owner_id,
+        compute_type="cpu",
+        default_volume_id=default_volume.volume_id,
+        storage_session_exchange_allowed=True,
         job_id=job.job_id if job else None,
         miner_hotkey=server.miner_hotkey,
         miner_uid=miner.node_id,
@@ -444,6 +455,7 @@ async def _hosts_running_chute(session, chute_id: str) -> set:
                     LaunchConfig.chute_id == chute_id,
                     LaunchConfig.verified_at.is_(None),
                     LaunchConfig.failed_at.is_(None),
+                    LaunchConfig.completed_at.is_(None),
                     Server.host_id.isnot(None),
                 )
             )
@@ -493,7 +505,11 @@ async def _launch_on_host(
     """
     # A one-slot ChuteFS appliance legitimately advertises zero schedulable chute capacity.
     # Exclude it before online/dispatch work; registration rejects zero on non-storage hosts.
-    hosts = (await session.execute(select(Host).where(Host.capacity > 0))).scalars().all()
+    hosts = (
+        (await session.execute(select(Host).where(Host.capacity > 0, Host.compute_type == "cpu")))
+        .scalars()
+        .all()
+    )
     if not hosts:
         return False
     container_intent = container_intent or await _container_intent(chute)
@@ -561,6 +577,7 @@ async def _launch_on_host(
                         GuestRelease.status == RELEASE_STATUS_ACTIVE,
                         GuestRelease.channel == host.release_channel,
                         GuestRelease.tee_type == "tdx",
+                        GuestRelease.compute_type == "cpu",
                     )
                 )
             ).scalar_one_or_none()
@@ -613,6 +630,7 @@ async def _launch_on_host(
                         GuestRelease.status == RELEASE_STATUS_ACTIVE,
                         GuestRelease.channel == host.release_channel,
                         GuestRelease.tee_type == "sev-snp",
+                        GuestRelease.compute_type == "cpu",
                     )
                 )
             ).scalar_one_or_none()
@@ -773,6 +791,7 @@ async def schedule_once() -> None:
                         LaunchConfig.server_id.isnot(None),
                         LaunchConfig.verified_at.is_(None),
                         LaunchConfig.failed_at.is_(None),
+                        LaunchConfig.completed_at.is_(None),
                     )
                 )
             )
@@ -832,6 +851,7 @@ async def schedule_once() -> None:
                         LaunchConfig.server_id.isnot(None),
                         LaunchConfig.verified_at.is_(None),
                         LaunchConfig.failed_at.is_(None),
+                        LaunchConfig.completed_at.is_(None),
                     )
                 )
             ).scalar() or 0
@@ -924,6 +944,7 @@ async def schedule_once() -> None:
                         and_(
                             LaunchConfig.job_id == Job.job_id,
                             LaunchConfig.failed_at.is_(None),
+                            LaunchConfig.completed_at.is_(None),
                         ),
                     )
                     .where(

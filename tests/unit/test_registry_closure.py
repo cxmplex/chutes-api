@@ -176,6 +176,9 @@ async def test_resolver_bounds_root_index_image_and_cosign_closure(
     }
     assert set(closure.blobs) == oci_graph["blobs"]
     assert closure.manifest_tags == (oci_graph["signature_tag"],)
+    assert dict(closure.manifest_tag_digests) == {
+        oci_graph["signature_tag"]: oci_graph["signature_digest"]
+    }
     assert len(closure.sha256) == 64
 
 
@@ -271,6 +274,7 @@ def test_registry_request_authorizes_only_persisted_descriptor_closure(oci_graph
     )
     blobs = sorted(oci_graph["blobs"])
     tags = [oci_graph["signature_tag"]]
+    tag_digests = {oci_graph["signature_tag"]: oci_graph["signature_digest"]}
     session = RegistrySession(
         repository="owner/image",
         actions=["pull"],
@@ -278,6 +282,7 @@ def test_registry_request_authorizes_only_persisted_descriptor_closure(oci_graph
         allowed_manifests=manifests,
         allowed_blobs=blobs,
         allowed_manifest_tags=tags,
+        manifest_tag_digests=tag_digests,
         descriptor_closure_sha256=canonical_sha256(
             {
                 "schema": "chutes.oci-descriptor-closure",
@@ -286,6 +291,7 @@ def test_registry_request_authorizes_only_persisted_descriptor_closure(oci_graph
                 "manifests": manifests,
                 "blobs": blobs,
                 "manifest_tags": tags,
+                "manifest_tag_digests": tag_digests,
             }
         ),
     )
@@ -392,7 +398,7 @@ async def test_session_creation_persists_resolver_derived_closure(oci_graph):
     locked_result.scalar_one.return_value = server
     db = AsyncMock()
     db.get.return_value = reservation
-    db.execute.side_effect = [locked_result, existing_result]
+    db.execute.side_effect = [Mock(), locked_result, existing_result]
     db.add = Mock()
     closure = Mock(
         manifests=(
@@ -402,6 +408,12 @@ async def test_session_creation_persists_resolver_derived_closure(oci_graph):
         ),
         blobs=tuple(sorted(oci_graph["blobs"])),
         manifest_tags=(oci_graph["signature_tag"],),
+        manifest_tag_digests=(
+            (
+                oci_graph["signature_tag"],
+                oci_graph["signature_digest"],
+            ),
+        ),
         sha256="a" * 64,
     )
     request = Mock()
@@ -413,7 +425,7 @@ async def test_session_creation_persists_resolver_derived_closure(oci_graph):
         ),
         patch.object(
             registry_router,
-            "_current_attested_model_b_server",
+            "_current_attested_registry_server",
             AsyncMock(return_value=server),
         ),
         patch.object(
@@ -435,6 +447,7 @@ async def test_session_creation_persists_resolver_derived_closure(oci_graph):
     assert row.allowed_manifests == list(closure.manifests)
     assert row.allowed_blobs == list(closure.blobs)
     assert row.allowed_manifest_tags == list(closure.manifest_tags)
+    assert row.manifest_tag_digests == dict(closure.manifest_tag_digests)
     assert row.descriptor_closure_sha256 == closure.sha256
     assert response.expires_at > now
 
@@ -451,6 +464,7 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
     )
     blobs = sorted(oci_graph["blobs"])
     tags = [oci_graph["signature_tag"]]
+    tag_digests = {oci_graph["signature_tag"]: oci_graph["signature_digest"]}
     closure_sha256 = canonical_sha256(
         {
             "schema": "chutes.oci-descriptor-closure",
@@ -459,6 +473,7 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
             "manifests": manifests,
             "blobs": blobs,
             "manifest_tags": tags,
+            "manifest_tag_digests": tag_digests,
         }
     )
     server = Mock(
@@ -477,6 +492,8 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
         session_id="session-1",
         token_id="token-1",
         server_id=server.server_id,
+        scope_id="td-reservation:reservation-1",
+        launch_config_id=None,
         attested_cert_pubkey_hash="c" * 64,
         repository="owner/image",
         actions=["pull"],
@@ -484,6 +501,7 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
         allowed_manifests=manifests,
         allowed_blobs=blobs,
         allowed_manifest_tags=tags,
+        manifest_tag_digests=tag_digests,
         descriptor_closure_sha256=closure_sha256,
         issued_at=now,
         expires_at=now + timedelta(minutes=5),
@@ -494,7 +512,7 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
     existing_result.scalar_one_or_none.return_value = existing
     db = AsyncMock()
     db.get.return_value = reservation
-    db.execute.side_effect = [locked_result, existing_result]
+    db.execute.side_effect = [Mock(), locked_result, existing_result]
     resolver = AsyncMock()
 
     with (
@@ -505,7 +523,7 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
         ),
         patch.object(
             registry_router,
-            "_current_attested_model_b_server",
+            "_current_attested_registry_server",
             AsyncMock(return_value=server),
         ),
         patch.object(
@@ -526,7 +544,7 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
 
     assert isinstance(response.token, str)
     assert response.expires_at == existing.expires_at
-    resolver.assert_not_awaited()
+    resolver.assert_awaited_once_with("owner/image", oci_graph["root_digest"])
     db.commit.assert_not_awaited()
 
 
@@ -543,3 +561,228 @@ def test_registry_nginx_authenticates_probe_token_manifest_and_blob_paths():
     assert "X-Chutes-Registry-Uri $request_uri" in chart
     assert "X-Client-Cert $ssl_client_escaped_cert" in chart
     assert "X-Client-Verify $ssl_client_verify" in chart
+    assert "x_chutes_registry_upstream_uri" in chart
+    assert "$registry_upstream_uri" in chart
+
+
+def test_registry_scope_down_migration_refuses_ambiguous_server_sessions():
+    migration = (
+        Path(__file__).resolve().parents[2]
+        / "api/migrations/20260724100500_registry_launch_scope.sql"
+    ).read_text()
+    assert "GROUP BY server_id" in migration
+    assert "HAVING COUNT(*) > 1" in migration
+    assert "cannot restore unique registry session per server" in migration
+
+
+@pytest.mark.asyncio
+async def test_broad_runtime_session_never_authorizes_registry_bytes(oci_graph):
+    with pytest.raises(HTTPException, match="cannot authorize registry bytes"):
+        await registry_router.registry_auth(
+            Mock(),
+            AsyncMock(),
+            registry_session=None,
+            attested_session="platform-session",
+            original_method="GET",
+            original_uri=f"/v2/owner/image/manifests/{oci_graph['root_digest']}",
+            launch_config_id="config-1",
+            hotkey=None,
+            signature=None,
+            nonce=None,
+            authorization=None,
+            sig_version=None,
+            client_verify=None,
+            client_cert=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_miner_launch_config_mints_and_uses_exact_registry_session(oci_graph):
+    server = Mock(
+        server_id="gpu-server",
+        miner_hotkey="5Owner",
+        compute_type="gpu",
+        gpu_management_mode="miner",
+        gpu_launch_reservation_id="gpu-reservation",
+        attested_cert_pubkey_hash="c" * 64,
+    )
+    launch_config = Mock(
+        config_id="config-1",
+        server_id=server.server_id,
+        miner_hotkey=server.miner_hotkey,
+        gpu_management_mode="miner",
+        gpu_launch_reservation_id="gpu-reservation",
+        failed_at=None,
+        completed_at=None,
+        verification_error=None,
+        registry_scope_active=True,
+        registry_scope_revoked_at=None,
+        retrieved_at=None,
+        job_id=None,
+        container_repository="owner/image",
+        container_manifest_digest=oci_graph["root_digest"],
+    )
+    closure = Mock(
+        manifests=tuple(
+            sorted(
+                {
+                    oci_graph["root_digest"],
+                    oci_graph["child_digest"],
+                    oci_graph["signature_digest"],
+                }
+            )
+        ),
+        blobs=tuple(sorted(oci_graph["blobs"])),
+        manifest_tags=(oci_graph["signature_tag"],),
+        manifest_tag_digests=(
+            (
+                oci_graph["signature_tag"],
+                oci_graph["signature_digest"],
+            ),
+        ),
+    )
+    closure.sha256 = canonical_sha256(
+        {
+            "schema": "chutes.oci-descriptor-closure",
+            "version": 1,
+            "root_manifest": oci_graph["root_digest"],
+            "manifests": list(closure.manifests),
+            "blobs": list(closure.blobs),
+            "manifest_tags": list(closure.manifest_tags),
+            "manifest_tag_digests": dict(closure.manifest_tag_digests),
+        }
+    )
+    locked_server = Mock()
+    locked_server.scalar_one.return_value = server
+    locked_config = Mock()
+    locked_config.unique.return_value.scalar_one_or_none.return_value = launch_config
+    no_session = Mock()
+    no_session.scalar_one_or_none.return_value = None
+    no_instance = Mock()
+    no_instance.unique.return_value.scalar_one_or_none.return_value = None
+    db = AsyncMock()
+    db.execute.side_effect = [
+        Mock(),
+        locked_server,
+        locked_config,
+        no_instance,
+        no_session,
+    ]
+    db.add = Mock()
+    body = registry_router.RegistrySessionRequestV1(
+        repository="owner/image",
+        manifest_digest=oci_graph["root_digest"],
+        launch_config_id=launch_config.config_id,
+    )
+    with (
+        patch.object(
+            registry_router,
+            "extract_client_cert_hash",
+            return_value=AsyncMock(return_value="c" * 64),
+        ),
+        patch.object(
+            registry_router,
+            "validate_gpu_runtime_session",
+            AsyncMock(return_value=(server, {"management_mode": "miner"})),
+        ),
+        patch.object(
+            registry_router,
+            "resolve_oci_descriptor_closure",
+            AsyncMock(return_value=closure),
+        ),
+        patch.object(registry_router.settings, "launch_config_key", "signing-key"),
+    ):
+        response = await registry_router.create_registry_session(
+            body,
+            Mock(),
+            db,
+            attested_session="broad-session",
+        )
+    row = db.add.call_args.args[0]
+    assert row.scope_id == "launch-config:config-1"
+    assert row.launch_config_id == "config-1"
+    assert response.allowed_blobs == list(closure.blobs)
+
+    session_result = Mock()
+    session_result.scalar_one_or_none.return_value = row
+    auth_db = AsyncMock()
+    auth_db.execute.return_value = session_result
+    auth_db.get.return_value = launch_config
+    with (
+        patch.object(
+            registry_router,
+            "extract_client_cert_hash",
+            return_value=AsyncMock(return_value="c" * 64),
+        ),
+        patch.object(
+            registry_router,
+            "_current_attested_registry_server",
+            AsyncMock(return_value=server),
+        ),
+        patch.object(
+            registry_router,
+            "_miner_launch_scope_current",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(registry_router.settings, "launch_config_key", "signing-key"),
+    ):
+        result = await registry_router.registry_auth(
+            Mock(),
+            auth_db,
+            registry_session=response.token,
+            attested_session=None,
+            original_method="GET",
+            original_uri=f"/v2/owner/image/manifests/{oci_graph['root_digest']}",
+            launch_config_id="config-1",
+            hotkey=None,
+            signature=None,
+            nonce=None,
+            authorization=None,
+            sig_version=None,
+            client_verify="SUCCESS",
+            client_cert="certificate",
+        )
+        assert result["auth_type"] == "attested_registry_session"
+        with pytest.raises(HTTPException, match="does not authorize"):
+            await registry_router.registry_auth(
+                Mock(),
+                auth_db,
+                registry_session=response.token,
+                attested_session=None,
+                original_method="GET",
+                original_uri=f"/v2/owner/image/manifests/sha256:{'f' * 64}",
+                launch_config_id="config-1",
+                hotkey=None,
+                signature=None,
+                nonce=None,
+                authorization=None,
+                sig_version=None,
+                client_verify="SUCCESS",
+                client_cert="certificate",
+            )
+        auth_db.get.return_value = Mock(
+            config_id="config-2",
+            server_id=server.server_id,
+            miner_hotkey=server.miner_hotkey,
+            failed_at=None,
+            verification_error=None,
+            container_repository="owner/image",
+            container_manifest_digest=oci_graph["root_digest"],
+        )
+        with pytest.raises(HTTPException, match="exact launch scope"):
+            await registry_router.registry_auth(
+                Mock(),
+                auth_db,
+                registry_session=response.token,
+                attested_session=None,
+                original_method="GET",
+                original_uri=(f"/v2/owner/image/manifests/{oci_graph['root_digest']}"),
+                launch_config_id="config-1",
+                hotkey=None,
+                signature=None,
+                nonce=None,
+                authorization=None,
+                sig_version=None,
+                client_verify="SUCCESS",
+                client_cert="certificate",
+            )

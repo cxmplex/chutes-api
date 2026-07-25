@@ -13,7 +13,11 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from api.releases.schemas import SignedL0BootstrapManifestV1
+from api.releases.schemas import (
+    SignedL0BootstrapManifest,
+    SignedL0BootstrapManifestV1,
+    SignedL0BootstrapManifestV2,
+)
 
 warnings.filterwarnings(
     "ignore",
@@ -102,7 +106,7 @@ def load_l0_publisher_keys(path: Path) -> L0PublisherKeyRegistryV1:
 
 
 def verify_signed_l0_manifest(
-    signed: SignedL0BootstrapManifestV1,
+    signed: SignedL0BootstrapManifest,
     keys_path: Path,
     *,
     now: datetime | None = None,
@@ -157,3 +161,17 @@ def verify_signed_l0_manifest(
     except (InvalidSignature, TypeError, ValueError) as exc:
         raise L0BootstrapVerificationError("L0 bootstrap manifest signature is invalid") from exc
     return manifest.digest()
+
+
+def parse_signed_l0_manifest(
+    value: Any,
+    *,
+    compute_type: str,
+) -> SignedL0BootstrapManifest:
+    """Parse only the manifest version assigned to the requested compute stream."""
+
+    if compute_type == "cpu":
+        return SignedL0BootstrapManifestV1.model_validate(value)
+    if compute_type == "gpu":
+        return SignedL0BootstrapManifestV2.model_validate(value)
+    raise L0BootstrapVerificationError("unsupported L0 bootstrap compute_type")

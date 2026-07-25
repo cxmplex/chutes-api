@@ -782,6 +782,14 @@ async def test_get_server_attestation_status_no_attestation(mock_db_session, sam
 # Server Deletion Tests
 
 
+def _empty_server_retirement_result():
+    result = Mock()
+    result.scalar_one_or_none.return_value = None
+    result.scalars.return_value.all.return_value = []
+    result.unique.return_value.scalars.return_value.all.return_value = []
+    return result
+
+
 @pytest.mark.asyncio
 async def test_delete_server_success(mock_db_session, sample_server):
     """Test successful server deletion (preserves LUKS config for potential reboot)."""
@@ -789,6 +797,7 @@ async def test_delete_server_success(mock_db_session, sample_server):
     miner_hotkey = "5FTestHotkey123"
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
+        mock_db_session.execute.return_value = _empty_server_retirement_result()
         result = await delete_server(mock_db_session, server_id, miner_hotkey)
 
         assert result is True
@@ -1159,6 +1168,7 @@ async def test_server_lifecycle_flow(mock_db_session, sample_server, server_args
 
     # Step 3: Delete server
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
+        mock_db_session.execute.return_value = _empty_server_retirement_result()
         deleted = await delete_server(mock_db_session, "test-server-123", miner_hotkey)
         assert deleted is True
 

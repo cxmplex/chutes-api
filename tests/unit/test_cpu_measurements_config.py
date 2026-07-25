@@ -131,6 +131,46 @@ def _direct_tdx_variant(
     }
 
 
+def _direct_gpu_group() -> dict:
+    names = [
+        "gpu-baremetal-tdx-1.11.0-b200-8gpu-platform",
+        "gpu-baremetal-tdx-1.11.0-b200-8gpu-miner",
+    ]
+    hardware = []
+    for index, (name, mode) in enumerate(zip(names, ("platform", "miner"), strict=True)):
+        hardware.append(
+            {
+                "name": name,
+                "gpu_profile_id": "b200-8gpu",
+                "management_mode": mode,
+                "mrtd": HEX96_MRTD,
+                "rtmr0": chr(ord("A") + index) * 96,
+                "rtmr1": HEX96_RTMR1,
+                "rtmr2": chr(ord("C") + index) * 96,
+                "boot_rtmr3": "0" * 96,
+                "runtime_rtmr3": HEX96_RTMR3,
+                "expected_gpus": ["b200"],
+                "gpu_count": 8,
+                "gpu_measurement_fingerprint": str(index + 1) * 64,
+            }
+        )
+    return {
+        "version": "1.11.0",
+        "tee_type": "tdx",
+        "provider": "bare-metal",
+        "compute_type": "gpu",
+        "role": "gpu",
+        "debug": False,
+        "rc": True,
+        "provenance_schema_version": 3,
+        "gpu_fingerprint_version": 1,
+        "profile_contract_sha256": "a" * 64,
+        "image_sha256": "b" * 64,
+        "image_measurement_names": names,
+        "hardware": hardware,
+    }
+
+
 def _snp_group(
     *,
     version: str = "1",
@@ -327,6 +367,66 @@ def test_nested_direct_tdx_storage_profile_gets_role_qualified_version(tmp_path)
     (measurement,) = settings._load_tee_measurements()
 
     assert measurement.version == "1.9.0-storage-tdx-2vcpu-8g"
+
+
+def test_nested_direct_gpu_matrix_loads_separate_versioned_fingerprints(tmp_path):
+    settings = _settings_for_document(
+        tmp_path,
+        _document(_direct_gpu_group()),
+    )
+
+    platform, miner = settings._load_tee_measurements()
+
+    assert platform.compute_type == miner.compute_type == "gpu"
+    assert platform.role == miner.role == "gpu"
+    assert (platform.management_mode, miner.management_mode) == ("platform", "miner")
+    assert platform.gpu_profile_id == miner.gpu_profile_id == "b200-8gpu"
+    assert platform.rtmr2 != miner.rtmr2
+    assert platform.gpu_measurement_fingerprint == "1" * 64
+    assert miner.gpu_measurement_fingerprint == "2" * 64
+    assert measurement_config_fingerprint(platform) != measurement_config_fingerprint(miner)
+
+
+def test_computed_boot_floor_is_compute_scoped(tmp_path, monkeypatch):
+    monkeypatch.delenv("TEE_MINIMUM_BOOT_VERSION", raising=False)
+    monkeypatch.delenv("TEE_GPU_MINIMUM_BOOT_VERSION", raising=False)
+    cpu = _tdx_group(version="1.10.0", name="cpu-gcp-1.10.0")
+    gpu = _direct_gpu_group()
+    gpu["version"] = "9.0.0"
+    gpu["rc"] = False
+    gpu["image_measurement_names"] = [
+        name.replace("1.11.0", "9.0.0") for name in gpu["image_measurement_names"]
+    ]
+    for item, name in zip(
+        gpu["hardware"],
+        gpu["image_measurement_names"],
+        strict=True,
+    ):
+        item["name"] = name
+    settings = _settings_for_document(tmp_path, _document(cpu, gpu))
+
+    assert settings.tee_minimum_boot_version == "1.10.0"
+    assert settings.tee_minimum_boot_version_for("cpu") == "1.10.0"
+    assert settings.tee_minimum_boot_version_for("gpu") == "9.0.0"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "unknown", "partial-mode"])
+def test_nested_direct_gpu_matrix_fails_closed_on_schema_drift(
+    tmp_path,
+    mutation,
+):
+    group = _direct_gpu_group()
+    if mutation == "missing":
+        del group["hardware"][0]["gpu_measurement_fingerprint"]
+    elif mutation == "unknown":
+        group["hardware"][0]["legacy_profile"] = "b200"
+    else:
+        group["hardware"].pop()
+        group["image_measurement_names"].pop()
+    settings = _settings_for_document(tmp_path, _document(group))
+
+    with pytest.raises(ValueError):
+        settings._load_tee_measurements()
 
 
 def test_nested_direct_tdx_rejects_name_profile_contradiction(tmp_path):

@@ -26,3 +26,7 @@ services:
   forge:
     environment: *validator_dev_trust
     volumes: *validator_dev_trust_mounts
+
+  gpu_platform_scheduler:
+    environment: *validator_dev_trust
+    volumes: *validator_dev_trust_mounts

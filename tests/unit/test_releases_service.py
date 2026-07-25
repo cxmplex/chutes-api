@@ -1,6 +1,7 @@
 """Release safety gates: exact CPU matrices, provenance, and rollout targeting."""
 
 import json
+import copy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -15,8 +16,11 @@ from api.releases.schemas import (
     RELEASE_STATUS_DRAFT,
     RELEASE_STATUS_SUPERSEDED,
     CreateReleaseRequest,
+    GpuReleaseImage,
+    GpuL0StorageClosure,
     GuestRelease,
     ReleaseImage,
+    RoleLaunchBinaryContract,
 )
 from api.server.schemas import Host
 
@@ -636,13 +640,461 @@ def test_release_request_accepts_each_role_matrix_and_rejects_empty():
     chute = ReleaseImage(**_image())
     storage = ReleaseImage(**_image("storage"))
 
-    assert CreateReleaseRequest(tee_type="sev-snp", chute=chute).storage is None
-    assert CreateReleaseRequest(tee_type="sev-snp", storage=storage).chute is None
-    both = CreateReleaseRequest(tee_type="sev-snp", chute=chute, storage=storage)
+    assert CreateReleaseRequest(tee_type="sev-snp", compute_type="cpu", chute=chute).storage is None
+    assert (
+        CreateReleaseRequest(tee_type="sev-snp", compute_type="cpu", storage=storage).chute is None
+    )
+    both = CreateReleaseRequest(
+        tee_type="sev-snp",
+        compute_type="cpu",
+        chute=chute,
+        storage=storage,
+    )
     assert both.chute is chute
     assert both.storage is storage
     with pytest.raises(ValidationError, match="at least one"):
-        CreateReleaseRequest(tee_type="sev-snp")
+        CreateReleaseRequest(tee_type="sev-snp", compute_type="cpu")
+
+
+def test_gpu_release_request_is_tdx_only_and_requires_exact_dual_cmdlines():
+    gpu = GpuReleaseImage(
+        url="https://artifacts.chutes.ai/releases/gpu-1.11.0.qcow2",
+        sha256="1" * 64,
+        debug=False,
+        version="1.11.0",
+        measurement_names=[
+            "gpu-baremetal-tdx-1.11.0-b200-8gpu-platform",
+            "gpu-baremetal-tdx-1.11.0-b200-8gpu-miner",
+        ],
+        kernel_sha256="2" * 64,
+        initrd_sha256="3" * 64,
+        cmdline_sha256={"platform": "4" * 64, "miner": "5" * 64},
+    )
+
+    request = CreateReleaseRequest(
+        tee_type="tdx",
+        compute_type="gpu",
+        gpu=gpu,
+    )
+    assert request.gpu is gpu
+    with pytest.raises(ValidationError, match="TDX-only"):
+        CreateReleaseRequest(
+            tee_type="sev-snp",
+            compute_type="gpu",
+            gpu=gpu,
+        )
+    with pytest.raises(ValidationError, match="cannot contain CPU"):
+        CreateReleaseRequest(
+            tee_type="tdx",
+            compute_type="gpu",
+            gpu=gpu,
+            chute=ReleaseImage(**_image()),
+        )
+    with pytest.raises(ValidationError, match="must differ"):
+        GpuReleaseImage(
+            **{
+                **gpu.model_dump(),
+                "cmdline_sha256": {
+                    "platform": "4" * 64,
+                    "miner": "4" * 64,
+                },
+            }
+        )
+
+
+def test_release_inheritance_rejects_cross_compute_streams():
+    cpu = _release(chute=_image())
+    cpu.compute_type = "cpu"
+    gpu = GuestRelease(
+        release_id="gpu-release",
+        channel=cpu.channel,
+        tee_type="tdx",
+        compute_type="gpu",
+        status=RELEASE_STATUS_DRAFT,
+        images={},
+    )
+
+    with pytest.raises(rsvc.ReleaseError, match="across compute streams"):
+        rsvc._merged_release_images(gpu, cpu)
+
+
+def test_persisted_release_slots_cannot_cross_compute_streams():
+    cpu = _release(chute=_image())
+    cpu.compute_type = "cpu"
+    cpu.images["gpu"] = {"sha256": "9" * 64}
+    with pytest.raises(rsvc.ReleaseError, match="opposite-stream"):
+        rsvc.release_manifest(cpu)
+
+    gpu = GuestRelease(
+        release_id="malformed-gpu",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="gpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={
+            "gpu": {
+                "url": "https://artifacts.chutes.ai/releases/gpu.qcow2",
+                "sha256": "1" * 64,
+            },
+            "chute": _image(),
+        },
+    )
+    with pytest.raises(rsvc.ReleaseError, match="opposite-stream"):
+        rsvc.release_manifest(gpu)
+
+
+def test_gpu_release_status_policy_tracks_runtime_convergence():
+    import inspect
+    from api.releases.schemas import ReleaseStatusResponse
+
+    gpu = GuestRelease(
+        release_id="gpu-source-only",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="gpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={"gpu": {"sha256": "1" * 64}},
+    )
+    cpu = _release(chute=_image())
+    cpu.compute_type = "cpu"
+
+    assert rsvc._runtime_convergence_supported(gpu) is True
+    assert rsvc._runtime_convergence_supported(cpu) is True
+    source = inspect.getsource(rsvc.release_status)
+    assert "GpuLaunchReservation" in source
+    assert '"runtime_convergence_state": "tracked"' in source
+    assert "guest_consumed_at" in source
+    assert "gpu_evidence_sha256" in source
+    assert "gpu_process_incarnation" in source
+    assert "ServerAttestation.attestation_id.desc()" in source
+    assert "latest.c.gpu_retired_at.is_(None)" in source
+    assert "_revocation_failed" in source
+    assert 'GpuLaunchReservation.state == "running"' in source
+    assert "storage_sibling_ready" in source
+    assert "old_process_exit_confirmed" in source
+    assert '"physical_host_convergence_proven": False' in source
+    assert '"pin_pruning_safe": False' in source
+    assert "runtime_convergence_state" in ReleaseStatusResponse.model_fields
+
+
+@pytest.mark.asyncio
+async def test_gpu_storage_desired_state_keeps_exact_cpu_release_identity_without_mutation():
+    profile_id = "storage-baremetal-tdx-1.10.0-2vcpu-8g"
+    storage = {
+        "url": "https://artifacts.chutes.ai/releases/storage-1.10.0.qcow2",
+        "sha256": "7" * 64,
+        "debug": False,
+        "version": "1.10.0",
+        "measurement_names": [profile_id],
+        "kernel_sha256": "8" * 64,
+        "initrd_sha256": "9" * 64,
+        "cmdline_sha256": "a" * 64,
+    }
+    source = GuestRelease(
+        release_id="cpu-storage-source",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="cpu",
+        status=RELEASE_STATUS_SUPERSEDED,
+        images={"storage": dict(storage)},
+    )
+    active_cpu = GuestRelease(
+        release_id="cpu-active",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="cpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={"storage": {**storage, "_inherited": True}},
+    )
+    gpu = GuestRelease(
+        release_id="gpu-active",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="gpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={"gpu": {"sha256": "b" * 64}},
+    )
+    host = Host(
+        host_id="gpu-host",
+        miner_hotkey="owner",
+        tee_type="tdx",
+        compute_type="gpu",
+        release_channel="stable",
+        storage_enabled=True,
+        storage_td_vcpus=2,
+        storage_td_mem="8G",
+    )
+    before_active = copy.deepcopy(active_cpu.images)
+    before_source = copy.deepcopy(source.images)
+    contract = RoleLaunchBinaryContract(
+        role="storage",
+        qemu_binary="qemu-system-x86_64",
+        qemu_package="qemu-system-x86",
+        qemu_package_version="1:10.1.0+ds-5ubuntu2.7",
+        qemu_binary_sha256="c" * 64,
+        machine_type="pc-q35-10.1",
+        firmware_filename="OVMF.inteltdx.fd",
+        firmware_sha256="d" * 64,
+    )
+    closure = GpuL0StorageClosure(
+        source_release_id=source.release_id,
+        image_version=storage["version"],
+        image_sha256=storage["sha256"],
+        kernel_sha256=storage["kernel_sha256"],
+        initrd_sha256=storage["initrd_sha256"],
+        cmdline_sha256=storage["cmdline_sha256"],
+        measurement_names=[profile_id],
+        launch_contract=contract,
+    )
+    db = AsyncMock()
+    db.get.return_value = source
+    with (
+        patch.object(rsvc, "get_active_release", AsyncMock(return_value=active_cpu)),
+        patch.object(rsvc, "_validate_active_release"),
+        patch.object(rsvc, "_storage_source_release", AsyncMock(return_value=source)),
+        patch.object(rsvc, "_storage_launch_contract", return_value=contract),
+        patch.object(
+            rsvc,
+            "_verify_l0_release_contract",
+            return_value=(
+                SimpleNamespace(
+                    manifest=SimpleNamespace(storage_closure=closure),
+                ),
+                "f" * 64,
+            ),
+        ),
+    ):
+        sibling = await rsvc._gpu_storage_sibling_for_host(
+            db,
+            gpu,
+            host,
+        )
+
+    assert sibling.source_release_id == source.release_id
+    assert sibling.active_cpu_release_id == active_cpu.release_id
+    assert sibling.profile_id == profile_id
+    assert sibling.image.sha256 == storage["sha256"]
+    assert sibling.launch_contract == contract
+    assert sibling.physical_co_location_trusted is False
+    assert active_cpu.images == before_active
+    assert source.images == before_source
+
+
+@pytest.mark.asyncio
+async def test_gpu_storage_intent_is_host_scoped_restart_idempotent_and_has_no_cpu_target():
+    gpu = GuestRelease(
+        release_id="gpu-active",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="gpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={"gpu": {"sha256": "b" * 64}},
+    )
+    host = Host(
+        host_id="gpu-host",
+        miner_hotkey="owner",
+        tee_type="tdx",
+        compute_type="gpu",
+        release_channel="stable",
+        storage_enabled=True,
+        provisioning_state="ready",
+        identity_durable_at=datetime.now(timezone.utc),
+    )
+    sibling = SimpleNamespace(
+        source_release_id="cpu-storage-source",
+        active_cpu_release_id="cpu-active",
+        profile_id="storage-baremetal-tdx-1.10.0-2vcpu-8g",
+        image=SimpleNamespace(
+            sha256="7" * 64,
+            version="1.10.0",
+            kernel_sha256="8" * 64,
+            initrd_sha256="9" * 64,
+            cmdline_sha256="a" * 64,
+        ),
+        launch_contract=RoleLaunchBinaryContract(
+            role="storage",
+            qemu_binary="qemu-system-x86_64",
+            qemu_package="qemu-system-x86",
+            qemu_package_version="1:10.1.0+ds-5ubuntu2.7",
+            qemu_binary_sha256="c" * 64,
+            machine_type="pc-q35-10.1",
+            firmware_filename="OVMF.inteltdx.fd",
+            firmware_sha256="d" * 64,
+        ),
+    )
+    empty = Mock()
+    empty.scalar_one_or_none.return_value = None
+    first_db = AsyncMock()
+    first_db.execute.return_value = empty
+    first_db.add = MagicMock()
+    with patch.object(
+        rsvc,
+        "_gpu_storage_sibling_for_host",
+        AsyncMock(return_value=sibling),
+    ):
+        created = await rsvc._ensure_gpu_storage_launch_intent_for_host(
+            first_db,
+            gpu,
+            host,
+        )
+    assert created.target_id is None
+    assert created.host_compute_type == "gpu"
+    assert created.release_id == sibling.source_release_id
+    assert created.gpu_release_id == gpu.release_id
+    assert created.active_cpu_release_id == sibling.active_cpu_release_id
+    assert created.claim_generation in {None, 0}
+    first_db.add.assert_called_once_with(created)
+
+    found = Mock()
+    found.scalar_one_or_none.return_value = created
+    restart_db = AsyncMock()
+    restart_db.execute.return_value = found
+    restart_db.add = MagicMock()
+    with patch.object(
+        rsvc,
+        "_gpu_storage_sibling_for_host",
+        AsyncMock(return_value=sibling),
+    ):
+        recovered = await rsvc._ensure_gpu_storage_launch_intent_for_host(
+            restart_db,
+            gpu,
+            host,
+        )
+    assert recovered is created
+    restart_db.add.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cpu_storage_activation_invalidates_incompatible_gpu_l0_without_reissue():
+    contract = RoleLaunchBinaryContract(
+        role="storage",
+        qemu_binary="qemu-system-x86_64",
+        qemu_package="qemu-system-x86",
+        qemu_package_version="1:10.1.0+ds-5ubuntu2.7",
+        qemu_binary_sha256="c" * 64,
+        machine_type="pc-q35-10.1",
+        firmware_filename="OVMF.inteltdx.fd",
+        firmware_sha256="d" * 64,
+    )
+    old_closure = GpuL0StorageClosure(
+        source_release_id="old-storage",
+        image_version="1.10.0",
+        image_sha256="1" * 64,
+        kernel_sha256="2" * 64,
+        initrd_sha256="3" * 64,
+        cmdline_sha256="4" * 64,
+        measurement_names=["storage-baremetal-tdx-1.10.0-2vcpu-8g"],
+        launch_contract=contract,
+    )
+    new_closure = old_closure.model_copy(
+        update={
+            "source_release_id": "new-storage",
+            "image_version": "1.11.0",
+            "image_sha256": "5" * 64,
+        }
+    )
+    cpu = GuestRelease(
+        release_id="cpu-new",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="cpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={"storage": {"sha256": "5" * 64}},
+    )
+    gpu = GuestRelease(
+        release_id="gpu-active",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="gpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={"gpu": {"sha256": "6" * 64}},
+    )
+    supersede = AsyncMock()
+    ensure = AsyncMock()
+    with (
+        patch.object(
+            rsvc,
+            "_gpu_l0_storage_closure",
+            AsyncMock(return_value=new_closure),
+        ),
+        patch.object(
+            rsvc,
+            "_verify_l0_release_contract",
+            return_value=(
+                SimpleNamespace(manifest=SimpleNamespace(storage_closure=old_closure)),
+                "a" * 64,
+            ),
+        ),
+        patch.object(rsvc, "_supersede_storage_intents", supersede),
+        patch.object(rsvc, "_ensure_gpu_storage_launch_intents", ensure),
+    ):
+        await rsvc._refresh_active_gpu_storage_intents(
+            AsyncMock(),
+            active_cpu_release=cpu,
+            gpu_release=gpu,
+        )
+    supersede.assert_awaited_once()
+    ensure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gpu_activation_rejects_l0_with_wrong_storage_artifact_closure():
+    contract = RoleLaunchBinaryContract(
+        role="storage",
+        qemu_binary="qemu-system-x86_64",
+        qemu_package="qemu-system-x86",
+        qemu_package_version="1:10.1.0+ds-5ubuntu2.7",
+        qemu_binary_sha256="c" * 64,
+        machine_type="pc-q35-10.1",
+        firmware_filename="OVMF.inteltdx.fd",
+        firmware_sha256="d" * 64,
+    )
+    expected = GpuL0StorageClosure(
+        source_release_id="storage-new",
+        image_version="1.11.0",
+        image_sha256="1" * 64,
+        kernel_sha256="2" * 64,
+        initrd_sha256="3" * 64,
+        cmdline_sha256="4" * 64,
+        measurement_names=["storage-baremetal-tdx-1.11.0-2vcpu-8g"],
+        launch_contract=contract,
+    )
+    wrong = expected.model_copy(update={"image_sha256": "5" * 64})
+    cpu = GuestRelease(
+        release_id="cpu-active",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="cpu",
+        status=RELEASE_STATUS_ACTIVE,
+        images={"storage": {"sha256": "1" * 64}},
+    )
+    gpu = GuestRelease(
+        release_id="gpu-draft",
+        channel="stable",
+        tee_type="tdx",
+        compute_type="gpu",
+        status=RELEASE_STATUS_DRAFT,
+        images={"gpu": {"sha256": "6" * 64}},
+    )
+    with (
+        patch.object(rsvc, "get_active_release", AsyncMock(return_value=cpu)),
+        patch.object(rsvc, "_validate_active_release"),
+        patch.object(
+            rsvc,
+            "_gpu_l0_storage_closure",
+            AsyncMock(return_value=expected),
+        ),
+        patch.object(
+            rsvc,
+            "_verify_l0_release_contract",
+            return_value=(
+                SimpleNamespace(manifest=SimpleNamespace(storage_closure=wrong)),
+                "a" * 64,
+            ),
+        ),
+    ):
+        with pytest.raises(rsvc.ReleaseError, match="does not match"):
+            await rsvc._validate_gpu_storage_stream(AsyncMock(), gpu)
 
 
 @pytest.mark.asyncio

@@ -8,26 +8,16 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.storage import service
+from cross_repo_tests import repository_root
 from tests.integration import test_storage_reconciliation_postgres as api_pg
 
 pytest_plugins = ["tests.integration.test_storage_reconciliation_postgres"]
-
-SEK8S_SOURCE_ROOT = Path(__file__).resolve().parents[3] / "sek8s" / "src" / "sek8s"
-if not SEK8S_SOURCE_ROOT.is_dir():
-    pytest.skip(
-        "Local cross-layer recovery test requires the sibling sek8s source checkout.",
-        allow_module_level=True,
-    )
-sys.path.insert(0, str(SEK8S_SOURCE_ROOT))
-
-from sek8s.storage_node.publication import write_async as node_write_async
-from sek8s.storage_node.recovery import recover_pending_replications
-from sek8s.storage_node.store import ContentStore
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -72,7 +62,7 @@ class ServiceBackedRecoveryTracker:
 
 
 class RestartedStorageNodeContext:
-    def __init__(self, store: ContentStore, tracker: ServiceBackedRecoveryTracker):
+    def __init__(self, store: Any, tracker: ServiceBackedRecoveryTracker):
         self.store = store
         self.tracker = tracker
         self._object_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -85,6 +75,15 @@ class RestartedStorageNodeContext:
 
 
 async def test_direct_upload_commit_restart_replay_is_cross_layer_safe(pg_session, tmp_path):
+    sek8s_source = repository_root("sek8s", start=Path(__file__)) / "src" / "sek8s"
+    sys.path.insert(0, str(sek8s_source))
+    try:
+        from sek8s.storage_node.publication import write_async as node_write_async
+        from sek8s.storage_node.recovery import recover_pending_replications
+        from sek8s.storage_node.store import ContentStore
+    finally:
+        sys.path.remove(str(sek8s_source))
+
     db, redis = pg_session
     target = await api_pg._server(db, redis, "restart-target", "restart-host")
     volume = await api_pg._volume(db, 1)

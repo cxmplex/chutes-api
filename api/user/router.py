@@ -17,7 +17,8 @@ from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Header, status, Request
 from fastapi.responses import HTMLResponse
 from api.database import get_db_session
-from api.chute.schemas import ChuteShare
+from api.chute.schemas import Chute, ChuteShare
+from api.image.schemas import Image
 from api.user.schemas import (
     UserRequest,
     User,
@@ -52,7 +53,11 @@ from api.config import settings
 from api.api_key.schemas import APIKey, APIKeyArgs
 from api.api_key.response import APIKeyCreationResponse
 from api.user.util import validate_the_username, generate_payment_address
-from api.user.templater import registration_token_form, registration_token_success, error_page
+from api.user.templater import (
+    registration_token_form,
+    registration_token_success,
+    error_page,
+)
 from api.agent_registration.schemas import (
     AgentRegistration,
     AgentRegistrationRequest,
@@ -219,7 +224,10 @@ async def admin_balance_lookup(
         (
             await db.execute(
                 select(User).where(
-                    or_(User.username == user_id_or_username, User.user_id == user_id_or_username)
+                    or_(
+                        User.username == user_id_or_username,
+                        User.user_id == user_id_or_username,
+                    )
                 )
             )
         )
@@ -228,7 +236,8 @@ async def admin_balance_lookup(
     )
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=f"User not found: {user_id_or_username}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User not found: {user_id_or_username}",
         )
     return {
         "user_id": user.user_id,
@@ -360,7 +369,8 @@ async def admin_balance_change(
     )
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=f"User not found: {balance_req.user_id}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User not found: {balance_req.user_id}",
         )
     user.balance += balance_req.amount
     event_id = str(uuid.uuid4())
@@ -515,7 +525,10 @@ async def balance_transfer(
         (
             await db.execute(
                 select(User).where(
-                    or_(User.user_id == transfer_req.user_id, User.username == transfer_req.user_id)
+                    or_(
+                        User.user_id == transfer_req.user_id,
+                        User.username == transfer_req.user_id,
+                    )
                 )
             )
         )
@@ -549,8 +562,16 @@ async def balance_transfer(
     credit_event_id = str(uuid.uuid4())
     origin_ip = request.state.client_ip
 
-    debit_raw = {"source_ip": origin_ip, "type": "balance_transfer", "direction": "debit"}
-    credit_raw = {"source_ip": origin_ip, "type": "balance_transfer", "direction": "credit"}
+    debit_raw = {
+        "source_ip": origin_ip,
+        "type": "balance_transfer",
+        "direction": "debit",
+    }
+    credit_raw = {
+        "source_ip": origin_ip,
+        "type": "balance_transfer",
+        "direction": "credit",
+    }
 
     transfer_sql = text("""
         WITH source AS (
@@ -1356,7 +1377,10 @@ async def admin_subscription_usage(
         (
             await db.execute(
                 select(User).where(
-                    or_(User.user_id == user_id_or_username, User.username == user_id_or_username)
+                    or_(
+                        User.user_id == user_id_or_username,
+                        User.username == user_id_or_username,
+                    )
                 )
             )
         )
@@ -1392,8 +1416,25 @@ async def delete_my_user(
             detail="Not authorized",
         )
 
+    from api.storage.service import prepare_user_storage_erasure
+
+    erasure = await prepare_user_storage_erasure(db, current_user.user_id)
+    if not erasure["ready"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    "Account deletion is staged until active launches stop and every ChuteFS "
+                    "volume is physically purged with its key shredded."
+                ),
+                **erasure,
+            },
+        )
+    await db.execute(delete(Chute).where(Chute.user_id == current_user.user_id))
+    await db.execute(delete(Image).where(Image.user_id == current_user.user_id))
     await db.execute(
-        text("DELETE FROM users WHERE user_id = :user_id"), {"user_id": current_user.user_id}
+        text("DELETE FROM users WHERE user_id = :user_id"),
+        {"user_id": current_user.user_id},
     )
     await db.commit()
     return {"deleted": True}
@@ -1478,7 +1519,9 @@ def _registration_response(user, fingerprint):
 
 @router.get("/name_check")
 async def check_username(
-    username: str, readonly: Optional[bool] = None, db: AsyncSession = Depends(get_db_session)
+    username: str,
+    readonly: Optional[bool] = None,
+    db: AsyncSession = Depends(get_db_session),
 ):
     """
     Check if a username is valid and available.
@@ -1674,7 +1717,8 @@ async def post_rtok(request: Request):
         except Exception as e:
             logger.error(f"RTOK: hCaptcha verification error: {e}")
             return HTMLResponse(
-                content=error_page("Verification error. Please try again."), status_code=500
+                content=error_page("Verification error. Please try again."),
+                status_code=500,
             )
 
     # Create the token and render it.

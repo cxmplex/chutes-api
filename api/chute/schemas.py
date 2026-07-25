@@ -146,9 +146,10 @@ class NodeSelector(BaseModel):
         """
         if not gpus:
             return gpus
-        if extra := set(map(lambda s: s.lower(), gpus)) - set(SUPPORTED_GPUS):
+        normalized = sorted({gpu.lower() for gpu in gpus})
+        if extra := set(normalized) - set(SUPPORTED_GPUS):
             raise ValueError(f"Invalid GPU identifiers `include`: {extra}")
-        return gpus
+        return normalized
 
     @validator("exclude")
     def validate_exclude(cls, gpus):
@@ -157,9 +158,10 @@ class NodeSelector(BaseModel):
         """
         if not gpus:
             return gpus
-        if extra := set(map(lambda s: s.lower(), gpus)) - set(SUPPORTED_GPUS):
+        normalized = sorted({gpu.lower() for gpu in gpus})
+        if extra := set(normalized) - set(SUPPORTED_GPUS):
             raise ValueError(f"Invalid GPU identifiers `exclude`: {extra}")
-        return gpus
+        return normalized
 
     @property
     def compute_multiplier(self) -> float:
@@ -241,7 +243,7 @@ class NodeSelector(BaseModel):
             if "mi300x" in allowed_gpus and len(allowed_gpus) > 1:
                 allowed_gpus.remove("mi300x")
 
-        return list(allowed_gpus)
+        return sorted(allowed_gpus)
 
 
 class ChuteArgs(BaseModel):
@@ -331,7 +333,10 @@ class Chute(Base):
         "Instance", back_populates="chute", lazy="select", cascade="all, delete-orphan"
     )
     shares = relationship(
-        "ChuteShare", back_populates="chute", lazy="select", cascade="all, delete-orphan"
+        "ChuteShare",
+        back_populates="chute",
+        lazy="select",
+        cascade="all, delete-orphan",
     )
     llm_detail = relationship(
         "LLMDetail",
@@ -505,7 +510,10 @@ class ChuteHistory(Base):
 class RollingUpdate(Base):
     __tablename__ = "rolling_updates"
     chute_id = Column(
-        String, ForeignKey("chutes.chute_id", ondelete="CASCADE"), nullable=False, primary_key=True
+        String,
+        ForeignKey("chutes.chute_id", ondelete="CASCADE"),
+        nullable=False,
+        primary_key=True,
     )
     old_version = Column(String, nullable=False)
     new_version = Column(String, nullable=False)
@@ -518,13 +526,22 @@ class RollingUpdate(Base):
 class ChuteShare(Base):
     __tablename__ = "chute_shares"
     chute_id = Column(
-        String, ForeignKey("chutes.chute_id", ondelete="CASCADE"), nullable=False, primary_key=True
+        String,
+        ForeignKey("chutes.chute_id", ondelete="CASCADE"),
+        nullable=False,
+        primary_key=True,
     )
     shared_by = Column(
-        String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, primary_key=True
+        String,
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+        primary_key=True,
     )
     shared_to = Column(
-        String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, primary_key=True
+        String,
+        ForeignKey("users.user_id", ondelete="CASCADE"),
+        nullable=False,
+        primary_key=True,
     )
     shared_at = Column(DateTime, server_default=func.now())
 
@@ -539,7 +556,10 @@ class ChuteShareArgs(BaseModel):
 class LLMDetail(Base):
     __tablename__ = "llm_details"
     chute_id = Column(
-        String, ForeignKey("chutes.chute_id", ondelete="CASCADE"), nullable=False, primary_key=True
+        String,
+        ForeignKey("chutes.chute_id", ondelete="CASCADE"),
+        nullable=False,
+        primary_key=True,
     )
     details = Column(JSONB, nullable=False)
     updated_at = Column(DateTime, server_default=func.now())

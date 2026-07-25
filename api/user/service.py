@@ -13,9 +13,18 @@ from api.database import get_session
 from api.user.schemas import User
 from api.api_key.util import get_and_check_api_key
 from api.user.tokens import get_user_from_token
+from api.server.gpu_sessions import (
+    GPU_RUNTIME_SESSION_HEADER,
+    validate_gpu_runtime_session,
+)
 from fastapi.security import APIKeyHeader
 from api.constants import HOTKEY_HEADER, SIGNATURE_HEADER, AUTHORIZATION_HEADER
-from api.constants import NONCE_HEADER, INTEGRATED_SUBNETS, SIG_VERSION_HEADER, SIG_VERSION_V2
+from api.constants import (
+    NONCE_HEADER,
+    INTEGRATED_SUBNETS,
+    SIG_VERSION_HEADER,
+    SIG_VERSION_V2,
+)
 from api.util import (
     nonce_is_valid,
     nonce_is_valid_v2,
@@ -74,10 +83,56 @@ def get_current_user(
         nonce: str | None = Header(None, alias=NONCE_HEADER),
         authorization: str | None = Header(None, alias=AUTHORIZATION_HEADER),
         sig_version: str | None = Header(None, alias=SIG_VERSION_HEADER),
+        attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
     ):
         """
         Helper to authenticate requests.
         """
+
+        if isinstance(attested_session, str) and attested_session:
+            if signature or nonce or authorization or api_key:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Attested GPU session cannot be combined with another credential.",
+                )
+            async with get_session(readonly=True) as session:
+                server, session_claims = await validate_gpu_runtime_session(
+                    session,
+                    attested_session,
+                    required_purpose=purpose,
+                )
+                if hotkey is not None and hotkey != server.miner_hotkey:
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="GPU runtime session owner does not match the public hotkey.",
+                    )
+                if (
+                    registered_to is not None
+                    and not (
+                        await session.execute(
+                            select(
+                                exists()
+                                .where(MetagraphNode.hotkey == server.miner_hotkey)
+                                .where(MetagraphNode.netuid == registered_to)
+                            )
+                        )
+                    ).scalar()
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail=f"Hotkey is not registered on netuid {registered_to}",
+                    )
+                user = (
+                    await session.execute(select(User).where(User.hotkey == server.miner_hotkey))
+                ).scalar_one_or_none()
+            if user is None and raise_not_found and registered_to is None:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="GPU runtime session owner has no validator user.",
+                )
+            request.state.gpu_runtime_server_id = server.server_id
+            request.state.gpu_runtime_session_expires_at = session_claims["exp"]
+            return user
 
         if (hotkey or signature or nonce) and (not hotkey or not signature or not nonce):
             hotkey, signature, nonce = None, None, None

@@ -152,6 +152,16 @@ class TeeMeasurementConfig:
     # Unsigned bindings are accepted only for explicit debug artifacts on an explicit dev validator.
     image_sha256: Optional[str] = None
     image_measurement_names: Optional[List[str]] = None
+    # Strict direct-TDX GPU pin identity. These remain absent on every existing CPU/storage and
+    # legacy GPU pin so their canonical fingerprints are unchanged.
+    compute_type: Optional[str] = None
+    role: Optional[str] = None
+    management_mode: Optional[str] = None
+    gpu_profile_id: Optional[str] = None
+    gpu_profile_contract_sha256: Optional[str] = None
+    gpu_measurement_fingerprint: Optional[str] = None
+    gpu_fingerprint_version: Optional[int] = None
+    provenance_schema_version: Optional[int] = None
     # Canonical identities assigned only after every configured source validates successfully.
     config_fingerprint: str = ""
     trust_set_fingerprint: str = ""
@@ -181,6 +191,8 @@ class TeeMeasurementConfig:
 
 def measurement_config_fingerprint(config: TeeMeasurementConfig) -> str:
     """Return the stable SHA-256 identity of every security-relevant config field."""
+    if getattr(config, "compute_type", None) == "gpu":
+        return gpu_measurement_config_fingerprint(config)
     payload = (
         asdict(config)
         if is_dataclass(config)
@@ -196,8 +208,51 @@ def measurement_config_fingerprint(config: TeeMeasurementConfig) -> str:
     for profile_field in ("profile_id", "vcpus", "memory_mib"):
         if payload.get(profile_field) is None:
             payload.pop(profile_field, None)
+    for gpu_field in (
+        "compute_type",
+        "role",
+        "management_mode",
+        "gpu_profile_id",
+        "gpu_profile_contract_sha256",
+        "gpu_measurement_fingerprint",
+        "gpu_fingerprint_version",
+        "provenance_schema_version",
+    ):
+        if payload.get(gpu_field) is None:
+            payload.pop(gpu_field, None)
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def gpu_measurement_config_fingerprint(config: TeeMeasurementConfig) -> str:
+    """Versioned canonical identity for one strict direct-TDX GPU pin."""
+
+    if (
+        config.compute_type != "gpu"
+        or config.role != "gpu"
+        or config.tee_type != "tdx"
+        or config.provider != "bare-metal"
+        or config.gpu_fingerprint_version != 1
+        or config.provenance_schema_version != 3
+    ):
+        raise ValueError("strict GPU measurement fingerprint metadata is incomplete")
+    payload = asdict(config)
+    payload.pop("config_fingerprint", None)
+    payload.pop("trust_set_fingerprint", None)
+    payload.pop("rc", None)
+    for profile_field in ("profile_id", "vcpus", "memory_mib"):
+        if payload.get(profile_field) is None:
+            payload.pop(profile_field, None)
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "fingerprint_version": 1,
+                "config": payload,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
 
 
@@ -267,8 +322,195 @@ def _field_names(values: set[object]) -> List[str]:
     return sorted(repr(value) for value in values)
 
 
+def _expand_nested_gpu_measurement_group(group: dict, source: object) -> List[dict]:
+    """Flatten one strict schema-v3 GPU profile×mode measurement group."""
+
+    group_keys = {
+        "version",
+        "tee_type",
+        "provider",
+        "compute_type",
+        "role",
+        "debug",
+        "rc",
+        "provenance_schema_version",
+        "gpu_fingerprint_version",
+        "profile_contract_sha256",
+        "image_sha256",
+        "image_measurement_names",
+        "hardware",
+    }
+    if set(group) != group_keys:
+        raise ValueError(
+            f"Invalid strict GPU measurement group {source}: keys must be exactly "
+            f"{sorted(group_keys)} (missing={_field_names(group_keys - set(group))}, "
+            f"unknown={_field_names(set(group) - group_keys)})."
+        )
+    if (
+        group["tee_type"] != "tdx"
+        or group["provider"] != "bare-metal"
+        or group["compute_type"] != "gpu"
+        or group["role"] != "gpu"
+        or group["provenance_schema_version"] != 3
+        or group["gpu_fingerprint_version"] != 1
+    ):
+        raise ValueError(
+            f"Invalid strict GPU measurement group {source}: expected "
+            "compute_type=gpu, role=gpu, TDX/bare-metal, provenance v3, fingerprint v1."
+        )
+    version = group["version"]
+    if not isinstance(version, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}", version
+    ):
+        raise ValueError(f"Invalid strict GPU measurement group {source}: version is invalid.")
+    if not isinstance(group["debug"], bool) or not isinstance(group["rc"], bool):
+        raise ValueError(
+            f"Invalid strict GPU measurement group {source}: debug and rc must be booleans."
+        )
+    for field in ("profile_contract_sha256", "image_sha256"):
+        value = group[field]
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError(
+                f"Invalid strict GPU measurement group {source}: {field} must be lowercase sha256."
+            )
+    names = group["image_measurement_names"]
+    if (
+        not isinstance(names, list)
+        or not names
+        or any(not isinstance(name, str) or not name for name in names)
+        or names != list(dict.fromkeys(names))
+    ):
+        raise ValueError(
+            f"Invalid strict GPU measurement group {source}: "
+            "image_measurement_names must be an ordered unique non-empty string list."
+        )
+    hardware = group["hardware"]
+    if not isinstance(hardware, list) or not hardware:
+        raise ValueError(
+            f"Invalid strict GPU measurement group {source}: hardware must be non-empty."
+        )
+    required_variant_keys = {
+        "name",
+        "gpu_profile_id",
+        "management_mode",
+        "mrtd",
+        "rtmr0",
+        "rtmr1",
+        "rtmr2",
+        "boot_rtmr3",
+        "runtime_rtmr3",
+        "expected_gpus",
+        "gpu_count",
+        "gpu_measurement_fingerprint",
+    }
+    allowed_variant_keys = required_variant_keys | {"description"}
+    flattened: List[dict] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    seen_fingerprints: set[str] = set()
+    profile_inventory: Dict[str, tuple[int, tuple[str, ...]]] = {}
+    profile_order: List[str] = []
+    for index, variant in enumerate(hardware):
+        path = f"{source}:hardware[{index}]"
+        if not isinstance(variant, dict) or not required_variant_keys.issubset(variant):
+            actual = set(variant) if isinstance(variant, dict) else set()
+            raise ValueError(
+                f"Invalid strict GPU measurement variant {path}: missing "
+                f"{_field_names(required_variant_keys - actual)}."
+            )
+        unknown = set(variant) - allowed_variant_keys
+        if unknown:
+            raise ValueError(
+                f"Invalid strict GPU measurement variant {path}: unknown {_field_names(unknown)}."
+            )
+        profile_id = variant["gpu_profile_id"]
+        mode = variant["management_mode"]
+        if not isinstance(profile_id, str) or not re.fullmatch(
+            r"[a-z0-9][a-z0-9-]{0,63}", profile_id
+        ):
+            raise ValueError(f"Invalid strict GPU measurement variant {path}: profile id.")
+        if mode not in {"platform", "miner"}:
+            raise ValueError(f"Invalid strict GPU measurement variant {path}: management mode.")
+        pair = (profile_id, mode)
+        if pair in seen_pairs:
+            raise ValueError(f"Invalid strict GPU measurement group {source}: duplicate {pair}.")
+        seen_pairs.add(pair)
+        if profile_id not in profile_order:
+            profile_order.append(profile_id)
+        expected_name = f"gpu-baremetal-tdx-{version}-{profile_id}-{mode}"
+        if variant["name"] != expected_name:
+            raise ValueError(
+                f"Invalid strict GPU measurement variant {path}: name contradicts profile/mode."
+            )
+        if (
+            not isinstance(variant["gpu_count"], int)
+            or isinstance(variant["gpu_count"], bool)
+            or variant["gpu_count"] <= 0
+            or not isinstance(variant["expected_gpus"], list)
+            or not variant["expected_gpus"]
+            or any(
+                not isinstance(gpu, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", gpu)
+                for gpu in variant["expected_gpus"]
+            )
+            or variant["expected_gpus"] != sorted(set(variant["expected_gpus"]))
+        ):
+            raise ValueError(
+                f"Invalid strict GPU measurement variant {path}: GPU inventory is invalid."
+            )
+        fingerprint = variant["gpu_measurement_fingerprint"]
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValueError(
+                f"Invalid strict GPU measurement variant {path}: fingerprint must be sha256."
+            )
+        if fingerprint in seen_fingerprints:
+            raise ValueError(
+                f"Invalid strict GPU measurement group {source}: duplicate measurement fingerprint."
+            )
+        seen_fingerprints.add(fingerprint)
+        inventory = (variant["gpu_count"], tuple(variant["expected_gpus"]))
+        if profile_id in profile_inventory and profile_inventory[profile_id] != inventory:
+            raise ValueError(
+                f"Invalid strict GPU measurement group {source}: profile {profile_id!r} "
+                "changes GPU identity between management modes."
+            )
+        profile_inventory[profile_id] = inventory
+        for field in (
+            "mrtd",
+            "rtmr0",
+            "rtmr1",
+            "rtmr2",
+            "boot_rtmr3",
+            "runtime_rtmr3",
+        ):
+            value = variant[field]
+            if not isinstance(value, str) or not re.fullmatch(r"[0-9A-F]{96}", value):
+                raise ValueError(
+                    f"Invalid strict GPU measurement variant {path}: {field} must be uppercase SHA-384."
+                )
+        flat = {key: value for key, value in group.items() if key != "hardware"}
+        flat.update(variant)
+        flat["gpu_profile_contract_sha256"] = flat.pop("profile_contract_sha256")
+        flattened.append(flat)
+    expected_pairs = [
+        (profile_id, mode) for profile_id in profile_order for mode in ("platform", "miner")
+    ]
+    actual_pairs = [(item["gpu_profile_id"], item["management_mode"]) for item in flattened]
+    if actual_pairs != expected_pairs:
+        raise ValueError(
+            f"Invalid strict GPU measurement group {source}: hardware must contain the "
+            "complete ordered profile by platform/miner matrix."
+        )
+    if [item["name"] for item in flattened] != names:
+        raise ValueError(
+            f"Invalid strict GPU measurement group {source}: hardware names/order must "
+            "exactly match image_measurement_names."
+        )
+    return flattened
+
+
 def _expand_nested_measurement_group(group: dict, source: object) -> List[dict]:
     """Flatten one strict source group into scalar per-hardware runtime entries."""
+    if group.get("compute_type") == "gpu":
+        return _expand_nested_gpu_measurement_group(group, source)
     legacy_maps = {"boot_rtmrs", "runtime_rtmrs"}.intersection(group)
     if legacy_maps:
         raise ValueError(
@@ -856,6 +1098,7 @@ class Settings(BaseSettings):
     launch_config_key: str = hashlib.sha256(
         os.getenv("LAUNCH_CONFIG_KEY", "launch-secret").encode()
     ).hexdigest()
+    gpu_launch_key_epoch: int = int(os.getenv("GPU_LAUNCH_KEY_EPOCH", "1"))
 
     # New, asymmetric launch config keys.
     launch_config_private_key_bytes: Optional[bytes] = load_launch_config_private_key()
@@ -866,7 +1109,8 @@ class Settings(BaseSettings):
             return self._launch_config_private_key
         if (key_bytes := load_launch_config_private_key()) is not None:
             self._launch_config_private_key = serialization.load_pem_private_key(key_bytes, None)
-        return self._launch_config_private_key
+            return self._launch_config_private_key
+        return None
 
     # Default quotas/discounts.
     default_quotas: dict = json.loads(os.getenv("DEFAULT_QUOTAS", '{"*": 0}'))
@@ -1421,6 +1665,14 @@ class Settings(BaseSettings):
                 "image_measurement_names",
                 "expected_gpus",
                 "gpu_count",
+                "compute_type",
+                "role",
+                "management_mode",
+                "gpu_profile_id",
+                "gpu_profile_contract_sha256",
+                "gpu_measurement_fingerprint",
+                "gpu_fingerprint_version",
+                "provenance_schema_version",
             }
             tdx_fields = {
                 "mrtd",
@@ -1694,6 +1946,18 @@ class Settings(BaseSettings):
                     memory_mib=measurement_config.get("memory_mib"),
                     image_sha256=image_sha256,
                     image_measurement_names=image_measurement_names,
+                    compute_type=measurement_config.get("compute_type"),
+                    role=measurement_config.get("role"),
+                    management_mode=measurement_config.get("management_mode"),
+                    gpu_profile_id=measurement_config.get("gpu_profile_id"),
+                    gpu_profile_contract_sha256=measurement_config.get(
+                        "gpu_profile_contract_sha256"
+                    ),
+                    gpu_measurement_fingerprint=measurement_config.get(
+                        "gpu_measurement_fingerprint"
+                    ),
+                    gpu_fingerprint_version=measurement_config.get("gpu_fingerprint_version"),
+                    provenance_schema_version=measurement_config.get("provenance_schema_version"),
                 )
             )
 
@@ -1708,6 +1972,17 @@ class Settings(BaseSettings):
                 "tee_type": config.tee_type,
                 "provider": config.provider,
             }
+            if config.compute_type == "gpu":
+                shared.update(
+                    {
+                        "compute_type": config.compute_type,
+                        "role": config.role,
+                        "gpu_profile_contract_sha256": config.gpu_profile_contract_sha256,
+                        "gpu_fingerprint_version": config.gpu_fingerprint_version,
+                        "provenance_schema_version": config.provenance_schema_version,
+                    }
+                )
+                return shared
             if config.tee_type == "tdx":
                 shared.update(
                     {
@@ -1750,8 +2025,13 @@ class Settings(BaseSettings):
                     or list(peer.image_measurement_names or [])
                     != list(config.image_measurement_names or [])
                     or _shared_image_fields(peer) != _shared_image_fields(config)
-                    or peer.gpu_count != config.gpu_count
-                    or peer.expected_gpus != config.expected_gpus
+                    or (
+                        config.compute_type != "gpu"
+                        and (
+                            peer.gpu_count != config.gpu_count
+                            or peer.expected_gpus != config.expected_gpus
+                        )
+                    )
                 ):
                     raise ValueError(
                         f"Inconsistent image provenance for measurement set "
@@ -1765,18 +2045,32 @@ class Settings(BaseSettings):
 
     @property
     def tee_minimum_boot_version(self) -> str:
-        """Minimum VM version accepted for boot attestation.
+        """CPU minimum retained for existing callers."""
 
-        Returns TEE_MINIMUM_BOOT_VERSION when set, allowing new platform measurement
-        configs to be added to the YAML incrementally without immediately enforcing a
-        version bump for platforms not yet upgraded. Falls back to the highest non-RC
-        version in the complete trust set, or "0.0.0" when no source is present.
+        return self.tee_minimum_boot_version_for("cpu")
+
+    def tee_minimum_boot_version_for(self, compute_type: str) -> str:
+        """Minimum VM version accepted within one compute-scoped trust stream.
+
+        Existing ``TEE_MINIMUM_BOOT_VERSION`` remains the CPU override. GPU may use
+        ``TEE_GPU_MINIMUM_BOOT_VERSION`` and otherwise derives only from GPU pins.
         """
-        if pinned := os.getenv("TEE_MINIMUM_BOOT_VERSION"):
+        if compute_type not in {"cpu", "gpu"}:
+            raise ValueError("compute_type must be cpu or gpu")
+        env_name = (
+            "TEE_MINIMUM_BOOT_VERSION" if compute_type == "cpu" else "TEE_GPU_MINIMUM_BOOT_VERSION"
+        )
+        if pinned := os.getenv(env_name):
             return pinned
         if not self._measurement_source_paths():
             return "0.0.0"
-        versions = [m.version for m in self.tee_measurements if m.version and not m.rc]
+        versions = [
+            measurement.version
+            for measurement in self.tee_measurements
+            if measurement.version
+            and not measurement.rc
+            and ((measurement.gpu_count > 0) == (compute_type == "gpu"))
+        ]
         if not versions:
             return "0.0.0"
         latest = versions[0]

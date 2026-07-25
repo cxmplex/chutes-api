@@ -2,7 +2,17 @@
 ORM definitions for servers and TDX attestations.
 """
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+import re
+import uuid
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from datetime import datetime, timezone
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -34,7 +44,7 @@ from api.constants import (
     ServerHealthStatus,
 )
 from api.database import Base, generate_uuid
-from api.host.schemas import TdQuoteCommitmentV1
+from api.host.schemas import GpuQuoteCommitmentV1, TdQuoteCommitmentV1
 from api.node.schemas import NodeArgs
 
 
@@ -59,6 +69,7 @@ class NonceResponse(BaseModel):
 
     nonce: str
     expires_at: str
+    context_sha256: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
 
 
 class BootAttestationArgs(BaseModel):
@@ -90,6 +101,12 @@ class RuntimeAttestationArgs(BaseModel):
     vtpm_quote: Optional[Dict[str, Any]] = Field(
         None, description="GCE vTPM quote required by a GCP SNP measurement"
     )
+    gpu_evidence: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        min_length=1,
+        max_length=64,
+        description="Fresh NVIDIA evidence for a reservation-owned GPU runtime.",
+    )
 
 
 class RuntimeAttestationNonceContext(BaseModel):
@@ -109,6 +126,48 @@ class RuntimeAttestationNonceContext(BaseModel):
     measurement_version: str
     measurement_config_fingerprint: str
     trust_set_fingerprint: str
+    gpu_launch_reservation_id: Optional[str] = None
+    gpu_allocation_group_id: Optional[str] = None
+    gpu_allocation_group_generation: Optional[int] = Field(None, ge=1)
+    gpu_host_boot_generation: Optional[int] = Field(None, ge=1)
+    gpu_reservation_generation: Optional[int] = Field(None, ge=1)
+    gpu_management_mode: Optional[Literal["platform", "miner"]] = None
+    gpu_process_incarnation: Optional[str] = None
+    gpu_topology_fingerprint: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
+    gpu_release_id: Optional[str] = None
+    gpu_profile_id: Optional[str] = None
+    gpu_chute_id: Optional[str] = None
+    gpu_job_id: Optional[str] = None
+    gpu_claims_sha256: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _exact_gpu_lineage(self) -> "RuntimeAttestationNonceContext":
+        gpu_required = (
+            self.gpu_launch_reservation_id,
+            self.gpu_allocation_group_id,
+            self.gpu_allocation_group_generation,
+            self.gpu_host_boot_generation,
+            self.gpu_reservation_generation,
+            self.gpu_management_mode,
+            self.gpu_process_incarnation,
+            self.gpu_topology_fingerprint,
+            self.gpu_release_id,
+            self.gpu_profile_id,
+            self.gpu_claims_sha256,
+        )
+        if self.compute_type == "gpu":
+            present = [value is not None for value in gpu_required]
+            if any(present) and not all(present):
+                raise ValueError("GPU runtime nonce requires complete reservation lineage")
+            if all(present) and (
+                self.role != "compute" or self.deployment_model != "bare-metal-model-b"
+            ):
+                raise ValueError("GPU runtime nonce requires a Model-B compute server")
+        elif any(
+            value is not None for value in (*gpu_required, self.gpu_chute_id, self.gpu_job_id)
+        ):
+            raise ValueError("CPU runtime nonce cannot carry GPU reservation lineage")
+        return self
 
 
 class RuntimeAttestationResponse(BaseModel):
@@ -119,6 +178,7 @@ class RuntimeAttestationResponse(BaseModel):
     status: str
     revocation_status: Dict[str, str]
     luks_quote_nonce: Optional[str] = None
+    gpu_evidence_sha256: Optional[str] = None
 
 
 class LuksCapabilityPurpose(str, Enum):
@@ -368,6 +428,391 @@ class LuksConfirmResponse(BaseModel):
     volumes: Dict[str, Any]
 
 
+class GpuInfraLeaseRequestV1(BaseModel):
+    """Request one exact generation lease for the miner-only infrastructure volume."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-lease-request"] = "chutes.gpu-infra-lease-request"
+    version: Literal[1] = 1
+    legacy_vm_name: Optional[str] = Field(None, min_length=1, max_length=256)
+
+    @field_validator("legacy_vm_name")
+    @classmethod
+    def validate_legacy_vm_name(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}", value):
+            raise ValueError("legacy_vm_name is not canonical")
+        return value
+
+
+class GpuInfraMigrationEntryV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    name: str = Field(..., pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    source_volume: Literal["storage", "tdx-cache"]
+    source_path: str = Field(..., pattern=r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,511}$")
+    destination_name: str = Field(..., pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    kind: Literal["file", "directory"]
+    required: bool
+
+
+class GpuInfraLegacySourceV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    namespace: Literal["storage", "tdx-cache"]
+    hotplug_serial: Literal["gpu-legacy-storage", "gpu-legacy-cache"]
+    filesystem_type: Literal["xfs", "ext4"]
+    luks_uuid: str = Field(
+        ...,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    filesystem_uuid: str = Field(
+        ...,
+        pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    )
+    generation: int = Field(..., ge=0)
+    current: Optional[str]
+    next: Optional[str]
+    lease_generation: Optional[int] = Field(None, ge=1)
+
+
+class GpuInfraLegacyMigrationV2(BaseModel):
+    """One-use, two-volume legacy migration capability."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    migration_id: str
+    legacy_server_id: str
+    capability: str = Field(..., min_length=32, max_length=512)
+    expires_at: str
+    storage: GpuInfraLegacySourceV1
+    cache: GpuInfraLegacySourceV1
+    postgres_password: str = Field(..., min_length=16, max_length=256)
+    required_entries: List[GpuInfraMigrationEntryV1]
+    optional_entries: List[GpuInfraMigrationEntryV1]
+
+
+class GpuInfraLeaseResponseV1(BaseModel):
+    """Encrypted-volume keys and lineage for one staged gpu-infra generation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-lease"] = "chutes.gpu-infra-lease"
+    version: Literal[1] = 1
+    server_id: str
+    volume_name: Literal["gpu-infra"] = "gpu-infra"
+    lease_id: str
+    generation: int = Field(..., ge=1)
+    confirmed_generation: int = Field(..., ge=0)
+    current: Optional[str]
+    next: str
+    active_key_slot: Optional[int] = Field(None, ge=0, le=7)
+    next_key_slot: int = Field(..., ge=0, le=7)
+    lease_expires_at: str
+    lease_reused: bool
+    awaiting_ack: bool
+    rollback_generation: Optional[int] = Field(None, ge=1)
+    rollback_key_slot: Optional[int] = Field(None, ge=0, le=7)
+    rollback_key: Optional[str] = None
+    retire_key_slot: Optional[int] = Field(None, ge=0, le=7)
+    k3s_encryption_key: str
+    legacy_migration: Optional[GpuInfraLegacyMigrationV2] = None
+
+    @model_validator(mode="after")
+    def validate_slots_and_generation(self) -> "GpuInfraLeaseResponseV1":
+        if self.generation != self.confirmed_generation + 1:
+            raise ValueError("gpu-infra generation must exactly follow the confirmed floor")
+        if self.awaiting_ack:
+            if self.next is None:
+                raise ValueError("awaiting-ack gpu-infra lease must retain its pending key")
+        elif self.active_key_slot is None:
+            if self.current is not None:
+                raise ValueError("first-format gpu-infra lease cannot carry a current key")
+        elif self.current is None or self.active_key_slot == self.next_key_slot:
+            raise ValueError("gpu-infra rotation key slots are invalid")
+        rollback_values = (
+            self.rollback_generation,
+            self.rollback_key_slot,
+            self.rollback_key,
+        )
+        if any(value is None for value in rollback_values) and any(
+            value is not None for value in rollback_values
+        ):
+            raise ValueError("gpu-infra rollback generation, slot, and key must be paired")
+        return self
+
+
+class GpuInfraConfirmRequestV1(BaseModel):
+    """Confirm the staged key and durable generation marker before old-key retirement."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-confirm-request"] = "chutes.gpu-infra-confirm-request"
+    version: Literal[1] = 1
+    lease_id: str = Field(..., min_length=32, max_length=128)
+    generation: int = Field(..., ge=1)
+    active_key_slot: int = Field(..., ge=0, le=7)
+    marker_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
+class GpuInfraConfirmResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-confirmed"] = "chutes.gpu-infra-confirmed"
+    version: Literal[1] = 1
+    server_id: str
+    lease_id: str
+    generation: int = Field(..., ge=1)
+    status: Literal["awaiting_ack"]
+
+
+class GpuInfraAcknowledgeRequestV1(BaseModel):
+    """Acknowledge that the prior key slot is absent after a confirmed rotation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-ack-request"] = "chutes.gpu-infra-ack-request"
+    version: Literal[1] = 1
+    lease_id: str = Field(..., min_length=32, max_length=128)
+    generation: int = Field(..., ge=1)
+    active_key_slot: int = Field(..., ge=0, le=7)
+    marker_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
+class GpuInfraAcknowledgeResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-current"] = "chutes.gpu-infra-current"
+    version: Literal[1] = 1
+    server_id: str
+    generation: int = Field(..., ge=1)
+    retire_key_slot: Optional[int] = Field(None, ge=0, le=7)
+    status: Literal["current"]
+
+
+class GpuInfraRetireRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-retire-request"] = "chutes.gpu-infra-retire-request"
+    version: Literal[1] = 1
+    generation: int = Field(..., ge=1)
+    active_key_slot: int = Field(..., ge=0, le=7)
+    retired_key_slot: int = Field(..., ge=0, le=7)
+    marker_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
+class GpuInfraRetireResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-retired"] = "chutes.gpu-infra-retired"
+    version: Literal[1] = 1
+    server_id: str
+    generation: int = Field(..., ge=1)
+    status: Literal["current"]
+
+
+class GpuInfraAbandonRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-abandon-request"] = "chutes.gpu-infra-abandon-request"
+    version: Literal[1] = 1
+    lease_id: str = Field(..., min_length=32, max_length=128)
+    generation: int = Field(..., ge=1)
+    restored_generation: int = Field(..., ge=0)
+    removed_key_slot: int = Field(..., ge=0, le=7)
+    marker_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+
+
+class GpuInfraAbandonResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-abandoned"] = "chutes.gpu-infra-abandoned"
+    version: Literal[1] = 1
+    server_id: str
+    confirmed_generation: int = Field(..., ge=0)
+    status: Literal["current"]
+
+
+class GpuInfraCloseRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-close-request"] = "chutes.gpu-infra-close-request"
+    version: Literal[1] = 1
+    generation: int = Field(..., ge=0)
+    filesystem_synced: Literal[True]
+    unmounted: Literal[True]
+    mapper_closed: Literal[True]
+
+
+class GpuInfraCloseResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-closed"] = "chutes.gpu-infra-closed"
+    version: Literal[1] = 1
+    server_id: str
+    generation: int = Field(..., ge=0)
+    status: Literal["closed"]
+
+
+class GpuLegacyCloseRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-legacy-close-request"] = "chutes.gpu-legacy-close-request"
+    version: Literal[1] = 1
+    cutover_authorization: str = Field(..., min_length=32, max_length=512)
+    target_host_id: str
+    storage_luks_uuid: str
+    storage_filesystem_uuid: str
+    storage_generation: int = Field(..., ge=0)
+    cache_luks_uuid: str
+    cache_filesystem_uuid: str
+    cache_filesystem_type: Literal["xfs", "ext4"]
+    cache_generation: int = Field(..., ge=0)
+    postgres_password: SecretStr = Field(..., min_length=16, max_length=256)
+    workloads_stopped: Literal[True]
+    postgres_stopped: Literal[True]
+    filesystems_synced: Literal[True]
+    filesystems_unmounted: Literal[True]
+    storage_mapper_closed: Literal[True]
+    cache_mapper_closed: Literal[True]
+
+    @field_validator(
+        "storage_luks_uuid",
+        "storage_filesystem_uuid",
+        "cache_luks_uuid",
+        "cache_filesystem_uuid",
+    )
+    @classmethod
+    def validate_uuid(cls, value: str) -> str:
+        canonical = str(uuid.UUID(value))
+        if canonical != value:
+            raise ValueError("legacy volume UUID must be canonical")
+        return value
+
+
+class GpuLegacyCloseResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-legacy-closed"] = "chutes.gpu-legacy-closed"
+    version: Literal[1] = 1
+    migration_id: str
+    legacy_server_id: str
+    status: Literal["guest_closed"]
+
+
+class GpuLegacyCutoverAuthorizeRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-legacy-cutover-authorize"] = "chutes.gpu-legacy-cutover-authorize"
+    version: Literal[1] = 1
+    legacy_server_id: str = Field(..., min_length=1, max_length=256)
+
+
+class GpuLegacyCutoverAuthorizeResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-legacy-cutover-authorization"] = (
+        "chutes.gpu-legacy-cutover-authorization"
+    )
+    version: Literal[1] = 1
+    authorization_id: str
+    cutover_authorization: str
+    legacy_server_id: str
+    legacy_vm_name: str
+    target_server_id: str
+    target_host_id: str
+    expires_at: str
+
+
+class GpuLegacyHostConfirmRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-legacy-host-confirm"] = "chutes.gpu-legacy-host-confirm"
+    version: Literal[1] = 1
+    old_qemu_absent: Literal[True]
+    storage_source_unowned: Literal[True]
+    cache_source_unowned: Literal[True]
+    storage_luks_uuid: str
+    cache_luks_uuid: str
+
+
+class GpuLegacyHostConfirmResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-legacy-ready"] = "chutes.gpu-legacy-ready"
+    version: Literal[1] = 1
+    migration_id: str
+    status: Literal["ready"]
+
+
+class GpuInfraMigrationPromoteRequestV1(BaseModel):
+    """Exact durable copy summary, before either legacy source is discarded."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-migration-promote"] = "chutes.gpu-infra-migration-promote"
+    version: Literal[1] = 1
+    migration_id: str = Field(..., min_length=1, max_length=128)
+    capability: str = Field(..., min_length=32, max_length=512)
+    marker_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    marker: Dict[str, Any]
+    content_summary: Dict[str, Any]
+
+
+class GpuInfraMigrationRefreshRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-migration-refresh"] = "chutes.gpu-infra-migration-refresh"
+    version: Literal[1] = 1
+    migration_id: str = Field(..., min_length=1, max_length=128)
+
+
+class GpuInfraMigrationRefreshResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-migration-capability"] = (
+        "chutes.gpu-infra-migration-capability"
+    )
+    version: Literal[1] = 1
+    server_id: str
+    migration_id: str
+    capability: str
+    expires_at: str
+    status: Literal["ready"]
+
+
+class GpuInfraMigrationPromoteResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-migration-promoted"] = "chutes.gpu-infra-migration-promoted"
+    version: Literal[1] = 1
+    server_id: str
+    migration_id: str
+    status: Literal["promoted"]
+
+
+class GpuInfraMigrationCompleteRequestV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-migration-complete"] = "chutes.gpu-infra-migration-complete"
+    version: Literal[1] = 1
+    migration_id: str = Field(..., min_length=1, max_length=128)
+    capability: str = Field(..., min_length=32, max_length=512)
+    marker_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    storage_discarded: Literal[True]
+    cache_discarded: Literal[True]
+
+
+class GpuInfraMigrationCompleteResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-infra-migration-finished"] = "chutes.gpu-infra-migration-finished"
+    version: Literal[1] = 1
+    server_id: str
+    migration_id: str
+    status: Literal["completed"]
+
+
 class GpuAttestationArgs(BaseModel):
     evidence: str = Field(..., description="Base64 encoded GPU evidence")
 
@@ -376,6 +821,30 @@ class GpuAttestationResponse(BaseModel):
     attestation_id: str
     verified_at: str
     gpu_info: Dict[str, Any]  # GPU details from evidence
+
+
+class NvidiaVerifiedDeviceV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    attestation_certificate_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    evidence_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    architecture: str = Field(..., min_length=1, max_length=64)
+
+
+class NvidiaVerificationResultV1(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema: Literal["chutes.nvidia-verification-result"]
+    version: Literal[1]
+    nonce: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    devices: List[NvidiaVerifiedDeviceV1] = Field(..., min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _unique_devices(self) -> "NvidiaVerificationResultV1":
+        identities = [item.attestation_certificate_sha256 for item in self.devices]
+        if identities != sorted(set(identities)):
+            raise ValueError("verified NVIDIA device identities must be sorted unique")
+        return self
 
 
 class CpuServerRegistrationArgs(BaseModel):
@@ -524,6 +993,122 @@ class CpuServerRegistrationResponse(BaseModel):
     luks_quote_nonce: Optional[str] = None
 
 
+class GpuServerRegistrationArgs(BaseModel):
+    """Reservation-bound direct-TDX GPU guest registration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    server_id: str
+    quote: str
+    gpu_evidence: List[Dict[str, Any]] = Field(..., min_length=1, max_length=64)
+    gpu_uuids: List[str] = Field(..., min_length=1, max_length=64)
+    launch_reservation: str = Field(..., min_length=1, max_length=4096)
+    quote_commitment: GpuQuoteCommitmentV1
+    td_signature: str = Field(..., min_length=1, max_length=2048)
+    external_host: Optional[str] = None
+    external_ports: Optional[Dict[str, int]] = None
+    endpoints: Optional[Dict[str, Any]] = None
+
+    @field_validator("gpu_uuids")
+    @classmethod
+    def _canonical_gpu_uuids(cls, value: List[str]) -> List[str]:
+        pattern = re.compile(
+            r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        )
+        if value != sorted(set(value)) or any(not pattern.fullmatch(item) for item in value):
+            raise ValueError("gpu_uuids must be sorted unique canonical NVIDIA UUIDs")
+        return value
+
+    @model_validator(mode="after")
+    def _matches_commitment(self) -> "GpuServerRegistrationArgs":
+        if (
+            self.server_id != self.quote_commitment.claims.server_id
+            or self.gpu_uuids != self.quote_commitment.claims.gpu_uuids
+        ):
+            raise ValueError("GPU registration request differs from its commitment")
+        return self
+
+
+class GpuServerRegistrationResponse(BaseModel):
+    server_id: str
+    owner_hotkey: str
+    reservation_id: str
+    claims_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    allocation_group_id: str
+    allocation_group_generation: int
+    process_incarnation: str
+    gpu_uuids: List[str]
+    gpu_identifiers: List[str]
+    management_mode: Literal["platform", "miner"]
+    measurement_version: str
+    measurement_name: str
+    measurement_config_fingerprint: str
+    trust_set_fingerprint: str
+    attestation_id: str
+    verified_at: str
+    runtime_session: Optional[str] = None
+    runtime_session_expires_at: Optional[str] = None
+    status: Literal["registered"] = "registered"
+
+    @model_validator(mode="after")
+    def _miner_session_shape(self) -> "GpuServerRegistrationResponse":
+        if not self.runtime_session or not self.runtime_session_expires_at:
+            raise ValueError("GPU registration requires an attested runtime session")
+        if (
+            not self.gpu_uuids
+            or len(self.gpu_uuids) != len(self.gpu_identifiers)
+            or len(set(self.gpu_uuids)) != len(self.gpu_uuids)
+        ):
+            raise ValueError("GPU registration requires an exact assigned device set")
+        return self
+
+
+class GpuRuntimeSessionResponse(BaseModel):
+    server_id: str
+    owner_hotkey: str
+    runtime_session: str
+    runtime_session_expires_at: str
+    allowed_purposes: List[
+        Literal[
+            "cache",
+            "gpu-infra",
+            "instances",
+            "launch",
+            "miner",
+            "nodes",
+            "registry",
+            "sockets",
+        ]
+    ]
+
+
+class UntrustedGpuPciDevice(BaseModel):
+    bdf: str = Field(..., pattern=r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
+    vendor_id: Literal["10de"] = "10de"
+    device_id: str = Field(..., pattern=r"^[0-9a-f]{4}$")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class UntrustedGpuInventory(BaseModel):
+    configured_profile: str = Field(
+        ..., min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$"
+    )
+    devices: List[UntrustedGpuPciDevice] = Field(default_factory=list, max_length=64)
+    observed_count: int = Field(0, ge=0, le=64)
+    expected_count: Optional[int] = Field(None, ge=1, le=64)
+    profile_match: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _count_matches_devices(self):
+        if self.observed_count != len(self.devices):
+            raise ValueError("observed_count must equal the reported PCI device count")
+        return self
+
+
 class HostRegistrationArgs(BaseModel):
     """Request body for Model-B L0 host registration (POST /hosts/register).
 
@@ -583,10 +1168,28 @@ class HostRegistrationArgs(BaseModel):
     tee_type: str = Field(
         "tdx", description="TEE provider the host launches guests with: tdx|sev-snp"
     )
+    compute_type: Literal["cpu", "gpu"] = Field(
+        "cpu",
+        description="Compute-scoped release identity for this enrolled launcher.",
+    )
     netuid: Optional[int] = Field(None, description="Subnet netuid (defaults to the validator's)")
     specs: Optional[dict] = Field(
         None,
         description="Host hardware inventory reported by the agent: cpu/memory/baseboard/system/bios",
+    )
+    untrusted_gpu_inventory: Optional[UntrustedGpuInventory] = Field(
+        None,
+        description=(
+            "GPU L0 host-reported PCI/topology inventory. Telemetry only; it never authorizes "
+            "scheduling or substitutes for attested GPU evidence."
+        ),
+    )
+    untrusted_gpu_inventory_ready: Optional[bool] = Field(
+        None,
+        description=(
+            "Whether the untrusted launcher believes its configured GPU profile is present. "
+            "Telemetry only."
+        ),
     )
     disk_total_gb: Optional[int] = Field(
         None,
@@ -616,9 +1219,37 @@ class HostRegistrationArgs(BaseModel):
         ge=1,
         description="Last publisher-signed L0 manifest generation accepted by this launcher.",
     )
+    host_boot_id: Optional[str] = Field(
+        None,
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+        description=(
+            "Kernel boot UUID signed by the logical host key. The validator converts changes "
+            "into a monotonic logical boot fence; this is not physical-host evidence."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_zero_capacity_storage_enrollment(self):
+        if self.compute_type == "gpu" and (
+            self.tee_type != "tdx" or self.storage_enabled is not True
+        ):
+            raise ValueError("GPU hosts require TDX and storage_enabled=true")
+        if self.compute_type == "cpu" and (
+            self.untrusted_gpu_inventory is not None
+            or self.untrusted_gpu_inventory_ready is not None
+        ):
+            raise ValueError("CPU hosts cannot report GPU L0 readiness telemetry")
+        if self.compute_type == "gpu" and (
+            self.untrusted_gpu_inventory is None
+            or self.untrusted_gpu_inventory_ready is None
+            or self.host_boot_id is None
+        ):
+            raise ValueError("GPU hosts must report explicit inventory readiness and host_boot_id")
+        if self.compute_type == "cpu" and self.host_boot_id is not None:
+            raise ValueError("CPU host registration must preserve the V1 boot contract")
         if self.capacity == 0 and not self.storage_enabled:
             raise ValueError("capacity=0 is valid only for an enrolled ChuteFS storage host")
         if (self.storage_td_vcpus is None) != (self.storage_td_mem is None):
@@ -646,6 +1277,14 @@ class HostRegistrationResponse(BaseModel):
     # host converges to the current release immediately (no separate poll on the first boot). None
     # when no release is active for the host's (channel, tee_type). Shape: api.releases.ReleaseManifest.
     release: Optional[Dict[str, Any]] = None
+    trusted_storage_ready: Optional[bool] = None
+    control_channel_eligible: Optional[bool] = None
+    trusted_schedulable: Optional[bool] = None
+    trusted_storage_reason: Optional[str] = None
+    untrusted_gpu_inventory: Optional[Dict[str, Any]] = None
+    untrusted_gpu_inventory_ready: Optional[bool] = None
+    host_boot_generation: Optional[int] = Field(None, ge=1)
+    gpu_inventory_report_generation: Optional[int] = Field(None, ge=0)
 
 
 class ServerArgs(BaseModel):
@@ -883,6 +1522,25 @@ class Server(Base):
         nullable=True,
     )
     launch_boot_generation = Column(Integer, nullable=True)
+    # GPU reservations intentionally use a separate claims/table contract from CPU V1.
+    gpu_launch_reservation_id = Column(
+        String,
+        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    gpu_allocation_group_id = Column(
+        String,
+        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    gpu_allocation_group_generation = Column(Integer, nullable=True)
+    gpu_management_mode = Column(String, nullable=True)
+    gpu_process_incarnation = Column(String, nullable=True)
+    gpu_topology_fingerprint = Column(String(64), nullable=True)
+    gpu_runtime_session_attestation_id = Column(String, nullable=True)
+    gpu_runtime_session_expires_at = Column(DateTime(timezone=True), nullable=True)
+    gpu_retired_at = Column(DateTime(timezone=True), nullable=True)
+    gpu_retirement_reason = Column(Text, nullable=True)
     # Model B (per-chute): the public host + per-TD DNAT'd external ports (e.g. {"primary":31000,...})
     # reported by the in-guest agent from the config volume. The scheduler deploys with these so the
     # chute advertises the externally reachable public_host:<ext> rather than the in-TD :8000 (which
@@ -970,6 +1628,8 @@ class Server(Base):
         storage rows are never sent there implicitly; they must advertise an explicit
         health_port and health_path in tee_endpoints.
         """
+        if self.compute_type == "gpu" and self.gpu_retired_at is not None:
+            return None
         if self.compute_type == "cpu" or self.storage_role:
             endpoints = self.tee_endpoints or {}
             port = endpoints.get("health_port")
@@ -1055,10 +1715,39 @@ class Server(Base):
             unique=True,
             postgresql_where=launch_reservation_id.isnot(None),
         ),
+        Index(
+            "uq_servers_gpu_launch_reservation",
+            "gpu_launch_reservation_id",
+            unique=True,
+            postgresql_where=gpu_launch_reservation_id.isnot(None),
+        ),
         CheckConstraint(
             "(launch_reservation_id IS NULL AND launch_boot_generation IS NULL) OR "
             "(launch_reservation_id IS NOT NULL AND launch_boot_generation > 0)",
             name="ck_servers_launch_reservation_generation",
+        ),
+        CheckConstraint(
+            "(gpu_launch_reservation_id IS NULL "
+            "AND gpu_allocation_group_id IS NULL "
+            "AND gpu_allocation_group_generation IS NULL "
+            "AND gpu_management_mode IS NULL "
+            "AND gpu_process_incarnation IS NULL "
+            "AND gpu_topology_fingerprint IS NULL) OR "
+            "(compute_type = 'gpu' AND gpu_launch_reservation_id IS NOT NULL "
+            "AND gpu_allocation_group_id IS NOT NULL "
+            "AND gpu_allocation_group_generation > 0 "
+            "AND gpu_management_mode IN ('platform', 'miner') "
+            "AND gpu_process_incarnation IS NOT NULL "
+            "AND gpu_topology_fingerprint ~ '^[0-9a-f]{64}$')",
+            name="ck_servers_gpu_launch_identity",
+        ),
+        CheckConstraint(
+            "(gpu_runtime_session_attestation_id IS NULL "
+            "AND gpu_runtime_session_expires_at IS NULL) OR "
+            "(gpu_launch_reservation_id IS NOT NULL "
+            "AND gpu_runtime_session_attestation_id IS NOT NULL "
+            "AND gpu_runtime_session_expires_at IS NOT NULL)",
+            name="ck_servers_gpu_runtime_session",
         ),
         CheckConstraint(
             "("
@@ -1099,8 +1788,14 @@ class Host(Base):
     netuid = Column(Integer, nullable=False, default=64, server_default="64")
     # TEE provider this host launches per-chute guests with: "tdx" | "sev-snp".
     tee_type = Column(String, nullable=False, default="tdx", server_default="tdx")
+    # Release/scheduler compute stream. Existing Model-B hosts are CPU launchers; GPU L0s use a
+    # distinct stream even when both are TDX and follow the same named channel.
+    compute_type = Column(String, nullable=False, default="cpu", server_default="cpu")
     # Max concurrent per-chute TDs (slot pool size on the node-agent).
     capacity = Column(Integer, nullable=False, default=1, server_default="1")
+    # Raw host-requested capacity. GPU capacity remains validator-clamped to zero until the exact
+    # CPU/storage sibling reservation, attestation, incarnation, and liveness are current.
+    reported_capacity = Column(Integer, nullable=False, default=1, server_default="1")
     # Signed L0 enrollment state. Allows a one-slot storage appliance to advertise zero schedulable
     # chute slots without letting ordinary compute hosts misuse capacity=0 registration.
     storage_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
@@ -1120,6 +1815,8 @@ class Host(Base):
     cpu_cores = Column(Integer, nullable=True)
     ram_gb = Column(Integer, nullable=True)
     specs = Column(JSONB, nullable=True)
+    untrusted_gpu_inventory = Column(JSONB, nullable=True)
+    untrusted_gpu_inventory_ready = Column(Boolean, nullable=True)
     # Physical disk inventory (GB) reported by the node-agent (informational; the host is not
     # attested). Tells the validator how much durable storage this host can back for ChuteFS.
     disk_total_gb = Column(Integer, nullable=True)
@@ -1146,11 +1843,22 @@ class Host(Base):
     steady_config_sha256 = Column(String(64), nullable=True)
     provisioning_heartbeat_at = Column(DateTime(timezone=True), nullable=True)
     provisioning_status = Column(JSONB, nullable=True)
+    # Signed logical-host telemetry. boot_generation is validator-owned but, like the
+    # enrolled host key, does not establish physical-host placement.
+    boot_id = Column(String, nullable=True)
+    boot_generation = Column(Integer, nullable=False, default=0, server_default="0")
+    gpu_inventory_report_generation = Column(Integer, nullable=False, default=0, server_default="0")
+    gpu_inventory_fingerprint = Column(String(64), nullable=True)
+    gpu_inventory_reconciled_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     __table_args__ = (
         CheckConstraint("capacity >= 0", name="ck_hosts_capacity_nonnegative"),
+        CheckConstraint(
+            "reported_capacity BETWEEN 0 AND 64",
+            name="ck_hosts_reported_capacity",
+        ),
         CheckConstraint(
             "capacity > 0 OR storage_enabled IS TRUE",
             name="ck_hosts_zero_capacity_storage_only",
@@ -1162,7 +1870,20 @@ class Host(Base):
             name="ck_hosts_storage_td_profile",
         ),
         Index("idx_hosts_miner", "miner_hotkey"),
-        Index("idx_hosts_release_targeting", "release_channel", "tee_type"),
+        Index(
+            "idx_hosts_release_targeting",
+            "release_channel",
+            "tee_type",
+            "compute_type",
+        ),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu')",
+            name="ck_hosts_compute_type",
+        ),
+        CheckConstraint(
+            "compute_type = 'cpu' OR tee_type = 'tdx'",
+            name="ck_hosts_gpu_tdx",
+        ),
         CheckConstraint(
             "provisioning_state IN ('legacy', 'unclaimed', 'persisting_identity', "
             "'awaiting_pcs', 'ready', 'revoked')",
@@ -1180,6 +1901,18 @@ class Host(Base):
             "(enrollment_generation IS NULL AND active_key_generation IS NULL) OR "
             "(enrollment_generation > 0 AND active_key_generation > 0)",
             name="ck_hosts_enrollment_generations",
+        ),
+        CheckConstraint(
+            "(boot_id IS NULL AND boot_generation = 0) OR "
+            "(boot_id ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            "[0-9a-f]{4}-[0-9a-f]{12}$' AND boot_generation > 0)",
+            name="ck_hosts_boot_generation",
+        ),
+        CheckConstraint(
+            "gpu_inventory_report_generation >= 0 "
+            "AND (gpu_inventory_fingerprint IS NULL "
+            "OR gpu_inventory_fingerprint ~ '^[0-9a-f]{64}$')",
+            name="ck_hosts_gpu_inventory_generation",
         ),
     )
 
@@ -1204,6 +1937,31 @@ class ServerAttestation(Base):
     revocation_status = Column(JSONB, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     verified_at = Column(DateTime(timezone=True), nullable=True)
+    gpu_retired_at = Column(DateTime(timezone=True), nullable=True)
+    gpu_evidence = Column(JSONB, nullable=True)
+    gpu_evidence_sha256 = Column(String(64), nullable=True)
+    gpu_evidence_certificate_sha256s = Column(JSONB, nullable=True)
+    gpu_launch_reservation_id = Column(String, nullable=True)
+    gpu_allocation_group_id = Column(
+        String,
+        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    gpu_allocation_group_generation = Column(Integer, nullable=True)
+    gpu_host_boot_generation = Column(Integer, nullable=True)
+    gpu_reservation_generation = Column(Integer, nullable=True)
+    gpu_management_mode = Column(String, nullable=True)
+    gpu_process_incarnation = Column(String, nullable=True)
+    gpu_topology_fingerprint = Column(String(64), nullable=True)
+    gpu_release_id = Column(
+        String,
+        ForeignKey("guest_releases.release_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    gpu_profile_id = Column(String, nullable=True)
+    gpu_chute_id = Column(String, nullable=True)
+    gpu_job_id = Column(String, nullable=True)
+    gpu_claims_sha256 = Column(String(64), nullable=True)
 
     server = relationship("Server", back_populates="runtime_attestations")
 
@@ -1224,6 +1982,48 @@ class ServerAttestation(Base):
                 "verification_error",
                 "verified_at",
             ],
+        ),
+        CheckConstraint(
+            "(gpu_launch_reservation_id IS NULL "
+            "AND gpu_allocation_group_id IS NULL "
+            "AND gpu_allocation_group_generation IS NULL "
+            "AND gpu_host_boot_generation IS NULL "
+            "AND gpu_reservation_generation IS NULL "
+            "AND gpu_management_mode IS NULL "
+            "AND gpu_process_incarnation IS NULL "
+            "AND gpu_topology_fingerprint IS NULL "
+            "AND gpu_release_id IS NULL "
+            "AND gpu_profile_id IS NULL "
+            "AND gpu_chute_id IS NULL "
+            "AND gpu_job_id IS NULL "
+            "AND gpu_claims_sha256 IS NULL "
+            "AND gpu_evidence IS NULL "
+            "AND gpu_evidence_sha256 IS NULL "
+            "AND gpu_evidence_certificate_sha256s IS NULL) OR "
+            "(gpu_launch_reservation_id IS NOT NULL "
+            "AND gpu_allocation_group_id IS NOT NULL "
+            "AND gpu_allocation_group_generation > 0 "
+            "AND gpu_host_boot_generation > 0 "
+            "AND gpu_reservation_generation > 0 "
+            "AND gpu_management_mode IN ('platform', 'miner') "
+            "AND gpu_process_incarnation IS NOT NULL "
+            "AND gpu_topology_fingerprint ~ '^[0-9a-f]{64}$' "
+            "AND gpu_release_id IS NOT NULL "
+            "AND gpu_profile_id IS NOT NULL "
+            "AND gpu_claims_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND gpu_evidence IS NOT NULL "
+            "AND gpu_evidence_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND jsonb_typeof(gpu_evidence_certificate_sha256s) = 'array' "
+            "AND (verification_error IS NOT NULL "
+            "OR jsonb_array_length(gpu_evidence_certificate_sha256s) > 0))",
+            name="ck_server_attestation_gpu_lineage",
+        ),
+        Index(
+            "idx_server_attestations_gpu_lineage",
+            "gpu_launch_reservation_id",
+            "gpu_allocation_group_id",
+            created_at.desc(),
+            postgresql_where=gpu_launch_reservation_id.isnot(None),
         ),
     )
 
@@ -1249,6 +2049,305 @@ class VmCacheConfig(Base):
     __table_args__ = (
         Index("idx_vm_cache_miner", "miner_hotkey"),
         Index("idx_vm_cache_last_boot", "last_boot_at"),
+    )
+
+
+class GpuMinerIdentity(Base):
+    """Validator-owned logical identity for one miner-managed whole GPU fabric."""
+
+    __tablename__ = "gpu_miner_identities"
+
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), primary_key=True)
+    server_id = Column(String, nullable=False, unique=True)
+    owner_hotkey = Column(String, nullable=False)
+    legacy_vm_name = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class GpuLegacyCutoverAuthorization(Base):
+    __tablename__ = "gpu_legacy_cutover_authorizations"
+
+    authorization_id = Column(String, primary_key=True)
+    token_hash = Column(String(64), nullable=False, unique=True)
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    owner_hotkey = Column(String, nullable=False)
+    legacy_server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    legacy_vm_name = Column(String, nullable=False)
+    target_server_id = Column(String, nullable=False, unique=True)
+    state = Column(String, nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    consumed_at = Column(DateTime(timezone=True), nullable=True)
+    migration_id = Column(
+        String,
+        ForeignKey("gpu_legacy_migrations.migration_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "(state = 'issued' AND consumed_at IS NULL AND migration_id IS NULL) OR "
+            "(state = 'consumed' AND consumed_at IS NOT NULL AND migration_id IS NOT NULL)",
+            name="ck_gpu_legacy_cutover_state",
+        ),
+        CheckConstraint(
+            "token_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_gpu_legacy_cutover_hash",
+        ),
+    )
+
+
+class GpuLegacyMigration(Base):
+    __tablename__ = "gpu_legacy_migrations"
+
+    migration_id = Column(String, primary_key=True)
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    owner_hotkey = Column(String, nullable=False)
+    legacy_server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    legacy_vm_name = Column(String, nullable=False)
+    target_server_id = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    close_attestation_id = Column(
+        String,
+        ForeignKey("server_attestations.attestation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    close_cert_hash = Column(String(64), nullable=False)
+    storage_luks_uuid = Column(String, nullable=False)
+    storage_filesystem_uuid = Column(String, nullable=False)
+    storage_generation = Column(Integer, nullable=False)
+    storage_current_passphrase = Column(Text, nullable=True)
+    storage_pending_passphrase = Column(Text, nullable=True)
+    storage_lease = Column(JSONB, nullable=True)
+    cache_luks_uuid = Column(String, nullable=False)
+    cache_filesystem_uuid = Column(String, nullable=False)
+    cache_filesystem_type = Column(String, nullable=False)
+    cache_generation = Column(Integer, nullable=False)
+    cache_current_passphrase = Column(Text, nullable=True)
+    cache_pending_passphrase = Column(Text, nullable=True)
+    cache_lease = Column(JSONB, nullable=True)
+    k3s_encryption_key = Column(Text, nullable=True)
+    postgres_password = Column(Text, nullable=True)
+    required_entries = Column(JSONB, nullable=False)
+    optional_entries = Column(JSONB, nullable=False)
+    guest_closed_at = Column(DateTime(timezone=True), nullable=False)
+    host_confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    source_capability_hash = Column(String(64), nullable=True)
+    source_capability_expires_at = Column(DateTime(timezone=True), nullable=True)
+    source_capability_consumed_at = Column(DateTime(timezone=True), nullable=True)
+    promoted_marker_sha256 = Column(String(64), nullable=True)
+    promoted_summary = Column(JSONB, nullable=True)
+    promoted_at = Column(DateTime(timezone=True), nullable=True)
+    discarded_at = Column(DateTime(timezone=True), nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    failure_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_hotkey",
+            "legacy_server_id",
+            name="uq_gpu_legacy_migration_source",
+        ),
+        UniqueConstraint(
+            "target_server_id",
+            name="uq_gpu_legacy_migration_target",
+        ),
+        CheckConstraint(
+            "state IN ('guest_closed', 'ready', 'leased', 'promoted', 'completed', 'abandoned')",
+            name="ck_gpu_legacy_migration_state",
+        ),
+        CheckConstraint(
+            "storage_generation >= 0 AND cache_generation >= 0",
+            name="ck_gpu_legacy_migration_generations",
+        ),
+        CheckConstraint(
+            "close_cert_hash ~ '^[0-9a-f]{64}$' "
+            "AND storage_luks_uuid ~ "
+            "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "
+            "AND storage_filesystem_uuid ~ "
+            "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "
+            "AND cache_luks_uuid ~ "
+            "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "
+            "AND cache_filesystem_uuid ~ "
+            "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "
+            "AND cache_filesystem_type IN ('xfs', 'ext4') "
+            "AND (source_capability_hash IS NULL "
+            "OR source_capability_hash ~ '^[0-9a-f]{64}$') "
+            "AND (promoted_marker_sha256 IS NULL "
+            "OR promoted_marker_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_gpu_legacy_migration_digests",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(required_entries) = 'array' "
+            "AND jsonb_array_length(required_entries) > 0 "
+            "AND jsonb_typeof(optional_entries) = 'array'",
+            name="ck_gpu_legacy_migration_entries",
+        ),
+        CheckConstraint(
+            "(state = 'guest_closed' AND host_confirmed_at IS NULL) "
+            "OR (state IN ('ready', 'leased') AND host_confirmed_at IS NOT NULL) "
+            "OR (state = 'promoted' AND promoted_at IS NOT NULL "
+            "AND promoted_marker_sha256 IS NOT NULL AND promoted_summary IS NOT NULL) "
+            "OR (state = 'completed' AND promoted_at IS NOT NULL "
+            "AND discarded_at IS NOT NULL AND completed_at IS NOT NULL "
+            "AND storage_current_passphrase IS NULL "
+            "AND storage_pending_passphrase IS NULL AND storage_lease IS NULL "
+            "AND cache_current_passphrase IS NULL "
+            "AND cache_pending_passphrase IS NULL AND cache_lease IS NULL "
+            "AND k3s_encryption_key IS NULL AND postgres_password IS NULL "
+            "AND source_capability_hash IS NULL "
+            "AND source_capability_expires_at IS NULL) "
+            "OR state = 'abandoned'",
+            name="ck_gpu_legacy_migration_progress",
+        ),
+        Index("idx_gpu_legacy_migrations_host_state", "host_id", "state"),
+    )
+
+
+class GpuInfraCustody(Base):
+    """Exact-lineage, generation-leased key custody for miner infrastructure."""
+
+    __tablename__ = "gpu_infra_custodies"
+
+    server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    owner_hotkey = Column(String, nullable=False)
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    host_boot_generation = Column(Integer, nullable=False)
+    reservation_id = Column(
+        String,
+        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    reservation_generation = Column(Integer, nullable=False)
+    allocation_group_id = Column(
+        String,
+        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    allocation_group_generation = Column(Integer, nullable=False)
+    management_mode = Column(String, nullable=False)
+    volume_name = Column(String, nullable=False, default="gpu-infra", server_default="gpu-infra")
+    current_passphrase = Column(Text, nullable=True)
+    pending_passphrase = Column(Text, nullable=True)
+    retiring_passphrase = Column(Text, nullable=True)
+    retiring_key_slot = Column(Integer, nullable=True)
+    k3s_encryption_key = Column(Text, nullable=False)
+    confirmed_generation = Column(Integer, nullable=False, default=0, server_default="0")
+    active_key_slot = Column(Integer, nullable=True)
+    pending_key_slot = Column(Integer, nullable=True)
+    lease_id = Column(String, nullable=True)
+    lease_generation = Column(Integer, nullable=True)
+    lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    lease_attestation_id = Column(
+        String,
+        ForeignKey("server_attestations.attestation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    lease_cert_hash = Column(String(64), nullable=True)
+    lease_session_jti = Column(String, nullable=True)
+    pending_marker_sha256 = Column(String(64), nullable=True)
+    state = Column(String, nullable=False, default="current", server_default="current")
+    rollback_generation = Column(Integer, nullable=True)
+    rollback_key_slot = Column(Integer, nullable=True)
+    rollback_passphrase = Column(Text, nullable=True)
+    sealed_at = Column(DateTime(timezone=True), nullable=True)
+    guest_closed_generation = Column(Integer, nullable=True)
+    guest_closed_at = Column(DateTime(timezone=True), nullable=True)
+    migration_id = Column(
+        String,
+        ForeignKey("gpu_legacy_migrations.migration_id", ondelete="RESTRICT"),
+        nullable=True,
+        unique=True,
+    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "management_mode = 'miner' AND volume_name = 'gpu-infra'",
+            name="ck_gpu_infra_mode",
+        ),
+        CheckConstraint(
+            "host_boot_generation > 0 AND reservation_generation > 0 "
+            "AND allocation_group_generation > 0 AND confirmed_generation >= 0 "
+            "AND (lease_generation IS NULL OR lease_generation = confirmed_generation + 1) "
+            "AND (rollback_generation IS NULL "
+            "OR rollback_generation = confirmed_generation + 1) "
+            "AND (guest_closed_generation IS NULL "
+            "OR guest_closed_generation = confirmed_generation)",
+            name="ck_gpu_infra_generations",
+        ),
+        CheckConstraint(
+            "(active_key_slot IS NULL OR active_key_slot BETWEEN 0 AND 7) "
+            "AND (pending_key_slot IS NULL OR pending_key_slot BETWEEN 0 AND 7) "
+            "AND (retiring_key_slot IS NULL OR retiring_key_slot BETWEEN 0 AND 7) "
+            "AND (rollback_key_slot IS NULL OR rollback_key_slot BETWEEN 0 AND 7) "
+            "AND (active_key_slot IS NULL OR pending_key_slot IS NULL "
+            "OR active_key_slot <> pending_key_slot)",
+            name="ck_gpu_infra_slots",
+        ),
+        CheckConstraint(
+            "state IN ('current', 'leased', 'awaiting_ack', 'sealed', 'conflict')",
+            name="ck_gpu_infra_state",
+        ),
+        CheckConstraint(
+            "((state IN ('leased', 'awaiting_ack') "
+            "AND pending_passphrase IS NOT NULL AND pending_key_slot IS NOT NULL "
+            "AND lease_id IS NOT NULL "
+            "AND lease_generation = confirmed_generation + 1 "
+            "AND lease_expires_at IS NOT NULL AND lease_attestation_id IS NOT NULL "
+            "AND lease_cert_hash ~ '^[0-9a-f]{64}$' AND lease_session_jti IS NOT NULL "
+            "AND (pending_marker_sha256 IS NULL "
+            "OR pending_marker_sha256 ~ '^[0-9a-f]{64}$')) "
+            "OR (state IN ('current', 'sealed', 'conflict') "
+            "AND pending_passphrase IS NULL AND pending_key_slot IS NULL "
+            "AND lease_id IS NULL AND lease_generation IS NULL "
+            "AND lease_expires_at IS NULL AND lease_attestation_id IS NULL "
+            "AND lease_cert_hash IS NULL AND lease_session_jti IS NULL "
+            "AND pending_marker_sha256 IS NULL))",
+            name="ck_gpu_infra_lease_shape",
+        ),
+        CheckConstraint(
+            "(rollback_generation IS NULL AND rollback_key_slot IS NULL "
+            "AND rollback_passphrase IS NULL) OR "
+            "(rollback_generation = confirmed_generation + 1 "
+            "AND rollback_key_slot IS NOT NULL AND rollback_passphrase IS NOT NULL)",
+            name="ck_gpu_infra_rollback_shape",
+        ),
+        CheckConstraint(
+            "(state = 'sealed' AND sealed_at IS NOT NULL) "
+            "OR (state <> 'sealed' AND sealed_at IS NULL)",
+            name="ck_gpu_infra_seal_shape",
+        ),
+        Index(
+            "idx_gpu_infra_host",
+            "host_id",
+            "allocation_group_id",
+            "allocation_group_generation",
+        ),
+        Index("idx_gpu_infra_reservation", "reservation_id", "reservation_generation"),
+        Index(
+            "idx_gpu_infra_lease_expiry",
+            "lease_expires_at",
+            postgresql_where=lease_expires_at.isnot(None),
+        ),
     )
 
 
@@ -1325,6 +2424,138 @@ class StorageVolume(Base):
             "delete_requested_at",
             "volume_id",
             postgresql_where=(deleted.is_(True) & purged_at.is_(None)),
+        ),
+    )
+
+
+class DefaultChuteFSVolumeBinding(Base):
+    """Durable default volume identity for one exact owner/chute pair.
+
+    ``chute_id`` intentionally has no foreign key: chute deletion revokes launches but must not
+    cascade into durable storage.  Ownership and volume identity are immutable in PostgreSQL.
+    """
+
+    __tablename__ = "default_chutefs_volume_bindings"
+
+    binding_id = Column(String, primary_key=True, default=generate_uuid)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False)
+    chute_id = Column(String, nullable=False)
+    volume_id = Column(
+        String,
+        ForeignKey("storage_volumes.volume_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    lifecycle_state = Column(String, nullable=False, default="active", server_default="active")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    retired_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_default_chutefs_binding_active",
+            "user_id",
+            "chute_id",
+            unique=True,
+            postgresql_where=lifecycle_state == "active",
+        ),
+        Index(
+            "idx_default_chutefs_binding_owner",
+            "user_id",
+            "chute_id",
+            created_at.desc(),
+        ),
+        CheckConstraint(
+            "(lifecycle_state = 'active' AND retired_at IS NULL) OR "
+            "(lifecycle_state = 'retired' AND retired_at IS NOT NULL)",
+            name="ck_default_chutefs_binding_lifecycle",
+        ),
+    )
+
+
+class ChuteFSLaunchSession(Base):
+    """Opaque rotating session restricted to one verified launch's default volume."""
+
+    __tablename__ = "chutefs_launch_sessions"
+
+    session_id = Column(String, primary_key=True)
+    config_id = Column(
+        String,
+        ForeignKey("launch_configs.config_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    instance_id = Column(
+        String,
+        ForeignKey("instances.instance_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    binding_id = Column(
+        String,
+        ForeignKey("default_chutefs_volume_bindings.binding_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    user_id = Column(String, nullable=False)
+    chute_id = Column(String, nullable=False)
+    job_id = Column(String, nullable=True)
+    compute_type = Column(String, nullable=False)
+    management_mode = Column(String, nullable=False)
+    server_id = Column(String, nullable=False)
+    volume_id = Column(
+        String,
+        ForeignKey("storage_volumes.volume_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    reservation_id = Column(String, nullable=True)
+    allocation_group_id = Column(String, nullable=True)
+    allocation_group_generation = Column(Integer, nullable=True)
+    process_incarnation = Column(String, nullable=True)
+    attestation_id = Column(String, nullable=True)
+    attested_cert_pubkey_hash = Column(String, nullable=True)
+    allowed_operations = Column(JSONB, nullable=False)
+    generation = Column(Integer, nullable=False, default=1, server_default="1")
+    access_token_hash = Column(String(64), nullable=False, unique=True)
+    refresh_token_hash = Column(String(64), nullable=False, unique=True)
+    access_expires_at = Column(DateTime(timezone=True), nullable=False)
+    refresh_expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    rotated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "idx_chutefs_launch_sessions_expiry",
+            "access_expires_at",
+            postgresql_where=revoked_at.is_(None),
+        ),
+        Index(
+            "idx_chutefs_launch_sessions_server",
+            "server_id",
+            postgresql_where=revoked_at.is_(None),
+        ),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu') "
+            "AND management_mode IN ('platform', 'miner') "
+            "AND jsonb_typeof(allowed_operations) = 'array' "
+            'AND allowed_operations = \'["put", "get", "list", "delete"]\'::jsonb '
+            "AND generation > 0 "
+            "AND access_expires_at <= refresh_expires_at "
+            "AND ((compute_type = 'cpu' AND management_mode = 'platform' "
+            "AND reservation_id IS NULL AND allocation_group_id IS NULL "
+            "AND allocation_group_generation IS NULL AND process_incarnation IS NULL) "
+            "OR (compute_type = 'gpu' AND reservation_id IS NOT NULL "
+            "AND allocation_group_id IS NOT NULL AND allocation_group_generation > 0 "
+            "AND process_incarnation IS NOT NULL AND attestation_id IS NOT NULL "
+            "AND attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$'))",
+            name="ck_chutefs_launch_session_scope",
+        ),
+        CheckConstraint(
+            "access_token_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_chutefs_launch_session_access_hash",
+        ),
+        CheckConstraint(
+            "refresh_token_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_chutefs_launch_session_refresh_hash",
         ),
     )
 

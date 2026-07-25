@@ -28,14 +28,21 @@ from api.config import settings
 from api.database import generate_uuid, get_db_session
 from api.host.schemas import (
     EnrollmentKeyChallengeRequestV1,
+    EnrollmentKeyChallengeRequestV2,
     EnrollmentKeyChallengeResponseV1,
+    EnrollmentKeyChallengeResponseV2,
     EnrollmentVoucherClaimsV1,
+    EnrollmentVoucherClaimsV2,
     EnrollmentVoucherMintRequestV1,
+    EnrollmentVoucherMintRequestV2,
     EnrollmentVoucherResponseV1,
+    EnrollmentVoucherResponseV2,
     HostAuthChallengeV1,
     HostEnrollmentChallenge,
     HostEnrollmentRedemptionV1,
+    HostEnrollmentRedemptionV2,
     HostEnrollmentResponseV1,
+    HostEnrollmentResponseV2,
     HostEnrollmentVoucher,
     HostIdentityDurabilityAckV1,
     HostKeyGeneration,
@@ -43,12 +50,16 @@ from api.host.schemas import (
     HostProvisioningHeartbeatV1,
     HostProvisioningStatusV1,
     HostSigningEnvelopeV1,
+    HostSigningEnvelopeV2,
     HostSocketAuthenticationV1,
+    HostSocketAuthenticationV2,
     HostSocketChallengeV1,
     PcsMailboxAckV1,
     PcsMailboxEnvelopeV1,
+    PcsMailboxEnvelopeV2,
     canonical_sha256,
 )
+from api.host.locks import acquire_gpu_lifecycle_lock
 from api.server.schemas import Host
 
 HOST_ID_HEADER = "X-Chutes-Host-Id"
@@ -99,13 +110,18 @@ def _verify_ed25519(public_key_b64: str, signature_b64: str, message: bytes) -> 
 async def mint_enrollment_voucher(
     db: AsyncSession,
     owner_hotkey: str,
-    request: EnrollmentVoucherMintRequestV1,
-) -> EnrollmentVoucherResponseV1:
+    request: EnrollmentVoucherMintRequestV1 | EnrollmentVoucherMintRequestV2,
+) -> EnrollmentVoucherResponseV1 | EnrollmentVoucherResponseV2:
     """Mint a one-use miner-owned enrollment voucher; persist only its hash."""
 
+    if isinstance(request, EnrollmentVoucherMintRequestV2):
+        await acquire_gpu_lifecycle_lock(db)
     existing = await db.get(Host, request.host_id)
     if existing is not None and existing.miner_hotkey != owner_hotkey:
         raise HostAuthError("Logical host is owned by another miner.")
+    compute_type = "gpu" if isinstance(request, EnrollmentVoucherMintRequestV2) else "cpu"
+    if existing is not None and (existing.compute_type or "cpu") != compute_type:
+        raise HostAuthError("Logical host compute_type is immutable across enrollment.")
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
         {"key": f"host-enrollment:{request.host_id}"},
@@ -133,7 +149,8 @@ async def mint_enrollment_voucher(
         )
         .values(invalidated_at=now)
     )
-    claims = EnrollmentVoucherClaimsV1(
+    claims_type = EnrollmentVoucherClaimsV2 if compute_type == "gpu" else EnrollmentVoucherClaimsV1
+    claims = claims_type(
         owner_hotkey=owner_hotkey,
         host_id=request.host_id,
         tee_type=request.tee_type,
@@ -153,6 +170,7 @@ async def mint_enrollment_voucher(
         owner_hotkey=owner_hotkey,
         host_id=request.host_id,
         tee_type=request.tee_type,
+        compute_type=compute_type,
         channel=request.channel,
         enrollment_generation=enrollment_generation,
         claims=claims.model_dump(mode="json", exclude_none=True),
@@ -163,6 +181,8 @@ async def mint_enrollment_voucher(
     )
     db.add(row)
     await db.commit()
+    if compute_type == "gpu":
+        return EnrollmentVoucherResponseV2(voucher=voucher, claims=claims)
     return EnrollmentVoucherResponseV1(voucher=voucher, claims=claims)
 
 
@@ -190,11 +210,21 @@ async def _locked_valid_voucher(
 
 
 async def create_enrollment_key_challenge(
-    db: AsyncSession, request: EnrollmentKeyChallengeRequestV1
-) -> EnrollmentKeyChallengeResponseV1:
+    db: AsyncSession,
+    request: EnrollmentKeyChallengeRequestV1 | EnrollmentKeyChallengeRequestV2,
+) -> EnrollmentKeyChallengeResponseV1 | EnrollmentKeyChallengeResponseV2:
     """Prove Ed25519 possession, then challenge the proposed X25519 recipient."""
 
+    if isinstance(request, EnrollmentKeyChallengeRequestV2):
+        await acquire_gpu_lifecycle_lock(db)
     voucher = await _locked_valid_voucher(db, request.voucher, allow_consumed=True)
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"gpu-allocation-host:{voucher.host_id}"},
+    )
+    request_compute = "gpu" if isinstance(request, EnrollmentKeyChallengeRequestV2) else "cpu"
+    if (voucher.compute_type or "cpu") != request_compute:
+        raise HostAuthError("Enrollment challenge version does not match voucher compute_type.")
     _verify_ed25519(
         request.ed25519_public_key,
         request.ed25519_signature,
@@ -215,6 +245,8 @@ async def create_enrollment_key_challenge(
             or key is None
             or key.revoked_at is not None
             or host.provisioning_state == "revoked"
+            or (host.compute_type or "cpu") != request_compute
+            or (request_compute == "gpu" and not host.storage_enabled)
             or host.enrollment_generation != voucher.enrollment_generation
             or key.enrollment_generation != voucher.enrollment_generation
             or key.ed25519_public_key != request.ed25519_public_key
@@ -229,11 +261,12 @@ async def create_enrollment_key_challenge(
         base64.b64decode(request.x25519_public_key, validate=True)
     )
     salt = bytes.fromhex(voucher.voucher_hash)
+    protocol_version = 2 if request_compute == "gpu" else 1
     key = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        info=b"chutes/model-b/enrollment-x25519-proof/v1",
+        info=f"chutes/model-b/enrollment-x25519-proof/v{protocol_version}".encode("ascii"),
     ).derive(ephemeral.exchange(recipient))
     nonce = secrets.token_bytes(12)
     aad = request.signing_bytes() + challenge_id.encode("ascii")
@@ -249,7 +282,12 @@ async def create_enrollment_key_challenge(
     )
     db.add(row)
     await db.commit()
-    return EnrollmentKeyChallengeResponseV1(
+    response_type = (
+        EnrollmentKeyChallengeResponseV2
+        if request_compute == "gpu"
+        else EnrollmentKeyChallengeResponseV1
+    )
+    return response_type(
         challenge_id=challenge_id,
         server_ephemeral_public_key=base64.b64encode(
             ephemeral.public_key().public_bytes(
@@ -263,11 +301,17 @@ async def create_enrollment_key_challenge(
 
 
 async def redeem_enrollment_voucher(
-    db: AsyncSession, request: HostEnrollmentRedemptionV1
-) -> HostEnrollmentResponseV1:
+    db: AsyncSession,
+    request: HostEnrollmentRedemptionV1 | HostEnrollmentRedemptionV2,
+) -> HostEnrollmentResponseV1 | HostEnrollmentResponseV2:
     """Atomically consume a voucher after proving possession of both host keys."""
 
+    if isinstance(request, HostEnrollmentRedemptionV2):
+        await acquire_gpu_lifecycle_lock(db)
     voucher = await _locked_valid_voucher(db, request.voucher, allow_consumed=True)
+    request_compute = "gpu" if isinstance(request, HostEnrollmentRedemptionV2) else "cpu"
+    if (voucher.compute_type or "cpu") != request_compute:
+        raise HostAuthError("Enrollment redemption version does not match voucher compute_type.")
     challenge = (
         await db.execute(
             select(HostEnrollmentChallenge)
@@ -301,6 +345,8 @@ async def redeem_enrollment_voucher(
     ).scalar_one_or_none()
     if host is not None and host.miner_hotkey != voucher.owner_hotkey:
         raise HostAuthError("Logical host is owned by another miner.")
+    if host is not None and (host.compute_type or "cpu") != request_compute:
+        raise HostAuthError("Logical host compute_type is immutable across enrollment.")
     if (
         host is not None
         and voucher.consumed_at is None
@@ -321,6 +367,8 @@ async def redeem_enrollment_voucher(
             or key is None
             or key.revoked_at is not None
             or host.provisioning_state == "revoked"
+            or (host.compute_type or "cpu") != request_compute
+            or (request_compute == "gpu" and not host.storage_enabled)
             or host.enrollment_generation != voucher.enrollment_generation
             or host.active_key_generation != key.generation
             or key.ed25519_public_key != request.ed25519_public_key
@@ -329,6 +377,17 @@ async def redeem_enrollment_voucher(
             raise HostAuthError("Consumed voucher does not match the enrolled key generation.")
         challenge.consumed_at = now
         await db.commit()
+        if request_compute == "gpu":
+            return HostEnrollmentResponseV2(
+                host_id=host.host_id,
+                owner_hotkey=host.miner_hotkey,
+                enrollment_generation=host.enrollment_generation,
+                key_generation=host.active_key_generation,
+                provisioning_state=host.provisioning_state,
+                tee_type="tdx",
+                compute_type="gpu",
+                storage_enabled=True,
+            )
         return HostEnrollmentResponseV1(
             host_id=host.host_id,
             owner_hotkey=host.miner_hotkey,
@@ -343,12 +402,23 @@ async def redeem_enrollment_voucher(
             miner_hotkey=voucher.owner_hotkey,
             netuid=settings.netuid,
             tee_type=voucher.tee_type,
+            compute_type=request_compute,
             release_channel=voucher.channel,
             capacity=1,
-            storage_enabled=False,
+            storage_enabled=request_compute == "gpu",
         )
         db.add(host)
         await db.flush()
+
+    if request_compute == "gpu" and host.active_key_generation is not None:
+        from api.host.gpu_allocations import fence_gpu_host_authority
+
+        await fence_gpu_host_authority(
+            db,
+            host.host_id,
+            code="host_key_rotated",
+            reason="GPU host key generation rotated before exact reset.",
+        )
 
     previous_keys = (
         (
@@ -381,6 +451,8 @@ async def redeem_enrollment_voucher(
     host.name = host.name or host.host_id
     host.miner_hotkey = voucher.owner_hotkey
     host.tee_type = voucher.tee_type
+    host.compute_type = request_compute
+    host.storage_enabled = request_compute == "gpu"
     host.release_channel = voucher.channel
     host.enrollment_generation = voucher.enrollment_generation
     host.active_key_generation = next_key_generation
@@ -431,6 +503,17 @@ async def redeem_enrollment_voucher(
                 f"Host {host.host_id} credential rotated but live-session disconnect "
                 f"dispatch failed: {exc}"
             )
+    if request_compute == "gpu":
+        return HostEnrollmentResponseV2(
+            host_id=host.host_id,
+            owner_hotkey=host.miner_hotkey,
+            enrollment_generation=host.enrollment_generation,
+            key_generation=host.active_key_generation,
+            provisioning_state=host.provisioning_state,
+            tee_type="tdx",
+            compute_type="gpu",
+            storage_enabled=True,
+        )
     return HostEnrollmentResponseV1(
         host_id=host.host_id,
         owner_hotkey=host.miner_hotkey,
@@ -511,6 +594,7 @@ async def record_provisioning_heartbeat(
 async def create_host_auth_challenge(
     db: AsyncSession, host_id: str, key_generation: int
 ) -> HostAuthChallengeV1:
+    await acquire_gpu_lifecycle_lock(db)
     host = await db.get(Host, host_id)
     key = await db.get(HostKeyGeneration, (host_id, key_generation))
     if (
@@ -547,6 +631,7 @@ async def create_host_socket_challenge(
     host_id: str,
     key_generation: int,
 ) -> HostSocketChallengeV1:
+    await acquire_gpu_lifecycle_lock(db)
     host = await db.get(Host, host_id)
     key = await db.get(HostKeyGeneration, (host_id, key_generation))
     if (
@@ -581,8 +666,9 @@ async def create_host_socket_challenge(
 async def verify_host_socket_authentication(
     db: AsyncSession,
     session_id: str,
-    authentication: HostSocketAuthenticationV1,
+    authentication: HostSocketAuthenticationV1 | HostSocketAuthenticationV2,
 ) -> Host:
+    await acquire_gpu_lifecycle_lock(db)
     if authentication.session_id != session_id:
         raise HostAuthError("Host socket authentication names another session.")
     now = _utcnow()
@@ -632,11 +718,24 @@ async def verify_host_socket_authentication(
         or key.revoked_at is not None
     ):
         raise HostAuthError("Host socket key generation is not active.")
+    authentication_compute = (
+        "gpu" if isinstance(authentication, HostSocketAuthenticationV2) else "cpu"
+    )
+    if (host.compute_type or "cpu") != authentication_compute:
+        raise HostAuthError("Host socket authentication version mismatches compute_type.")
     _verify_ed25519(
         key.ed25519_public_key,
         authentication.signature,
         authentication.signing_bytes(),
     )
+    if authentication_compute == "gpu":
+        from api.host.reservations import gpu_host_storage_readiness
+
+        readiness = await gpu_host_storage_readiness(db, host)
+        host.capacity = int(host.reported_capacity or 0) if readiness.trusted_schedulable else 0
+        if not readiness.control_channel_eligible:
+            await db.commit()
+            raise HostAuthError(f"GPU host storage gate is not ready: {readiness.reason}.")
     key.last_used_at = now
     await db.commit()
     return host
@@ -653,6 +752,7 @@ async def get_current_host(
 ) -> Host:
     """Authenticate one method/path/body-bound request from an active logical host key."""
 
+    await acquire_gpu_lifecycle_lock(db)
     if not all(
         [
             host_id_header,
@@ -734,7 +834,13 @@ async def get_current_host(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Logical-host key generation is not active.",
         )
-    envelope = HostSigningEnvelopeV1(
+    envelope_type = (
+        HostSigningEnvelopeV2 if (host.compute_type or "cpu") == "gpu" else HostSigningEnvelopeV1
+    )
+    envelope_kwargs = {}
+    if envelope_type is HostSigningEnvelopeV2:
+        envelope_kwargs["compute_type"] = "gpu"
+    envelope = envelope_type(
         host_id=host_id_header,
         key_generation=key_generation,
         challenge_id=challenge_id,
@@ -745,6 +851,7 @@ async def get_current_host(
         ),
         body_sha256=getattr(request.state, "body_sha256", None) or _EMPTY_SHA256,
         issued_at=issued_at,
+        **envelope_kwargs,
     )
     try:
         _verify_ed25519(key.ed25519_public_key, signature, envelope.signing_bytes())
@@ -790,16 +897,19 @@ def _pcs_window_is_valid(
 async def store_pcs_mailbox(
     db: AsyncSession,
     owner_hotkey: str,
-    envelope: PcsMailboxEnvelopeV1,
+    envelope: PcsMailboxEnvelopeV1 | PcsMailboxEnvelopeV2,
 ) -> None:
     """Validate the complete miner-signed ciphertext envelope and store no plaintext."""
 
+    if isinstance(envelope, PcsMailboxEnvelopeV2):
+        await acquire_gpu_lifecycle_lock(db)
     aad = envelope.aad
     host = (
         await db.execute(select(Host).where(Host.host_id == aad.host_id).with_for_update())
     ).scalar_one_or_none()
     key = await db.get(HostKeyGeneration, (aad.host_id, aad.key_generation))
     now = _utcnow()
+    envelope_compute = "gpu" if isinstance(envelope, PcsMailboxEnvelopeV2) else "cpu"
     if (
         host is None
         or key is None
@@ -810,6 +920,7 @@ async def store_pcs_mailbox(
         or key.revoked_at is not None
         or key.x25519_fingerprint != aad.recipient_fingerprint
         or host.tee_type != "tdx"
+        or (host.compute_type or "cpu") != envelope_compute
         or host.provisioning_state != "awaiting_pcs"
         or host.identity_durable_at is None
         or not _pcs_window_is_valid(aad.issued_at, aad.expires_at, now)
@@ -862,7 +973,10 @@ async def store_pcs_mailbox(
     await db.commit()
 
 
-async def consume_pcs_mailbox(db: AsyncSession, host: Host) -> PcsMailboxEnvelopeV1:
+async def consume_pcs_mailbox(
+    db: AsyncSession,
+    host: Host,
+) -> PcsMailboxEnvelopeV1 | PcsMailboxEnvelopeV2:
     if host.provisioning_state != "awaiting_pcs" or host.identity_durable_at is None:
         raise HostAuthError("PCS mailbox is unavailable before identity durability.")
     row = (
@@ -885,7 +999,11 @@ async def consume_pcs_mailbox(db: AsyncSession, host: Host) -> PcsMailboxEnvelop
         row.invalidated_at = now
         await db.commit()
         raise HostAuthError("PCS mailbox is unavailable or expired.")
-    envelope = PcsMailboxEnvelopeV1.model_validate(row.envelope)
+    envelope = (
+        PcsMailboxEnvelopeV2.model_validate(row.envelope)
+        if (host.compute_type or "cpu") == "gpu"
+        else PcsMailboxEnvelopeV1.model_validate(row.envelope)
+    )
     if (
         row.envelope_sha256 != canonical_sha256(envelope)
         or envelope.aad.issued_at != row.issued_at
@@ -951,12 +1069,26 @@ async def acknowledge_pcs_mailbox(
 async def revoke_host_credentials(
     db: AsyncSession, host_id: str, owner_hotkey: str, reason: str
 ) -> None:
+    await acquire_gpu_lifecycle_lock(db)
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"gpu-allocation-host:{host_id}"},
+    )
     host = (
         await db.execute(select(Host).where(Host.host_id == host_id).with_for_update())
     ).scalar_one_or_none()
     if host is None or host.miner_hotkey != owner_hotkey:
         raise HostAuthError("Logical host is unknown or owned by another miner.")
     now = _utcnow()
+    if host.compute_type == "gpu":
+        from api.host.gpu_allocations import fence_gpu_host_authority
+
+        await fence_gpu_host_authority(
+            db,
+            host_id,
+            code="host_key_revoked",
+            reason="GPU host credential revoked before exact reset.",
+        )
     await db.execute(
         update(HostEnrollmentVoucher)
         .where(

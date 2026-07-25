@@ -23,6 +23,10 @@ data:
             "registry.chutes.ai"       "${DEPOT_REGISTRY}";
             default                    "${DEPOT_REGISTRY}";
         }
+        map $chutes_authorized_uri $registry_upstream_uri {
+            "" $request_uri;
+            default $chutes_authorized_uri;
+        }
         log_format proxylog '$remote_addr\t$http_x_chutes_hotkey\t[$time_local] ($request_time) '
                     '"$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $content_length $http_host';
 
@@ -57,12 +61,13 @@ data:
 
             location /v2/ {
                 auth_request /auth;
+                auth_request_set $chutes_authorized_uri $upstream_http_x_chutes_registry_upstream_uri;
                 limit_except GET HEAD {
                     deny all;
                 }
                 resolver kube-dns.kube-system.svc.cluster.local valid=30s ipv6=off;
                 set $depot_upstream "${DEPOT_REGISTRY}";
-                proxy_pass https://$depot_upstream$request_uri;
+                proxy_pass https://$depot_upstream$registry_upstream_uri;
 
                 proxy_ssl_server_name on;
                 proxy_ssl_name ${DEPOT_REGISTRY};

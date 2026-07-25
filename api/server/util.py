@@ -63,6 +63,7 @@ from api.server.schemas import (
     LuksVolumeConfirmStatus,
     LuksVolumeGenerationLease,
     LuksVolumeRotation,
+    NvidiaVerificationResultV1,
 )
 
 
@@ -1254,7 +1255,9 @@ async def verify_quote(
     return result
 
 
-async def verify_gpu_evidence(evidence: list[Dict[str, str]], expected_nonce: str) -> None:
+async def verify_gpu_evidence(
+    evidence: list[Dict[str, str]], expected_nonce: str
+) -> NvidiaVerificationResultV1:
     try:
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as fp:
             json.dump(evidence, fp)
@@ -1268,18 +1271,34 @@ async def verify_gpu_evidence(evidence: list[Dict[str, str]], expected_nonce: st
                 fp.name,
             ]
 
-            process = await asyncio.create_subprocess_exec(*verify_gpus_cmd)
-
-            await asyncio.gather(process.wait())
+            process = await asyncio.create_subprocess_exec(
+                *verify_gpus_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await process.communicate()
 
             if process.returncode != 0:
                 raise InvalidGpuEvidenceError()
 
+            try:
+                result = NvidiaVerificationResultV1.model_validate_json(stdout)
+            except ValueError as exc:
+                raise InvalidGpuEvidenceError(
+                    "NVIDIA verifier returned no canonical authenticated device identities."
+                ) from exc
+            if result.nonce != expected_nonce or len(result.devices) != len(evidence):
+                raise InvalidGpuEvidenceError(
+                    "NVIDIA verifier output does not match nonce/evidence cardinality."
+                )
             logger.info("GPU evidence verified successfully.")
+            return result
 
     except FileNotFoundError as e:
         logger.error(f"Failed to verify GPU evidence.  chutes-nvattest command not found?:\n{e}")
         raise GpuEvidenceError("Failed to verify GPU evidence.")
+    except (InvalidGpuEvidenceError, GpuEvidenceError):
+        raise
     except Exception as e:
         logger.error(f"Unexepected exception encoutnered verifying GPU evidence:\n{e}")
         raise GpuEvidenceError("Encountered an unexpected exception verifying GPU evidence.")

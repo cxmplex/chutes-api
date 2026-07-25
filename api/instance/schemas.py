@@ -20,7 +20,9 @@ from sqlalchemy import (
     Numeric,
     Double,
     UniqueConstraint,
+    CheckConstraint,
     event,
+    text,
 )
 from typing import Optional
 from api.database import Base, generate_uuid
@@ -87,9 +89,15 @@ class LaunchConfigArgs(BaseModel):
     inspecto: Optional[str] = None
 
 
+class LaunchRegistryScope(BaseModel):
+    repository: str
+    manifest_digest: str
+
+
 class LaunchConfigResponse(BaseModel):
     token: str
     config_id: str
+    registry: Optional[LaunchRegistryScope] = None
 
 
 class TeeLaunchConfigArgs(LaunchConfigArgs):
@@ -142,6 +150,19 @@ class Instance(Base):
         ForeignKey("servers.server_id", ondelete="SET NULL"),
         nullable=True,
     )
+    gpu_management_mode = Column(String, nullable=True)
+    gpu_launch_reservation_id = Column(
+        String,
+        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    gpu_allocation_group_id = Column(
+        String,
+        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    gpu_allocation_group_generation = Column(Integer, nullable=True)
+    gpu_process_incarnation = Column(String, nullable=True)
     cacert = Column(String, nullable=True)
     port_mappings = Column(JSONB, nullable=True)
     inspecto = Column(String, nullable=True)
@@ -180,6 +201,28 @@ class Instance(Base):
             "last_queried_at",
         ),
         UniqueConstraint("host", "port", name="unique_host_port"),
+        Index(
+            "uq_instances_gpu_reservation",
+            "gpu_launch_reservation_id",
+            unique=True,
+            postgresql_where=text(
+                "gpu_launch_reservation_id IS NOT NULL AND gpu_management_mode = 'platform'"
+            ),
+        ),
+        CheckConstraint(
+            "(gpu_management_mode IS NULL "
+            "AND gpu_launch_reservation_id IS NULL "
+            "AND gpu_allocation_group_id IS NULL "
+            "AND gpu_allocation_group_generation IS NULL "
+            "AND gpu_process_incarnation IS NULL) OR "
+            "(gpu_management_mode IN ('platform', 'miner') "
+            "AND gpu_launch_reservation_id IS NOT NULL "
+            "AND gpu_allocation_group_id IS NOT NULL "
+            "AND gpu_allocation_group_generation > 0 "
+            "AND gpu_process_incarnation IS NOT NULL "
+            "AND server_id IS NOT NULL)",
+            name="ck_instances_gpu_manager",
+        ),
     )
 
 
@@ -189,6 +232,21 @@ class LaunchConfig(Base):
     seed = Column(Numeric, nullable=False)
     env_key = Column(String, nullable=False)
     chute_id = Column(String, ForeignKey("chutes.chute_id", ondelete="CASCADE"), nullable=False)
+    # Authoritative storage owner. Jobs use Job.user_id; normal cord/deployment launches use
+    # Chute.user_id. This must never be inferred from chute visibility at authorization time.
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False)
+    compute_type = Column(String, nullable=False)
+    default_volume_id = Column(
+        String,
+        ForeignKey("storage_volumes.volume_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    storage_session_exchange_allowed = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
     job_id = Column(
         String,
         ForeignKey("jobs.job_id", ondelete="CASCADE"),
@@ -207,17 +265,71 @@ class LaunchConfig(Base):
         ForeignKey("servers.server_id", ondelete="SET NULL"),
         nullable=True,
     )
+    gpu_management_mode = Column(String, nullable=True)
+    gpu_launch_reservation_id = Column(
+        String,
+        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    container_repository = Column(String, nullable=True)
+    container_manifest_digest = Column(String, nullable=True)
+    registry_scope_active = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    registry_scope_revoked_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     retrieved_at = Column(DateTime, nullable=True)
     verified_at = Column(DateTime, nullable=True)
     failed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
     verification_error = Column(String, nullable=True)
     nonce = Column(String, nullable=True)
 
     instance = relationship("Instance", back_populates="config", uselist=False, lazy="joined")
     job = relationship("Job", back_populates="launch_config")
 
-    __table_args__ = (UniqueConstraint("job_id", name="uq_job_launch_config"),)
+    __table_args__ = (
+        Index(
+            "uq_job_launch_config_active",
+            "job_id",
+            unique=True,
+            postgresql_where=text(
+                "job_id IS NOT NULL AND failed_at IS NULL AND completed_at IS NULL"
+            ),
+        ),
+        CheckConstraint(
+            "(container_repository IS NULL AND container_manifest_digest IS NULL "
+            "AND NOT registry_scope_active AND registry_scope_revoked_at IS NULL) OR "
+            "(server_id IS NOT NULL AND container_repository IS NOT NULL "
+            "AND container_manifest_digest ~ '^sha256:[0-9a-f]{64}$' "
+            "AND (((gpu_management_mode = 'miner') "
+            "AND (registry_scope_active OR registry_scope_revoked_at IS NOT NULL)) "
+            "OR ((gpu_management_mode IS DISTINCT FROM 'miner') "
+            "AND NOT registry_scope_active AND registry_scope_revoked_at IS NULL)))",
+            name="ck_launch_config_registry_scope",
+        ),
+        CheckConstraint(
+            "(gpu_management_mode IS NULL AND gpu_launch_reservation_id IS NULL) OR "
+            "(gpu_management_mode IN ('platform', 'miner') "
+            "AND gpu_launch_reservation_id IS NOT NULL AND server_id IS NOT NULL)",
+            name="ck_launch_config_gpu_manager",
+        ),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu')",
+            name="ck_launch_config_compute_type",
+        ),
+        Index(
+            "uq_launch_configs_gpu_reservation",
+            "gpu_launch_reservation_id",
+            unique=True,
+            postgresql_where=text(
+                "gpu_launch_reservation_id IS NOT NULL AND gpu_management_mode = 'platform'"
+            ),
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

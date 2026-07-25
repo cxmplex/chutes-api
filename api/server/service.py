@@ -3,6 +3,7 @@ Core server management and TDX attestation logic.
 """
 
 import asyncio
+import hashlib
 import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
@@ -35,10 +36,18 @@ from api.metagraph import MetagraphNode
 from api.host.reservations import (
     LaunchReservationError,
     consume_launch_reservation,
+    gpu_host_storage_readiness,
     reservation_bound_attestation_nonce,
     resolve_launch_reservation,
 )
-from api.host.schemas import TdRegistrationSignatureV1
+from api.host.schemas import (
+    GpuLaunchReservation,
+    GpuRegistrationSignatureV1,
+    TdLaunchReservation,
+    TdRegistrationSignatureV1,
+    canonical_sha256,
+)
+from api.host.locks import acquire_gpu_lifecycle_lock
 from bittensor_wallet.keypair import Keypair
 from api.node.util import _track_nodes
 from api.server.client import TeeServerClient
@@ -49,6 +58,7 @@ from api.server.quote import (
 )
 from api.server.snp_quote import SnpReport
 from api.server.schemas import (
+    ChuteFSLaunchSession,
     Server,
     Host,
     HostRegistrationArgs,
@@ -59,6 +69,7 @@ from api.server.schemas import (
     RuntimeAttestationNonceContext,
     ServerArgs,
     CpuServerRegistrationArgs,
+    GpuServerRegistrationArgs,
     TeeUpgradeWindow,
     MaintenanceReason,
     SoleSurvivorBlock,
@@ -108,11 +119,12 @@ from api.server.util import (
     cert_to_base64_der,
     validate_user_nonce,
 )
-from api.instance.schemas import Instance, instance_nodes
+from api.instance.schemas import Instance, LaunchConfig, instance_nodes
+from api.job.schemas import Job
 from api.instance.util import purge_and_notify
 from api.chute.schemas import Chute
 from api.node.schemas import Node
-from sqlalchemy.orm import aliased, joinedload
+from sqlalchemy.orm import aliased, joinedload, lazyload
 from api.server.schemas import TeeInstanceEvidence
 from api.node.schemas import NodeArgs
 from api.util import get_signing_message, nonce_is_valid_v2, semcomp
@@ -308,6 +320,8 @@ async def issue_boot_attestation_nonce(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Boot attestation nonce requires a registered TEE server.",
         )
+    if server.compute_type == "gpu" and server.gpu_retired_at is not None:
+        raise MeasurementMismatchError("Retired GPU server cannot obtain boot capabilities.")
     if server.storage_role:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -659,7 +673,11 @@ async def process_boot_attestation(
         _validate_boot_measurement(server, measurement_config)
         config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(measurement_config)
 
-        minimum_version = settings.tee_minimum_boot_version
+        minimum_version = settings.tee_minimum_boot_version_for(
+            (server.compute_type or "cpu").lower()
+        )
+        if not isinstance(minimum_version, str):
+            minimum_version = settings.tee_minimum_boot_version
         if semcomp(measurement_config.version, minimum_version) < 0:
             logger.warning(
                 f"Boot attestation rejected: VM version {measurement_config.version} "
@@ -876,10 +894,15 @@ def _expected_gcp_identity(server_id: str) -> Optional[dict]:
 
 def runtime_attestation_context_for_server(
     server: Server,
+    gpu_reservation=None,
+    gpu_group=None,
+    gpu_host=None,
 ) -> RuntimeAttestationNonceContext:
     """Build the one accepted runtime identity from current trust and persisted registration."""
     if not server.is_tee:
         raise MeasurementMismatchError("Runtime attestation requires a registered TEE server.")
+    if server.compute_type == "gpu" and server.gpu_retired_at is not None:
+        raise MeasurementMismatchError("Retired GPU server cannot obtain runtime nonces.")
     measurements = settings.tee_measurements
     trust_set_fingerprint = measurement_trust_set_fingerprint(measurements)
     config = next(
@@ -948,22 +971,96 @@ def runtime_attestation_context_for_server(
             "Storage runtime identity requires a CPU-only bare-metal Model-B server."
         )
 
-    return RuntimeAttestationNonceContext(
-        server_id=server.server_id,
-        miner_hotkey=server.miner_hotkey,
-        vm_name=server.name,
-        cert_hash=_registered_cert_hash(server),
-        role="storage" if storage_role else "compute",
-        compute_type=compute_type,
-        tee_type=tee_type,
-        provider=canonical_provider,
-        deployment_model=deployment_model,
-        host_id=server.host_id,
-        measurement_name=config.name,
-        measurement_version=config.version,
-        measurement_config_fingerprint=config_fingerprint,
-        trust_set_fingerprint=trust_set_fingerprint,
-    )
+    context = {
+        "server_id": server.server_id,
+        "miner_hotkey": server.miner_hotkey,
+        "vm_name": server.name,
+        "cert_hash": _registered_cert_hash(server),
+        "role": "storage" if storage_role else "compute",
+        "compute_type": compute_type,
+        "tee_type": tee_type,
+        "provider": canonical_provider,
+        "deployment_model": deployment_model,
+        "host_id": server.host_id,
+        "measurement_name": config.name,
+        "measurement_version": config.version,
+        "measurement_config_fingerprint": config_fingerprint,
+        "trust_set_fingerprint": trust_set_fingerprint,
+    }
+    if compute_type == "gpu" and server.gpu_launch_reservation_id:
+        if (
+            gpu_reservation is None
+            or gpu_group is None
+            or gpu_host is None
+            or gpu_reservation.state != "running"
+            or gpu_group.state != "running"
+            or gpu_reservation.server_id != server.server_id
+            or gpu_reservation.reservation_id != server.gpu_launch_reservation_id
+            or gpu_reservation.allocation_group_id != server.gpu_allocation_group_id
+            or gpu_reservation.allocation_group_generation != server.gpu_allocation_group_generation
+            or gpu_reservation.management_mode != server.gpu_management_mode
+            or gpu_reservation.process_incarnation != server.gpu_process_incarnation
+            or gpu_reservation.topology_fingerprint != server.gpu_topology_fingerprint
+            or gpu_group.allocation_group_id != gpu_reservation.allocation_group_id
+            or gpu_group.generation != gpu_reservation.allocation_group_generation
+            or gpu_group.reservation_id != gpu_reservation.reservation_id
+            or gpu_group.reservation_generation != gpu_reservation.reservation_generation
+            or gpu_host.host_id != gpu_reservation.host_id
+            or gpu_host.boot_generation != gpu_reservation.host_boot_generation
+            or gpu_host.active_key_generation != gpu_reservation.host_key_generation
+        ):
+            raise MeasurementMismatchError(
+                "GPU runtime reservation, group, host, and process lineage is no longer current."
+            )
+        context.update(
+            {
+                "gpu_launch_reservation_id": gpu_reservation.reservation_id,
+                "gpu_allocation_group_id": gpu_reservation.allocation_group_id,
+                "gpu_allocation_group_generation": gpu_reservation.allocation_group_generation,
+                "gpu_host_boot_generation": gpu_reservation.host_boot_generation,
+                "gpu_reservation_generation": gpu_reservation.reservation_generation,
+                "gpu_management_mode": gpu_reservation.management_mode,
+                "gpu_process_incarnation": gpu_reservation.process_incarnation,
+                "gpu_topology_fingerprint": gpu_reservation.topology_fingerprint,
+                "gpu_release_id": gpu_reservation.gpu_release_id,
+                "gpu_profile_id": gpu_reservation.profile_id,
+                "gpu_chute_id": gpu_reservation.chute_id,
+                "gpu_job_id": gpu_reservation.job_id,
+                "gpu_claims_sha256": gpu_reservation.claims_sha256,
+            }
+        )
+    return RuntimeAttestationNonceContext(**context)
+
+
+async def runtime_attestation_context_for_server_db(
+    db: AsyncSession,
+    server: Server,
+) -> RuntimeAttestationNonceContext:
+    """Load and lock the durable GPU lineage before issuing or consuming a nonce."""
+
+    if server.compute_type != "gpu" or not server.gpu_launch_reservation_id:
+        return runtime_attestation_context_for_server(server)
+    from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
+
+    await acquire_gpu_lifecycle_lock(db)
+    host = (
+        await db.execute(select(Host).where(Host.host_id == server.host_id).with_for_update())
+    ).scalar_one_or_none()
+    group = (
+        await db.execute(
+            select(GpuAllocationGroup)
+            .where(GpuAllocationGroup.allocation_group_id == server.gpu_allocation_group_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    reservation = (
+        await db.execute(
+            select(GpuLaunchReservation)
+            .where(GpuLaunchReservation.reservation_id == server.gpu_launch_reservation_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    return runtime_attestation_context_for_server(server, reservation, group, host)
 
 
 async def _validate_cpu_registration_host(
@@ -972,6 +1069,7 @@ async def _validate_cpu_registration_host(
     miner_hotkey: str,
     tee_type: str,
     measurement_config,
+    reservation_claims=None,
 ) -> Optional[Host]:
     """Bind a Model-B TD claim to its enrolled launcher before any capacity mutation."""
     measurement_provider = _canonical_infrastructure_provider(
@@ -999,6 +1097,19 @@ async def _validate_cpu_registration_host(
         raise ServerRegistrationError(f"Host {host_id} is not registered for this CPU TEE server.")
     if host.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(f"Host {host_id} is registered to a different miner.")
+    host_compute_type = host.compute_type or "cpu"
+    gpu_storage_sibling = bool(
+        host_compute_type == "gpu"
+        and getattr(reservation_claims, "version", None) == 2
+        and getattr(reservation_claims, "host_compute_type", None) == "gpu"
+        and getattr(reservation_claims, "role", None) == "storage"
+        and (measurement_config.name or "").startswith("storage-")
+        and host.storage_enabled
+    )
+    if host_compute_type != "cpu" and not gpu_storage_sibling:
+        raise ServerRegistrationError(
+            f"Host {host_id} belongs to the GPU compute stream, not CPU registration."
+        )
 
     registered_tee = (host.tee_type or "").strip().lower()
     if registered_tee != tee_type:
@@ -1008,7 +1119,7 @@ async def _validate_cpu_registration_host(
 
 def _verify_td_registration_signature(
     cert_pem: str,
-    signed: TdRegistrationSignatureV1,
+    signed: TdRegistrationSignatureV1 | GpuRegistrationSignatureV1,
     signature_b64: str,
 ) -> None:
     try:
@@ -1026,6 +1137,88 @@ def _verify_td_registration_signature(
         raise ServerRegistrationError(
             "TD registration signature from the attested serving key is invalid."
         ) from exc
+
+
+def _validate_existing_model_b_server_identity(
+    server: Server,
+    claims,
+    prior_reservation: Optional[TdLaunchReservation],
+) -> None:
+    exact = bool(
+        server.server_id == claims.server_id
+        and server.miner_hotkey == claims.owner_hotkey
+        and server.compute_type == "cpu"
+        and server.self_registered is True
+        and server.storage_role == (claims.role == "storage")
+        and server.host_id == claims.host_id
+        and prior_reservation is not None
+        and prior_reservation.server_id == claims.server_id
+        and prior_reservation.owner_hotkey == claims.owner_hotkey
+        and prior_reservation.host_id == claims.host_id
+        and prior_reservation.role == claims.role
+        and prior_reservation.compute_type == "cpu"
+        and prior_reservation.process_incarnation == claims.process_incarnation
+    )
+    if not exact:
+        raise ServerRegistrationError(
+            "Existing server identity is not the same Model-B CPU/storage role lineage."
+        )
+
+
+def _assert_reserved_nvidia_devices(
+    claims,
+    verified_gpu_evidence,
+) -> None:
+    verified_certificate_identities = [
+        item.attestation_certificate_sha256 for item in verified_gpu_evidence.devices
+    ]
+    if verified_certificate_identities != claims.gpu_attestation_certificate_sha256s:
+        raise InvalidGpuEvidenceError(
+            "Verified NVIDIA device certificates do not match the reserved GPU group."
+        )
+
+
+def _gpu_attestation_lineage(
+    reservation,
+    claims,
+    raw_evidence: list[dict[str, Any]],
+    verified_gpu_evidence,
+) -> dict[str, Any]:
+    """Persist the exact reservation and NVIDIA evidence used for one attempt."""
+
+    evidence = {
+        "schema": "chutes.persisted-nvidia-evidence",
+        "version": 1,
+        "raw": raw_evidence,
+        "verified": (
+            verified_gpu_evidence.model_dump(mode="json")
+            if verified_gpu_evidence is not None
+            else None
+        ),
+    }
+    certificate_identities = (
+        [item.attestation_certificate_sha256 for item in verified_gpu_evidence.devices]
+        if verified_gpu_evidence is not None
+        else []
+    )
+    return {
+        "gpu_evidence": evidence,
+        "gpu_evidence_sha256": canonical_sha256(evidence),
+        "gpu_evidence_certificate_sha256s": certificate_identities,
+        "gpu_launch_reservation_id": reservation.reservation_id,
+        "gpu_allocation_group_id": reservation.allocation_group_id,
+        "gpu_allocation_group_generation": reservation.allocation_group_generation,
+        "gpu_host_boot_generation": reservation.host_boot_generation,
+        "gpu_reservation_generation": reservation.reservation_generation,
+        "gpu_management_mode": reservation.management_mode,
+        "gpu_process_incarnation": reservation.process_incarnation,
+        "gpu_topology_fingerprint": reservation.topology_fingerprint,
+        "gpu_release_id": reservation.gpu_release_id,
+        "gpu_profile_id": reservation.profile_id,
+        "gpu_chute_id": reservation.chute_id,
+        "gpu_job_id": reservation.job_id,
+        "gpu_claims_sha256": reservation.claims_sha256,
+    }
 
 
 async def register_cpu_server(
@@ -1211,6 +1404,7 @@ async def register_cpu_server(
         miner_hotkey,
         tee_type,
         measurement_config,
+        reservation_claims,
     )
     if reservation_claims is not None:
         if (
@@ -1237,6 +1431,17 @@ async def register_cpu_server(
     if server is not None and server.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(
             f"Server {args.server_id} is already registered to a different miner."
+        )
+    if server is not None and reservation_claims is not None:
+        prior_reservation = (
+            await db.get(TdLaunchReservation, server.launch_reservation_id)
+            if server.launch_reservation_id
+            else None
+        )
+        _validate_existing_model_b_server_identity(
+            server,
+            reservation_claims,
+            prior_reservation,
         )
     # Model B: several per-chute TDs run on ONE L0 host and self-register from that host's single
     # public IP -- they are distinguished by their DNAT'd external_ports, not by IP. A co-tenant
@@ -1373,6 +1578,349 @@ async def register_cpu_server(
     }
 
 
+async def register_gpu_server(
+    db: AsyncSession,
+    server_ip: str,
+    args: GpuServerRegistrationArgs,
+    nonce: str,
+    expected_cert_hash: str,
+    cert_pem: str,
+) -> Dict[str, Any]:
+    """Register one reservation-bound GPU guest and atomically publish running state."""
+
+    from api.host.gpu_allocations import (
+        GpuAllocationError,
+        GpuAllocationQuarantinedError,
+        resolve_gpu_registration_reservation,
+    )
+    from api.node.schemas import Node
+
+    try:
+        host, reservation, group, claims = await resolve_gpu_registration_reservation(
+            db,
+            args.launch_reservation,
+            args.quote_commitment,
+        )
+    except GpuAllocationQuarantinedError as exc:
+        await db.commit()
+        raise ServerRegistrationError(str(exc)) from exc
+    except GpuAllocationError as exc:
+        raise ServerRegistrationError(str(exc)) from exc
+    if (
+        args.server_id != claims.server_id
+        or args.quote_commitment.attested_spki_sha256 != expected_cert_hash.lower()
+        or args.gpu_uuids != claims.gpu_uuids
+    ):
+        raise ServerRegistrationError(
+            "GPU guest identity differs from its exact launch reservation."
+        )
+    signed_registration = GpuRegistrationSignatureV1(
+        server_id=args.server_id,
+        request_nonce=nonce,
+        quote_commitment=args.quote_commitment,
+    )
+    _verify_td_registration_signature(cert_pem, signed_registration, args.td_signature)
+    server = None
+    if reservation.guest_consumed_at is not None:
+        server = (
+            await db.execute(
+                select(Server).where(Server.server_id == claims.server_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        prior = (
+            await db.get(
+                ServerAttestation,
+                reservation.registration_attestation_id,
+            )
+            if reservation.registration_attestation_id
+            else None
+        )
+        from api.server.gpu_sessions import (
+            _current_attestation,
+            _latest_attestation_attempt,
+            mint_gpu_runtime_session,
+        )
+
+        latest = await _latest_attestation_attempt(db, claims.server_id)
+        if server is None or prior is None or latest is None:
+            raise ServerRegistrationError(
+                "Consumed GPU registration has incomplete prior success lineage."
+            )
+        try:
+            _current_attestation(
+                server,
+                latest,
+                expected_id=reservation.registration_attestation_id,
+            )
+        except HTTPException as exc:
+            raise ServerRegistrationError(
+                "Consumed GPU registration no longer has a current prior success."
+            ) from exc
+        if not (
+            reservation.state == "running"
+            and group.state == "running"
+            and server is not None
+            and prior is not None
+            and latest is not None
+            and latest.attestation_id == prior.attestation_id
+            and prior.verified_at is not None
+            and prior.verification_error is None
+            and prior.gpu_retired_at is None
+            and server.gpu_retired_at is None
+            and server.gpu_launch_reservation_id == reservation.reservation_id
+            and server.attested_cert_pubkey_hash == expected_cert_hash.lower()
+            and server.attested_cert == cert_pem
+            and prior.quote_data == args.quote
+            and isinstance(prior.gpu_evidence, dict)
+            and prior.gpu_evidence.get("raw") == args.gpu_evidence
+            and prior.gpu_claims_sha256 == reservation.claims_sha256
+        ):
+            raise ServerRegistrationError(
+                "Consumed GPU registration retry differs from the prior exact success."
+            )
+        runtime_session, runtime_session_expiry = mint_gpu_runtime_session(
+            server,
+            prior,
+        )
+        server.gpu_runtime_session_attestation_id = prior.attestation_id
+        server.gpu_runtime_session_expires_at = runtime_session_expiry
+        await db.commit()
+        return {
+            "server_id": server.server_id,
+            "owner_hotkey": claims.owner_hotkey,
+            "reservation_id": reservation.reservation_id,
+            "claims_sha256": reservation.claims_sha256,
+            "allocation_group_id": group.allocation_group_id,
+            "allocation_group_generation": group.generation,
+            "process_incarnation": reservation.process_incarnation,
+            "gpu_uuids": list(claims.gpu_uuids),
+            "gpu_identifiers": list(claims.gpu_identifiers),
+            "management_mode": claims.management_mode,
+            "measurement_version": prior.measurement_version,
+            "measurement_name": prior.measurement_name,
+            "measurement_config_fingerprint": prior.measurement_config_fingerprint,
+            "trust_set_fingerprint": prior.trust_set_fingerprint,
+            "attestation_id": prior.attestation_id,
+            "verified_at": prior.verified_at.isoformat(),
+            "runtime_session": runtime_session,
+            "runtime_session_expires_at": runtime_session_expiry.isoformat(),
+            "status": "registered",
+        }
+    try:
+        quote_nonce = hashlib.sha256(
+            bytes.fromhex(nonce) + bytes.fromhex(args.quote_commitment.report_data_nonce())
+        ).hexdigest()
+    except ValueError as exc:
+        raise ServerRegistrationError("GPU registration nonce is malformed.") from exc
+    quote = build_runtime_quote(args.quote, "tdx", None, None)
+    verification_result = await verify_quote(
+        quote,
+        quote_nonce,
+        expected_cert_hash,
+    )
+    revocation_status = dict(getattr(verification_result, "revocation_status", {}) or {})
+    measurement_config = get_matching_measurement_config(quote)
+    expected_identifiers = sorted(claims.gpu_identifiers)
+    if (
+        measurement_config.name != claims.measurement_name
+        or measurement_config.version != reservation.image_version
+        or getattr(measurement_config, "compute_type", None) != "gpu"
+        or getattr(measurement_config, "role", None) != "gpu"
+        or getattr(measurement_config, "gpu_profile_id", None) != claims.gpu_profile_id
+        or getattr(measurement_config, "management_mode", None) != claims.management_mode
+        or getattr(measurement_config, "gpu_profile_contract_sha256", None)
+        != claims.profile_contract_sha256
+        or getattr(measurement_config, "image_sha256", None) != claims.image_sha256
+        or measurement_config.gpu_count != len(claims.gpu_uuids)
+        or sorted(measurement_config.expected_gpus or []) != sorted(set(expected_identifiers))
+    ):
+        raise MeasurementMismatchError(
+            "GPU quote does not match the reservation release/profile/mode identity."
+        )
+    if len(args.gpu_evidence) != len(claims.gpu_uuids):
+        raise InvalidGpuEvidenceError("GPU evidence count does not match the reserved UUID set.")
+    verified_gpu_evidence = await verify_gpu_evidence(args.gpu_evidence, quote_nonce)
+    _assert_reserved_nvidia_devices(claims, verified_gpu_evidence)
+
+    server = (
+        await db.execute(
+            select(Server).where(Server.server_id == claims.server_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if server is not None and (
+        server.miner_hotkey != claims.owner_hotkey
+        or (
+            server.gpu_retired_at is None
+            and server.gpu_launch_reservation_id != reservation.reservation_id
+        )
+    ):
+        raise ServerRegistrationError(
+            "GPU server identity already belongs to another active lineage."
+        )
+    if server is None:
+        server = Server(server_id=claims.server_id, netuid=settings.netuid)
+        db.add(server)
+    server.name = claims.server_id
+    server.ip = server_ip
+    server.miner_hotkey = claims.owner_hotkey
+    server.is_tee = True
+    server.self_registered = True
+    server.compute_type = "gpu"
+    server.tee_type = "tdx"
+    server.host_id = claims.host_id
+    server.launch_reservation_id = None
+    server.launch_boot_generation = None
+    server.gpu_launch_reservation_id = reservation.reservation_id
+    server.gpu_allocation_group_id = claims.allocation_group_id
+    server.gpu_allocation_group_generation = claims.allocation_group_generation
+    server.gpu_management_mode = claims.management_mode
+    server.gpu_process_incarnation = claims.process_incarnation
+    server.gpu_topology_fingerprint = claims.topology_fingerprint
+    server.gpu_retired_at = None
+    server.gpu_retirement_reason = None
+    server.external_host = args.external_host
+    server.external_ports = args.external_ports
+    server.storage_role = False
+    server.attested_cert = cert_pem
+    server.attested_cert_pubkey_hash = expected_cert_hash.lower()
+    server.tee_endpoints = args.endpoints
+    config_fingerprint, trust_set_fingerprint = _stamp_server_measurement(
+        server, measurement_config
+    )
+    server.attestation_revocation_status = revocation_status
+    await db.flush()
+
+    existing_nodes = (
+        (
+            await db.execute(
+                select(Node)
+                .where(Node.uuid.in_(claims.gpu_uuids))
+                .order_by(Node.uuid)
+                .with_for_update(of=Node)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    blockers = [
+        item
+        for item in existing_nodes
+        if item.server_id != server.server_id or item.gpu_retired_at is None
+    ]
+    if blockers:
+        raise ServerRegistrationError(
+            "One or more verified GPU UUIDs still belong to an active server lineage."
+        )
+    for item in existing_nodes:
+        await db.delete(item)
+    gpu_identifier = claims.gpu_identifiers[0]
+    gpu_spec = SUPPORTED_GPUS[gpu_identifier]
+    for index, gpu_uuid in enumerate(claims.gpu_uuids):
+        db.add(
+            Node(
+                uuid=gpu_uuid,
+                name=f"NVIDIA {gpu_identifier.upper()}",
+                memory=int(group.vram_mib) * 1024 * 1024,
+                major=gpu_spec.get("major"),
+                minor=gpu_spec.get("minor"),
+                processors=gpu_spec["processors"],
+                sxm=gpu_spec.get("sxm", True),
+                clock_rate=float(gpu_spec["clock_rate"]["base"]) * 1000,
+                max_threads_per_processor=gpu_spec["max_threads_per_processor"],
+                concurrent_kernels=gpu_spec.get("concurrent_kernels", True),
+                ecc=gpu_spec.get("ecc", True),
+                seed=0,
+                miner_hotkey=claims.owner_hotkey,
+                gpu_identifier=gpu_identifier,
+                device_index=index,
+                server_id=server.server_id,
+                verification_host=server_ip,
+                verification_port=30443,
+                verified_at=datetime.now(timezone.utc),
+                gpu_allocation_group_id=group.allocation_group_id,
+                gpu_allocation_group_generation=group.generation,
+            )
+        )
+    now = datetime.now(timezone.utc)
+    attestation = ServerAttestation(
+        quote_data=args.quote,
+        server_id=server.server_id,
+        created_at=now,
+        verified_at=now,
+        measurement_version=measurement_config.version,
+        measurement_name=measurement_config.name,
+        measurement_config_fingerprint=config_fingerprint,
+        trust_set_fingerprint=trust_set_fingerprint,
+        revocation_status=revocation_status,
+        **_gpu_attestation_lineage(
+            reservation,
+            claims,
+            args.gpu_evidence,
+            verified_gpu_evidence,
+        ),
+    )
+    db.add(attestation)
+    await db.flush()
+    reservation.guest_consumed_at = now
+    reservation.registration_attestation_id = attestation.attestation_id
+    reservation.state = "running"
+    reservation.running_at = now
+    group.state = "running"
+    group.running_at = now
+    group.updated_at = now
+    from api.releases.schemas import GuestReleaseTarget
+
+    target = (
+        await db.execute(
+            select(GuestReleaseTarget)
+            .where(
+                GuestReleaseTarget.release_id == reservation.gpu_release_id,
+                GuestReleaseTarget.host_id == reservation.host_id,
+                GuestReleaseTarget.compute_type == "gpu",
+                GuestReleaseTarget.role == "gpu",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if target is not None:
+        target.consumed_at = now
+        target.consumed_server_id = server.server_id
+        target.consumed_attestation_id = attestation.attestation_id
+        target.consumed_cert_pubkey_hash = expected_cert_hash.lower()
+        target.consumed_measurement_name = measurement_config.name
+        target.consumed_measurement_version = measurement_config.version
+        target.consumed_measurement_config_fingerprint = config_fingerprint
+        target.consumed_trust_set_fingerprint = trust_set_fingerprint
+    from api.server.gpu_sessions import mint_gpu_runtime_session
+
+    runtime_session, runtime_session_expiry = mint_gpu_runtime_session(server, attestation)
+    server.gpu_runtime_session_attestation_id = attestation.attestation_id
+    server.gpu_runtime_session_expires_at = runtime_session_expiry
+    await db.commit()
+    runtime_session_expires_at = runtime_session_expiry.isoformat()
+    return {
+        "server_id": server.server_id,
+        "owner_hotkey": claims.owner_hotkey,
+        "reservation_id": reservation.reservation_id,
+        "claims_sha256": reservation.claims_sha256,
+        "allocation_group_id": group.allocation_group_id,
+        "allocation_group_generation": group.generation,
+        "process_incarnation": reservation.process_incarnation,
+        "gpu_uuids": list(claims.gpu_uuids),
+        "gpu_identifiers": list(claims.gpu_identifiers),
+        "management_mode": claims.management_mode,
+        "measurement_version": measurement_config.version,
+        "measurement_name": measurement_config.name,
+        "measurement_config_fingerprint": config_fingerprint,
+        "trust_set_fingerprint": trust_set_fingerprint,
+        "attestation_id": attestation.attestation_id,
+        "verified_at": now.isoformat(),
+        "runtime_session": runtime_session,
+        "runtime_session_expires_at": runtime_session_expires_at,
+        "status": "registered",
+    }
+
+
 def _sum_disk_gb(disks: Any) -> Optional[int]:
     """Sum the size_gb of a node-agent specs.disk_info() list (non-rotational + rotational), or None.
 
@@ -1399,6 +1947,8 @@ async def register_host(
     lets the host change its owner, TEE type, desired-state channel, or enrollment generation.
     """
     miner_hotkey = authenticated_host.miner_hotkey
+    if authenticated_host.compute_type is None:
+        authenticated_host.compute_type = "cpu"
     if args.host_id != authenticated_host.host_id:
         raise ServerRegistrationError("Host telemetry does not match the authenticated host.")
     if (
@@ -1411,11 +1961,14 @@ async def register_host(
         )
     if (
         (args.tee_type or "tdx").strip().lower() != authenticated_host.tee_type
+        or args.compute_type != (authenticated_host.compute_type or "cpu")
         or args.release_channel != authenticated_host.release_channel
     ):
         raise ServerRegistrationError(
-            "Host telemetry cannot change the enrolled TEE type or release channel."
+            "Host telemetry cannot change the enrolled TEE, compute type, or release channel."
         )
+    if (authenticated_host.compute_type or "cpu") == "gpu" and not args.storage_enabled:
+        raise ServerRegistrationError("GPU hosts must remain storage-enabled.")
     capacity = int(args.capacity)
     storage_enabled = bool(getattr(args, "storage_enabled", False))
     if capacity < 0 or capacity > 64:
@@ -1424,6 +1977,16 @@ async def register_host(
         raise ServerRegistrationError(
             "capacity=0 is valid only for an enrolled ChuteFS storage host."
         )
+    if authenticated_host.compute_type == "gpu":
+        from api.host.gpu_allocations import (
+            GpuAllocationError,
+            advance_gpu_host_boot,
+        )
+
+        try:
+            await advance_gpu_host_boot(db, authenticated_host, str(args.host_boot_id))
+        except GpuAllocationError as exc:
+            raise ServerRegistrationError(str(exc)) from exc
 
     # Dev (skip_metagraph_check): auto-create the metagraph row so downstream FK references
     # (self-registered server rows) are satisfied. Prod membership is enforced by the router auth.
@@ -1443,6 +2006,7 @@ async def register_host(
     # Enrollment creates the host row. Registration is telemetry-only and may never upsert identity.
     host = authenticated_host
     host.name = args.name or args.host_id
+    host.reported_capacity = capacity
     host.capacity = capacity
     host.storage_enabled = storage_enabled
     host.storage_td_vcpus = args.storage_td_vcpus
@@ -1453,6 +2017,12 @@ async def register_host(
     # Hardware inventory (informational; the host is not attested). Denormalize cores/ram for queries.
     specs = args.specs or {}
     host.specs = specs or None
+    host.untrusted_gpu_inventory = (
+        args.untrusted_gpu_inventory.model_dump(mode="json")
+        if args.untrusted_gpu_inventory is not None
+        else None
+    )
+    host.untrusted_gpu_inventory_ready = args.untrusted_gpu_inventory_ready
     cpu = specs.get("cpu") or {}
     mem = specs.get("memory") or {}
     host.cpu_cores = cpu.get("physical_cores") or cpu.get("logical_cpus")
@@ -1483,6 +2053,7 @@ async def register_host(
         db,
         host.tee_type,
         args.release_channel,
+        host.compute_type,
         host_id=host.host_id,
         miner_hotkey=miner_hotkey,
     )
@@ -1496,6 +2067,7 @@ async def register_host(
                     GuestRelease.status == RELEASE_STATUS_ACTIVE,
                     GuestRelease.channel == host.release_channel,
                     GuestRelease.tee_type == host.tee_type,
+                    GuestRelease.compute_type == host.compute_type,
                 )
             )
         ).scalar_one_or_none()
@@ -1505,6 +2077,10 @@ async def register_host(
                 active_release,
                 host,
             )
+    readiness = None
+    if host.compute_type == "gpu":
+        readiness = await gpu_host_storage_readiness(db, host)
+        host.capacity = capacity if readiness.trusted_schedulable else 0
     await db.commit()
     await db.refresh(host)
 
@@ -1517,12 +2093,26 @@ async def register_host(
     # response: returning a successful registration with release=None would make a cold canary boot
     # indistinguishable from "no desired release" and could allow bootstrap bytes to launch.
     release = manifest.model_dump() if manifest else None
-    return {
+    response = {
         "host_id": host.host_id,
         "capacity": host.capacity,
         "status": "registered",
         "release": release,
     }
+    if host.compute_type == "gpu":
+        response.update(
+            {
+                "trusted_storage_ready": readiness.trusted_storage_ready,
+                "control_channel_eligible": readiness.control_channel_eligible,
+                "trusted_schedulable": readiness.trusted_schedulable,
+                "trusted_storage_reason": readiness.reason,
+                "untrusted_gpu_inventory": host.untrusted_gpu_inventory,
+                "untrusted_gpu_inventory_ready": host.untrusted_gpu_inventory_ready,
+                "host_boot_generation": host.boot_generation,
+                "gpu_inventory_report_generation": host.gpu_inventory_report_generation,
+            }
+        )
+    return response
 
 
 async def request_host_image_upgrade(
@@ -1923,7 +2513,7 @@ async def process_runtime_attestation(
         raise MeasurementMismatchError(
             "Runtime attestation source IP does not match the registered server."
         )
-    current_context = runtime_attestation_context_for_server(server)
+    current_context = await runtime_attestation_context_for_server_db(db, server)
     if nonce_context != current_context:
         raise NonceError("Runtime nonce identity no longer matches the exact registered server.")
     if (
@@ -1934,8 +2524,27 @@ async def process_runtime_attestation(
             "Runtime attestation certificate does not match the registered server."
         )
 
+    gpu_runtime = nonce_context.gpu_launch_reservation_id is not None
+    runtime_precheck_error: Optional[AttestationError] = None
+    if gpu_runtime:
+        if not args.gpu_evidence:
+            runtime_precheck_error = InvalidGpuEvidenceError(
+                "GPU runtime re-attestation requires fresh NVIDIA evidence."
+            )
+        runtime_evidence_nonce = hashlib.sha256(
+            bytes.fromhex(expected_nonce) + bytes.fromhex(canonical_sha256(nonce_context))
+        ).hexdigest()
+    else:
+        if args.gpu_evidence is not None:
+            runtime_precheck_error = InvalidGpuEvidenceError(
+                "CPU runtime re-attestation cannot carry NVIDIA evidence."
+            )
+        runtime_evidence_nonce = expected_nonce
+
     # Parse and verify quote
     try:
+        if runtime_precheck_error is not None:
+            raise runtime_precheck_error
         tee_type = (args.tee_type or "tdx").strip().lower()
         if tee_type != (server.tee_type or "tdx").strip().lower():
             raise MeasurementMismatchError(
@@ -1949,7 +2558,7 @@ async def process_runtime_attestation(
         )
         verification_result = await verify_quote(
             quote,
-            expected_nonce,
+            runtime_evidence_nonce,
             expected_cert_hash,
             expected_gcp_identity=_expected_gcp_identity(server.server_id),
         )
@@ -1981,6 +2590,36 @@ async def process_runtime_attestation(
                 "Runtime quote does not preserve the nonce-bound measurement, role, "
                 "compute class, and provider identity."
             )
+        gpu_lineage: dict[str, Any] = {}
+        verified_gpu_evidence = None
+        if gpu_runtime:
+            from api.host.gpu_allocations import _validate_row_claims
+            from api.host.schemas import GpuLaunchReservation
+
+            reservation = await db.get(
+                GpuLaunchReservation,
+                nonce_context.gpu_launch_reservation_id,
+            )
+            if reservation is None:
+                raise MeasurementMismatchError(
+                    "GPU runtime reservation disappeared after nonce issuance."
+                )
+            claims = _validate_row_claims(reservation)
+            if len(args.gpu_evidence) != len(claims.gpu_uuids) or reservation.state != "running":
+                raise InvalidGpuEvidenceError(
+                    "GPU runtime evidence does not cover the current running reservation."
+                )
+            verified_gpu_evidence = await verify_gpu_evidence(
+                args.gpu_evidence,
+                runtime_evidence_nonce,
+            )
+            _assert_reserved_nvidia_devices(claims, verified_gpu_evidence)
+            gpu_lineage = _gpu_attestation_lineage(
+                reservation,
+                claims,
+                args.gpu_evidence,
+                verified_gpu_evidence,
+            )
         config_fingerprint, trust_set_fingerprint = _stamp_server_measurement(
             server, measurement_config
         )
@@ -1995,6 +2634,7 @@ async def process_runtime_attestation(
             trust_set_fingerprint=trust_set_fingerprint,
             revocation_status=revocation_status,
             verified_at=func.now(),
+            **gpu_lineage,
         )
 
         db.add(attestation)
@@ -2017,9 +2657,17 @@ async def process_runtime_attestation(
             "status": "verified",
             "revocation_status": revocation_status,
             "luks_quote_nonce": luks_quote_nonce,
+            "gpu_evidence_sha256": (
+                gpu_lineage.get("gpu_evidence_sha256") if gpu_runtime else None
+            ),
         }
 
-    except (InvalidQuoteError, MeasurementMismatchError) as e:
+    except (
+        InvalidQuoteError,
+        MeasurementMismatchError,
+        InvalidGpuEvidenceError,
+        GpuEvidenceError,
+    ) as e:
         # Create failed attestation record
         measurement_version = None
         measurement_name = None
@@ -2035,15 +2683,46 @@ async def process_runtime_attestation(
             measurement_name = measurement_config.name
         except (InvalidQuoteError, MeasurementMismatchError):
             pass
+        failed_gpu_lineage: dict[str, Any] = {}
+        if gpu_runtime and nonce_context.gpu_launch_reservation_id:
+            from api.host.gpu_allocations import _validate_row_claims
+            from api.host.schemas import GpuLaunchReservation
+
+            reservation = await db.get(
+                GpuLaunchReservation,
+                nonce_context.gpu_launch_reservation_id,
+            )
+            if reservation is not None:
+                claims = _validate_row_claims(reservation)
+                failed_gpu_lineage = _gpu_attestation_lineage(
+                    reservation,
+                    claims,
+                    list(args.gpu_evidence or []),
+                    None,
+                )
         attestation = ServerAttestation(
             server_id=server_id,
             quote_data=args.quote,
             verification_error=str(e.detail),
             measurement_version=measurement_version,
             measurement_name=measurement_name,
+            **failed_gpu_lineage,
         )
 
         db.add(attestation)
+        if gpu_runtime and nonce_context.gpu_launch_reservation_id:
+            await db.flush()
+            from api.host.gpu_allocations import (
+                quarantine_gpu_reservation_control_plane,
+            )
+
+            await quarantine_gpu_reservation_control_plane(
+                db,
+                nonce_context.gpu_launch_reservation_id,
+                code="gpu_runtime_attestation_failed",
+                reason=str(e.detail),
+                metadata={"attestation_id": attestation.attestation_id},
+            )
         await db.commit()
 
         logger.error(f"Runtime attestation failed: {str(e)}")
@@ -2116,7 +2795,123 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
         ServerNotFoundError: If server not found
     """
     server = await check_server_ownership(db, server_id, miner_hotkey)
+    if server.compute_type == "gpu" and server.gpu_launch_reservation_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Reservation-owned GPU servers require the exact teardown/reset "
+                "lifecycle before retirement."
+            ),
+        )
+    config_ids = list(
+        (
+            await db.execute(
+                select(LaunchConfig.config_id)
+                .where(LaunchConfig.server_id == server_id)
+                .order_by(LaunchConfig.config_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from api.storage.launch_sessions import lock_launch_storage_lifecycle
 
+    for config_id in config_ids:
+        await lock_launch_storage_lifecycle(db, config_id)
+    active_reservation = (
+        await db.execute(
+            select(GpuLaunchReservation.reservation_id)
+            .where(
+                GpuLaunchReservation.server_id == server_id,
+                GpuLaunchReservation.state.in_(
+                    ("reserved", "claimed", "launching", "running", "resetting")
+                ),
+            )
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if server.compute_type == "gpu" and active_reservation is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Reservation-owned GPU servers require the exact teardown/reset "
+                "lifecycle before retirement."
+            ),
+        )
+
+    now = datetime.now(timezone.utc)
+    now_naive = now.replace(tzinfo=None)
+    await db.execute(
+        ChuteFSLaunchSession.__table__.update()
+        .where(
+            ChuteFSLaunchSession.server_id == server_id,
+            ChuteFSLaunchSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    instances = list(
+        (
+            await db.execute(
+                select(Instance)
+                .where(Instance.server_id == server_id)
+                .order_by(Instance.instance_id)
+                .options(lazyload("*"))
+                .with_for_update()
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
+    for instance in instances:
+        instance.active = False
+        instance.verified = False
+        instance.verification_error = "Owning server retired."
+        instance.gpu_management_mode = None
+        instance.gpu_launch_reservation_id = None
+        instance.gpu_allocation_group_id = None
+        instance.gpu_allocation_group_generation = None
+        instance.gpu_process_incarnation = None
+        instance.server_id = None
+    jobs = list(
+        (
+            await db.execute(
+                select(Job)
+                .where(Job.instance_id.in_([item.instance_id for item in instances]))
+                .options(lazyload("*"))
+                .with_for_update()
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
+        if instances
+        else []
+    )
+    for job in jobs:
+        job.active = False
+        job.verified = False
+        job.finished_at = job.finished_at or now_naive
+        job.gpu_management_mode = None
+        job.gpu_launch_reservation_id = None
+    await db.execute(
+        LaunchConfig.__table__.update()
+        .where(
+            LaunchConfig.server_id == server_id,
+            LaunchConfig.failed_at.is_(None),
+            LaunchConfig.completed_at.is_(None),
+        )
+        .values(
+            failed_at=now_naive,
+            verification_error="Owning server retired.",
+        )
+    )
+    await db.flush()
+    await db.execute(
+        delete(ChuteFSLaunchSession).where(ChuteFSLaunchSession.server_id == server_id)
+    )
+    await db.execute(delete(LaunchConfig).where(LaunchConfig.server_id == server_id))
     await db.delete(server)
     await db.commit()
 
@@ -2181,6 +2976,7 @@ async def _validate_luks_capability_identity(
         )
     if (
         not server.is_tee
+        or (server.compute_type == "gpu" and server.gpu_retired_at is not None)
         or server.miner_hotkey != capability.miner_hotkey
         or server.name != capability.vm_name
         or bool(server.storage_role) != is_storage

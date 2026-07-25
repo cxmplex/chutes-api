@@ -1550,21 +1550,12 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
                     )
                 ).scalars()
             )
-            assert versions == {
-                "20260713140000",
-                "20260713150000",
-                "20260713160000",
-                "20260713170000",
-                "20260713220000",
-                "20260714070000",
-                "20260714071000",
-                "20260714072000",
-                "20260714073000",
-                "20260714100000",
-                "20260714110000",
-                "20260715120000",
-                "20260715121000",
+            expected_versions = {
+                path.name.split("_", 1)[0]
+                for path in (Path(__file__).resolve().parents[2] / "api/migrations").glob("*.sql")
+                if path.name.split("_", 1)[0] >= database_migrations.TRACKED_MIGRATION_BASELINE
             }
+            assert versions == expected_versions
             server_health_shape = (
                 await connection.execute(
                     text(

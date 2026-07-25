@@ -32,7 +32,6 @@ from tests.unit.test_cpu_scheduler import (
 
 NOW = datetime.now(timezone.utc)
 OLD = NOW - timedelta(seconds=ac.SERVER_REAP_GRACE_SECONDS + 60)
-YOUNG = NOW - timedelta(seconds=10)
 
 
 @pytest.fixture
@@ -75,9 +74,70 @@ class TestSendAgentCommand:
         }
 
     @pytest.mark.asyncio
-    async def test_no_config_id_no_correlation_key(self, mock_settings, fake_redis):
+    async def test_every_command_exposes_exact_pending_status(self, mock_settings, fake_redis):
         command_id = await ac.send_agent_command("srv-1", "stop_instance", {"chute_id": "c"})
-        assert f"agent:cmd:{command_id}" not in fake_redis.store
+        assert f"agent:cmd:{command_id}" in fake_redis.store
+        assert await ac.get_agent_command_status("srv-1", "stop_instance", command_id) == {
+            "command_id": command_id,
+            "server_id": "srv-1",
+            "command": "stop_instance",
+            "status": "pending",
+            "detail": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_retry_reuses_persisted_command_id(
+        self,
+        mock_settings,
+        fake_redis,
+    ):
+        for _ in range(2):
+            returned = await ac.send_agent_command(
+                "gpu-host",
+                "launch_gpu",
+                {"reservation_id": "gpu-reservation"},
+                command_id="stable-command",
+            )
+            assert returned == "stable-command"
+        payloads = [json.loads(raw) for _channel, raw in fake_redis.published]
+        assert [payload["command_id"] for payload in payloads] == [
+            "stable-command",
+            "stable-command",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_terminal_ack_survives_idempotent_command_retry(
+        self,
+        mock_settings,
+    ):
+        command_id = await ac.send_agent_command(
+            "gpu-host",
+            "confirm_gpu_legacy_sources",
+            {"migration_id": "migration-1"},
+            command_id="stable-confirm",
+        )
+        await ac.handle_agent_command_ack(
+            "gpu-host",
+            {"command_id": command_id, "status": "ok", "detail": "closed"},
+        )
+        await ac.send_agent_command(
+            "gpu-host",
+            "confirm_gpu_legacy_sources",
+            {"migration_id": "migration-1"},
+            command_id=command_id,
+        )
+        assert await ac.wait_for_agent_command_ack(
+            "gpu-host",
+            "confirm_gpu_legacy_sources",
+            command_id,
+            timeout_seconds=0.01,
+        ) == {
+            "command_id": command_id,
+            "server_id": "gpu-host",
+            "command": "confirm_gpu_legacy_sources",
+            "status": "ok",
+            "detail": "closed",
+        }
 
 
 class TestAgentLiveness:
@@ -172,6 +232,7 @@ def _server_row(
         self_registered=self_registered,
         created_at=created_at,
         attested_cert=attested_cert,
+        miner_hotkey="hk-miner",
     )
 
 
@@ -406,7 +467,8 @@ class TestReconcileServerContainers:
     @pytest.mark.asyncio
     async def test_young_instance_grace_period(self, mock_settings):
         """A just-dispatched deploy must not be purged before the container appears."""
-        purge, _ = await self._run([_instance_row(created_at=YOUNG)], [], [])
+        young = datetime.now(timezone.utc) - timedelta(seconds=10)
+        purge, _ = await self._run([_instance_row(created_at=young)], [], [])
         purge.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -454,9 +516,12 @@ class TestReconcileHostSlots:
         session = FakeSession(handlers)
         purge = AsyncMock()
         send = AsyncMock()
+        retire_server = AsyncMock(return_value=True)
+        session.retire_server = retire_server
         with (
             patch("api.database.get_session", _session_ctx(session)),
             patch("api.instance.util.purge_and_notify", purge),
+            patch("api.server.service.delete_server", retire_server),
             patch.object(ac, "send_agent_command", send),
         ):
             await ac._reconcile_host_slots("host-1", slots)
@@ -471,10 +536,11 @@ class TestReconcileHostSlots:
         session, purge, send = await self._run(handlers, [])
         purge.assert_awaited_once()
         assert purge.await_args.args[0] is instance
-        executed = dict(session.executed)
-        assert "text:update_launch_configs" in executed
-        assert executed["text:update_launch_configs"]["server_id"] == "td-dead"
-        assert executed["text:delete_servers"]["server_id"] == "td-dead"
+        session.retire_server.assert_awaited_once_with(
+            session,
+            "td-dead",
+            dead.miner_hotkey,
+        )
 
     @pytest.mark.asyncio
     async def test_reported_server_row_kept(self, mock_settings):
@@ -487,18 +553,17 @@ class TestReconcileHostSlots:
         )
         purge.assert_not_awaited()
         send.assert_not_awaited()
-        keys = [k for k, _ in session.executed]
-        assert "text:delete_servers" not in keys
+        session.retire_server.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_young_server_row_grace_period(self, mock_settings):
         """A TD still inside its boot+register window must not be reaped."""
-        booting = _server_row(server_id="td-young", host_id="host-1", created_at=YOUNG)
+        young = datetime.now(timezone.utc) - timedelta(seconds=10)
+        booting = _server_row(server_id="td-young", host_id="host-1", created_at=young)
         handlers = self._handlers([booting])
         session, purge, _ = await self._run(handlers, [])
         purge.assert_not_awaited()
-        keys = [k for k, _ in session.executed]
-        assert "text:delete_servers" not in keys
+        session.retire_server.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_orphan_td_for_deleted_chute_torn_down(self, mock_settings):
@@ -676,6 +741,63 @@ class TestAgentAuthenticate:
             assert await ss.agent_authenticate("sess-1", dict(AGENT_HEADERS)) is False
         assert clean_sio.emit.await_args.args[0] == "auth_failed"
         clean_sio.disconnect.assert_awaited_once_with("sess-1")
+
+
+class TestGpuTdSocketChallenge:
+    @pytest.mark.asyncio
+    async def test_gpu_challenge_binds_exact_reservation_lineage(
+        self,
+        clean_sio,
+    ):
+        server = SimpleNamespace(
+            server_id="gpu-server",
+            self_registered=True,
+            compute_type="gpu",
+            attested_cert="certificate",
+            attested_cert_pubkey_hash="a" * 64,
+            gpu_launch_reservation_id="gpu-reservation",
+            gpu_allocation_group_id="gpu-group",
+            gpu_allocation_group_generation=7,
+            gpu_process_incarnation="gpu-process",
+        )
+        reservation = SimpleNamespace(
+            reservation_id="gpu-reservation",
+            state="running",
+            server_id=server.server_id,
+            claims_sha256="b" * 64,
+            allocation_group_id="gpu-group",
+            allocation_group_generation=7,
+            process_incarnation="gpu-process",
+        )
+        result = MagicMock()
+        result.scalar_one_or_none.return_value = server
+        session = AsyncMock()
+        session.execute.return_value = result
+        session.get.return_value = reservation
+        redis = AsyncMock()
+        with (
+            patch.object(ss, "get_session", _session_ctx(session)),
+            patch.object(
+                ss,
+                "settings",
+                SimpleNamespace(redis_client=redis),
+            ),
+            patch(
+                "api.server.gpu_sessions._latest_attestation_attempt",
+                AsyncMock(return_value=SimpleNamespace()),
+            ),
+            patch("api.server.gpu_sessions._current_attestation"),
+        ):
+            assert await ss.td_challenge(
+                "sess-gpu",
+                {"server_id": server.server_id},
+            )
+        event, payload = clean_sio.emit.await_args.args[:2]
+        assert event == "td_challenge"
+        assert payload["gpu_launch_reservation_id"] == (reservation.reservation_id)
+        assert payload["gpu_claims_sha256"] == reservation.claims_sha256
+        assert payload["gpu_allocation_group_id"] == (reservation.allocation_group_id)
+        assert "launch_reservation_id" not in payload
 
 
 class TestAgentStatusEvent:

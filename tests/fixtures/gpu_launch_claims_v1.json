@@ -1,0 +1,60 @@
+{
+  "schema": "chutes.gpu-launch-reservation",
+  "version": 1,
+  "reservation_id": "fixture-reservation",
+  "token_id": "fixture-token",
+  "owner_hotkey": "fixture-owner",
+  "workload_owner": "fixture-owner",
+  "host_id": "fixture-host",
+  "host_key_generation": 2,
+  "host_boot_generation": 3,
+  "compute_type": "gpu",
+  "tee_type": "tdx",
+  "management_mode": "platform",
+  "allocation_group_id": "fixture-group",
+  "allocation_group_generation": 4,
+  "reservation_generation": 5,
+  "gpu_bdfs": ["0000:01:00.0"],
+  "gpu_uuids": ["GPU-00000000-0000-0000-0000-000000000001"],
+  "gpu_identifiers": ["b200"],
+  "gpu_attestation_certificate_sha256s": ["1111111111111111111111111111111111111111111111111111111111111111"],
+  "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+  "gpu_release_id": "fixture-release",
+  "gpu_profile_id": "b200-8gpu",
+  "profile_contract_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+  "measurement_name": "gpu-baremetal-tdx-1.11.0-b200-8gpu-platform",
+  "kernel_measurement_mode": "efi-image-as-is",
+  "qemu_binary_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+  "qemu_package_version": "1:10.2.1+ds-1ubuntu4",
+  "machine_type": "pc-q35-10.2",
+  "tdvf_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "image_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+  "image_version": "1.11.0",
+  "kernel_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+  "initrd_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+  "mode_cmdline_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+  "release_target_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "server_id": "fixture-server",
+  "process_incarnation": "fixture-process",
+  "chute_id": "fixture-chute",
+  "job_id": "fixture-job",
+  "container_repository": "fixture/image",
+  "container_manifest_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "descriptor_closure_sha256": "72fbde50aab8b457e56e34328bd9396948fa96f12915d27c7d29b0c69bd67e8c",
+  "allowed_manifests": [
+    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  ],
+  "allowed_blobs": [
+    "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  ],
+  "allowed_manifest_tags": [
+    "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sig"
+  ],
+  "manifest_tag_digests": {
+    "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sig": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "launch_nonce": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4=",
+  "issued_at": "2026-07-23T00:00:00Z",
+  "expires_at": "2026-07-23T00:15:00Z"
+}

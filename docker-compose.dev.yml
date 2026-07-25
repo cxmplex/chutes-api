@@ -64,6 +64,7 @@ services:
       - ./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro
       - ./config/launch_config_private_key.pem:/etc/config/launch_config_private_key.pem:ro
       - ../sek8s/.dev-cosign/cosign.pub:/etc/chutes/provenance/cosign.pub:ro
+      - ./config/l0-publisher-keys.json:/etc/chutes/l0-publisher/keys.json:ro
 
   socket:
     entrypoint: ["uv", "run", "uvicorn", "api.socket_server:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
@@ -124,6 +125,45 @@ services:
       # Same dev posture as the api service: SKIP_METAGRAPH_CHECK with the mTLS marker required
       # fails closed at settings init, so the scheduler would crash-loop without this.
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
+      LAUNCH_CONFIG_PRIVATE_KEY_PATH: /etc/config/launch_config_private_key.pem
+      DB_SSL: disable
+      CHUTES_VERSION: "0.6.10"
+      REGISTRY_EXTERNAL_HOST: "192.168.100.1:5000"
+      LAUNCH_CONFIG_BASE_URL: "http://66.30.131.197:8000"
+    restart: always
+    depends_on:
+      - postgres
+      - redis
+
+  gpu_platform_scheduler:
+    build:
+      context: .
+      target: api
+    entrypoint: ["uv", "run", "python", "-m", "api.gpu_scheduler"]
+    volumes:
+      - ./api:/app/api
+      - ./config/tee_measurements.yaml:/etc/config/tee_measurements.yaml:ro
+      - ./config/launch_config_private_key.pem:/etc/config/launch_config_private_key.pem:ro
+      - ../sek8s/.dev-cosign/cosign.pub:/etc/chutes/provenance/cosign.pub:ro
+      - ./config/l0-publisher-keys.json:/etc/chutes/l0-publisher/keys.json:ro
+    environment:
+      POSTGRESQL: postgresql+asyncpg://user:password@postgres:5432/chutes
+      PRIMARY_REDIS_HOST: redis
+      PRIMARY_REDIS_PORT: "6379"
+      REDIS_PASSWORD: redispassword
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_REGION: us-east-1
+      STORAGE_BUCKET: chutes
+      VALIDATOR_SS58: 5DCJTfVx3ReNyxW3SgQEKFgvXFuqnK3BNW1vMhTQK4jdZbV4
+      VALIDATOR_SEED: 971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20
+      SKIP_METAGRAPH_CHECK: "true"
+      ALLOW_DEBUG_MEASUREMENTS: "true"
+      REQUIRE_MTLS_CLIENT_VERIFY: "false"
+      TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
+      TRUSTED_PROVENANCE_PUBLIC_KEY_PATH: /etc/chutes/provenance/cosign.pub
+      TRUSTED_L0_PUBLISHER_KEYS_PATH: /etc/chutes/l0-publisher/keys.json
       LAUNCH_CONFIG_PRIVATE_KEY_PATH: /etc/config/launch_config_private_key.pem
       DB_SSL: disable
       CHUTES_VERSION: "0.6.10"

@@ -194,6 +194,7 @@ def _chute(
         node_selector["min_benchmark_score"] = min_benchmark_score
     return SimpleNamespace(
         chute_id=chute_id,
+        user_id="chute-owner",
         version=version,
         disabled=disabled,
         cords=[{"path": "/x"}] if cords else [],
@@ -257,6 +258,7 @@ def _instance(
 def _job(job_id="job-1", chute_id="chute-1", method="run", job_args=None):
     return SimpleNamespace(
         job_id=job_id,
+        user_id="job-owner",
         chute_id=chute_id,
         miner_hotkey=None,
         instance_id=None,
@@ -728,6 +730,16 @@ class TestDispatchDeploy:
         with (
             patch("api.cpu_scheduler.send_agent_command", send),
             patch("api.cpu_scheduler.create_launch_jwt_v2", return_value="jwt-token"),
+            patch(
+                "api.cpu_scheduler.ensure_default_volume_binding",
+                AsyncMock(
+                    return_value=(
+                        SimpleNamespace(binding_id="binding-1"),
+                        SimpleNamespace(volume_id="volume-1"),
+                        10_000,
+                    )
+                ),
+            ),
             patch("api.image.forge.get_image_digest", digest_mock),
         ):
             await cs._dispatch_deploy(session, chute, server, job=job)
@@ -788,6 +800,10 @@ class TestDispatchDeploy:
         added = session.added[0]
         assert isinstance(added, LaunchConfig)
         assert added.chute_id == chute.chute_id
+        assert added.user_id == chute.user_id
+        assert added.compute_type == "cpu"
+        assert added.default_volume_id == "volume-1"
+        assert added.storage_session_exchange_allowed is True
         assert added.server_id == "srv-1"
         assert added.env_type == "tee"
         assert added.miner_uid == 7
@@ -804,6 +820,7 @@ class TestDispatchDeploy:
         assert payload["job_ports"] == [{"port": 8888, "proto": "tcp"}]
         assert payload["disk_gb"] == 50
         assert session.added[0].job_id == job.job_id
+        assert session.added[0].user_id == job.user_id
 
 
 class TestLaunchOnHost:

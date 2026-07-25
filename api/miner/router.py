@@ -11,7 +11,7 @@ from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import APIRouter, Depends, Header, status, HTTPException, Response, Request
 from starlette.responses import StreamingResponse
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.future import select
 from sqlalchemy.orm import class_mapper, joinedload
 from typing import Any, Optional
@@ -143,7 +143,20 @@ async def list_nodes(
     _: User = Depends(get_current_user(purpose="miner", registered_to=settings.netuid)),
 ):
     return StreamingResponse(
-        _stream_items(Node, selector=select(Node).where(Node.miner_hotkey == hotkey))
+        _stream_items(
+            Node,
+            selector=select(Node)
+            .outerjoin(Server, Server.server_id == Node.server_id)
+            .where(
+                Node.miner_hotkey == hotkey,
+                Node.gpu_retired_at.is_(None),
+                or_(
+                    Server.server_id.is_(None),
+                    Server.gpu_management_mode.is_(None),
+                    Server.gpu_management_mode != "platform",
+                ),
+            ),
+        )
     )
 
 
@@ -160,7 +173,13 @@ async def list_servers(
     """
     query = (
         select(Server)
-        .where(Server.miner_hotkey == hotkey)
+        .where(
+            Server.miner_hotkey == hotkey,
+            or_(
+                Server.gpu_management_mode.is_(None),
+                Server.gpu_management_mode != "platform",
+            ),
+        )
         .options(joinedload(Server.nodes))
         .order_by(Server.created_at.desc())
     )
@@ -179,7 +198,13 @@ async def list_instances(
     return StreamingResponse(
         _stream_items(
             Instance,
-            selector=select(Instance).where(Instance.miner_hotkey == hotkey),
+            selector=select(Instance).where(
+                Instance.miner_hotkey == hotkey,
+                or_(
+                    Instance.gpu_management_mode.is_(None),
+                    Instance.gpu_management_mode != "platform",
+                ),
+            ),
             explicit_null=explicit_null,
         )
     )
@@ -190,7 +215,16 @@ async def list_available_jobs(
     _: User = Depends(get_current_user(purpose="miner", registered_to=settings.netuid)),
 ):
     return StreamingResponse(
-        _stream_items(Job, selector=select(Job).where(Job.instance_id.is_(None)))
+        _stream_items(
+            Job,
+            selector=select(Job).where(
+                Job.instance_id.is_(None),
+                or_(
+                    Job.gpu_management_mode.is_(None),
+                    Job.gpu_management_mode != "platform",
+                ),
+            ),
+        )
     )
 
 
@@ -223,6 +257,9 @@ async def release_job(
     job.miner_hotkey = None
     job.miner_coldkey = None
     job.instance_id = None
+    if job.gpu_management_mode == "miner":
+        job.gpu_management_mode = None
+        job.gpu_launch_reservation_id = None
     await db.commit()
     await db.refresh(job)
 
@@ -269,6 +306,7 @@ async def get_full_inventory(
     JOIN chutes ON instances.chute_id = chutes.chute_id
     JOIN metagraph_nodes on instances.miner_hotkey = metagraph_nodes.hotkey AND metagraph_nodes.netuid = 64
     WHERE nodes.miner_hotkey = '{hotkey}'
+      AND COALESCE(instances.gpu_management_mode, 'miner') <> 'platform'
     """
     )
     result = await session.execute(query, {"hotkey": hotkey})
@@ -308,6 +346,7 @@ async def list_active_instances(
               AND ich.ended_at IS NULL
         WHERE i.active = true
         AND i.verified = true
+        AND COALESCE(i.gpu_management_mode, 'miner') <> 'platform'
     """)
     result = await session.execute(query)
     return [

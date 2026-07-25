@@ -20,7 +20,13 @@ def evidence():
 
 
 def test_verifier_success(verifier, evidence):
-    assert verifier.attest(TEST_NONCE, evidence)
+    result = verifier.attest(TEST_NONCE, evidence)
+    assert result["schema"] == "chutes.nvidia-verification-result"
+    assert result["nonce"] == TEST_NONCE
+    assert len(result["devices"]) == len(evidence)
+    assert len(
+        {item["attestation_certificate_sha256"] for item in result["devices"]}
+    ) == len(evidence)
 
 
 def test_verifier_bad_nonce(verifier, evidence):

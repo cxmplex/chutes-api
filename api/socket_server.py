@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict
 from loguru import logger
 from fastapi import FastAPI, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 import api.database.orms  # noqa
 from api.config import settings
 from api.database import get_session
@@ -20,7 +20,9 @@ from api.server.schemas import Host, Server, ServerAttestation
 from api.host import service as host_service
 from api.host.schemas import (
     HostSocketAuthenticationV1,
+    HostSocketAuthenticationV2,
     HostKeyGeneration,
+    GpuLaunchReservation,
     TdSocketAuthenticationV1,
     TdSocketChallengeV1,
 )
@@ -40,6 +42,7 @@ fastapi_app = FastAPI()
 app = socketio.ASGIApp(sio, fastapi_app)
 sio.session_map = {}
 sio.reverse_map = {}
+sio.miner_expiry_tasks = {}
 # 1-click CPU TEE agent sessions: server_id -> session_id, and session_id -> {hotkey, server_id}.
 sio.agent_sessions = {}
 sio.agent_meta = {}
@@ -63,6 +66,17 @@ async def _validate_agent_session(session_id: str) -> bool:
                 and host.active_key_generation == generation
                 and key.revoked_at is None
             )
+            if valid and host.compute_type == "gpu":
+                from api.host.reservations import gpu_host_storage_readiness
+
+                readiness = await gpu_host_storage_readiness(session, host)
+                desired_capacity = (
+                    int(host.reported_capacity or 0) if readiness.trusted_schedulable else 0
+                )
+                if host.capacity != desired_capacity:
+                    host.capacity = desired_capacity
+                    await session.commit()
+                valid = readiness.control_channel_eligible
         elif attested_spki:
             server = await session.get(Server, meta["server_id"])
             latest = (
@@ -141,6 +155,9 @@ async def disconnect(session_id):
     """
     if (hotkey := sio.session_map.pop(session_id, None)) is not None:
         sio.reverse_map.pop(hotkey, None)
+        expiry_task = sio.miner_expiry_tasks.pop(session_id, None)
+        if expiry_task is not None and expiry_task is not asyncio.current_task():
+            expiry_task.cancel()
         logger.info(f"Disconnected authenticated miner: {hotkey}")
     if (meta := sio.agent_meta.pop(session_id, None)) is not None:
         server_id = meta["server_id"]
@@ -148,6 +165,17 @@ async def disconnect(session_id):
             sio.agent_sessions.pop(server_id, None)
         await mark_agent_offline(server_id)
         logger.info(f"Disconnected 1-click agent: server_id={server_id}")
+
+
+async def _expire_miner_session(session_id: str, expires_at: int) -> None:
+    delay = max(
+        0.0,
+        expires_at - datetime.now(timezone.utc).timestamp(),
+    )
+    await asyncio.sleep(delay)
+    if session_id in sio.session_map:
+        logger.info(f"Disconnecting expired attested miner session: {session_id}")
+        await sio.disconnect(session_id)
 
 
 @sio.event
@@ -165,11 +193,24 @@ async def authenticate(session_id: str, headers: Dict[str, str]) -> bool:
             hotkey=headers.get(cst.HOTKEY_HEADER),
             signature=headers.get(cst.SIGNATURE_HEADER),
             nonce=headers.get(cst.NONCE_HEADER),
+            authorization=None,
+            api_key=None,
+            sig_version=headers.get(cst.SIG_VERSION_HEADER),
+            attested_session=headers.get("X-Chutes-Attested-Session"),
         )
         hotkey = headers.get(cst.HOTKEY_HEADER)
         logger.info(f"Successfully authenticated miner {hotkey=}, {session_id=}")
         sio.session_map[session_id] = hotkey
         sio.reverse_map[hotkey] = session_id
+        expires_at = getattr(
+            request.state,
+            "gpu_runtime_session_expires_at",
+            None,
+        )
+        if isinstance(expires_at, int):
+            sio.miner_expiry_tasks[session_id] = asyncio.create_task(
+                _expire_miner_session(session_id, expires_at)
+            )
         await sio.emit("auth_success", {"message": "Authenticated"}, to=session_id)
         return True
     except HTTPException as e:
@@ -356,12 +397,52 @@ async def td_challenge(session_id: str, data: Dict[str, object]) -> bool:
                     select(Server).where(
                         Server.server_id == server_id,
                         Server.self_registered.is_(True),
-                        Server.launch_reservation_id.is_not(None),
+                        or_(
+                            Server.launch_reservation_id.is_not(None),
+                            Server.gpu_launch_reservation_id.is_not(None),
+                        ),
                     )
                 )
             ).scalar_one_or_none()
-        if server is None or not server.attested_cert or not server.attested_cert_pubkey_hash:
-            raise ValueError("server has no current reservation-attested identity")
+            if server is None or not server.attested_cert or not server.attested_cert_pubkey_hash:
+                raise ValueError("server has no current reservation-attested identity")
+            reservation_identity = {}
+            if server.compute_type == "gpu":
+                from api.server.gpu_sessions import (
+                    _current_attestation,
+                    _latest_attestation_attempt,
+                )
+
+                reservation = await session.get(
+                    GpuLaunchReservation,
+                    server.gpu_launch_reservation_id,
+                )
+                _current_attestation(
+                    server,
+                    await _latest_attestation_attempt(session, server.server_id),
+                )
+                if (
+                    reservation is None
+                    or reservation.state != "running"
+                    or reservation.server_id != server.server_id
+                    or reservation.reservation_id != server.gpu_launch_reservation_id
+                    or reservation.allocation_group_id != server.gpu_allocation_group_id
+                    or reservation.allocation_group_generation
+                    != server.gpu_allocation_group_generation
+                    or reservation.process_incarnation != server.gpu_process_incarnation
+                ):
+                    raise ValueError("GPU socket reservation lineage is not current")
+                reservation_identity = {
+                    "gpu_launch_reservation_id": reservation.reservation_id,
+                    "gpu_claims_sha256": reservation.claims_sha256,
+                    "gpu_allocation_group_id": reservation.allocation_group_id,
+                    "gpu_allocation_group_generation": (reservation.allocation_group_generation),
+                    "gpu_process_incarnation": reservation.process_incarnation,
+                }
+            else:
+                reservation_identity = {
+                    "launch_reservation_id": server.launch_reservation_id,
+                }
         now = datetime.now(timezone.utc)
         challenge = TdSocketChallengeV1(
             challenge_id=secrets.token_hex(32),
@@ -370,13 +451,18 @@ async def td_challenge(session_id: str, data: Dict[str, object]) -> bool:
             attested_spki_sha256=server.attested_cert_pubkey_hash.lower(),
             challenge=secrets.token_urlsafe(32),
             expires_at=now + timedelta(seconds=120),
+            **reservation_identity,
         )
         await settings.redis_client.setex(
             f"td:socket-challenge:{challenge.challenge_id}",
             120,
             challenge.model_dump_json(),
         )
-        await sio.emit("td_challenge", challenge.model_dump(mode="json"), to=session_id)
+        await sio.emit(
+            "td_challenge",
+            challenge.model_dump(mode="json", exclude_none=True),
+            to=session_id,
+        )
         return True
     except Exception as exc:
         logger.warning(f"TD socket challenge rejected: {exc}")
@@ -419,13 +505,48 @@ async def td_authenticate(session_id: str, data: Dict[str, object]) -> bool:
                     select(Server).where(
                         Server.server_id == authentication.server_id,
                         Server.self_registered.is_(True),
-                        Server.launch_reservation_id.is_not(None),
+                        or_(
+                            Server.launch_reservation_id.is_not(None),
+                            Server.gpu_launch_reservation_id.is_not(None),
+                        ),
                         Server.attested_cert_pubkey_hash == authentication.attested_spki_sha256,
                     )
                 )
             ).scalar_one_or_none()
-        if server is None or not server.attested_cert:
-            raise ValueError("TD attested identity is no longer current")
+            if server is None or not server.attested_cert:
+                raise ValueError("TD attested identity is no longer current")
+            reservation_fields = (
+                "launch_reservation_id",
+                "gpu_launch_reservation_id",
+                "gpu_claims_sha256",
+                "gpu_allocation_group_id",
+                "gpu_allocation_group_generation",
+                "gpu_process_incarnation",
+            )
+            if any(
+                getattr(authentication, field) != getattr(challenge, field)
+                for field in reservation_fields
+            ):
+                raise ValueError("TD socket authentication changed reservation lineage")
+            if server.compute_type == "gpu":
+                reservation = await session.get(
+                    GpuLaunchReservation,
+                    server.gpu_launch_reservation_id,
+                )
+                if (
+                    reservation is None
+                    or reservation.state != "running"
+                    or reservation.server_id != server.server_id
+                    or reservation.reservation_id != authentication.gpu_launch_reservation_id
+                    or reservation.claims_sha256 != authentication.gpu_claims_sha256
+                    or reservation.allocation_group_id != authentication.gpu_allocation_group_id
+                    or reservation.allocation_group_generation
+                    != authentication.gpu_allocation_group_generation
+                    or reservation.process_incarnation != authentication.gpu_process_incarnation
+                ):
+                    raise ValueError("GPU socket authentication reservation is stale")
+            elif server.launch_reservation_id != authentication.launch_reservation_id:
+                raise ValueError("TD socket launch reservation changed")
         if not _verify_attested_socket_signature_b64(
             server.attested_cert,
             authentication.signing_bytes(),
@@ -488,7 +609,11 @@ async def host_authenticate(session_id: str, data: Dict[str, object]) -> bool:
     """Authenticate an L0 control channel with its persistent Ed25519 host key."""
 
     try:
-        authentication = HostSocketAuthenticationV1.model_validate(data)
+        authentication = (
+            HostSocketAuthenticationV2.model_validate(data)
+            if isinstance(data, dict) and data.get("version") == 2
+            else HostSocketAuthenticationV1.model_validate(data)
+        )
         async with get_session() as session:
             host = await host_service.verify_host_socket_authentication(
                 session, session_id, authentication

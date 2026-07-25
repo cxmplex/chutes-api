@@ -9,6 +9,8 @@ Endpoint groups + auth:
   - per-volume key release: attested mTLS cert + a fresh quote bound to a single-use storage_key nonce.
 """
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +25,7 @@ from api.permissions import Permissioning
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.storage import service
+from api.storage import launch_sessions
 from api.storage.schemas import (
     AnnounceModelHoldingsRequest,
     AnnounceModelHoldingsResponse,
@@ -43,6 +46,8 @@ from api.storage.schemas import (
     GrantResponse,
     GrantVerifyRequest,
     GrantVerifyResponse,
+    DefaultGrantRequest,
+    DefaultVolumeDiscoveryResponse,
     KeyNonceResponse,
     InventoryPageRequest,
     InventoryPageResponse,
@@ -51,6 +56,8 @@ from api.storage.schemas import (
     LegacyReplicaAdoptionRequest,
     ListObjectsRequest,
     ListObjectsResponse,
+    LaunchStorageExchangeRequest,
+    LaunchStorageExchangeResponse,
     LocateObjectRequest,
     LocateObjectResponse,
     ModelAccessRequest,
@@ -399,7 +406,16 @@ async def issue_launch_model_access(
         body.revision,
         body.requested_revision,
     )
-    peer = await service.model_ensure_target(db, body.repo_id, body.revision)
+    requester_server_id = requester.get("requester_server_id")
+    requester_server = (
+        await db.get(Server, requester_server_id) if requester_server_id is not None else None
+    )
+    peer = await service.model_ensure_target(
+        db,
+        body.repo_id,
+        body.revision,
+        preferred_host_id=requester_server.host_id if requester_server is not None else None,
+    )
     if peer is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -627,6 +643,269 @@ async def delete_volume(
     )
 
 
+@router.delete(
+    "/default-volume/chutes/{chute_id}",
+    response_model=DeleteVolumeResponse,
+)
+async def delete_default_volume(
+    chute_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(require_v2=True)),
+):
+    """Explicitly retire this owner's default volume for a chute without accepting a volume id."""
+    return DeleteVolumeResponse(
+        **(
+            await service.delete_default_volume_for_chute(
+                db,
+                current_user.user_id,
+                chute_id,
+            )
+        )
+    )
+
+
+# --- launch-bound default volume ---------------------------------------------------------------
+
+
+@router.post(
+    "/default-volume/session/exchange",
+    response_model=LaunchStorageExchangeResponse,
+)
+async def exchange_default_volume_session(
+    body: LaunchStorageExchangeRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    token = authorization.strip().split(" ")[-1]
+    context, session = await launch_sessions.exchange_launch_token(
+        db,
+        body.config_id,
+        token,
+        request,
+    )
+    return {
+        "launch_context": context.model_dump(),
+        "storage_session": session.model_dump(),
+    }
+
+
+@router.post(
+    "/default-volume/session/refresh",
+    response_model=LaunchStorageExchangeResponse,
+)
+async def refresh_default_volume_session(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    context, session = await launch_sessions.refresh_launch_storage_session(
+        db,
+        authorization,
+        request,
+    )
+    return {
+        "launch_context": context.model_dump(),
+        "storage_session": session.model_dump(),
+    }
+
+
+@router.get(
+    "/default-volume",
+    response_model=DefaultVolumeDiscoveryResponse,
+)
+async def discover_default_volume(
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    authorized = await launch_sessions.authorize_default_volume(
+        db,
+        authorization,
+        request,
+        "list",
+    )
+    aggregate_quota = await service.storage_aggregate_quota(
+        db,
+        authorized.config.user_id,
+    )
+    return DefaultVolumeDiscoveryResponse(
+        launch_context=authorized.context,
+        volume=VolumeResponse(**service._volume_response(authorized.volume, aggregate_quota)),
+    )
+
+
+@router.post("/default-volume/objects/placement", response_model=PlacementResponse)
+async def plan_default_placement(
+    body: PlacementRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, "put")
+    obj, peers = await service.plan_object_placement(
+        db,
+        authorized.volume,
+        body.request_id,
+        body.key,
+        body.size_bytes,
+    )
+    return PlacementResponse(
+        object_id=obj.object_id,
+        expected_predecessor_id=obj.expected_predecessor_id,
+        lifecycle_state=obj.lifecycle_state,
+        salt=obj.salt,
+        replicas=peers,
+        replication_factor=authorized.volume.replication_factor,
+        replicas_available=len(peers),
+        under_replicated=len(peers) < authorized.volume.replication_factor,
+        durability_state=obj.durability_state,
+    )
+
+
+@router.post("/default-volume/objects/commit", response_model=CommitObjectResponse)
+async def commit_default_object(
+    body: CommitObjectRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, "put")
+    obj, replicas_confirmed = await service.commit_object(
+        db,
+        authorized.volume,
+        body.object_id,
+        body.key,
+        salt=body.salt,
+    )
+    return CommitObjectResponse(
+        object_id=obj.object_id,
+        lifecycle_state=obj.lifecycle_state,
+        size_bytes=obj.size_bytes,
+        used_bytes=authorized.volume.used_bytes,
+        quota_bytes=authorized.volume.quota_bytes,
+        replicas_confirmed=replicas_confirmed,
+        replication_factor=authorized.volume.replication_factor,
+        under_replicated=replicas_confirmed < authorized.volume.replication_factor,
+        durability_state=obj.durability_state,
+    )
+
+
+@router.post("/default-volume/objects/locate", response_model=LocateObjectResponse)
+async def locate_default_object(
+    body: LocateObjectRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, "get")
+    obj, peers, replicas_confirmed = await service.locate_object(
+        db,
+        authorized.volume,
+        body.key,
+    )
+    return LocateObjectResponse(
+        object_id=obj.object_id,
+        lifecycle_state=obj.lifecycle_state,
+        key=obj.object_key,
+        size_bytes=obj.size_bytes,
+        sha256=obj.sha256,
+        salt=obj.salt,
+        plaintext_sha256=obj.plaintext_sha256,
+        peers=peers,
+        replicas_confirmed=replicas_confirmed,
+        replication_factor=authorized.volume.replication_factor,
+        under_replicated=replicas_confirmed < authorized.volume.replication_factor,
+        durability_state=obj.durability_state,
+    )
+
+
+@router.post("/default-volume/objects/list", response_model=ListObjectsResponse)
+async def list_default_objects(
+    body: ListObjectsRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, "list")
+    objects = await service.list_objects(
+        db,
+        authorized.volume,
+        body.prefix,
+        body.limit,
+        after=body.after,
+    )
+    return ListObjectsResponse(
+        objects=[
+            ObjectInfo(
+                object_id=obj.object_id,
+                lifecycle_state=obj.lifecycle_state,
+                key=obj.object_key,
+                size_bytes=obj.size_bytes,
+                sha256=obj.sha256,
+                created_at=obj.created_at.isoformat() if obj.created_at else "",
+                replicas_confirmed=obj.durable_replica_count,
+                replication_factor=authorized.volume.replication_factor,
+                durability_state=obj.durability_state,
+            )
+            for obj in objects
+        ],
+        next_cursor=objects[-1].object_key if len(objects) == body.limit else None,
+    )
+
+
+@router.post("/default-volume/objects/delete", response_model=DeleteObjectResponse)
+async def delete_default_object(
+    body: DeleteObjectRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    authorized = await launch_sessions.authorize_default_volume(
+        db, authorization, request, "delete"
+    )
+    obj, used, erase_tasks_pending = await service.delete_object(
+        db,
+        authorized.volume,
+        body.key,
+    )
+    return DeleteObjectResponse(
+        deleted=True,
+        object_id=obj.object_id if obj is not None else None,
+        used_bytes=used,
+        erase_tasks_pending=erase_tasks_pending,
+        purge_pending=erase_tasks_pending > 0 or obj is not None,
+    )
+
+
+@router.post("/default-volume/grant", response_model=GrantResponse)
+async def issue_default_volume_grant(
+    body: DefaultGrantRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db_session),
+    authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
+):
+    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, body.op)
+    from api.storage.service import GRANT_TTL_SECONDS
+
+    remaining_access_seconds = max(
+        1,
+        int((authorized.session.access_expires_at - datetime.now(timezone.utc)).total_seconds()),
+    )
+    effective_ttl = min(GRANT_TTL_SECONDS, remaining_access_seconds)
+    grant = await service.issue_grant(
+        db,
+        authorized.config.user_id,
+        authorized.volume.volume_id,
+        [body.op],
+        launch_session_id=authorized.session.session_id,
+        launch_session_generation=authorized.session.generation,
+        ttl_seconds=effective_ttl,
+    )
+
+    return GrantResponse(grant=grant, expires_in=effective_ttl)
+
+
 # --- object metadata: placement / commit / locate / list / delete (owner) ----------------------
 
 
@@ -778,10 +1057,11 @@ async def issue_grant(
 @router.post("/grant/verify", response_model=GrantVerifyResponse)
 async def verify_grant(
     body: GrantVerifyRequest,
+    db: AsyncSession = Depends(get_db_session),
     _=Depends(require_attested_caller),
 ):
     """A storage TD verifies a presented grant authorizes an object op on a volume."""
-    payload = await service.verify_grant(body.grant, body.volume_id, body.op)
+    payload = await service.verify_grant(body.grant, body.volume_id, body.op, db=db)
     if payload is None:
         return GrantVerifyResponse(ok=False)
     return GrantVerifyResponse(

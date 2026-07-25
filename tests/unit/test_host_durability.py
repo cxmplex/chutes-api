@@ -20,6 +20,7 @@ from api.host.schemas import (
     HostSocketAuthenticationV1,
     PcsMailboxAckV1,
 )
+from cross_repo_tests import repository_root
 from api.server.schemas import Host
 
 
@@ -222,7 +223,9 @@ class _Db:
             return self.key
         return None
 
-    async def execute(self, _query):
+    async def execute(self, _query, _params=None):
+        if "pg_advisory_xact_lock" in str(_query):
+            return _Result(None)
         return _Result(self.execute_values.pop(0))
 
     async def commit(self):
@@ -230,10 +233,7 @@ class _Db:
 
 
 def _load_node_agent_modules(monkeypatch):
-    workspace = Path(__file__).resolve().parents[3]
-    sek8s = workspace / "sek8s" / "src"
-    if not sek8s.is_dir():
-        pytest.skip("sibling sek8s repository is required")
+    sek8s = repository_root("sek8s", start=Path(__file__)) / "src"
     for package in ("sek8s-common", "chutes-agent", "chutes-node-agent"):
         monkeypatch.syspath_prepend(str(sek8s / package))
     identity_module = importlib.import_module("chutes_node_agent.identity")

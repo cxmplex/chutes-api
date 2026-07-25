@@ -24,7 +24,7 @@ from sqlalchemy import and_, delete, exists, func, or_, select, text, tuple_, up
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, lazyload
 
 from api.config import (
     measurement_config_fingerprint,
@@ -32,9 +32,12 @@ from api.config import (
     settings,
 )
 from api.chute.schemas import Chute
+from api.host.schemas import GpuLaunchReservation
 from api.instance.schemas import Instance, LaunchConfig
 from api.server.quote import build_runtime_quote
 from api.server.schemas import (
+    ChuteFSLaunchSession,
+    DefaultChuteFSVolumeBinding,
     ContentHolding,
     ReplicaPlacement,
     Server,
@@ -571,7 +574,7 @@ async def authorize_launch_model_request(
     expected_server_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve a signed launch token to one verified instance and its declared immutable model."""
-    from api.instance.util import _decode_chutes_jwt
+    from api.instance.util import _decode_chutes_jwt, load_launch_config_from_jwt
 
     token = (authorization or "").strip().split(" ")[-1]
     try:
@@ -590,9 +593,18 @@ async def authorize_launch_model_request(
             detail="Launch token is missing its config or chute binding.",
         )
 
-    launch_config = (
-        await db.execute(select(LaunchConfig).where(LaunchConfig.config_id == config_id))
-    ).scalar_one_or_none()
+    try:
+        launch_config = await load_launch_config_from_jwt(
+            db,
+            config_id,
+            token,
+            allow_retrieved=True,
+        )
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Launch token identity no longer matches its config.",
+        ) from exc
     instance = (
         await db.execute(select(Instance).where(Instance.config_id == config_id))
     ).scalar_one_or_none()
@@ -606,6 +618,10 @@ async def authorize_launch_model_request(
         or launch_config.failed_at is not None
         or launch_config.verified_at is None
         or not instance.verified
+        or (
+            getattr(instance, "activated_at", None) is not None
+            and not getattr(instance, "active", False)
+        )
         or launch_config.chute_id != token_chute_id
         or instance.chute_id != token_chute_id
         or payload.get("env_type") != launch_config.env_type
@@ -616,14 +632,79 @@ async def authorize_launch_model_request(
         )
 
     if expected_server_id is None:
-        # CPU-TEE instances carry a registered attested server identity and must use the mTLS route.
         if instance.server_id is not None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Attested CPU instances must authorize model access over mTLS.",
+            if not (
+                launch_config.compute_type == "gpu"
+                and launch_config.gpu_management_mode == "miner"
+                and launch_config.server_id == instance.server_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Platform-attested instances must authorize model access over mTLS.",
+                )
+            from api.server.gpu_sessions import (
+                _current_attestation,
+                _latest_attestation_attempt,
+            )
+            from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
+
+            requester_server = await db.get(Server, instance.server_id)
+            requester_reservation = (
+                await db.get(
+                    GpuLaunchReservation,
+                    launch_config.gpu_launch_reservation_id,
+                )
+                if launch_config.gpu_launch_reservation_id
+                else None
+            )
+            requester_group = (
+                await db.get(
+                    GpuAllocationGroup,
+                    requester_reservation.allocation_group_id,
+                )
+                if requester_reservation is not None
+                else None
+            )
+            latest = (
+                await _latest_attestation_attempt(db, instance.server_id)
+                if requester_server is not None
+                else None
+            )
+            if (
+                requester_server is None
+                or requester_server.gpu_management_mode != "miner"
+                or requester_server.gpu_retired_at is not None
+                or requester_server.gpu_launch_reservation_id
+                != launch_config.gpu_launch_reservation_id
+                or requester_server.gpu_runtime_session_expires_at is None
+                or requester_server.gpu_runtime_session_expires_at <= datetime.now(timezone.utc)
+                or requester_reservation is None
+                or requester_group is None
+                or requester_reservation.state != "running"
+                or requester_group.state != "running"
+                or requester_reservation.management_mode != "miner"
+                or requester_reservation.server_id != requester_server.server_id
+                or requester_reservation.chute_id is not None
+                or requester_reservation.job_id is not None
+                or requester_group.reservation_id != requester_reservation.reservation_id
+                or requester_group.generation != requester_reservation.allocation_group_generation
+                or requester_group.process_incarnation != requester_reservation.process_incarnation
+                or instance.gpu_allocation_group_id != requester_reservation.allocation_group_id
+                or instance.gpu_allocation_group_generation
+                != requester_reservation.allocation_group_generation
+                or instance.gpu_process_incarnation != requester_reservation.process_incarnation
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Miner GPU launch server session is no longer current.",
+                )
+            _current_attestation(
+                requester_server,
+                latest,
+                expected_id=requester_server.gpu_runtime_session_attestation_id,
             )
         requester_kind = "launch_instance"
-        requester_server_id = None
+        requester_server_id = instance.server_id
         requester_cert_hash = None
     else:
         if instance.server_id != expected_server_id:
@@ -979,10 +1060,10 @@ async def announce_model_holdings(
 
 
 async def local_storage_peer(db: AsyncSession, host_id: str) -> Optional[StoragePeer]:
-    """The attested storage TD on a given L0 host (for a chute to reach its same-host storage node).
+    """The attested storage TD routed under a cloneable logical L0 host identity.
 
-    Same-host chute<->storage traffic is L2-isolated, so it traverses the host DNAT at
-    external_host:<storage port> exactly like a cross-host peer -- this just resolves which one is local.
+    This is a logical routing preference only and is not trusted physical co-location evidence.
+    Traffic still traverses external_host:<storage port> exactly like any other peer.
     """
     servers = list(
         (
@@ -1126,23 +1207,14 @@ async def storage_aggregate_quota(db: AsyncSession, user_id: str) -> int:
     return _effective_storage_quotas(user)[1]
 
 
-def _volume_response(volume: StorageVolume, aggregate_quota_bytes: int) -> Dict:
-    return {
-        "volume_id": volume.volume_id,
-        "name": volume.name,
-        "replication_factor": volume.replication_factor,
-        "quota_bytes": volume.quota_bytes,
-        "aggregate_quota_bytes": aggregate_quota_bytes,
-        "used_bytes": volume.used_bytes,
-        "created_at": volume.created_at.isoformat() if volume.created_at else "",
-    }
-
-
-async def create_volume(
-    db: AsyncSession, user_id: str, name: str, replication_factor: int
+async def _create_volume_for_locked_user(
+    db: AsyncSession,
+    user: User,
+    name: str,
+    replication_factor: int,
 ) -> tuple[StorageVolume, int]:
-    """Create a confidential volume and generate + store its (encrypted) application-layer key."""
-    user = await _lock_storage_user(db, user_id)
+    """Create a volume/key while the caller holds the owner's user-row lock."""
+    user_id = user.user_id
     per_volume_quota, aggregate_quota = _effective_storage_quotas(user)
     active_count = (
         await db.execute(
@@ -1180,19 +1252,143 @@ async def create_volume(
         quota_bytes=per_volume_quota,
         used_bytes=0,
     )
-    db.add(volume)
     try:
         async with db.begin_nested():
+            db.add(volume)
+            await db.flush()
+            key_b64 = base64.b64encode(secrets.token_bytes(32)).decode()
+            db.add(
+                StorageVolumeKey(
+                    volume_id=volume.volume_id,
+                    encrypted_key=encrypt_passphrase(key_b64),
+                )
+            )
             await db.flush()
     except IntegrityError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Volume '{name}' already exists.",
         ) from exc
-    # Per-volume application-layer key (32 bytes), encrypted at rest with the same Fernet primitive
-    # as LUKS passphrases; released only to attested storage TDs that hold a replica of this volume.
-    key_b64 = base64.b64encode(secrets.token_bytes(32)).decode()
-    db.add(StorageVolumeKey(volume_id=volume.volume_id, encrypted_key=encrypt_passphrase(key_b64)))
+    return volume, aggregate_quota
+
+
+async def ensure_default_volume_binding(
+    db: AsyncSession,
+    user_id: str,
+    chute_id: str,
+) -> tuple[DefaultChuteFSVolumeBinding, StorageVolume, int]:
+    """Return or transactionally create the one active default volume for owner/chute.
+
+    The user-row lock serializes quota accounting and concurrent first launches. A retired binding
+    blocks replacement until physical erase metadata is terminal and the old key is shredded.
+    """
+    user = await _lock_storage_user(db, user_id)
+    binding = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.user_id == user_id,
+                DefaultChuteFSVolumeBinding.chute_id == chute_id,
+                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if binding is not None:
+        volume = (
+            await db.execute(
+                select(StorageVolume)
+                .where(StorageVolume.volume_id == binding.volume_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        key_row = (
+            await db.get(StorageVolumeKey, binding.volume_id, with_for_update=True)
+            if volume is not None
+            else None
+        )
+        if volume is None or key_row is None or volume.user_id != user_id or volume.deleted:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The active default ChuteFS binding is inconsistent or deleting.",
+            )
+        return binding, volume, _effective_storage_quotas(user)[1]
+
+    retired = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.user_id == user_id,
+                DefaultChuteFSVolumeBinding.chute_id == chute_id,
+                DefaultChuteFSVolumeBinding.lifecycle_state == "retired",
+            )
+            .order_by(
+                DefaultChuteFSVolumeBinding.retired_at.desc(),
+                DefaultChuteFSVolumeBinding.binding_id.desc(),
+            )
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if retired is not None:
+        old_volume = (
+            await db.execute(
+                select(StorageVolume)
+                .where(StorageVolume.volume_id == retired.volume_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if old_volume is None or old_volume.purged_at is None or old_volume.key_shredded_at is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The prior default ChuteFS volume is still completing physical erase and "
+                    "key shredding."
+                ),
+            )
+
+    binding_id = str(uuid4())
+    volume, aggregate_quota = await _create_volume_for_locked_user(
+        db,
+        user,
+        f"default-{chute_id}-{binding_id[:12]}",
+        3,
+    )
+    binding = DefaultChuteFSVolumeBinding(
+        binding_id=binding_id,
+        user_id=user_id,
+        chute_id=chute_id,
+        volume_id=volume.volume_id,
+        lifecycle_state="active",
+    )
+    db.add(binding)
+    await db.flush()
+    logger.success(
+        f"Bound default ChuteFS volume {volume.volume_id} to owner {user_id}, chute {chute_id}"
+    )
+    return binding, volume, aggregate_quota
+
+
+def _volume_response(volume: StorageVolume, aggregate_quota_bytes: int) -> Dict:
+    return {
+        "volume_id": volume.volume_id,
+        "name": volume.name,
+        "replication_factor": volume.replication_factor,
+        "quota_bytes": volume.quota_bytes,
+        "aggregate_quota_bytes": aggregate_quota_bytes,
+        "used_bytes": volume.used_bytes,
+        "created_at": volume.created_at.isoformat() if volume.created_at else "",
+    }
+
+
+async def create_volume(
+    db: AsyncSession, user_id: str, name: str, replication_factor: int
+) -> tuple[StorageVolume, int]:
+    """Create a confidential volume and generate + store its (encrypted) application-layer key."""
+    user = await _lock_storage_user(db, user_id)
+    volume, aggregate_quota = await _create_volume_for_locked_user(
+        db, user, name, replication_factor
+    )
     await db.commit()
     await db.refresh(volume)
     logger.success(f"Created ChuteFS volume {volume.volume_id} ({name}) for user {user_id}")
@@ -1421,6 +1617,20 @@ async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
         volume.delete_requested_at = datetime.now(timezone.utc)
         volume.used_bytes = 0
         await db.flush()
+    binding = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.volume_id == volume_id,
+                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if binding is not None:
+        binding.lifecycle_state = "retired"
+        binding.retired_at = datetime.now(timezone.utc)
+        await db.flush()
     await _retire_deleted_volume_batch(db, volume, limit=settings.storage_reconcile_batch_size)
     pending = (
         await db.execute(
@@ -1440,6 +1650,224 @@ async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
         "erase_tasks_pending": int(pending),
         "key_shredded": volume.key_shredded_at is not None,
         "purge_pending": volume.purged_at is None,
+    }
+
+
+async def delete_default_volume_for_chute(
+    db: AsyncSession,
+    user_id: str,
+    chute_id: str,
+) -> Dict:
+    """Explicit owner lifecycle operation that never accepts an arbitrary volume id."""
+    await _lock_storage_user(db, user_id)
+    binding = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.user_id == user_id,
+                DefaultChuteFSVolumeBinding.chute_id == chute_id,
+            )
+            .order_by(
+                (DefaultChuteFSVolumeBinding.lifecycle_state == "active").desc(),
+                DefaultChuteFSVolumeBinding.created_at.desc(),
+                DefaultChuteFSVolumeBinding.binding_id.desc(),
+            )
+            .limit(1)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if binding is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Default ChuteFS volume not found for this owner and chute.",
+        )
+    return await delete_volume(db, binding.volume_id, user_id)
+
+
+async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[str, Any]:
+    """Stage every user volume for secure erase, then remove storage identity only when safe."""
+    await _lock_storage_user(db, user_id)
+    volumes = list(
+        (
+            await db.execute(
+                select(StorageVolume)
+                .where(StorageVolume.user_id == user_id)
+                .order_by(StorageVolume.volume_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    configs = list(
+        (
+            await db.execute(
+                select(LaunchConfig.config_id)
+                .where(LaunchConfig.user_id == user_id)
+                .order_by(LaunchConfig.config_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from api.storage.launch_sessions import lock_launch_storage_lifecycle
+
+    for config_id in configs:
+        await lock_launch_storage_lifecycle(db, config_id)
+
+    locked_configs = list(
+        (
+            await db.execute(
+                select(LaunchConfig)
+                .where(LaunchConfig.user_id == user_id)
+                .order_by(LaunchConfig.config_id)
+                .options(lazyload("*"))
+                .with_for_update()
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
+    locked_instances = {
+        instance.config_id: instance
+        for instance in (
+            (
+                await db.execute(
+                    select(Instance)
+                    .where(Instance.config_id.in_(configs))
+                    .order_by(Instance.config_id)
+                    .options(lazyload("*"))
+                    .with_for_update()
+                )
+            )
+            .unique()
+            .scalars()
+            .all()
+            if configs
+            else []
+        )
+    }
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(ChuteFSLaunchSession)
+        .where(
+            ChuteFSLaunchSession.user_id == user_id,
+            ChuteFSLaunchSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    reservation_ids = sorted(
+        {
+            config.gpu_launch_reservation_id
+            for config in locked_configs
+            if config.gpu_launch_reservation_id
+        }
+    )
+    locked_reservations = {
+        reservation.reservation_id: reservation
+        for reservation in (
+            (
+                await db.execute(
+                    select(GpuLaunchReservation)
+                    .where(GpuLaunchReservation.reservation_id.in_(reservation_ids))
+                    .order_by(GpuLaunchReservation.reservation_id)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+            if reservation_ids
+            else []
+        )
+    }
+    active_reservation_states = {
+        "reserved",
+        "claimed",
+        "launching",
+        "running",
+        "resetting",
+        "quarantined",
+    }
+    active_launches: list[str] = []
+    for config in locked_configs:
+        instance = locked_instances.get(config.config_id)
+        reservation = locked_reservations.get(config.gpu_launch_reservation_id)
+        instance_active = instance is not None and (
+            bool(instance.active) or bool(instance.verified)
+        )
+        reservation_active = (
+            reservation is not None and reservation.state in active_reservation_states
+        )
+        pending_unverified = (
+            config.failed_at is None and config.completed_at is None and config.verified_at is None
+        )
+        if instance_active or reservation_active or pending_unverified:
+            active_launches.append(config.config_id)
+        elif config.failed_at is None and config.completed_at is None:
+            config.completed_at = now
+
+    for volume in volumes:
+        if not volume.deleted:
+            volume.deleted = True
+            volume.delete_requested_at = now
+            volume.used_bytes = 0
+        binding = (
+            await db.execute(
+                select(DefaultChuteFSVolumeBinding)
+                .where(
+                    DefaultChuteFSVolumeBinding.volume_id == volume.volume_id,
+                    DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if binding is not None:
+            binding.lifecycle_state = "retired"
+            binding.retired_at = now
+        await db.flush()
+        await _retire_deleted_volume_batch(
+            db,
+            volume,
+            limit=settings.storage_reconcile_batch_size,
+        )
+
+    purge_pending = [
+        volume.volume_id
+        for volume in volumes
+        if volume.purged_at is None or volume.key_shredded_at is None
+    ]
+    key_rows_remain = bool(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(StorageVolumeKey)
+                .join(StorageVolume, StorageVolume.volume_id == StorageVolumeKey.volume_id)
+                .where(StorageVolume.user_id == user_id)
+            )
+        ).scalar_one()
+    )
+    if active_launches or purge_pending or key_rows_remain:
+        await db.commit()
+        return {
+            "ready": False,
+            "active_launches": active_launches,
+            "purge_pending": purge_pending,
+            "keys_pending": key_rows_remain,
+        }
+
+    await db.execute(delete(ChuteFSLaunchSession).where(ChuteFSLaunchSession.user_id == user_id))
+    await db.execute(delete(LaunchConfig).where(LaunchConfig.user_id == user_id))
+    await db.execute(
+        delete(DefaultChuteFSVolumeBinding).where(DefaultChuteFSVolumeBinding.user_id == user_id)
+    )
+    await db.execute(delete(StorageVolume).where(StorageVolume.user_id == user_id))
+    await db.flush()
+    return {
+        "ready": True,
+        "active_launches": [],
+        "purge_pending": [],
+        "keys_pending": False,
     }
 
 
@@ -5686,16 +6114,51 @@ async def release_volume_key(
 # --- object-op grants --------------------------------------------------------------------------
 
 
-async def issue_grant(db: AsyncSession, user_id: str, volume_id: str, ops: List[str]) -> str:
+async def issue_grant(
+    db: AsyncSession,
+    user_id: str,
+    volume_id: str,
+    ops: List[str],
+    *,
+    launch_session_id: Optional[str] = None,
+    launch_session_generation: Optional[int] = None,
+    ttl_seconds: int = GRANT_TTL_SECONDS,
+) -> str:
     """Mint a short-lived opaque grant a storage TD can verify to authorize object ops on a volume."""
     await _get_owned_volume(db, volume_id, user_id)
     token = secrets.token_urlsafe(32)
-    payload = json.dumps({"user_id": user_id, "volume_id": volume_id, "ops": list(ops)})
-    await settings.redis_client.setex(f"storage:grant:{token}", GRANT_TTL_SECONDS, payload)
+    grant_context = {"user_id": user_id, "volume_id": volume_id, "ops": list(ops)}
+    if launch_session_id is not None:
+        if (
+            not isinstance(launch_session_generation, int)
+            or isinstance(launch_session_generation, bool)
+            or launch_session_generation < 1
+        ):
+            raise ValueError("launch session generation is required")
+        grant_context.update(
+            {
+                "auth_kind": "launch_default",
+                "launch_session_id": launch_session_id,
+                "launch_session_generation": launch_session_generation,
+            }
+        )
+    elif launch_session_generation is not None:
+        raise ValueError("launch session generation requires a launch session")
+    ttl_seconds = max(1, min(int(ttl_seconds), GRANT_TTL_SECONDS))
+    grant_context["expires_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    ).isoformat()
+    payload = json.dumps(grant_context)
+    await settings.redis_client.setex(f"storage:grant:{token}", ttl_seconds, payload)
     return token
 
 
-async def verify_grant(grant: str, volume_id: str, op: str) -> Optional[Dict]:
+async def verify_grant(
+    grant: str,
+    volume_id: str,
+    op: str,
+    db: Optional[AsyncSession] = None,
+) -> Optional[Dict]:
     """Verify a grant authorizes `op` on `volume_id`; returns the grant payload or None."""
     raw = await settings.redis_client.get(f"storage:grant:{grant}")
     if not raw:
@@ -5705,5 +6168,37 @@ async def verify_grant(grant: str, volume_id: str, op: str) -> Optional[Dict]:
     except (ValueError, AttributeError):
         return None
     if payload.get("volume_id") != volume_id or op not in (payload.get("ops") or []):
+        return None
+    try:
+        expires_at = datetime.fromisoformat(payload["expires_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if expires_at <= datetime.now(timezone.utc):
+        return None
+    if payload.get("auth_kind") == "launch_default":
+        launch_session_id = payload.get("launch_session_id")
+        launch_session_generation = payload.get("launch_session_generation")
+        if (
+            not isinstance(launch_session_id, str)
+            or not isinstance(launch_session_generation, int)
+            or isinstance(launch_session_generation, bool)
+            or db is None
+        ):
+            return None
+        from api.storage.launch_sessions import validate_launch_bound_grant
+
+        if not await validate_launch_bound_grant(
+            db,
+            launch_session_id,
+            payload.get("user_id"),
+            volume_id,
+            launch_session_generation,
+        ):
+            return None
+    elif (
+        "launch_session_id" in payload
+        or "launch_session_generation" in payload
+        or "auth_kind" in payload
+    ):
         return None
     return payload

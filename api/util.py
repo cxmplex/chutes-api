@@ -800,10 +800,11 @@ async def notify_created(instance, gpu_count: int = None, gpu_type: str = None):
                 "gpu_model_name": gpu_type,
                 "miner_hotkey": instance.miner_hotkey,
                 "instance_id": instance.instance_id,
+                "management_mode": getattr(instance, "gpu_management_mode", None),
             },
         }
         await settings.redis_client.publish("events", json.dumps(event_data).decode())
-        if instance.config_id:
+        if instance.config_id and getattr(instance, "gpu_management_mode", None) != "platform":
             event_data["filter_recipients"] = [instance.miner_hotkey]
             event_data["data"]["config_id"] = instance.config_id
             await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
@@ -828,15 +829,18 @@ async def notify_deleted(
                 "config_id": instance.config_id,
                 "gpu_count": gpu_count,
                 "gpu_model_name": gpu_type,
+                "management_mode": getattr(instance, "gpu_management_mode", None),
             },
         }
         await settings.redis_client.publish("events", json.dumps(event_data).decode())
-        event_data["filter_recipients"] = [instance.miner_hotkey]
-        await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
-
-        # 1-click CPU TEE instances (Model A VM container / Model B per-chute TD) are torn down
-        # by an explicit agent command -- their agents do not consume miner_broadcast. No-op for
-        # GPU instances (no server_id).
+        if getattr(instance, "gpu_management_mode", None) != "platform":
+            event_data["filter_recipients"] = [instance.miner_hotkey]
+            await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
+    except Exception:
+        pass
+    try:
+        # Managed TEE instances use an explicit exact agent command. Platform GPU
+        # teardown remains mandatory even if best-effort event publication failed.
         from api.agent_channel import send_instance_teardown
 
         await send_instance_teardown(
@@ -846,7 +850,7 @@ async def notify_deleted(
             config_id=instance.config_id,
         )
     except Exception:
-        ...
+        pass
 
 
 async def notify_verified(instance, gpu_count: int = None, gpu_type: str = None):
@@ -857,10 +861,12 @@ async def notify_verified(instance, gpu_count: int = None, gpu_type: str = None)
             "data": {
                 "instance_id": instance.instance_id,
                 "miner_hotkey": instance.miner_hotkey,
+                "management_mode": getattr(instance, "gpu_management_mode", None),
             },
             "filter_recipients": [instance.miner_hotkey],
         }
-        await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
+        if getattr(instance, "gpu_management_mode", None) != "platform":
+            await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
         await settings.redis_client.publish(
             "events",
             json.dumps(
@@ -883,27 +889,28 @@ async def notify_verified(instance, gpu_count: int = None, gpu_type: str = None)
 
 async def notify_job_deleted(job):
     try:
-        await settings.redis_client.publish(
-            "miner_broadcast",
-            json.dumps(
-                {
-                    "reason": "job_deleted",
-                    "data": {
-                        "instance_id": job.instance_id,
-                        "job_id": job.job_id,
-                    },
-                }
-            ).decode(),
-        )
-
-        # CPU TEE job instances are agent-run: dispatch an explicit teardown. Resolves the
-        # instance row first, so it is a no-op when the instance purge already handled it
-        # (purge() -> notify_job_deleted) and a no-op for GPU jobs (no server_id).
+        if getattr(job, "gpu_management_mode", None) != "platform":
+            await settings.redis_client.publish(
+                "miner_broadcast",
+                json.dumps(
+                    {
+                        "reason": "job_deleted",
+                        "data": {
+                            "instance_id": job.instance_id,
+                            "job_id": job.job_id,
+                        },
+                    }
+                ).decode(),
+            )
+    except Exception:
+        pass
+    try:
+        # Managed job instances require exact teardown independent of event delivery.
         from api.agent_channel import send_job_instance_teardown
 
         await send_job_instance_teardown(job.instance_id)
     except Exception:
-        ...
+        pass
 
 
 async def notify_activated(instance, gpu_count: int = None, gpu_type: str = None):
@@ -919,10 +926,11 @@ async def notify_activated(instance, gpu_count: int = None, gpu_type: str = None
                 "config_id": instance.config_id,
                 "gpu_count": gpu_count,
                 "gpu_model_name": gpu_type,
+                "management_mode": getattr(instance, "gpu_management_mode", None),
             },
         }
         await settings.redis_client.publish("events", json.dumps(event_data).decode())
-        if instance.config_id:
+        if instance.config_id and getattr(instance, "gpu_management_mode", None) != "platform":
             event_data["filter_recipients"] = [instance.miner_hotkey]
             await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
     except Exception as exc:
@@ -942,11 +950,13 @@ async def notify_disabled(instance, gpu_count: int = None, gpu_type: str = None)
                 "config_id": instance.config_id,
                 "gpu_count": gpu_count,
                 "gpu_model_name": gpu_type,
+                "management_mode": getattr(instance, "gpu_management_mode", None),
             },
         }
         await settings.redis_client.publish("events", json.dumps(event_data).decode())
-        event_data["filter_recipients"] = [instance.miner_hotkey]
-        await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
+        if getattr(instance, "gpu_management_mode", None) != "platform":
+            event_data["filter_recipients"] = [instance.miner_hotkey]
+            await settings.redis_client.publish("miner_broadcast", json.dumps(event_data).decode())
     except Exception as exc:
         logger.warning(f"Error broadcasting instance disabled event: {exc}")
 

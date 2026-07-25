@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -13,6 +14,11 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 DIRECT_TDX_SCHEMA_VERSION = 2
+DIRECT_TDX_GPU_SCHEMA_VERSION = 3
+GPU_PROFILE_SCHEMA = "chutes.gpu-tdx-launch-profiles"
+GPU_PROFILE_SCHEMA_VERSION = 1
+GPU_FINGERPRINT_VERSION = 1
+GPU_MANAGEMENT_MODES = ("platform", "miner")
 REQUIRED_RELEASE_VCPU_SIZES = (1, 2, 4, 8)
 REQUIRED_DIRECT_TDX_PROFILES = tuple(
     {
@@ -397,8 +403,726 @@ def _validate_direct_tdx_provenance(document: dict[str, Any]) -> None:
         raise ProvenanceError("direct-TDX profiles for one image must share one runtime RTMR3")
 
 
+def _validate_sha256(value: Any, path: str, *, nullable: bool = False) -> None:
+    if value is None and nullable:
+        return
+    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
+        raise ProvenanceError(f"{path} must be 64 lowercase hex characters")
+
+
+def _validate_nonempty_string(value: Any, path: str) -> None:
+    if not isinstance(value, str) or not value or any(ord(character) < 0x20 for character in value):
+        raise ProvenanceError(f"{path} must be a non-empty printable string")
+
+
+def _is_strict_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_gpu_profile_contract(contract: dict[str, Any]) -> None:
+    """Validate the canonical whole-fabric GPU launch-profile contract."""
+
+    if not isinstance(contract, dict):
+        raise ProvenanceError("provenance.profile_contract must be an object")
+    _require_exact_keys(
+        contract,
+        {
+            "schema",
+            "version",
+            "allocation_policy",
+            "management_modes",
+            "device_order",
+            "profiles",
+            "unsupported_profiles",
+        },
+        "provenance.profile_contract",
+    )
+    if (
+        contract["schema"] != GPU_PROFILE_SCHEMA
+        or not _is_strict_int(contract["version"])
+        or contract["version"] != GPU_PROFILE_SCHEMA_VERSION
+    ):
+        raise ProvenanceError("unsupported GPU launch-profile contract")
+    if contract["allocation_policy"] != "whole-fabric":
+        raise ProvenanceError("GPU launch profiles must use whole-fabric allocation")
+    if contract["management_modes"] != list(GPU_MANAGEMENT_MODES):
+        raise ProvenanceError("GPU launch profiles must support exactly platform then miner mode")
+    expected_device_order = [
+        "root",
+        "network",
+        "config",
+        "scratch",
+        "gpu-infra:miner-only",
+        "vsock",
+        "iommufd",
+        "pxb:profile-order",
+        "vfio:assigned-order",
+        "fw_cfg:profile-order",
+        "option-rom:profile",
+    ]
+    if contract["device_order"] != expected_device_order:
+        raise ProvenanceError("GPU launch-profile device order is not canonical")
+
+    profiles = contract["profiles"]
+    if not isinstance(profiles, list) or not profiles:
+        raise ProvenanceError("GPU launch profiles must be a non-empty list")
+    unsupported = contract["unsupported_profiles"]
+    if not isinstance(unsupported, list):
+        raise ProvenanceError("unsupported GPU launch profiles must be a list")
+    normalized_unsupported = []
+    for index, profile in enumerate(unsupported):
+        path = f"provenance.profile_contract.unsupported_profiles[{index}]"
+        if not isinstance(profile, dict) or set(profile) != {
+            "status",
+            "reason",
+        } | {
+            "id",
+            "model",
+            "pci_vendor_id",
+            "pci_device_ids",
+            "expected_gpu_identifiers",
+            "gpu_count",
+            "vram_mib",
+            "allocation",
+            "host",
+            "guest",
+            "qemu",
+            "firmware",
+            "topology",
+            "pci",
+            "smbios",
+            "fw_cfg",
+            "option_roms",
+            "policy",
+        }:
+            raise ProvenanceError(f"{path} has non-canonical fields")
+        if (
+            profile["status"] != "uncharacterized"
+            or not isinstance(profile["reason"], str)
+            or not profile["reason"]
+        ):
+            raise ProvenanceError(f"{path} must explain uncharacterized status")
+        normalized_unsupported.append(
+            {key: value for key, value in profile.items() if key not in {"status", "reason"}}
+        )
+    seen_ids: set[str] = set()
+    expected_profile_keys = {
+        "id",
+        "model",
+        "pci_vendor_id",
+        "pci_device_ids",
+        "expected_gpu_identifiers",
+        "gpu_count",
+        "vram_mib",
+        "allocation",
+        "host",
+        "guest",
+        "qemu",
+        "firmware",
+        "topology",
+        "pci",
+        "smbios",
+        "fw_cfg",
+        "option_roms",
+        "policy",
+    }
+    for index, profile in enumerate(profiles + normalized_unsupported):
+        collection = "profiles" if index < len(profiles) else "unsupported_profiles"
+        item_index = index if collection == "profiles" else index - len(profiles)
+        path = f"provenance.profile_contract.{collection}[{item_index}]"
+        if not isinstance(profile, dict):
+            raise ProvenanceError(f"{path} must be an object")
+        _require_exact_keys(profile, expected_profile_keys, path)
+        profile_id = profile["id"]
+        if (
+            not isinstance(profile_id, str)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", profile_id)
+            or profile_id in seen_ids
+        ):
+            raise ProvenanceError(f"{path}.id is invalid or duplicated")
+        if collection == "profiles" and (
+            profile_id.startswith("b300") or profile.get("model") == "B300"
+        ):
+            raise ProvenanceError("B300 is uncharacterized and cannot be a measurable GPU profile")
+        seen_ids.add(profile_id)
+
+        for field in ("model", "pci_vendor_id"):
+            _validate_nonempty_string(profile[field], f"{path}.{field}")
+        if not re.fullmatch(r"[0-9a-f]{4}", profile["pci_vendor_id"]):
+            raise ProvenanceError(f"{path}.pci_vendor_id must be four lowercase hex characters")
+        pci_device_ids = profile["pci_device_ids"]
+        identifiers = profile["expected_gpu_identifiers"]
+        if (
+            not isinstance(pci_device_ids, list)
+            or not pci_device_ids
+            or any(
+                not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{4}", value)
+                for value in pci_device_ids
+            )
+            or pci_device_ids != sorted(set(pci_device_ids))
+        ):
+            raise ProvenanceError(f"{path}.pci_device_ids must be sorted unique PCI IDs")
+        if (
+            not isinstance(identifiers, list)
+            or not identifiers
+            or any(
+                not isinstance(value, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value)
+                for value in identifiers
+            )
+            or identifiers != sorted(set(identifiers))
+        ):
+            raise ProvenanceError(
+                f"{path}.expected_gpu_identifiers must be sorted unique identifiers"
+            )
+        gpu_count = profile["gpu_count"]
+        if not isinstance(gpu_count, int) or isinstance(gpu_count, bool) or gpu_count <= 0:
+            raise ProvenanceError(f"{path}.gpu_count must be a positive integer")
+        if (
+            not isinstance(profile["vram_mib"], int)
+            or isinstance(profile["vram_mib"], bool)
+            or profile["vram_mib"] <= 0
+        ):
+            raise ProvenanceError(f"{path}.vram_mib must be a positive integer")
+
+        allocation = profile["allocation"]
+        if not isinstance(allocation, dict):
+            raise ProvenanceError(f"{path}.allocation must be an object")
+        _require_exact_keys(
+            allocation,
+            {"kind", "groups", "devices_per_group", "allow_partial"},
+            f"{path}.allocation",
+        )
+        if (
+            allocation["kind"] != "whole-fabric"
+            or not _is_strict_int(allocation["groups"])
+            or allocation["groups"] != 1
+            or not _is_strict_int(allocation["devices_per_group"])
+            or allocation["devices_per_group"] != gpu_count
+            or allocation["allow_partial"] is not False
+        ):
+            raise ProvenanceError(f"{path}.allocation must describe one indivisible whole fabric")
+
+        host = profile["host"]
+        if not isinstance(host, dict):
+            raise ProvenanceError(f"{path}.host must be an object")
+        _require_exact_keys(
+            host,
+            {"logical_cpus", "sockets", "reserved_logical_cpus"},
+            f"{path}.host",
+        )
+        if (
+            any(
+                not isinstance(host[field], int)
+                or isinstance(host[field], bool)
+                or host[field] <= 0
+                for field in ("logical_cpus", "sockets", "reserved_logical_cpus")
+            )
+            or host["reserved_logical_cpus"] >= host["logical_cpus"]
+        ):
+            raise ProvenanceError(f"{path}.host has invalid CPU topology")
+
+        guest = profile["guest"]
+        if not isinstance(guest, dict):
+            raise ProvenanceError(f"{path}.guest must be an object")
+        _require_exact_keys(guest, {"vcpus", "memory_mib", "smp"}, f"{path}.guest")
+        expected_vcpus = host["logical_cpus"] - host["reserved_logical_cpus"]
+        if (
+            guest["vcpus"] != expected_vcpus
+            or not isinstance(guest["memory_mib"], int)
+            or isinstance(guest["memory_mib"], bool)
+            or guest["memory_mib"] <= 0
+            or guest["smp"]
+            != (
+                f"{expected_vcpus},sockets={host['sockets']},"
+                f"cores={expected_vcpus // host['sockets']},threads=1"
+            )
+            or expected_vcpus % host["sockets"]
+        ):
+            raise ProvenanceError(f"{path}.guest does not match the exact host CPU topology")
+
+        qemu = profile["qemu"]
+        if not isinstance(qemu, dict):
+            raise ProvenanceError(f"{path}.qemu must be an object")
+        _require_exact_keys(
+            qemu,
+            {
+                "distribution",
+                "upstream_version",
+                "binary",
+                "package",
+                "package_version",
+                "machine_type",
+                "cpu",
+                "predictor_cpu",
+            },
+            f"{path}.qemu",
+        )
+        for field, value in qemu.items():
+            _validate_nonempty_string(value, f"{path}.qemu.{field}")
+        if not re.fullmatch(r"pc-q35-[0-9]+\.[0-9]+", qemu["machine_type"]):
+            raise ProvenanceError(f"{path}.qemu.machine_type must pin a versioned Q35 machine")
+
+        firmware = profile["firmware"]
+        if not isinstance(firmware, dict):
+            raise ProvenanceError(f"{path}.firmware must be an object")
+        _require_exact_keys(firmware, {"filename"}, f"{path}.firmware")
+        if firmware["filename"] != "OVMF.inteltdx.fd":
+            raise ProvenanceError(f"{path}.firmware must select the characterized Intel TDVF")
+
+        topology = profile["topology"]
+        if not isinstance(topology, dict):
+            raise ProvenanceError(f"{path}.topology must be an object")
+        _require_exact_keys(
+            topology,
+            {
+                "kind",
+                "host_numa_nodes",
+                "gpu_numa_nodes",
+                "nvswitch_count",
+                "infiniband_count",
+                "nvlink_links_per_pair",
+            },
+            f"{path}.topology",
+        )
+        if topology["kind"] not in {"flat", "numa-pxb"}:
+            raise ProvenanceError(f"{path}.topology.kind is invalid")
+        if (
+            topology["host_numa_nodes"] is not None
+            and (
+                not isinstance(topology["host_numa_nodes"], int)
+                or isinstance(topology["host_numa_nodes"], bool)
+                or topology["host_numa_nodes"] <= 0
+            )
+        ) or (
+            not isinstance(topology["gpu_numa_nodes"], list)
+            or any(
+                not isinstance(node, int) or isinstance(node, bool) or node < 0
+                for node in topology["gpu_numa_nodes"]
+            )
+            or any(
+                not isinstance(topology[field], int)
+                or isinstance(topology[field], bool)
+                or topology[field] < 0
+                for field in ("nvswitch_count", "infiniband_count")
+            )
+        ):
+            raise ProvenanceError(f"{path}.topology has invalid values")
+        if (
+            not isinstance(topology["nvlink_links_per_pair"], int)
+            or isinstance(topology["nvlink_links_per_pair"], bool)
+            or topology["nvlink_links_per_pair"] <= 0
+        ):
+            raise ProvenanceError(f"{path}.topology.nvlink_links_per_pair must be positive")
+        if topology["kind"] == "numa-pxb":
+            if (
+                topology["host_numa_nodes"] != 2
+                or len(topology["gpu_numa_nodes"]) != gpu_count
+                or any(node not in {0, 1} for node in topology["gpu_numa_nodes"])
+            ):
+                raise ProvenanceError(f"{path}.topology has an invalid NUMA/PXB GPU layout")
+        elif topology["gpu_numa_nodes"]:
+            raise ProvenanceError(f"{path}.topology flat profiles must not encode NUMA placement")
+
+        pci = profile["pci"]
+        if not isinstance(pci, dict):
+            raise ProvenanceError(f"{path}.pci must be an object")
+        _require_exact_keys(
+            pci,
+            {
+                "root_port_start",
+                "root_slot_start",
+                "pxb_bus_start",
+                "pxb_bus_stride",
+                "pxb_root_slot_start",
+                "gpu_bar_mib",
+                "use_gpu_bar_fw_cfg",
+            },
+            f"{path}.pci",
+        )
+        if any(
+            not isinstance(pci[field], int) or isinstance(pci[field], bool) or pci[field] <= 0
+            for field in (
+                "root_port_start",
+                "root_slot_start",
+                "pxb_bus_start",
+                "pxb_bus_stride",
+                "pxb_root_slot_start",
+                "gpu_bar_mib",
+            )
+        ) or not isinstance(pci["use_gpu_bar_fw_cfg"], bool):
+            raise ProvenanceError(f"{path}.pci has invalid values")
+
+        if not isinstance(profile["smbios"], list) or any(
+            not isinstance(value, str) or not value for value in profile["smbios"]
+        ):
+            raise ProvenanceError(f"{path}.smbios must be an exact string list")
+        fw_cfg = profile["fw_cfg"]
+        if not isinstance(fw_cfg, list) or any(
+            not isinstance(value, str) or not value for value in fw_cfg
+        ):
+            raise ProvenanceError(f"{path}.fw_cfg must be an exact string list")
+        expected_fw_cfg = (
+            [
+                f"name=opt/ovmf/X-PciMmio64Mb{item},string={pci['gpu_bar_mib']}"
+                for item in range(1, gpu_count + 1)
+            ]
+            if pci["use_gpu_bar_fw_cfg"]
+            else []
+        )
+        if fw_cfg != expected_fw_cfg:
+            raise ProvenanceError(f"{path}.fw_cfg does not match the exact BAR policy")
+
+        option_roms = profile["option_roms"]
+        if not isinstance(option_roms, dict):
+            raise ProvenanceError(f"{path}.option_roms must be an object")
+        _require_exact_keys(
+            option_roms,
+            {"virtio_net", "vfio_gpu_romfile"},
+            f"{path}.option_roms",
+        )
+        if option_roms != {"virtio_net": "", "vfio_gpu_romfile": None}:
+            raise ProvenanceError(f"{path}.option_roms does not match the characterized launch")
+
+        policy = profile["policy"]
+        if not isinstance(policy, dict):
+            raise ProvenanceError(f"{path}.policy must be an object")
+        _require_exact_keys(
+            policy,
+            {
+                "cc_mode",
+                "ppcie_mode",
+                "passthrough_nvswitches",
+                "passthrough_infiniband",
+                "fabric_manager_required",
+                "host_bridge_policy",
+                "reset_args",
+            },
+            f"{path}.policy",
+        )
+        if (
+            policy["cc_mode"] != "on"
+            or policy["ppcie_mode"] != "off"
+            or policy["passthrough_nvswitches"] is not False
+            or policy["passthrough_infiniband"] is not False
+            or policy["fabric_manager_required"] is not True
+            or policy["host_bridge_policy"] != "exclude-cx7-smdl-sw_mng"
+            or policy["reset_args"] != ["--reset-with-sbr", "--reset-after-cc-mode-switch"]
+        ):
+            raise ProvenanceError(f"{path}.policy is not the characterized whole-fabric policy")
+
+
+def gpu_profile_contract_fingerprint(contract: dict[str, Any]) -> str:
+    """Versioned canonical identity of the exact GPU profile contract."""
+
+    validate_gpu_profile_contract(contract)
+    return hashlib.sha256(canonical_provenance_bytes(contract)).hexdigest()
+
+
+def _validate_direct_tdx_gpu_provenance(document: dict[str, Any]) -> None:
+    _require_exact_keys(
+        document,
+        {
+            "schema_version",
+            "compute_type",
+            "role",
+            "tee_type",
+            "provider",
+            "version",
+            "image",
+            "build_flags",
+            "source_manifest_sha256",
+            "build_inputs_sha256",
+            "launch_public_key_id",
+            "launch_public_key_epoch",
+            "supported_management_modes",
+            "profile_contract",
+            "profile_contract_sha256",
+            "artifacts",
+            "launch_environments",
+            "measurements",
+            "hardware_evidence",
+        },
+        "provenance",
+    )
+    if (
+        not _is_strict_int(document["schema_version"])
+        or document["schema_version"] != DIRECT_TDX_GPU_SCHEMA_VERSION
+        or document["compute_type"] != "gpu"
+        or document["role"] != "gpu"
+        or document["tee_type"] != "tdx"
+        or document["provider"] != "bare-metal"
+    ):
+        raise ProvenanceError(
+            "schema_version 3 is reserved for bare-metal direct-TDX GPU provenance"
+        )
+    if not isinstance(document["version"], str) or not _VERSION_RE.fullmatch(document["version"]):
+        raise ProvenanceError("provenance version is missing or invalid")
+    if document["supported_management_modes"] != list(GPU_MANAGEMENT_MODES):
+        raise ProvenanceError("GPU provenance must support exactly platform then miner mode")
+
+    image = document["image"]
+    if not isinstance(image, dict):
+        raise ProvenanceError("provenance.image must be an object")
+    _require_exact_keys(image, {"filename", "sha256"}, "provenance.image")
+    if not isinstance(image["filename"], str) or not re.fullmatch(
+        r"[A-Za-z0-9._+-]+\.qcow2", image["filename"]
+    ):
+        raise ProvenanceError("provenance.image.filename must name a simple qcow2 file")
+    _validate_sha256(image["sha256"], "provenance.image.sha256")
+
+    flags = document["build_flags"]
+    if not isinstance(flags, dict):
+        raise ProvenanceError("provenance.build_flags must be an object")
+    _require_exact_keys(flags, {"debug_build", "debug_logging"}, "provenance.build_flags")
+    if not all(isinstance(flags[key], bool) for key in flags):
+        raise ProvenanceError("provenance debug flags must be JSON booleans")
+    if flags["debug_logging"] and not flags["debug_build"]:
+        raise ProvenanceError("debug_logging=true requires debug_build=true")
+    if image["filename"].endswith("-debug.qcow2") != flags["debug_build"]:
+        raise ProvenanceError("image filename and debug_build posture disagree")
+    _validate_sha256(
+        document["source_manifest_sha256"],
+        "provenance.source_manifest_sha256",
+    )
+    _validate_sha256(
+        document["build_inputs_sha256"],
+        "provenance.build_inputs_sha256",
+    )
+    _validate_sha256(
+        document["launch_public_key_id"],
+        "provenance.launch_public_key_id",
+    )
+    if (
+        not _is_strict_int(document["launch_public_key_epoch"])
+        or document["launch_public_key_epoch"] < 1
+    ):
+        raise ProvenanceError("provenance.launch_public_key_epoch must be positive")
+
+    contract = document["profile_contract"]
+    validate_gpu_profile_contract(contract)
+    profile_digest = gpu_profile_contract_fingerprint(contract)
+    _validate_sha256(
+        document["profile_contract_sha256"],
+        "provenance.profile_contract_sha256",
+    )
+    if document["profile_contract_sha256"] != profile_digest:
+        raise ProvenanceError("GPU profile contract digest does not match its canonical bytes")
+
+    artifacts = document["artifacts"]
+    if not isinstance(artifacts, dict):
+        raise ProvenanceError("provenance.artifacts must be an object")
+    _require_exact_keys(
+        artifacts,
+        {
+            "boot_mode",
+            "root_mode",
+            "image_sha256",
+            "kernel_sha256",
+            "initrd_sha256",
+            "cmdline_sha256",
+            "verity_roothash",
+            "kernel_measurement_mode",
+        },
+        "provenance.artifacts",
+    )
+    if artifacts["boot_mode"] != "direct" or artifacts["root_mode"] != "dm-verity":
+        raise ProvenanceError("GPU provenance must bind direct boot with a dm-verity root")
+    if artifacts["image_sha256"] != image["sha256"]:
+        raise ProvenanceError("provenance.artifacts.image_sha256 must match provenance.image")
+    for field in ("image_sha256", "kernel_sha256", "initrd_sha256", "verity_roothash"):
+        _validate_sha256(artifacts[field], f"provenance.artifacts.{field}")
+    cmdline_hashes = artifacts["cmdline_sha256"]
+    if not isinstance(cmdline_hashes, dict):
+        raise ProvenanceError("provenance.artifacts.cmdline_sha256 must be an object")
+    _require_exact_keys(
+        cmdline_hashes,
+        set(GPU_MANAGEMENT_MODES),
+        "provenance.artifacts.cmdline_sha256",
+    )
+    for mode in GPU_MANAGEMENT_MODES:
+        _validate_sha256(
+            cmdline_hashes[mode],
+            f"provenance.artifacts.cmdline_sha256.{mode}",
+        )
+    if len(set(cmdline_hashes.values())) != len(GPU_MANAGEMENT_MODES):
+        raise ProvenanceError("GPU management modes must use distinct cmdline hashes")
+    if artifacts["kernel_measurement_mode"] not in {
+        "qemu-patched",
+        "efi-image-as-is",
+    }:
+        raise ProvenanceError("GPU provenance kernel measurement mode is invalid")
+
+    profiles = contract["profiles"]
+    profile_by_id = {profile["id"]: profile for profile in profiles}
+    environments = document["launch_environments"]
+    if not isinstance(environments, list) or len(environments) != len(profiles):
+        raise ProvenanceError(
+            "GPU launch_environments must contain exactly one entry per launch profile"
+        )
+    expected_environment_keys = {
+        "profile_id",
+        "firmware_filename",
+        "firmware_sha256",
+        "qemu_binary",
+        "qemu_binary_sha256",
+        "qemu_package",
+        "qemu_package_version",
+        "machine_type",
+        "cpu",
+        "predictor_cpu",
+    }
+    environment_by_profile: dict[str, dict[str, Any]] = {}
+    for index, (profile, environment) in enumerate(zip(profiles, environments, strict=True)):
+        path = f"provenance.launch_environments[{index}]"
+        if not isinstance(environment, dict):
+            raise ProvenanceError(f"{path} must be an object")
+        _require_exact_keys(environment, expected_environment_keys, path)
+        if environment["profile_id"] != profile["id"]:
+            raise ProvenanceError(f"{path}.profile_id does not match the ordered profile contract")
+        expected = {
+            "firmware_filename": profile["firmware"]["filename"],
+            "qemu_binary": profile["qemu"]["binary"],
+            "qemu_package": profile["qemu"]["package"],
+            "qemu_package_version": profile["qemu"]["package_version"],
+            "machine_type": profile["qemu"]["machine_type"],
+            "cpu": profile["qemu"]["cpu"],
+            "predictor_cpu": profile["qemu"]["predictor_cpu"],
+        }
+        for field, value in expected.items():
+            if environment[field] != value:
+                raise ProvenanceError(f"{path}.{field} does not match the GPU profile contract")
+        _validate_sha256(environment["firmware_sha256"], f"{path}.firmware_sha256")
+        _validate_sha256(environment["qemu_binary_sha256"], f"{path}.qemu_binary_sha256")
+        environment_by_profile[profile["id"]] = environment
+
+    measurements = document["measurements"]
+    expected_pairs = [
+        (profile["id"], mode) for profile in profiles for mode in GPU_MANAGEMENT_MODES
+    ]
+    if not isinstance(measurements, list) or len(measurements) != len(expected_pairs):
+        raise ProvenanceError(
+            "GPU measurements must contain the complete ordered profile by management-mode matrix"
+        )
+    seen_names: set[str] = set()
+    seen_tuples: set[tuple[str, ...]] = set()
+    profile_mode_rtmr3: dict[str, dict[str, str]] = {}
+    for index, ((profile_id, mode), entry) in enumerate(
+        zip(expected_pairs, measurements, strict=True)
+    ):
+        path = f"provenance.measurements[{index}]"
+        if not isinstance(entry, dict):
+            raise ProvenanceError(f"{path} must be an object")
+        _require_exact_keys(
+            entry,
+            {"name", "profile_id", "management_mode", "values"},
+            path,
+        )
+        if entry["profile_id"] != profile_id or entry["management_mode"] != mode:
+            raise ProvenanceError(f"{path} does not match the ordered profile/mode matrix")
+        expected_name = f"gpu-baremetal-tdx-{document['version']}-{profile_id}-{mode}"
+        if entry["name"] != expected_name or entry["name"] in seen_names:
+            raise ProvenanceError(f"{path}.name is invalid or duplicated")
+        seen_names.add(entry["name"])
+        _validate_measurement_values(
+            entry["values"],
+            tee_type="tdx",
+            provider="bare-metal",
+            path=f"{path}.values",
+        )
+        boot_rtmrs = entry["values"]["boot_rtmrs"]
+        runtime_rtmrs = entry["values"]["runtime_rtmrs"]
+        if boot_rtmrs["RTMR3"] != "0" * 96 or runtime_rtmrs["RTMR3"] == "0" * 96:
+            raise ProvenanceError(f"{path}.values has an invalid RTMR3 transition")
+        for register in ("RTMR0", "RTMR1", "RTMR2"):
+            if boot_rtmrs[register] != runtime_rtmrs[register]:
+                raise ProvenanceError(f"{path}.values {register} cannot change after boot")
+        measurement_tuple = (
+            entry["values"]["mrtd"],
+            *(runtime_rtmrs[register] for register in ("RTMR0", "RTMR1", "RTMR2", "RTMR3")),
+        )
+        if measurement_tuple in seen_tuples:
+            raise ProvenanceError(
+                f"{path}.values duplicates another profile/mode measurement tuple"
+            )
+        seen_tuples.add(measurement_tuple)
+        profile_mode_rtmr3.setdefault(profile_id, {})[mode] = runtime_rtmrs["RTMR3"]
+
+    if any(values.get("platform") == values.get("miner") for values in profile_mode_rtmr3.values()):
+        raise ProvenanceError("GPU platform and miner runtime RTMR3 values must differ per profile")
+
+    if set(profile_by_id) != set(environment_by_profile):
+        raise ProvenanceError("GPU launch environments do not cover every profile")
+    evidence = document["hardware_evidence"]
+    if not isinstance(evidence, list) or len(evidence) != len(measurements):
+        raise ProvenanceError(
+            "GPU hardware_evidence must contain one quote/CCEL record per measurement"
+        )
+    for index, (entry, evidence_entry) in enumerate(zip(measurements, evidence, strict=True)):
+        path = f"provenance.hardware_evidence[{index}]"
+        if not isinstance(evidence_entry, dict):
+            raise ProvenanceError(f"{path} must be an object")
+        _require_exact_keys(
+            evidence_entry,
+            {
+                "measurement_name",
+                "quote_sha256",
+                "ccel_sha256",
+                "ccel_replay_sha256",
+            },
+            path,
+        )
+        if evidence_entry["measurement_name"] != entry["name"]:
+            raise ProvenanceError(f"{path} does not match the ordered measurement matrix")
+        for field in ("quote_sha256", "ccel_sha256", "ccel_replay_sha256"):
+            _validate_sha256(evidence_entry[field], f"{path}.{field}")
+
+
+def gpu_measurement_fingerprint(
+    document: dict[str, Any],
+    measurement: dict[str, Any],
+) -> str:
+    """Return the separate versioned identity for one strict GPU measurement."""
+
+    _validate_direct_tdx_gpu_provenance(document)
+    matching = [
+        entry for entry in document["measurements"] if entry["name"] == measurement.get("name")
+    ]
+    if len(matching) != 1 or matching[0] != measurement:
+        raise ProvenanceError("GPU measurement is not an exact member of the provenance matrix")
+    profile = next(
+        profile
+        for profile in document["profile_contract"]["profiles"]
+        if profile["id"] == measurement["profile_id"]
+    )
+    environment = next(
+        value
+        for value in document["launch_environments"]
+        if value["profile_id"] == measurement["profile_id"]
+    )
+    evidence = next(
+        value
+        for value in document["hardware_evidence"]
+        if value["measurement_name"] == measurement["name"]
+    )
+    payload = {
+        "fingerprint_version": GPU_FINGERPRINT_VERSION,
+        "provenance_schema_version": DIRECT_TDX_GPU_SCHEMA_VERSION,
+        "profile_contract_sha256": document["profile_contract_sha256"],
+        "image_sha256": document["image"]["sha256"],
+        "artifacts": document["artifacts"],
+        "profile": profile,
+        "launch_environment": environment,
+        "measurement": measurement,
+        "hardware_evidence": evidence,
+    }
+    return hashlib.sha256(canonical_provenance_bytes(payload)).hexdigest()
+
+
 def validate_provenance_document(document: dict[str, Any]) -> None:
     """Validate the canonical schema independently of release policy."""
+    if document.get("schema_version") == DIRECT_TDX_GPU_SCHEMA_VERSION:
+        _validate_direct_tdx_gpu_provenance(document)
+        return
     if document.get("schema_version") == DIRECT_TDX_SCHEMA_VERSION:
         _validate_direct_tdx_provenance(document)
         return

@@ -37,7 +37,12 @@ from api.database import get_db_session
 from api.image.schemas import Image
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2
-from api.server.schemas import Server
+from api.server.schemas import (
+    DefaultChuteFSVolumeBinding,
+    Server,
+    StorageVolume,
+    StorageVolumeKey,
+)
 from api.server.util import get_public_key_hash
 from api.storage.router import router as storage_router
 from tests.integration import test_storage_reconciliation_postgres as api_pg
@@ -238,11 +243,38 @@ async def _seed_launch(
         db.add(requester)
         await db.flush()
 
+    default_volume = StorageVolume(
+        user_id=api_pg.USER_ID,
+        name=f"default-{suffix}",
+        replication_factor=3,
+        quota_bytes=1024**3,
+        used_bytes=0,
+    )
+    db.add(default_volume)
+    await db.flush()
+    db.add_all(
+        [
+            StorageVolumeKey(
+                volume_id=default_volume.volume_id,
+                encrypted_key="test-only-model-access-key",
+            ),
+            DefaultChuteFSVolumeBinding(
+                user_id=api_pg.USER_ID,
+                chute_id=chute_id,
+                volume_id=default_volume.volume_id,
+            ),
+        ]
+    )
+    await db.flush()
     launch = LaunchConfig(
         config_id=config_id,
         seed=1,
         env_key=f"env-{suffix}",
         chute_id=chute_id,
+        user_id=api_pg.USER_ID,
+        compute_type="cpu" if env_type == "tee" else "gpu",
+        default_volume_id=default_volume.volume_id,
+        storage_session_exchange_allowed=False,
         host="127.0.0.20",
         port=8000,
         env_type=env_type,
@@ -594,12 +626,28 @@ async def test_cpu_cold_start_crosses_real_routes_tls_storage_and_template(
     tmp_path,
     monkeypatch,
 ):
-    workspace = Path(__file__).resolve().parents[3]
-    sdk_root = workspace / "chutes"
-    sek8s_root = workspace / "sek8s" / "src" / "sek8s"
-    sek8s_common_root = workspace / "sek8s" / "src" / "sek8s-common"
-    if not all(path.is_dir() for path in (sdk_root, sek8s_root, sek8s_common_root)):
-        pytest.skip("Sibling chutes and sek8s source checkouts are required")
+    from cross_repo_tests import repository_root
+
+    sdk_root = repository_root("sdk", start=Path(__file__))
+    sek8s_worktree = repository_root("sek8s", start=Path(__file__))
+    sek8s_root = sek8s_worktree / "src" / "sek8s"
+    sek8s_common_root = sek8s_worktree / "src" / "sek8s-common"
+    from prometheus_client import REGISTRY
+
+    original_collector_to_names = dict(REGISTRY._collector_to_names)
+    original_names_to_collectors = dict(REGISTRY._names_to_collectors)
+    REGISTRY._collector_to_names.clear()
+    REGISTRY._names_to_collectors.clear()
+    original_sibling_modules = {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if name == "chutes"
+        or name.startswith("chutes.")
+        or name == "sek8s"
+        or name.startswith("sek8s.")
+    }
+    for name in original_sibling_modules:
+        sys.modules.pop(name, None)
     monkeypatch.syspath_prepend(str(sek8s_common_root))
     monkeypatch.syspath_prepend(str(sek8s_root))
     monkeypatch.syspath_prepend(str(sdk_root))
@@ -614,8 +662,6 @@ async def test_cpu_cold_start_crosses_real_routes_tls_storage_and_template(
             "0+source" if distribution == "sek8s-common" else metadata_version(distribution)
         ),
     )
-    from bittensor_wallet.keypair import Keypair
-
     from api.chute import util as chute_util
     from api.misc import router as misc
     from api.user import service as user_service
@@ -746,7 +792,6 @@ async def test_cpu_cold_start_crosses_real_routes_tls_storage_and_template(
         (held_snapshot / "config.json").write_bytes(content)
         tracker = StorageTracker(
             storage_config,
-            Keypair.create_from_seed("0x" + "1" * 64),
             target.storage_incarnation,
         )
         storage_app = build_app(StorageNodeContext(storage_config, store, tracker))
@@ -873,3 +918,16 @@ async def test_cpu_cold_start_crosses_real_routes_tls_storage_and_template(
         _shared.is_tee_env.cache_clear()
         _shared.is_cpu_tee_env.cache_clear()
         chute_util._get_one.cache_clear()
+        for name in tuple(sys.modules):
+            if (
+                name == "chutes"
+                or name.startswith("chutes.")
+                or name == "sek8s"
+                or name.startswith("sek8s.")
+            ):
+                sys.modules.pop(name, None)
+        sys.modules.update(original_sibling_modules)
+        REGISTRY._collector_to_names.clear()
+        REGISTRY._collector_to_names.update(original_collector_to_names)
+        REGISTRY._names_to_collectors.clear()
+        REGISTRY._names_to_collectors.update(original_names_to_collectors)

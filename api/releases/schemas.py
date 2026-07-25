@@ -1,18 +1,17 @@
 """Fleet image release registry: ORM + request/response models.
 
 A "guest release" is the validator-owned desired state for the guest images an L0 host boots its
-TDs from -- a per-(channel, tee_type) manifest of the chute image and (optionally) the storage-TD
-image, each with its URL, sha256, version and the measurement names those images attest as. L0
-node-agents converge to the ACTIVE release for their tee_type (registration response + periodic poll
-+ a control-channel rollout nudge). Activation requires signed canonical provenance and exact,
-complete CPU-only measurement matrices already pinned on the validator.
+TDs from -- a per-(channel, tee_type, compute_type) manifest. CPU releases contain the independently
+versioned chute/storage roles. GPU releases contain one direct-TDX GPU artifact with two signed
+management-mode command lines. L0 node-agents converge only to the ACTIVE release for their exact
+compute stream.
 """
 
 import base64
 import ipaddress
 import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional, Union
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, StrictBool, field_validator, model_validator
@@ -23,6 +22,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    PrimaryKeyConstraint,
     String,
     Text,
     UniqueConstraint,
@@ -39,6 +39,7 @@ RELEASE_STATUS_DRAFT = "draft"
 RELEASE_STATUS_ACTIVE = "active"
 RELEASE_STATUS_SUPERSEDED = "superseded"
 _VALID_TEE_TYPES = ("sev-snp", "tdx")
+_VALID_COMPUTE_TYPES = ("cpu", "gpu")
 _DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _REJECTED_DNS_SUFFIXES = (
     ".home.arpa",
@@ -197,7 +198,7 @@ def validate_l0_artifact_url(value: str) -> str:
 
 
 class GuestRelease(Base):
-    """A published set of guest images for one (channel, tee_type), and its lifecycle status."""
+    """A published set of guest images for one compute-scoped release stream."""
 
     __tablename__ = "guest_releases"
     __table_args__ = (
@@ -205,6 +206,7 @@ class GuestRelease(Base):
             "uq_guest_release_active",
             "channel",
             "tee_type",
+            "compute_type",
             unique=True,
             postgresql_where=text("status = 'active'"),
         ),
@@ -212,8 +214,17 @@ class GuestRelease(Base):
             "idx_guest_releases_l0_generation",
             "tee_type",
             "channel",
+            "compute_type",
             "l0_manifest_generation",
             postgresql_where=text("l0_manifest_generation IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu')",
+            name="ck_guest_releases_compute_type",
+        ),
+        CheckConstraint(
+            "compute_type = 'cpu' OR tee_type = 'tdx'",
+            name="ck_guest_releases_gpu_tdx",
         ),
         CheckConstraint(
             "(l0_manifest IS NULL AND l0_manifest_digest IS NULL "
@@ -234,6 +245,7 @@ class GuestRelease(Base):
         server_default=RELEASE_CHANNEL_DEFAULT,
     )
     tee_type = Column(String, nullable=False)
+    compute_type = Column(String, nullable=False, default="cpu", server_default="cpu")
     status = Column(
         String,
         nullable=False,
@@ -258,12 +270,18 @@ class GuestRelease(Base):
 
 
 class L0BootstrapPublication(Base):
-    """One admitted publisher-signed L0 generation for a TEE/channel slot."""
+    """One admitted publisher-signed L0 generation for a compute-scoped slot."""
 
     __tablename__ = "l0_bootstrap_publications"
 
     tee_type = Column(String, primary_key=True)
     channel = Column(String, primary_key=True)
+    compute_type = Column(
+        String,
+        primary_key=True,
+        default="cpu",
+        server_default="cpu",
+    )
     generation = Column(Integer, primary_key=True)
     manifest_digest = Column(String(64), nullable=False)
     key_id = Column(String, nullable=False)
@@ -286,13 +304,29 @@ class L0BootstrapPublication(Base):
     activated_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
+        PrimaryKeyConstraint(
+            "tee_type",
+            "channel",
+            "compute_type",
+            "generation",
+            name="pk_l0_bootstrap_publications",
+        ),
         UniqueConstraint(
             "tee_type",
             "channel",
+            "compute_type",
             "manifest_digest",
             name="uq_l0_bootstrap_slot_digest",
         ),
         CheckConstraint("tee_type IN ('sev-snp', 'tdx')", name="ck_l0_publication_tee"),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu')",
+            name="ck_l0_publication_compute_type",
+        ),
+        CheckConstraint(
+            "compute_type = 'cpu' OR tee_type = 'tdx'",
+            name="ck_l0_publication_gpu_tdx",
+        ),
         CheckConstraint("generation > 0 AND key_epoch > 0", name="ck_l0_publication_generation"),
         CheckConstraint(
             "manifest_digest ~ '^[0-9a-f]{64}$' AND squashfs_sha256 ~ '^[0-9a-f]{64}$'",
@@ -306,6 +340,7 @@ class L0BootstrapPublication(Base):
             "idx_l0_publication_slot_latest",
             "tee_type",
             "channel",
+            "compute_type",
             "generation",
         ),
     )
@@ -331,6 +366,7 @@ class GuestReleaseTarget(Base):
     host_id = Column(String, nullable=False)
     miner_hotkey = Column(String, nullable=False)
     tee_type = Column(String, nullable=False)
+    compute_type = Column(String, nullable=False, default="cpu", server_default="cpu")
     role = Column(String, nullable=False)
     current_generation = Column(Integer, nullable=False, default=1, server_default="1")
     current_token_id = Column(String, nullable=False, default=generate_uuid)
@@ -349,6 +385,7 @@ class GuestReleaseTarget(Base):
             "release_id",
             "host_id",
             "role",
+            "compute_type",
             name="uq_guest_release_logical_target",
         ),
         UniqueConstraint(
@@ -359,7 +396,19 @@ class GuestReleaseTarget(Base):
             "consumed_attestation_id",
             name="uq_guest_release_target_attestation",
         ),
-        CheckConstraint("role IN ('chute', 'storage')", name="ck_guest_release_target_role"),
+        CheckConstraint(
+            "role IN ('chute', 'storage', 'gpu')",
+            name="ck_guest_release_target_role",
+        ),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu')",
+            name="ck_guest_release_target_compute_type",
+        ),
+        CheckConstraint(
+            "(compute_type = 'cpu' AND role IN ('chute', 'storage')) OR "
+            "(compute_type = 'gpu' AND tee_type = 'tdx' AND role = 'gpu')",
+            name="ck_guest_release_target_compute_role",
+        ),
         CheckConstraint(
             "current_generation > 0",
             name="ck_guest_release_target_generation",
@@ -447,8 +496,8 @@ class GuestReleaseTargetTokenGeneration(Base):
     )
 
 
-class ReleaseImage(BaseModel):
-    """One image in a release manifest (the chute image or the storage-TD image)."""
+class _ReleaseImageCommon(BaseModel):
+    """Fields shared by CPU/storage and GPU release images."""
 
     url: str = Field(
         ...,
@@ -488,9 +537,6 @@ class ReleaseImage(BaseModel):
     initrd_sha256: Optional[str] = Field(
         None, description="Signed direct-boot initrd sidecar sha256."
     )
-    cmdline_sha256: Optional[str] = Field(
-        None, description="Signed direct-boot command-line sidecar sha256."
-    )
     provenance_payload: Optional[str] = Field(
         None,
         exclude=True,
@@ -513,7 +559,7 @@ class ReleaseImage(BaseModel):
             raise ValueError("sha256 must be 64 hex chars")
         return v
 
-    @field_validator("kernel_sha256", "initrd_sha256", "cmdline_sha256")
+    @field_validator("kernel_sha256", "initrd_sha256")
     @classmethod
     def _valid_optional_sha(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
@@ -529,6 +575,175 @@ class ReleaseImage(BaseModel):
     @classmethod
     def _valid_url(cls, v: str) -> str:
         return validate_release_image_url(v)
+
+
+class ReleaseImage(_ReleaseImageCommon):
+    """One CPU chute or storage image, preserving the direct-TDX v2 contract."""
+
+    cmdline_sha256: Optional[str] = Field(
+        None, description="Signed direct-boot command-line sidecar sha256."
+    )
+
+    @field_validator("cmdline_sha256")
+    @classmethod
+    def _valid_cmdline_sha(cls, value: Optional[str]) -> Optional[str]:
+        return cls._valid_optional_sha(value)
+
+
+class GpuCmdlineHashes(BaseModel):
+    """Exactly the two measured management-mode command-line sidecars."""
+
+    platform: str
+    miner: str
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    @field_validator("platform", "miner")
+    @classmethod
+    def _valid_sha(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("GPU cmdline sha256 must be 64 lowercase hex characters")
+        return normalized
+
+    @model_validator(mode="after")
+    def _distinct_modes(self):
+        if self.platform == self.miner:
+            raise ValueError("GPU platform and miner cmdline hashes must differ")
+        return self
+
+
+class GpuReleaseImage(_ReleaseImageCommon):
+    """One direct-TDX GPU artifact with two independently measured boot modes."""
+
+    kernel_sha256: str
+    initrd_sha256: str
+    cmdline_sha256: GpuCmdlineHashes
+
+    model_config = {"extra": "forbid"}
+
+
+class RoleLaunchBinaryContract(BaseModel):
+    """Exact QEMU/TDVF identity for one measured direct-TDX role."""
+
+    role: Literal["storage", "gpu"]
+    qemu_binary: str = Field(..., min_length=1, max_length=255, pattern=r"^[A-Za-z0-9._/+:-]+$")
+    qemu_package: str = Field(
+        ..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9.+:-]*$"
+    )
+    qemu_package_version: str = Field(..., min_length=1, max_length=128)
+    qemu_binary_sha256: str
+    machine_type: str = Field(..., pattern=r"^pc-q35-[0-9]+\.[0-9]+$")
+    firmware_filename: str = Field("OVMF.inteltdx.fd", pattern=r"^OVMF\.inteltdx\.fd$")
+    firmware_sha256: str
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    @field_validator("qemu_binary_sha256", "firmware_sha256")
+    @classmethod
+    def _valid_launch_digest(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("launch binary digest must be 64 lowercase hex characters")
+        return normalized
+
+    @field_validator("qemu_package_version")
+    @classmethod
+    def _valid_package_version(cls, value: str) -> str:
+        if value != value.strip() or any(
+            ord(character) < 0x21 or ord(character) > 0x7E for character in value
+        ):
+            raise ValueError("qemu_package_version must be visible ASCII without whitespace")
+        return value
+
+
+class GpuStorageSibling(BaseModel):
+    """Exact CPU/storage desired state logically routed through one GPU L0.
+
+    The storage artifact and its launch environment retain their independent CPU
+    release identity. This descriptor is not a physical co-location claim.
+    """
+
+    schema: Literal["chutes.gpu-storage-sibling"] = "chutes.gpu-storage-sibling"
+    version: Literal[1] = 1
+    source_compute_type: Literal["cpu"] = "cpu"
+    source_release_id: str = Field(..., min_length=1, max_length=256)
+    active_cpu_release_id: str = Field(..., min_length=1, max_length=256)
+    profile_id: str = Field(..., min_length=1, max_length=256)
+    image: ReleaseImage
+    launch_contract: RoleLaunchBinaryContract
+    physical_co_location_trusted: Literal[False] = False
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    @model_validator(mode="after")
+    def _exact_storage_role(self):
+        if self.launch_contract.role != "storage":
+            raise ValueError("GPU storage sibling must carry a storage launch contract")
+        if self.profile_id not in self.image.measurement_names:
+            raise ValueError("GPU storage sibling profile is not in the CPU storage release")
+        for field in ("kernel_sha256", "initrd_sha256", "cmdline_sha256"):
+            if not getattr(self.image, field):
+                raise ValueError(f"GPU storage sibling direct-TDX image is missing {field}")
+        return self
+
+
+class GpuL0StorageClosure(BaseModel):
+    """Exact independently signed CPU/storage launch closure baked into a GPU L0."""
+
+    schema: Literal["chutes.gpu-l0-storage-closure"] = "chutes.gpu-l0-storage-closure"
+    version: Literal[1] = 1
+    source_release_id: str = Field(..., min_length=1, max_length=256)
+    image_version: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+    )
+    image_sha256: str
+    kernel_sha256: str
+    initrd_sha256: str
+    cmdline_sha256: str
+    measurement_names: List[str] = Field(..., min_length=1)
+    launch_contract: RoleLaunchBinaryContract
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    @field_validator(
+        "image_sha256",
+        "kernel_sha256",
+        "initrd_sha256",
+        "cmdline_sha256",
+    )
+    @classmethod
+    def _valid_digest(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if len(normalized) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized
+        ):
+            raise ValueError("GPU L0 storage closure digest must be lowercase sha256")
+        return normalized
+
+    @field_validator("measurement_names")
+    @classmethod
+    def _valid_measurement_names(cls, value: List[str]) -> List[str]:
+        if len(value) != len(set(value)) or any(
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,255}", name)
+            for name in value
+        ):
+            raise ValueError("GPU L0 storage closure measurements must be unique canonical names")
+        return value
+
+    @model_validator(mode="after")
+    def _storage_role(self):
+        if self.launch_contract.role != "storage":
+            raise ValueError("GPU L0 storage closure requires a storage launch contract")
+        return self
 
 
 class L0ArtifactV1(BaseModel):
@@ -648,6 +863,64 @@ class SignedL0BootstrapManifestV1(BaseModel):
         return value
 
 
+class L0BootstrapManifestV2(L0BootstrapManifestV1):
+    """GPU L0 bootstrap contract with an explicit compute-stream identity."""
+
+    version: Literal[2] = 2
+    compute_type: Literal["gpu"] = "gpu"
+    storage_closure: GpuL0StorageClosure
+    gpu_profile_id: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-z0-9][a-z0-9-]*$")
+    gpu_qemu_sha256s: List[str] = Field(..., min_length=1)
+    gpu_tdvf_sha256s: List[str] = Field(..., min_length=1)
+    gpu_launch_public_key_id: str
+    gpu_launch_public_key_epoch: int = Field(..., ge=1)
+    gpu_build_inputs_sha256: str
+
+    @field_validator(
+        "gpu_launch_public_key_id",
+        "gpu_build_inputs_sha256",
+    )
+    @classmethod
+    def _gpu_digest(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+            raise ValueError("GPU L0 closure identities must be lowercase sha256")
+        return normalized
+
+    @field_validator("gpu_qemu_sha256s", "gpu_tdvf_sha256s")
+    @classmethod
+    def _gpu_digest_list(cls, value: List[str]) -> List[str]:
+        if value != sorted(set(value)) or any(
+            not re.fullmatch(r"[0-9a-f]{64}", item) for item in value
+        ):
+            raise ValueError("GPU launch closure hashes must be sorted unique sha256")
+        return value
+
+    @model_validator(mode="after")
+    def _gpu_tdx_only(self):
+        if self.tee_type != "tdx":
+            raise ValueError("L0 bootstrap manifest v2 is reserved for GPU TDX")
+        return self
+
+
+class SignedL0BootstrapManifestV2(BaseModel):
+    manifest: L0BootstrapManifestV2
+    signature: str = Field(..., min_length=88, max_length=88)
+
+    model_config = {"extra": "forbid", "frozen": True}
+
+    @field_validator("signature")
+    @classmethod
+    def _valid_signature(cls, value: str) -> str:
+        return SignedL0BootstrapManifestV1._valid_signature(value)
+
+
+SignedL0BootstrapManifest = Union[
+    SignedL0BootstrapManifestV1,
+    SignedL0BootstrapManifestV2,
+]
+
+
 class ReleaseL0(BaseModel):
     """The L0 host netboot set for a release (the RAM-root appliance the box re-netboots into).
 
@@ -667,7 +940,7 @@ class ReleaseL0(BaseModel):
         None,
         description="Override the l0/<tee>/ netboot base URL (else the box's baked default).",
     )
-    bootstrap: Optional[SignedL0BootstrapManifestV1] = Field(
+    bootstrap: Optional[SignedL0BootstrapManifest] = Field(
         None,
         description=(
             "Publisher-signed canonical L0 artifact contract. Required for activation of a "
@@ -698,9 +971,13 @@ class ReleaseL0(BaseModel):
 
 
 class CreateReleaseRequest(BaseModel):
-    """Create a draft release for one or both independently versioned guest roles."""
+    """Create one explicit CPU or GPU release stream."""
 
     tee_type: str = Field(..., description="Target fleet: sev-snp | tdx")
+    compute_type: Literal["cpu", "gpu"] = Field(
+        ...,
+        description="Compute-scoped desired-state stream.",
+    )
     channel: str = Field(RELEASE_CHANNEL_DEFAULT, description="Release channel (default 'stable')")
     chute: Optional[ReleaseImage] = Field(
         None,
@@ -714,6 +991,12 @@ class CreateReleaseRequest(BaseModel):
         description=(
             "The always-on storage-TD image manifest. Omit it for a chute-only release; an "
             "omitted slot preserves the currently staged storage image."
+        ),
+    )
+    gpu: Optional[GpuReleaseImage] = Field(
+        None,
+        description=(
+            "The single direct-TDX GPU artifact, including both platform and miner cmdline hashes."
         ),
     )
     l0: Optional[ReleaseL0] = Field(
@@ -736,8 +1019,18 @@ class CreateReleaseRequest(BaseModel):
 
     @model_validator(mode="after")
     def _guest_role_required(self):
-        if self.chute is None and self.storage is None:
-            raise ValueError("at least one of chute or storage must be provided")
+        if self.compute_type == "cpu":
+            if self.gpu is not None:
+                raise ValueError("CPU releases cannot contain a gpu image slot")
+            if self.chute is None and self.storage is None:
+                raise ValueError("CPU releases require at least one of chute or storage")
+        else:
+            if self.tee_type != "tdx":
+                raise ValueError("GPU releases are TDX-only")
+            if self.chute is not None or self.storage is not None:
+                raise ValueError("GPU releases cannot contain CPU chute or storage image slots")
+            if self.gpu is None:
+                raise ValueError("GPU releases require exactly one gpu image slot")
         return self
 
 
@@ -768,8 +1061,11 @@ class ReleaseManifest(BaseModel):
     release_id: str
     channel: str
     tee_type: str
+    compute_type: Literal["cpu", "gpu"]
     chute: Optional[ReleaseImage] = None
     storage: Optional[ReleaseImage] = None
+    gpu: Optional[GpuReleaseImage] = None
+    storage_sibling: Optional[GpuStorageSibling] = None
     l0: Optional[ReleaseL0] = None
 
 
@@ -777,6 +1073,7 @@ class ReleaseResponse(BaseModel):
     release_id: str
     channel: str
     tee_type: str
+    compute_type: Literal["cpu", "gpu"]
     status: str
     images: Dict
     notes: Optional[str] = None
@@ -803,9 +1100,12 @@ class UntrustedReleaseHostStatus(BaseModel):
     untrusted_online: bool
     untrusted_staged_chute_sha: Optional[str] = None
     untrusted_staged_storage_sha: Optional[str] = None
+    untrusted_staged_gpu_sha: Optional[str] = None
     untrusted_stage_matches_release: bool
     untrusted_running_l0_version: Optional[str] = None
     untrusted_l0_matches_release: Optional[bool] = None
+    untrusted_gpu_inventory: Optional[Dict] = None
+    untrusted_gpu_inventory_ready: Optional[bool] = None
 
 
 class LogicalReleaseTargetStatus(BaseModel):
@@ -825,6 +1125,12 @@ class LogicalReleaseTargetStatus(BaseModel):
     running_image_version: Optional[str] = None
     running_process_incarnation: Optional[str] = None
     running_storage_incarnation: Optional[str] = None
+    allocation_group_id: Optional[str] = None
+    allocation_group_generation: Optional[int] = Field(None, ge=1)
+    management_mode: Optional[Literal["platform", "miner"]] = None
+    storage_sibling_ready: Optional[bool] = None
+    runtime_session_ready: Optional[bool] = None
+    gpu_evidence_sha256: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
     host_credential_cloneable: bool = Field(
         True,
         description=(
@@ -844,9 +1150,22 @@ class ReleaseStatusResponse(BaseModel):
     release_id: str
     status: str
     tee_type: str
+    compute_type: Literal["cpu", "gpu"]
     required_roles: List[str] = Field(default_factory=list)
     required_chute_measurement_names: List[str] = Field(default_factory=list)
     required_storage_measurement_names: List[str] = Field(default_factory=list)
+    required_gpu_measurement_names: List[str] = Field(default_factory=list)
+    gpu_storage_siblings: List[Dict] = Field(default_factory=list)
+    all_gpu_storage_siblings_ready: bool = False
+    runtime_convergence_supported: bool = Field(
+        True,
+        description="True when the release has reservation-bound runtime convergence telemetry.",
+    )
+    source_staged_only: bool = Field(
+        False,
+        description="True when status can prove only source staging, not runtime convergence.",
+    )
+    runtime_convergence_state: Literal["tracked",]
     attestation_max_age_seconds: int
     untrusted_hosts: List[UntrustedReleaseHostStatus]
     trusted_measurement_counts: Dict[str, int] = Field(default_factory=dict)

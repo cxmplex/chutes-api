@@ -834,6 +834,33 @@ cpuScheduler:
       cpu: "500m"
       memory: "2Gi"
 
+gpuPlatformScheduler:
+  enabled: true
+  replicaCount: 1
+  image: validator:latest
+  imagePullPolicy: Always
+  nodeSelector: {}
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/name
+                  operator: In
+                  values:
+                    - gpu-platform-scheduler
+            topologyKey: kubernetes.io/hostname
+  tolerations: []
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "2Gi"
+    limits:
+      cpu: "500m"
+      memory: "2Gi"
+
 # autostaker runs as a CronJob (one-shot api/autostaker.py per tick), not a long-running
 # worker. validatorSs58 left empty here -> cronjobEnv falls back to the validator-credentials
 # secret; set a literal in the overlay to match prod.

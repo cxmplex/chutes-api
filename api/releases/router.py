@@ -27,7 +27,7 @@ from api.releases.schemas import (
     ReleaseStatusResponse,
     RolloutRequest,
     RolloutResponse,
-    SignedL0BootstrapManifestV1,
+    SignedL0BootstrapManifest,
 )
 from api.user.schemas import User
 from api.user.service import get_current_user
@@ -122,6 +122,7 @@ async def release_status_endpoint(
 @router.get("/", response_model=List[ReleaseResponse])
 async def list_releases_endpoint(
     tee_type: Optional[str] = Query(None),
+    compute_type: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(raise_not_found=False)),
@@ -131,6 +132,14 @@ async def list_releases_endpoint(
     q = select(GuestRelease).order_by(GuestRelease.created_at.desc())
     if tee_type:
         q = q.where(GuestRelease.tee_type == tee_type.strip().lower())
+    if compute_type:
+        normalized_compute = compute_type.strip().lower()
+        if normalized_compute not in {"cpu", "gpu"}:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="compute_type must be cpu or gpu",
+            )
+        q = q.where(GuestRelease.compute_type == normalized_compute)
     if status_filter:
         q = q.where(GuestRelease.status == status_filter)
     rows = (await db.execute(q)).scalars().all()
@@ -139,12 +148,13 @@ async def list_releases_endpoint(
 
 @router.get(
     "/l0-bootstrap",
-    response_model=SignedL0BootstrapManifestV1,
+    response_model=SignedL0BootstrapManifest,
     response_model_exclude_none=True,
 )
 async def l0_bootstrap_endpoint(
     tee_type: str = Query(..., description="Target Model-B TEE type."),
     channel: str = Query("stable"),
+    compute_type: str = Query("cpu", pattern=r"^(cpu|gpu)$"),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     db: AsyncSession = Depends(get_db_session),
     _: User | None = Depends(
@@ -165,13 +175,21 @@ async def l0_bootstrap_endpoint(
             detail="Missing miner hotkey header.",
         )
     try:
-        bootstrap = await service.active_l0_bootstrap(db, tee_type, channel)
+        bootstrap = await service.active_l0_bootstrap(
+            db,
+            tee_type,
+            channel,
+            compute_type,
+        )
     except service.ReleaseError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     if bootstrap is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No active L0 bootstrap for channel={channel} tee_type={tee_type}",
+            detail=(
+                f"No active L0 bootstrap for channel={channel} tee_type={tee_type} "
+                f"compute_type={compute_type}"
+            ),
         )
     return bootstrap
 
@@ -180,6 +198,7 @@ async def l0_bootstrap_endpoint(
 async def current_release_endpoint(
     tee_type: str = Query(..., description="The polling host's launcher tee_type: sev-snp | tdx"),
     channel: str = Query("stable"),
+    compute_type: str = Query("cpu", pattern=r"^(cpu|gpu)$"),
     host_id: str = Query(..., description="Enrolled logical L0 launcher requesting its tokens"),
     db: AsyncSession = Depends(get_db_session),
     current_host: Host = Depends(host_service.get_ready_host),
@@ -199,6 +218,7 @@ async def current_release_endpoint(
             db,
             tee_type,
             channel,
+            compute_type,
             host_id=host_id,
             miner_hotkey=current_host.miner_hotkey,
         )
@@ -207,6 +227,9 @@ async def current_release_endpoint(
     if manifest is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"No active release for channel={channel} tee_type={tee_type}",
+            detail=(
+                f"No active release for channel={channel} tee_type={tee_type} "
+                f"compute_type={compute_type}"
+            ),
         )
     return manifest

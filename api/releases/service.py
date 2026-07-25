@@ -1,9 +1,8 @@
 """Fleet image release service: create/activate/rollout/status + the host-facing active manifest.
 
-Desired-state model: for each (channel, tee_type) at most one release is ACTIVE. L0 node-agents
-converge to the active release for their tee_type. Activation verifies canonical detached-cosign
-provenance, exact image/pin identity, and complete CPU-only size matrices before desired state can
-change. Unsigned provenance exists only for explicit debug artifacts in explicit dev posture.
+Desired-state model: for each (channel, tee_type, compute_type) at most one release is ACTIVE.
+Activation verifies canonical detached-cosign provenance, exact image/pin identity, and the complete
+CPU size matrix or GPU profile-by-management-mode matrix before desired state can change.
 """
 
 import hashlib
@@ -12,6 +11,9 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Dict, List, Optional
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import and_, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,13 +29,16 @@ from api.host.schemas import StorageLaunchIntent
 from api.host.schemas import TdLaunchReservation
 from api.releases.bootstrap import (
     L0BootstrapVerificationError,
+    parse_signed_l0_manifest,
     verify_signed_l0_manifest,
 )
 from api.releases.provenance import (
+    DIRECT_TDX_GPU_SCHEMA_VERSION,
     REQUIRED_DIRECT_TDX_PROFILES,
     REQUIRED_RELEASE_VCPU_SIZES,
     ProvenanceError,
     expected_pin_version,
+    gpu_measurement_fingerprint,
     load_canonical_provenance,
     measurement_values,
     normalize_provider,
@@ -44,19 +49,61 @@ from api.releases.schemas import (
     RELEASE_STATUS_DRAFT,
     RELEASE_STATUS_SUPERSEDED,
     CreateReleaseRequest,
+    GpuL0StorageClosure,
+    GpuStorageSibling,
+    GpuReleaseImage,
     GuestRelease,
     GuestReleaseTarget,
     L0BootstrapPublication,
-    SignedL0BootstrapManifestV1,
+    SignedL0BootstrapManifest,
     ReleaseImage,
     ReleaseL0,
     ReleaseManifest,
+    RoleLaunchBinaryContract,
 )
 from api.server.schemas import Host, Server, ServerAttestation
+from api.host.locks import acquire_gpu_lifecycle_lock
 
 
 class ReleaseError(Exception):
     """Raised for release create/activate/rollout errors (mapped to HTTP 4xx by the router)."""
+
+
+def _configured_gpu_launch_signer_identity() -> tuple[str, int]:
+    private_key = getattr(settings, "launch_config_private_key", None)
+    epoch = getattr(settings, "gpu_launch_key_epoch", None)
+    if (
+        not isinstance(private_key, ec.EllipticCurvePrivateKey)
+        or not isinstance(private_key.curve, ec.SECP256R1)
+        or not isinstance(epoch, int)
+        or isinstance(epoch, bool)
+        or epoch < 1
+    ):
+        raise ReleaseError(
+            "GPU activation requires the current configured P-256 launch signer and epoch."
+        )
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return hashlib.sha256(public_der).hexdigest(), epoch
+
+
+def _compute_type(release: GuestRelease) -> str:
+    """Return the ORM/server-default compute scope for transient or persisted rows."""
+
+    value = release.compute_type or "cpu"
+    if value not in {"cpu", "gpu"}:
+        raise ReleaseError(f"Release {release.release_id} has an invalid compute_type.")
+    if release.compute_type is None:
+        release.compute_type = value
+    return value
+
+
+def _runtime_convergence_supported(release: GuestRelease) -> bool:
+    """Both streams have reservation-bound runtime convergence telemetry."""
+
+    return _compute_type(release) in {"cpu", "gpu"}
 
 
 def _loaded_measurements_by_name() -> dict:
@@ -70,14 +117,37 @@ def _loaded_measurements_by_name() -> dict:
 
 def _release_measurement_names(release: GuestRelease) -> List[str]:
     names: List[str] = []
-    for key in ("chute", "storage"):
+    for key in _release_image_roles(release):
         img = (release.images or {}).get(key) or {}
         names.extend(img.get("measurement_names") or [])
     return names
 
 
+def _release_image_roles(release: GuestRelease) -> tuple[str, ...]:
+    return ("gpu",) if _compute_type(release) == "gpu" else ("chute", "storage")
+
+
+def _validate_release_stream_slots(release: GuestRelease) -> None:
+    """Reject malformed persisted JSON that crosses CPU/GPU release streams."""
+
+    images = release.images or {}
+    allowed = set(_release_image_roles(release)) | {"l0"}
+    unexpected = sorted(set(images) - allowed)
+    if unexpected:
+        raise ReleaseError(
+            f"Release {release.release_id} contains opposite-stream or unknown slots: {unexpected}."
+        )
+    if _compute_type(release) == "gpu":
+        if release.tee_type != "tdx" or not isinstance(images.get("gpu"), dict):
+            raise ReleaseError("GPU releases must contain exactly one TDX gpu image slot.")
+    elif images.get("gpu") is not None:
+        raise ReleaseError("CPU releases cannot contain a gpu image slot.")
+
+
 def _merged_release_images(release: GuestRelease, current_active: Optional[GuestRelease]) -> dict:
     """Materialize omitted image slots without promoting inherited roles to explicit ones."""
+    if current_active is not None and _compute_type(current_active) != _compute_type(release):
+        raise ReleaseError("Release images cannot be inherited across compute streams.")
     if current_active is not None and current_active.release_id == release.release_id:
         return {
             role: dict(image) if isinstance(image, dict) else image
@@ -88,13 +158,13 @@ def _merged_release_images(release: GuestRelease, current_active: Optional[Guest
     if current_active is not None:
         for role, image in (current_active.images or {}).items():
             inherited = dict(image) if isinstance(image, dict) else image
-            if role in {"chute", "storage", "l0"} and isinstance(inherited, dict):
+            if role in {"chute", "storage", "gpu", "l0"} and isinstance(inherited, dict):
                 inherited["_inherited"] = True
             merged[role] = inherited
     for role, image in (release.images or {}).items():
         replacement = dict(image) if isinstance(image, dict) else image
         if (
-            role in {"chute", "storage"}
+            role in {"chute", "storage", "gpu"}
             and isinstance(replacement, dict)
             and replacement.get("_inherited")
         ):
@@ -138,6 +208,194 @@ def _image_from_manifest(images: dict, key: str) -> Optional[ReleaseImage]:
         initrd_sha256=raw.get("initrd_sha256"),
         cmdline_sha256=raw.get("cmdline_sha256"),
     )
+
+
+def _gpu_image_from_manifest(images: dict) -> Optional[GpuReleaseImage]:
+    raw = (images or {}).get("gpu")
+    if not raw:
+        return None
+    raw = dict(raw)
+    raw.pop("_inherited", None)
+    return GpuReleaseImage(
+        url=raw["url"],
+        sha256=raw["sha256"],
+        debug=raw["debug"],
+        version=raw["version"],
+        measurement_names=raw.get("measurement_names") or [],
+        kernel_sha256=raw["kernel_sha256"],
+        initrd_sha256=raw["initrd_sha256"],
+        cmdline_sha256=raw["cmdline_sha256"],
+    )
+
+
+def _validate_gpu_image_provenance(
+    release: GuestRelease,
+    image: dict,
+    loaded_by_name: dict,
+) -> None:
+    """Require one strict direct-TDX GPU provenance and complete profile/mode pin matrix."""
+
+    if _compute_type(release) != "gpu" or release.tee_type != "tdx":
+        raise ReleaseError("GPU release provenance is valid only for the TDX GPU stream.")
+    names = image.get("measurement_names") or []
+    if not names or len(names) != len(set(names)):
+        raise ReleaseError("GPU release measurement names must be non-empty and unique.")
+    missing = sorted(set(names) - set(loaded_by_name))
+    if missing:
+        raise ReleaseError(
+            f"Refusing to activate GPU release with unpinned measurement names: {missing}."
+        )
+    configs = [loaded_by_name[name] for name in names]
+    wrong_pin_scope = sorted(
+        config.name
+        for config in configs
+        if config.tee_type != "tdx"
+        or normalize_provider(config.provider) != "bare-metal"
+        or getattr(config, "compute_type", None) != "gpu"
+        or getattr(config, "role", None) != "gpu"
+        or getattr(config, "provenance_schema_version", None) != DIRECT_TDX_GPU_SCHEMA_VERSION
+        or getattr(config, "gpu_fingerprint_version", None) != 1
+        or not isinstance(config.gpu_count, int)
+        or isinstance(config.gpu_count, bool)
+        or config.gpu_count <= 0
+        or not list(config.expected_gpus or [])
+    )
+    if wrong_pin_scope:
+        raise ReleaseError(
+            "GPU release pins must be bare-metal TDX entries with explicit GPU identity: "
+            f"{wrong_pin_scope}."
+        )
+
+    payload = image.get("provenance_payload")
+    signature = image.get("provenance_signature")
+    unsigned_debug_allowed = bool(
+        image.get("debug") is True
+        and settings.allow_debug_measurements
+        and settings.skip_metagraph_check
+    )
+    if not payload:
+        raise ReleaseError("GPU release activation requires canonical schema-version 3 provenance.")
+    try:
+        if signature:
+            provenance = verify_provenance_signature(
+                payload,
+                signature,
+                settings.trusted_provenance_public_key_path,
+                cosign_binary=settings.provenance_cosign_binary,
+            )
+        elif unsigned_debug_allowed:
+            provenance = load_canonical_provenance(payload)
+        else:
+            raise ProvenanceError("detached signature is missing")
+    except ProvenanceError as exc:
+        raise ReleaseError(f"Refusing to activate GPU image: untrusted provenance: {exc}") from exc
+    if provenance["schema_version"] != DIRECT_TDX_GPU_SCHEMA_VERSION:
+        raise ReleaseError("GPU releases require the separate direct-TDX GPU provenance schema.")
+    signer_key_id, signer_epoch = _configured_gpu_launch_signer_identity()
+    if (
+        provenance["launch_public_key_id"] != signer_key_id
+        or provenance["launch_public_key_epoch"] != signer_epoch
+    ):
+        raise ReleaseError(
+            "GPU provenance launch signer does not match the currently configured signer."
+        )
+
+    expected = {
+        "compute_type": "gpu",
+        "role": "gpu",
+        "tee_type": "tdx",
+        "provider": "bare-metal",
+        "version": image.get("version"),
+    }
+    mismatched = {
+        field: {"expected": value, "actual": provenance.get(field)}
+        for field, value in expected.items()
+        if provenance.get(field) != value
+    }
+    if mismatched:
+        raise ReleaseError(f"GPU provenance does not match release semantics: {mismatched}.")
+    if provenance["image"]["sha256"] != image.get("sha256"):
+        raise ReleaseError("GPU release sha256 does not match signed provenance.")
+    if provenance["build_flags"]["debug_build"] is not image.get("debug"):
+        raise ReleaseError("GPU release debug posture does not match signed provenance.")
+    raw_l0 = (release.images or {}).get("l0")
+    try:
+        signed_l0 = parse_signed_l0_manifest(
+            (raw_l0 or {}).get("bootstrap"),
+            compute_type="gpu",
+        )
+    except (AttributeError, L0BootstrapVerificationError, ValueError) as exc:
+        raise ReleaseError("GPU activation requires its exact signed L0 launch closure.") from exc
+    l0_manifest = signed_l0.manifest
+    expected_qemu = sorted(
+        {item["qemu_binary_sha256"] for item in provenance["launch_environments"]}
+    )
+    expected_tdvf = sorted({item["firmware_sha256"] for item in provenance["launch_environments"]})
+    if (
+        not getattr(l0_manifest, "gpu_qemu_sha256s", None)
+        or len(l0_manifest.gpu_qemu_sha256s) != 1
+        or not set(l0_manifest.gpu_qemu_sha256s).issubset(expected_qemu)
+        or not getattr(l0_manifest, "gpu_tdvf_sha256s", None)
+        or len(l0_manifest.gpu_tdvf_sha256s) != 1
+        or not set(l0_manifest.gpu_tdvf_sha256s).issubset(expected_tdvf)
+        or not any(
+            item["profile_id"] == l0_manifest.gpu_profile_id
+            and item["qemu_binary_sha256"] == l0_manifest.gpu_qemu_sha256s[0]
+            and item["firmware_sha256"] == l0_manifest.gpu_tdvf_sha256s[0]
+            for item in provenance["launch_environments"]
+        )
+        or getattr(l0_manifest, "gpu_launch_public_key_id", None)
+        != provenance["launch_public_key_id"]
+        or getattr(l0_manifest, "gpu_launch_public_key_epoch", None)
+        != provenance["launch_public_key_epoch"]
+        or getattr(l0_manifest, "gpu_build_inputs_sha256", None)
+        != provenance["build_inputs_sha256"]
+    ):
+        raise ReleaseError("GPU provenance QEMU/TDVF/key/build closure differs from signed L0.")
+
+    signed_names = [entry["name"] for entry in provenance["measurements"]]
+    if signed_names != names:
+        raise ReleaseError(
+            "GPU release measurement names do not exactly match the signed profile/mode matrix."
+        )
+    signed_artifacts = provenance["artifacts"]
+    sidecars = {
+        "kernel_sha256": signed_artifacts["kernel_sha256"],
+        "initrd_sha256": signed_artifacts["initrd_sha256"],
+        "cmdline_sha256": signed_artifacts["cmdline_sha256"],
+    }
+    for field, signed_value in sidecars.items():
+        supplied = image.get(field)
+        if supplied is not None and supplied != signed_value:
+            raise ReleaseError(f"GPU release {field} does not match signed provenance.")
+        image[field] = signed_value
+
+    profile_by_id = {
+        profile["id"]: profile for profile in provenance["profile_contract"]["profiles"]
+    }
+    value_mismatches = []
+    for config, entry in zip(configs, provenance["measurements"], strict=True):
+        profile = profile_by_id[entry["profile_id"]]
+        expected_gpu_fingerprint = gpu_measurement_fingerprint(provenance, entry)
+        if (
+            config.version != provenance["version"]
+            or getattr(config, "gpu_profile_id", None) != entry["profile_id"]
+            or getattr(config, "management_mode", None) != entry["management_mode"]
+            or getattr(config, "gpu_profile_contract_sha256", None)
+            != provenance["profile_contract_sha256"]
+            or getattr(config, "gpu_measurement_fingerprint", None) != expected_gpu_fingerprint
+            or config.gpu_count != profile["gpu_count"]
+            or list(config.expected_gpus or []) != profile["expected_gpu_identifiers"]
+            or config.image_sha256 != image.get("sha256")
+            or list(config.image_measurement_names or []) != names
+            or config.debug is not image.get("debug")
+            or measurement_values(config) != entry["values"]
+        ):
+            value_mismatches.append(config.name)
+    if value_mismatches:
+        raise ReleaseError(
+            f"Loaded GPU pin values do not match canonical provenance for {value_mismatches}."
+        )
 
 
 def _validate_image_provenance(
@@ -447,7 +705,7 @@ def _l0_from_manifest(images: dict) -> Optional[ReleaseL0]:
 
 def _verify_l0_release_contract(
     release: GuestRelease, *, allow_expired: bool = False
-) -> tuple[SignedL0BootstrapManifestV1, str]:
+) -> tuple[SignedL0BootstrapManifest, str]:
     """Purely verify one release wrapper against its publisher-signed L0 contract."""
     raw = (release.images or {}).get("l0")
     if raw is None:
@@ -455,7 +713,10 @@ def _verify_l0_release_contract(
             "A seedless Model-B release must carry a publisher-signed L0 bootstrap manifest."
         )
     try:
-        signed = SignedL0BootstrapManifestV1.model_validate(raw.get("bootstrap"))
+        signed = parse_signed_l0_manifest(
+            raw.get("bootstrap"),
+            compute_type=_compute_type(release),
+        )
         digest = verify_signed_l0_manifest(
             signed,
             settings.trusted_l0_publisher_keys_path,
@@ -465,8 +726,16 @@ def _verify_l0_release_contract(
         raise ReleaseError(f"Untrusted L0 bootstrap manifest: {exc}") from exc
 
     manifest = signed.manifest
-    if manifest.tee_type != release.tee_type or manifest.channel != release.channel:
-        raise ReleaseError("L0 bootstrap manifest TEE/channel does not match the guest release.")
+    release_compute_type = _compute_type(release)
+    manifest_compute_type = getattr(manifest, "compute_type", "cpu")
+    if (
+        manifest.tee_type != release.tee_type
+        or manifest.channel != release.channel
+        or manifest_compute_type != release_compute_type
+    ):
+        raise ReleaseError(
+            "L0 bootstrap manifest TEE/channel/compute type does not match the guest release."
+        )
     if (
         manifest.release_id is not None
         and manifest.release_id != release.release_id
@@ -484,7 +753,7 @@ def _verify_l0_release_contract(
 
 def _stamp_release_l0_audit(
     release: GuestRelease,
-    signed: SignedL0BootstrapManifestV1,
+    signed: SignedL0BootstrapManifest,
     digest: str,
 ) -> None:
     manifest = signed.manifest
@@ -501,15 +770,25 @@ async def _admit_l0_bootstrap(
 ) -> L0BootstrapPublication:
     """Transactionally admit one monotonic publisher generation without GET-side mutation."""
 
+    await acquire_gpu_lifecycle_lock(db)
     signed, digest = _verify_l0_release_contract(release)
     manifest = signed.manifest
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": f"l0-bootstrap:{release.tee_type}:{release.channel}"},
+        {
+            "lock_key": (
+                f"l0-bootstrap:{release.channel}:{release.tee_type}:{_compute_type(release)}"
+            )
+        },
     )
     existing = await db.get(
         L0BootstrapPublication,
-        (release.tee_type, release.channel, manifest.generation),
+        (
+            release.tee_type,
+            release.channel,
+            _compute_type(release),
+            manifest.generation,
+        ),
     )
     latest = (
         await db.execute(
@@ -517,6 +796,7 @@ async def _admit_l0_bootstrap(
             .where(
                 L0BootstrapPublication.tee_type == release.tee_type,
                 L0BootstrapPublication.channel == release.channel,
+                L0BootstrapPublication.compute_type == _compute_type(release),
             )
             .order_by(L0BootstrapPublication.generation.desc())
             .limit(1)
@@ -545,6 +825,7 @@ async def _admit_l0_bootstrap(
         publication = L0BootstrapPublication(
             tee_type=release.tee_type,
             channel=release.channel,
+            compute_type=_compute_type(release),
             generation=manifest.generation,
             manifest_digest=digest,
             key_id=manifest.key_id,
@@ -579,6 +860,7 @@ async def _mark_l0_publication_active(
         .where(
             L0BootstrapPublication.tee_type == release.tee_type,
             L0BootstrapPublication.channel == release.channel,
+            L0BootstrapPublication.compute_type == _compute_type(release),
             L0BootstrapPublication.admission_status == "active",
             L0BootstrapPublication.generation != publication.generation,
         )
@@ -596,11 +878,17 @@ async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRe
         images["chute"] = _image_to_dict(req.chute)
     if req.storage is not None:
         images["storage"] = _image_to_dict(req.storage)
+    if req.gpu is not None:
+        images["gpu"] = {
+            **_image_to_dict(req.gpu),
+            "cmdline_sha256": req.gpu.cmdline_sha256.model_dump(),
+        }
     if req.l0 is not None:
         images["l0"] = _l0_to_dict(req.l0)
     release = GuestRelease(
         channel=req.channel,
         tee_type=req.tee_type,
+        compute_type=req.compute_type,
         status=RELEASE_STATUS_DRAFT,
         images=images,
         notes=req.notes,
@@ -617,7 +905,7 @@ async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRe
     await db.refresh(release)
     logger.success(
         f"Created draft guest release {release.release_id} (channel={release.channel} "
-        f"tee_type={release.tee_type})"
+        f"tee_type={release.tee_type} compute_type={release.compute_type})"
     )
     if req.activate:
         await activate_release(db, release.release_id)
@@ -625,35 +913,86 @@ async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRe
     return release
 
 
+async def _lock_release_streams(
+    db: AsyncSession,
+    *,
+    channel: str,
+    tee_type: str,
+    compute_type: str,
+) -> Dict[str, GuestRelease]:
+    """Lock composed stream identities and active rows in deterministic CPU→GPU order."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    compute_types = (
+        ("cpu", "gpu") if tee_type == "tdx" and compute_type in {"cpu", "gpu"} else (compute_type,)
+    )
+    for locked_compute_type in compute_types:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": (f"guest-release:{channel}:{tee_type}:{locked_compute_type}")},
+        )
+    active_rows = (
+        (
+            await db.execute(
+                select(GuestRelease)
+                .where(
+                    GuestRelease.channel == channel,
+                    GuestRelease.tee_type == tee_type,
+                    GuestRelease.compute_type.in_(compute_types),
+                    GuestRelease.status == RELEASE_STATUS_ACTIVE,
+                )
+                .order_by(GuestRelease.compute_type.asc())
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {row.compute_type: row for row in active_rows}
+
+
 async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
-    """Make a release the ACTIVE desired state for its (channel, tee_type).
+    """Make a release the ACTIVE desired state for its compute-scoped stream.
 
     GATE: every measurement name the release references MUST already be pinned in
     settings.tee_measurements. Otherwise TDs launched from the new image would fail attestation
     fleet-wide -- so refuse activation until the measurements are pinned (committed yaml / ConfigMap).
-    Supersedes the prior active release for the same (channel, tee_type).
+    Supersedes the prior active release for the same (channel, tee_type, compute_type).
     """
+    await acquire_gpu_lifecycle_lock(db)
     release = await db.get(GuestRelease, release_id)
     if release is None:
         raise ReleaseError(f"Release {release_id} not found")
-    # Serialize the supersede/activate transaction for one desired-state slot. The partial unique
-    # index is the final invariant; this lock makes concurrent activations deterministic instead of
-    # surfacing a late IntegrityError after both callers supersede the prior row.
-    await db.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": f"guest-release:{release.channel}:{release.tee_type}"},
+    if release.compute_type is None:
+        release.compute_type = "cpu"
+    active_streams = await _lock_release_streams(
+        db,
+        channel=release.channel,
+        tee_type=release.tee_type,
+        compute_type=release.compute_type,
     )
-    current_active = await get_active_release(db, release.tee_type, release.channel, lock=True)
+    current_active = active_streams.get(release.compute_type)
+    if current_active is None:
+        current_active = await get_active_release(
+            db,
+            release.tee_type,
+            release.channel,
+            release.compute_type,
+            lock=True,
+        )
     if not isinstance(current_active, GuestRelease):
         current_active = None
     original_images = release.images
     release.images = _merged_release_images(release, current_active)
     try:
-        if release.tee_type == "tdx" and not (release.images or {}).get("chute"):
-            raise ReleaseError(
-                "A managed TDX desired state must include a schema-v2 direct-boot chute image; "
-                "a first or legacy-partial storage-only release is unschedulable."
-            )
+        _validate_release_stream_slots(release)
+        if _runtime_convergence_supported(release) and release.tee_type == "tdx":
+            required_slot = "gpu" if _compute_type(release) == "gpu" else "chute"
+            if not (release.images or {}).get(required_slot):
+                raise ReleaseError(
+                    f"A managed TDX {_compute_type(release)} desired state must include "
+                    f"its direct-boot {required_slot} image slot; the release is unschedulable."
+                )
         required = _release_measurement_names(release)
         if not required:
             raise ReleaseError(
@@ -662,10 +1001,14 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
                 "verified)."
             )
         loaded_by_name = _loaded_measurements_by_name()
-        for image_role in ("chute", "storage"):
+        for image_role in _release_image_roles(release):
             image = (release.images or {}).get(image_role)
             if image:
-                _validate_image_provenance(release, image_role, image, loaded_by_name)
+                if image_role == "gpu":
+                    _validate_gpu_image_provenance(release, image, loaded_by_name)
+                else:
+                    _validate_image_provenance(release, image_role, image, loaded_by_name)
+        await _validate_gpu_storage_stream(db, release)
         publication = await _validate_l0_bootstrap(db, release)
         await _mark_l0_publication_active(db, release, publication)
     except Exception:
@@ -677,6 +1020,12 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     if release.status == RELEASE_STATUS_ACTIVE:
         if release.targets_captured_at is None:
             await _capture_release_targets(db, release)
+        if _compute_type(release) == "cpu" and release.tee_type == "tdx":
+            await _refresh_active_gpu_storage_intents(
+                db,
+                active_cpu_release=release,
+                gpu_release=active_streams.get("gpu"),
+            )
         await db.commit()
         await db.refresh(release)
         return release
@@ -687,6 +1036,7 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
         .where(
             GuestRelease.channel == release.channel,
             GuestRelease.tee_type == release.tee_type,
+            GuestRelease.compute_type == release.compute_type,
             GuestRelease.status == RELEASE_STATUS_ACTIVE,
             GuestRelease.release_id != release.release_id,
         )
@@ -695,11 +1045,18 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     release.status = RELEASE_STATUS_ACTIVE
     release.activated_at = datetime.now(timezone.utc)
     await _capture_release_targets(db, release)
+    if _compute_type(release) == "cpu" and release.tee_type == "tdx":
+        await _refresh_active_gpu_storage_intents(
+            db,
+            active_cpu_release=release,
+            gpu_release=active_streams.get("gpu"),
+        )
     await db.commit()
     await db.refresh(release)
     logger.success(
         f"Activated guest release {release.release_id} (channel={release.channel} "
-        f"tee_type={release.tee_type}); measurements verified pinned: {sorted(set(required))}"
+        f"tee_type={release.tee_type} compute_type={release.compute_type}); "
+        f"measurements verified pinned: {sorted(set(required))}"
     )
     return release
 
@@ -708,15 +1065,18 @@ async def get_active_release(
     db: AsyncSession,
     tee_type: str,
     channel: str = "stable",
+    compute_type: str = "cpu",
     *,
     lock: bool = False,
 ) -> Optional[GuestRelease]:
     query = select(GuestRelease).where(
         GuestRelease.tee_type == tee_type,
         GuestRelease.channel == channel,
+        GuestRelease.compute_type == compute_type,
         GuestRelease.status == RELEASE_STATUS_ACTIVE,
     )
     if lock:
+        await acquire_gpu_lifecycle_lock(db)
         query = query.with_for_update()
     return (await db.execute(query)).scalar_one_or_none()
 
@@ -725,7 +1085,8 @@ async def active_l0_bootstrap(
     db: AsyncSession,
     tee_type: str,
     channel: str,
-) -> Optional[SignedL0BootstrapManifestV1]:
+    compute_type: str = "cpu",
+) -> Optional[SignedL0BootstrapManifest]:
     """Return the newest transactionally admitted bootstrap without mutating state."""
 
     normalized_tee = tee_type.strip().lower()
@@ -735,6 +1096,7 @@ async def active_l0_bootstrap(
             .where(
                 L0BootstrapPublication.tee_type == normalized_tee,
                 L0BootstrapPublication.channel == channel,
+                L0BootstrapPublication.compute_type == compute_type,
             )
             .order_by(L0BootstrapPublication.generation.desc())
             .limit(1)
@@ -744,7 +1106,10 @@ async def active_l0_bootstrap(
         return None
 
     try:
-        signed = SignedL0BootstrapManifestV1.model_validate(publication.signed_manifest)
+        signed = parse_signed_l0_manifest(
+            publication.signed_manifest,
+            compute_type=compute_type,
+        )
         digest = verify_signed_l0_manifest(
             signed,
             settings.trusted_l0_publisher_keys_path,
@@ -752,11 +1117,14 @@ async def active_l0_bootstrap(
     except (L0BootstrapVerificationError, ValueError, TypeError) as exc:
         raise ReleaseError(f"Admitted L0 bootstrap is no longer trusted: {exc}") from exc
     manifest = signed.manifest
+    manifest_compute_type = getattr(manifest, "compute_type", "cpu")
     if (
         manifest.tee_type != normalized_tee
         or manifest.channel != channel
+        or manifest_compute_type != compute_type
         or publication.tee_type != normalized_tee
         or publication.channel != channel
+        or (publication.compute_type or "cpu") != compute_type
         or publication.generation != manifest.generation
         or publication.manifest_digest != digest
         or publication.key_id != manifest.key_id
@@ -770,12 +1138,15 @@ async def active_l0_bootstrap(
 
 def release_manifest(release: GuestRelease) -> ReleaseManifest:
     """The host-facing desired state; TD launch authorization is separate and one-use."""
+    _validate_release_stream_slots(release)
     return ReleaseManifest(
         release_id=release.release_id,
         channel=release.channel,
         tee_type=release.tee_type,
+        compute_type=_compute_type(release),
         chute=_image_from_manifest(release.images, "chute"),
         storage=_image_from_manifest(release.images, "storage"),
+        gpu=_gpu_image_from_manifest(release.images),
         l0=_l0_from_manifest(release.images),
     )
 
@@ -784,6 +1155,11 @@ def _target_roles_for_host(release: GuestRelease, host: Host) -> List[str]:
     """Release roles this enrolled logical host can actually run."""
     images = release.images or {}
     roles: List[str] = []
+    if _compute_type(release) == "gpu":
+        gpu = images.get("gpu") or {}
+        if gpu and not gpu.get("_inherited") and int(host.reported_capacity or 0) > 0:
+            roles.append("gpu")
+        return roles
     chute = images.get("chute") or {}
     storage = images.get("storage") or {}
     if chute and not chute.get("_inherited") and int(host.capacity or 0) > 0:
@@ -801,6 +1177,8 @@ def _apply_storage_auto_opt_in(release: GuestRelease, host: Host) -> None:
     longer include the TD that will become the always-on storage role.
     """
 
+    if _compute_type(release) != "cpu":
+        return
     storage = (release.images or {}).get("storage") or {}
     if not storage or storage.get("_inherited"):
         return
@@ -843,6 +1221,396 @@ def _storage_profile_for_host(release: GuestRelease, host: Host) -> str:
     return matches[0]
 
 
+async def _storage_source_release(
+    db: AsyncSession,
+    active_cpu_release: GuestRelease,
+) -> GuestRelease:
+    """Resolve the immutable release row that explicitly introduced active storage bytes."""
+
+    image = (active_cpu_release.images or {}).get("storage") or {}
+    if not image.get("_inherited"):
+        return active_cpu_release
+    candidates = (
+        (
+            await db.execute(
+                select(GuestRelease)
+                .where(
+                    GuestRelease.tee_type == active_cpu_release.tee_type,
+                    GuestRelease.channel == active_cpu_release.channel,
+                    GuestRelease.compute_type == "cpu",
+                    GuestRelease.activated_at.is_not(None),
+                )
+                .order_by(
+                    GuestRelease.activated_at.desc().nullslast(),
+                    GuestRelease.created_at.desc(),
+                    GuestRelease.release_id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    exact = []
+    for candidate in candidates:
+        candidate_image = (candidate.images or {}).get("storage")
+        if (
+            isinstance(candidate_image, dict)
+            and (
+                active_cpu_release.activated_at is None
+                or candidate.activated_at <= active_cpu_release.activated_at
+            )
+            and not candidate_image.get("_inherited")
+            and candidate_image.get("sha256") == image.get("sha256")
+            and candidate_image.get("version") == image.get("version")
+            and candidate_image.get("kernel_sha256") == image.get("kernel_sha256")
+            and candidate_image.get("initrd_sha256") == image.get("initrd_sha256")
+            and candidate_image.get("cmdline_sha256") == image.get("cmdline_sha256")
+            and candidate_image.get("measurement_names") == image.get("measurement_names")
+        ):
+            exact.append(candidate)
+    if not exact:
+        raise ReleaseError("Active CPU storage inheritance has no exact explicit source release.")
+    return exact[0]
+
+
+async def _validate_gpu_storage_stream(
+    db: AsyncSession,
+    gpu_release: GuestRelease,
+) -> None:
+    if _compute_type(gpu_release) != "gpu":
+        return
+    active_cpu = await get_active_release(db, "tdx", gpu_release.channel, "cpu")
+    if active_cpu is None:
+        raise ReleaseError(
+            "GPU activation requires an independently active CPU/storage TDX release "
+            f"for channel {gpu_release.channel!r}."
+        )
+    _validate_active_release(active_cpu)
+    storage = (active_cpu.images or {}).get("storage")
+    if not isinstance(storage, dict):
+        raise ReleaseError("Active CPU TDX release has no storage role to compose with GPU L0.")
+    expected = await _gpu_l0_storage_closure(db, active_cpu)
+    signed, _digest = _verify_l0_release_contract(gpu_release)
+    if signed.manifest.storage_closure != expected:
+        raise ReleaseError(
+            "GPU L0 storage closure does not match the active independent CPU/storage release."
+        )
+
+
+def _storage_launch_contract(image: dict) -> RoleLaunchBinaryContract:
+    """Extract the signed direct-TDX QEMU/TDVF identity without changing CPU rows."""
+
+    payload = image.get("provenance_payload")
+    if not isinstance(payload, str) or not payload:
+        raise ReleaseError("GPU storage composition requires signed CPU storage provenance.")
+    try:
+        provenance = load_canonical_provenance(payload)
+    except ProvenanceError as exc:
+        raise ReleaseError(f"CPU storage provenance is invalid: {exc}") from exc
+    launch = provenance.get("launch_contract")
+    if (
+        provenance.get("schema_version") != 2
+        or provenance.get("role") != "storage"
+        or provenance.get("tee_type") != "tdx"
+        or provenance.get("provider") != "bare-metal"
+        or not isinstance(launch, dict)
+        or launch.get("image_sha256") != image.get("sha256")
+        or launch.get("kernel_sha256") != image.get("kernel_sha256")
+        or launch.get("initrd_sha256") != image.get("initrd_sha256")
+        or launch.get("cmdline_sha256") != image.get("cmdline_sha256")
+    ):
+        raise ReleaseError(
+            "GPU storage composition requires an exact schema-v2 direct-TDX storage contract."
+        )
+    return RoleLaunchBinaryContract(
+        role="storage",
+        qemu_binary="qemu-system-x86_64",
+        qemu_package="qemu-system-x86",
+        qemu_package_version=launch["qemu_package_version"],
+        qemu_binary_sha256=launch["qemu_binary_sha256"],
+        machine_type=launch["machine_type"],
+        firmware_filename="OVMF.inteltdx.fd",
+        firmware_sha256=launch["firmware_sha256"],
+    )
+
+
+async def _gpu_l0_storage_closure(
+    db: AsyncSession,
+    active_cpu_release: GuestRelease,
+) -> GpuL0StorageClosure:
+    """Resolve the one closure a GPU L0 is publisher-authorized to launch."""
+
+    if (
+        _compute_type(active_cpu_release) != "cpu"
+        or active_cpu_release.tee_type != "tdx"
+        or active_cpu_release.status != RELEASE_STATUS_ACTIVE
+    ):
+        raise ReleaseError("GPU L0 storage closure requires an active CPU TDX release.")
+    storage = (active_cpu_release.images or {}).get("storage")
+    if not isinstance(storage, dict):
+        raise ReleaseError("Active CPU TDX release has no storage image closure.")
+    source = await _storage_source_release(db, active_cpu_release)
+    source_storage = (source.images or {}).get("storage") if source is not None else None
+    if not isinstance(source_storage, dict) or source_storage.get("_inherited"):
+        raise ReleaseError("CPU storage source release has no explicit immutable image.")
+    required = (
+        "sha256",
+        "version",
+        "measurement_names",
+        "kernel_sha256",
+        "initrd_sha256",
+        "cmdline_sha256",
+    )
+    if any(not source_storage.get(field) for field in required):
+        raise ReleaseError("CPU storage source release has an incomplete artifact closure.")
+    return GpuL0StorageClosure(
+        source_release_id=source.release_id,
+        image_version=source_storage["version"],
+        image_sha256=source_storage["sha256"],
+        kernel_sha256=source_storage["kernel_sha256"],
+        initrd_sha256=source_storage["initrd_sha256"],
+        cmdline_sha256=source_storage["cmdline_sha256"],
+        measurement_names=list(source_storage["measurement_names"]),
+        launch_contract=_storage_launch_contract(source_storage),
+    )
+
+
+async def _gpu_storage_sibling_for_host(
+    db: AsyncSession,
+    gpu_release: GuestRelease,
+    host: Host,
+) -> GpuStorageSibling:
+    """Compose one GPU host with the independently active CPU/storage stream."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    if (
+        _compute_type(gpu_release) != "gpu"
+        or gpu_release.tee_type != "tdx"
+        or host.compute_type != "gpu"
+        or host.tee_type != "tdx"
+        or not host.storage_enabled
+    ):
+        raise ReleaseError(
+            "GPU storage sibling composition requires a storage-enabled TDX GPU host."
+        )
+    active_cpu = await get_active_release(
+        db,
+        "tdx",
+        gpu_release.channel,
+        "cpu",
+    )
+    if active_cpu is None:
+        raise ReleaseError(
+            "GPU desired state requires an independently active CPU/storage TDX release "
+            f"for channel {gpu_release.channel!r}."
+        )
+    _validate_active_release(active_cpu)
+    storage = (active_cpu.images or {}).get("storage")
+    if not isinstance(storage, dict):
+        raise ReleaseError("Active CPU TDX desired state has no storage image.")
+    closure = await _gpu_l0_storage_closure(db, active_cpu)
+    signed_l0, _l0_digest = _verify_l0_release_contract(
+        gpu_release,
+        allow_expired=gpu_release.status == RELEASE_STATUS_ACTIVE,
+    )
+    if signed_l0.manifest.storage_closure != closure:
+        raise ReleaseError(
+            "Active GPU L0 is incompatible with the current CPU/storage launch closure."
+        )
+    source = await db.get(GuestRelease, closure.source_release_id)
+    source_storage = (source.images or {}).get("storage")
+    if not isinstance(source_storage, dict):
+        raise ReleaseError("Resolved CPU storage source release has no storage image.")
+    profile_id = _storage_profile_for_host(active_cpu, host)
+    image = _image_from_manifest({"storage": source_storage}, "storage")
+    if image is None:
+        raise ReleaseError("Resolved CPU storage source image is invalid.")
+    return GpuStorageSibling(
+        source_release_id=source.release_id,
+        active_cpu_release_id=active_cpu.release_id,
+        profile_id=profile_id,
+        image=image,
+        launch_contract=closure.launch_contract,
+    )
+
+
+async def _supersede_storage_intents(
+    db: AsyncSession,
+    *criteria,
+) -> List[StorageLaunchIntent]:
+    """Supersede intents and invalidate every unconsumed reservation in one transaction."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    intents = (
+        (
+            await db.execute(
+                select(StorageLaunchIntent)
+                .where(
+                    StorageLaunchIntent.state == "active",
+                    *criteria,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not intents:
+        return []
+    intent_ids = [intent.intent_id for intent in intents]
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(TdLaunchReservation)
+        .where(
+            TdLaunchReservation.storage_intent_id.in_(intent_ids),
+            TdLaunchReservation.consumed_at.is_(None),
+            TdLaunchReservation.invalidated_at.is_(None),
+        )
+        .values(invalidated_at=now)
+    )
+    for intent in intents:
+        intent.state = "superseded"
+    await db.flush()
+    return intents
+
+
+async def _ensure_gpu_storage_launch_intent_for_host(
+    db: AsyncSession,
+    gpu_release: GuestRelease,
+    host: Host,
+) -> StorageLaunchIntent:
+    """Create or recover one GPU-host storage intent without touching CPU targets."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    if (
+        host.miner_hotkey is None
+        or host.compute_type != "gpu"
+        or host.tee_type != "tdx"
+        or host.release_channel != gpu_release.channel
+        or host.provisioning_state != "ready"
+        or host.identity_durable_at is None
+        or not host.storage_enabled
+    ):
+        raise ReleaseError(
+            f"GPU storage-sibling host {host.host_id} is not launch-intent eligible."
+        )
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {"key": f"gpu-storage-intent:{host.host_id}"},
+    )
+    sibling = await _gpu_storage_sibling_for_host(db, gpu_release, host)
+    process_incarnation = "stor" + hashlib.sha256(host.host_id.encode()).hexdigest()[:8]
+    expected = {
+        "target_id": None,
+        "release_id": sibling.source_release_id,
+        "tee_type": "tdx",
+        "channel": gpu_release.channel,
+        "host_id": host.host_id,
+        "owner_hotkey": host.miner_hotkey,
+        "server_id": f"chute-{process_incarnation}",
+        "process_incarnation": process_incarnation,
+        "profile_id": sibling.profile_id,
+        "image_sha256": sibling.image.sha256,
+        "image_version": sibling.image.version,
+        "host_compute_type": "gpu",
+        "gpu_release_id": gpu_release.release_id,
+        "active_cpu_release_id": sibling.active_cpu_release_id,
+        "kernel_sha256": sibling.image.kernel_sha256,
+        "initrd_sha256": sibling.image.initrd_sha256,
+        "cmdline_sha256": sibling.image.cmdline_sha256,
+        "launch_contract": sibling.launch_contract.model_dump(mode="json"),
+    }
+    active = (
+        await db.execute(
+            select(StorageLaunchIntent)
+            .where(
+                StorageLaunchIntent.host_id == host.host_id,
+                StorageLaunchIntent.owner_hotkey == host.miner_hotkey,
+                StorageLaunchIntent.tee_type == "tdx",
+                StorageLaunchIntent.channel == gpu_release.channel,
+                StorageLaunchIntent.state == "active",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if active is not None and all(
+        getattr(active, name) == value for name, value in expected.items()
+    ):
+        return active
+    if active is not None:
+        await _supersede_storage_intents(
+            db,
+            StorageLaunchIntent.intent_id == active.intent_id,
+        )
+    stored = StorageLaunchIntent(
+        intent_id=generate_uuid(),
+        state="active",
+        **expected,
+    )
+    db.add(stored)
+    await db.flush()
+    return stored
+
+
+async def _ensure_gpu_storage_launch_intents(
+    db: AsyncSession,
+    gpu_release: GuestRelease,
+    targets: List[GuestReleaseTarget],
+) -> None:
+    if _compute_type(gpu_release) != "gpu":
+        return
+    for host_id in sorted({target.host_id for target in targets if target.role == "gpu"}):
+        host = await db.get(Host, host_id)
+        if host is None:
+            raise ReleaseError(f"GPU rollout target {host_id} no longer has an enrolled host.")
+        await _ensure_gpu_storage_launch_intent_for_host(db, gpu_release, host)
+
+
+async def _refresh_active_gpu_storage_intents(
+    db: AsyncSession,
+    *,
+    active_cpu_release: GuestRelease,
+    gpu_release: Optional[GuestRelease],
+) -> None:
+    if gpu_release is None:
+        return
+    compatible = False
+    try:
+        expected_closure = await _gpu_l0_storage_closure(db, active_cpu_release)
+        signed_l0, _digest = _verify_l0_release_contract(
+            gpu_release,
+            allow_expired=True,
+        )
+        compatible = signed_l0.manifest.storage_closure == expected_closure
+    except ReleaseError:
+        compatible = False
+    if not compatible:
+        await _supersede_storage_intents(
+            db,
+            StorageLaunchIntent.gpu_release_id == gpu_release.release_id,
+            StorageLaunchIntent.host_compute_type == "gpu",
+        )
+        logger.warning(
+            f"GPU release {gpu_release.release_id} L0 cannot launch the new CPU/storage "
+            "closure; sibling intents were invalidated and no replacements were issued."
+        )
+        return
+    targets = (
+        (
+            await db.execute(
+                select(GuestReleaseTarget).where(
+                    GuestReleaseTarget.release_id == gpu_release.release_id,
+                    GuestReleaseTarget.compute_type == "gpu",
+                    GuestReleaseTarget.role == "gpu",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    await _ensure_gpu_storage_launch_intents(db, gpu_release, targets)
+
+
 async def _ensure_storage_launch_intents(
     db: AsyncSession,
     release: GuestRelease,
@@ -850,18 +1618,17 @@ async def _ensure_storage_launch_intents(
 ) -> None:
     """Materialize immutable, server-selected launch authority for storage targets."""
 
+    await acquire_gpu_lifecycle_lock(db)
+    if _compute_type(release) != "cpu":
+        return
     image = (release.images or {}).get("storage") or {}
     if not image or image.get("_inherited"):
         return
-    await db.execute(
-        update(StorageLaunchIntent)
-        .where(
-            StorageLaunchIntent.tee_type == release.tee_type,
-            StorageLaunchIntent.channel == release.channel,
-            StorageLaunchIntent.release_id != release.release_id,
-            StorageLaunchIntent.state == "active",
-        )
-        .values(state="superseded")
+    await _supersede_storage_intents(
+        db,
+        StorageLaunchIntent.tee_type == release.tee_type,
+        StorageLaunchIntent.channel == release.channel,
+        StorageLaunchIntent.release_id != release.release_id,
     )
     for target in [item for item in targets if item.role == "storage"]:
         process_incarnation = "stor" + hashlib.sha256(target.host_id.encode()).hexdigest()[:8]
@@ -900,6 +1667,7 @@ async def _ensure_storage_launch_intents(
             host is None
             or host.miner_hotkey != target.miner_hotkey
             or host.tee_type != release.tee_type
+            or host.compute_type != release.compute_type
             or host.release_channel != release.channel
             or host.provisioning_state != "ready"
             or host.identity_durable_at is None
@@ -939,6 +1707,9 @@ async def _ensure_storage_launch_intent_for_host(
 ) -> Optional[StorageLaunchIntent]:
     """Repair one returning host without coupling registration to sibling targets."""
 
+    await acquire_gpu_lifecycle_lock(db)
+    if _compute_type(release) != "cpu":
+        return None
     image = (release.images or {}).get("storage") or {}
     if not image:
         return None
@@ -946,6 +1717,7 @@ async def _ensure_storage_launch_intent_for_host(
     if (
         host.miner_hotkey is None
         or host.tee_type != release.tee_type
+        or host.compute_type != release.compute_type
         or host.release_channel != release.channel
         or host.provisioning_state != "ready"
         or host.identity_durable_at is None
@@ -974,7 +1746,10 @@ async def _ensure_storage_launch_intent_for_host(
     ):
         return active
     if active is not None and not inherited_storage:
-        active.state = "superseded"
+        await _supersede_storage_intents(
+            db,
+            StorageLaunchIntent.intent_id == active.intent_id,
+        )
 
     candidates = (
         (
@@ -984,6 +1759,7 @@ async def _ensure_storage_launch_intent_for_host(
                     GuestReleaseTarget.host_id == host.host_id,
                     GuestReleaseTarget.miner_hotkey == host.miner_hotkey,
                     GuestReleaseTarget.tee_type == release.tee_type,
+                    GuestReleaseTarget.compute_type == release.compute_type,
                     GuestReleaseTarget.role == "storage",
                 )
                 .order_by(
@@ -1005,6 +1781,7 @@ async def _ensure_storage_launch_intent_for_host(
         if (
             source is not None
             and source.tee_type == release.tee_type
+            and source.compute_type == release.compute_type
             and source.channel == release.channel
             and isinstance(source_image, dict)
             and source_image.get("sha256") == image.get("sha256")
@@ -1030,15 +1807,11 @@ async def _ensure_storage_launch_intent_for_host(
         "image_sha256": image["sha256"],
         "image_version": image["version"],
     }
-    await db.execute(
-        update(StorageLaunchIntent)
-        .where(
-            StorageLaunchIntent.tee_type == release.tee_type,
-            StorageLaunchIntent.channel == release.channel,
-            StorageLaunchIntent.host_id == host.host_id,
-            StorageLaunchIntent.state == "active",
-        )
-        .values(state="superseded")
+    await _supersede_storage_intents(
+        db,
+        StorageLaunchIntent.tee_type == release.tee_type,
+        StorageLaunchIntent.channel == release.channel,
+        StorageLaunchIntent.host_id == host.host_id,
     )
     stored = (
         await db.execute(
@@ -1075,6 +1848,8 @@ async def _capture_release_targets(
     release: GuestRelease,
 ) -> List[GuestReleaseTarget]:
     """Capture an immutable enrolled logical target set exactly once."""
+    await acquire_gpu_lifecycle_lock(db)
+    _compute_type(release)
     if release.targets_captured_at is not None:
         targets = (
             (
@@ -1088,6 +1863,7 @@ async def _capture_release_targets(
             .all()
         )
         await _ensure_storage_launch_intents(db, release, targets)
+        await _ensure_gpu_storage_launch_intents(db, release, targets)
         return targets
 
     query = (
@@ -1103,6 +1879,7 @@ async def _capture_release_targets(
         .where(
             Host.tee_type == release.tee_type,
             Host.release_channel == release.channel,
+            Host.compute_type == release.compute_type,
             Host.provisioning_state == "ready",
             Host.identity_durable_at.is_not(None),
             Host.active_key_generation.is_not(None),
@@ -1123,6 +1900,7 @@ async def _capture_release_targets(
                     host_id=host.host_id,
                     miner_hotkey=host.miner_hotkey,
                     tee_type=release.tee_type,
+                    compute_type=release.compute_type,
                     role=role,
                     current_generation=1,
                     current_token_id=f"audit:{target_id}",
@@ -1131,7 +1909,7 @@ async def _capture_release_targets(
             )
     explicit_roles = {
         role
-        for role in ("chute", "storage")
+        for role in _release_image_roles(release)
         if isinstance((release.images or {}).get(role), dict)
         and not (release.images or {})[role].get("_inherited")
     }
@@ -1147,6 +1925,7 @@ async def _capture_release_targets(
     release.targets_captured_at = captured_at
     await db.flush()
     await _ensure_storage_launch_intents(db, release, targets)
+    await _ensure_gpu_storage_launch_intents(db, release, targets)
     return targets
 
 
@@ -1163,15 +1942,25 @@ async def _manifest_for_logical_host(
         raise ReleaseError(
             "Guest release target reissue was removed; request an exact launch reservation."
         )
-    return release_manifest(release)
+    manifest = release_manifest(release)
+    if _compute_type(release) == "gpu":
+        sibling = await _gpu_storage_sibling_for_host(db, release, host)
+        await _ensure_gpu_storage_launch_intent_for_host(db, release, host)
+        manifest = manifest.model_copy(update={"storage_sibling": sibling})
+    return manifest
 
 
 def _validate_active_release(release: GuestRelease) -> None:
     """Revalidate desired state against the current trust set before serving or dispatching it."""
+    _compute_type(release)
+    _validate_release_stream_slots(release)
     raw_l0 = (release.images or {}).get("l0")
     if raw_l0 is not None:
         try:
-            signed_l0 = SignedL0BootstrapManifestV1.model_validate(raw_l0.get("bootstrap"))
+            signed_l0 = parse_signed_l0_manifest(
+                raw_l0.get("bootstrap"),
+                compute_type=release.compute_type,
+            )
             l0_digest = verify_signed_l0_manifest(
                 signed_l0,
                 settings.trusted_l0_publisher_keys_path,
@@ -1182,9 +1971,11 @@ def _validate_active_release(release: GuestRelease) -> None:
                 f"Active release {release.release_id} has an untrusted L0 manifest: {exc}"
             ) from exc
         l0_manifest = signed_l0.manifest
+        l0_compute_type = getattr(l0_manifest, "compute_type", "cpu")
         if (
             l0_manifest.tee_type != release.tee_type
             or l0_manifest.channel != release.channel
+            or l0_compute_type != release.compute_type
             or (
                 l0_manifest.release_id is not None
                 and l0_manifest.release_id != release.release_id
@@ -1214,18 +2005,23 @@ def _validate_active_release(release: GuestRelease) -> None:
         raise ReleaseError(f"Active release {release.release_id} has partial L0 audit state.")
     loaded_by_name = _loaded_measurements_by_name()
     images = release.images or {}
-    if not any(images.get(role) for role in ("chute", "storage")):
+    image_roles = _release_image_roles(release)
+    if not any(images.get(role) for role in image_roles):
         raise ReleaseError(f"Active release {release.release_id} contains no guest images.")
-    for role in ("chute", "storage"):
+    for role in image_roles:
         image = images.get(role)
         if image:
-            _validate_image_provenance(release, role, image, loaded_by_name)
+            if role == "gpu":
+                _validate_gpu_image_provenance(release, image, loaded_by_name)
+            else:
+                _validate_image_provenance(release, role, image, loaded_by_name)
 
 
 async def active_manifest_for_host(
     db: AsyncSession,
     tee_type: str,
     channel: str = "stable",
+    compute_type: str = "cpu",
     *,
     host_id: Optional[str] = None,
     miner_hotkey: Optional[str] = None,
@@ -1242,6 +2038,7 @@ async def active_manifest_for_host(
         db,
         tee_type.strip().lower(),
         channel,
+        compute_type,
         lock=bool(reissue_roles),
     )
     if release is None:
@@ -1254,10 +2051,14 @@ async def active_manifest_for_host(
         raise ReleaseError(f"Logical rollout host {host_id} is not enrolled.")
     if miner_hotkey is None or host.miner_hotkey != miner_hotkey:
         raise ReleaseError(f"Logical rollout host {host_id} is owned by another miner.")
-    if host.tee_type != release.tee_type or host.release_channel != release.channel:
+    if (
+        host.tee_type != release.tee_type
+        or host.compute_type != release.compute_type
+        or host.release_channel != release.channel
+    ):
         raise ReleaseError(
             f"Logical rollout host {host_id} is not enrolled in "
-            f"{release.channel}/{release.tee_type}."
+            f"{release.channel}/{release.tee_type}/{release.compute_type}."
         )
     return await _manifest_for_logical_host(
         db,
@@ -1308,6 +2109,7 @@ async def rollout_release(
         captured_host_ids &= set(host_ids)
     q = select(Host).where(
         Host.tee_type == release.tee_type,
+        Host.compute_type == release.compute_type,
         Host.host_id.in_(captured_host_ids),
     )
     hosts = (await db.execute(q)).scalars().all()
@@ -1348,7 +2150,8 @@ async def rollout_release(
                 }
             )
     logger.success(
-        f"Rollout of release {release_id} ({release.tee_type}): dispatched to {dispatched}/{len(hosts)} host(s)"
+        f"Rollout of release {release_id} ({release.tee_type}/{release.compute_type}): "
+        f"dispatched to {dispatched}/{len(hosts)} host(s)"
         + (f" (dispatch subset: {host_ids})" if host_ids else "")
         + (" +reboot_l0" if reboot_l0 else "")
     )
@@ -1372,34 +2175,33 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
 
     chute_img = (release.images or {}).get("chute") or {}
     storage_img = (release.images or {}).get("storage") or {}
+    gpu_img = (release.images or {}).get("gpu") or {}
     if chute_img.get("_inherited"):
         chute_img = {}
     if storage_img.get("_inherited"):
         storage_img = {}
+    if gpu_img.get("_inherited"):
+        gpu_img = {}
     l0_spec = (release.images or {}).get("l0") or {}
     chute_sha = chute_img.get("sha256")
     storage_sha = storage_img.get("sha256")
+    gpu_sha = gpu_img.get("sha256")
     l0_version = l0_spec.get("version")
     chute_names = list(chute_img.get("measurement_names") or [])
     storage_names = list(storage_img.get("measurement_names") or [])
+    gpu_names = list(gpu_img.get("measurement_names") or [])
     names_by_role = {
-        role: names for role, names in (("chute", chute_names), ("storage", storage_names)) if names
+        role: names
+        for role, names in (
+            ("chute", chute_names),
+            ("storage", storage_names),
+            ("gpu", gpu_names),
+        )
+        if names
     }
     required_roles = list(names_by_role)
     required_names = [name for names in names_by_role.values() for name in names]
 
-    hosts = (
-        (
-            await db.execute(
-                select(Host).where(
-                    Host.tee_type == release.tee_type,
-                    Host.release_channel == release.channel,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
     targets = (
         (
             await db.execute(
@@ -1415,29 +2217,74 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         .scalars()
         .all()
     )
-    reservations = (
+    target_host_ids = sorted({target.host_id for target in targets})
+    hosts = (
         (
             await db.execute(
-                select(TdLaunchReservation)
-                .where(
-                    TdLaunchReservation.release_id == release.release_id,
-                    TdLaunchReservation.consumed_at.is_not(None),
-                    TdLaunchReservation.invalidated_at.is_(None),
-                )
-                .order_by(
-                    TdLaunchReservation.host_id,
-                    TdLaunchReservation.role,
-                    TdLaunchReservation.boot_generation,
-                    TdLaunchReservation.issued_at,
+                select(Host).where(
+                    Host.tee_type == release.tee_type,
+                    Host.release_channel == release.channel,
+                    Host.compute_type == release.compute_type,
+                    Host.host_id.in_(target_host_ids),
                 )
             )
         )
         .scalars()
         .all()
+        if target_host_ids
+        else []
     )
+    reservations = []
+    gpu_reservations = []
+    if release.compute_type == "cpu":
+        reservations = (
+            (
+                await db.execute(
+                    select(TdLaunchReservation)
+                    .where(
+                        TdLaunchReservation.release_id == release.release_id,
+                        TdLaunchReservation.consumed_at.is_not(None),
+                        TdLaunchReservation.invalidated_at.is_(None),
+                    )
+                    .order_by(
+                        TdLaunchReservation.host_id,
+                        TdLaunchReservation.role,
+                        TdLaunchReservation.boot_generation,
+                        TdLaunchReservation.issued_at,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    else:
+        from api.host.schemas import GpuLaunchReservation
+
+        gpu_reservations = (
+            (
+                await db.execute(
+                    select(GpuLaunchReservation)
+                    .where(
+                        GpuLaunchReservation.gpu_release_id == release.release_id,
+                        GpuLaunchReservation.guest_consumed_at.is_not(None),
+                        GpuLaunchReservation.state == "running",
+                    )
+                    .order_by(
+                        GpuLaunchReservation.host_id,
+                        GpuLaunchReservation.reservation_generation,
+                        GpuLaunchReservation.issued_at,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
     reservation_by_target = {
         (reservation.host_id, reservation.role): reservation for reservation in reservations
     }
+    reservation_by_target.update(
+        {(reservation.host_id, "gpu"): reservation for reservation in gpu_reservations}
+    )
 
     cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=settings.release_attestation_max_age_seconds
@@ -1451,6 +2298,8 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         ServerAttestation.trust_set_fingerprint.label("trust_set_fingerprint"),
         ServerAttestation.verification_error.label("verification_error"),
         ServerAttestation.verified_at.label("verified_at"),
+        ServerAttestation.revocation_status.label("revocation_status"),
+        ServerAttestation.gpu_retired_at.label("gpu_retired_at"),
         func.row_number()
         .over(
             partition_by=ServerAttestation.server_id,
@@ -1471,6 +2320,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 latest.c.measurement_config_fingerprint,
                 latest.c.trust_set_fingerprint,
                 latest.c.verified_at,
+                latest.c.revocation_status,
             )
             .join(latest, latest.c.server_id == Server.server_id)
             .where(
@@ -1478,10 +2328,12 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 latest.c.verification_error.is_(None),
                 latest.c.verified_at.is_not(None),
                 latest.c.verified_at >= cutoff,
+                latest.c.gpu_retired_at.is_(None),
                 Server.self_registered.is_(True),
                 Server.is_tee.is_(True),
-                Server.compute_type == "cpu",
+                Server.compute_type == release.compute_type,
                 Server.tee_type == release.tee_type,
+                Server.gpu_retired_at.is_(None),
             )
         )
     ).all()
@@ -1508,7 +2360,9 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
             return False
         role_image = (release.images or {}).get(role) or {}
         measurement_role = (
-            "storage" if str(measurement_name or "").startswith("storage-") else "chute"
+            "storage"
+            if str(measurement_name or "").startswith("storage-")
+            else ("gpu" if expected_config.gpu_count > 0 else "chute")
         )
         return bool(
             role == measurement_role
@@ -1527,6 +2381,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
             and server.trust_set_fingerprint == trust_set_fingerprint
             and expected_config.tee_type == release.tee_type
             and server.tee_type == release.tee_type
+            and server.compute_type == release.compute_type
             and bool(server.storage_role) == (role == "storage")
             and getattr(expected_config, "image_sha256", None) == role_image.get("sha256")
         )
@@ -1539,7 +2394,14 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         measurement_config_fingerprint_value,
         trust_set_fingerprint,
         verified_at,
+        revocation_status,
     ) in attested_rows:
+        from api.server.gpu_sessions import _revocation_failed
+
+        if _revocation_failed(revocation_status) or dict(revocation_status or {}) != dict(
+            server.attestation_revocation_status or {}
+        ):
+            continue
         latest_by_server[server.server_id] = (
             server,
             attestation_id,
@@ -1549,9 +2411,20 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
             trust_set_fingerprint,
             verified_at,
         )
-        server_role = "storage" if bool(server.storage_role) else "chute"
+        server_role = (
+            "storage"
+            if bool(server.storage_role)
+            else ("gpu" if server.compute_type == "gpu" else "chute")
+        )
+        expected_measurement = loaded_by_name.get(measurement_name)
         measurement_role = (
-            "storage" if str(measurement_name or "").startswith("storage-") else "chute"
+            "storage"
+            if str(measurement_name or "").startswith("storage-")
+            else (
+                "gpu"
+                if expected_measurement is not None and expected_measurement.gpu_count > 0
+                else "chute"
+            )
         )
         # Omitted roles are preserved and intentionally ignored. A mismatch touching a required
         # role remains relevant logical rollout telemetry, but automatic pin pruning is always false.
@@ -1576,12 +2449,41 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
     host_by_id = {host.host_id: host for host in hosts}
     online_by_host = {host.host_id: await is_agent_online(host.host_id) for host in hosts}
     host_rows = []
+    gpu_storage_siblings = []
     for host in hosts:
         staged = host.staged_images or {}
         staged_chute = (staged.get("chute") or {}).get("sha256")
         staged_storage = (staged.get("storage") or {}).get("sha256")
+        staged_gpu = (staged.get("gpu") or {}).get("sha256")
         chute_ok = (not chute_sha) or staged_chute == chute_sha
-        storage_ok = (not storage_sha) or staged_storage == storage_sha
+        host_storage_sha = storage_sha
+        storage_contract_ok = True
+        if release.compute_type == "gpu":
+            try:
+                sibling = await _gpu_storage_sibling_for_host(db, release, host)
+                host_storage_sha = sibling.image.sha256
+                from api.host.reservations import gpu_host_storage_readiness
+
+                readiness = await gpu_host_storage_readiness(db, host)
+                gpu_storage_siblings.append(readiness.model_dump(mode="json"))
+            except ReleaseError:
+                storage_contract_ok = False
+                gpu_storage_siblings.append(
+                    {
+                        "schema": "chutes.gpu-host-storage-readiness",
+                        "version": 1,
+                        "host_id": host.host_id,
+                        "trusted_storage_ready": False,
+                        "control_channel_eligible": False,
+                        "trusted_schedulable": False,
+                        "reason": "gpu_l0_storage_closure_incompatible",
+                        "physical_co_location_trusted": False,
+                    }
+                )
+        storage_ok = storage_contract_ok and (
+            (not host_storage_sha) or staged_storage == host_storage_sha
+        )
+        gpu_ok = (not gpu_sha) or staged_gpu == gpu_sha
         running_l0 = getattr(host, "l0_version", None)
         l0_matches = None if not l0_version else (running_l0 == l0_version)
         host_rows.append(
@@ -1590,9 +2492,12 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 "untrusted_online": online_by_host[host.host_id],
                 "untrusted_staged_chute_sha": staged_chute,
                 "untrusted_staged_storage_sha": staged_storage,
-                "untrusted_stage_matches_release": bool(chute_ok and storage_ok),
+                "untrusted_staged_gpu_sha": staged_gpu,
+                "untrusted_stage_matches_release": bool(chute_ok and storage_ok and gpu_ok),
                 "untrusted_running_l0_version": running_l0,
                 "untrusted_l0_matches_release": l0_matches,
+                "untrusted_gpu_inventory": host.untrusted_gpu_inventory,
+                "untrusted_gpu_inventory_ready": host.untrusted_gpu_inventory_ready,
             }
         )
 
@@ -1604,6 +2509,201 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
             continue
         logical_target_counts[target.role] += 1
         reservation = reservation_by_target.get((target.host_id, target.role))
+        if release.compute_type == "gpu":
+            from api.host.reservations import gpu_host_storage_readiness
+            from api.host.schemas import GpuAllocationGroup
+            from api.server.gpu_sessions import _current_attestation
+
+            current_host = host_by_id.get(target.host_id)
+            server = (
+                await db.get(Server, reservation.server_id) if reservation is not None else None
+            )
+            group = (
+                await db.get(GpuAllocationGroup, reservation.allocation_group_id)
+                if reservation is not None
+                else None
+            )
+            latest_attempt = (
+                (
+                    await db.execute(
+                        select(ServerAttestation)
+                        .where(ServerAttestation.server_id == server.server_id)
+                        .order_by(
+                            ServerAttestation.created_at.desc(),
+                            ServerAttestation.attestation_id.desc(),
+                        )
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                if server is not None
+                else None
+            )
+            latest_current = False
+            if server is not None:
+                try:
+                    _current_attestation(server, latest_attempt)
+                    latest_current = True
+                except HTTPException:
+                    latest_current = False
+            expected_config = (
+                loaded_by_name.get(latest_attempt.measurement_name)
+                if latest_attempt is not None
+                else None
+            )
+            fresh_exact = bool(
+                reservation is not None
+                and reservation.state == "running"
+                and reservation.guest_consumed_at is not None
+                and reservation.gpu_release_id == release.release_id
+                and reservation.image_sha256 == gpu_sha
+                and reservation.measurement_name in gpu_names
+                and server is not None
+                and server.gpu_retired_at is None
+                and server.gpu_launch_reservation_id == reservation.reservation_id
+                and server.gpu_allocation_group_id == reservation.allocation_group_id
+                and server.gpu_allocation_group_generation
+                == reservation.allocation_group_generation
+                and server.gpu_management_mode == reservation.management_mode
+                and server.gpu_process_incarnation == reservation.process_incarnation
+                and server.gpu_topology_fingerprint == reservation.topology_fingerprint
+                and group is not None
+                and group.state == "running"
+                and group.reservation_id == reservation.reservation_id
+                and group.generation == reservation.allocation_group_generation
+                and group.reservation_generation == reservation.reservation_generation
+                and latest_current
+                and latest_attempt is not None
+                and latest_attempt.gpu_launch_reservation_id == reservation.reservation_id
+                and latest_attempt.gpu_allocation_group_id == reservation.allocation_group_id
+                and latest_attempt.gpu_allocation_group_generation
+                == reservation.allocation_group_generation
+                and latest_attempt.gpu_host_boot_generation == reservation.host_boot_generation
+                and latest_attempt.gpu_reservation_generation == reservation.reservation_generation
+                and latest_attempt.gpu_management_mode == reservation.management_mode
+                and latest_attempt.gpu_process_incarnation == reservation.process_incarnation
+                and latest_attempt.gpu_topology_fingerprint == reservation.topology_fingerprint
+                and latest_attempt.gpu_release_id == reservation.gpu_release_id
+                and latest_attempt.gpu_profile_id == reservation.profile_id
+                and latest_attempt.gpu_claims_sha256 == reservation.claims_sha256
+                and latest_attempt.gpu_evidence_certificate_sha256s
+                == reservation.gpu_attestation_certificate_sha256s
+                and expected_config is not None
+                and exact_release_identity(
+                    server,
+                    latest_attempt.measurement_name,
+                    latest_attempt.measurement_version,
+                    latest_attempt.measurement_config_fingerprint,
+                    latest_attempt.trust_set_fingerprint,
+                    "gpu",
+                )
+            )
+            storage_ready = False
+            if current_host is not None:
+                readiness = await gpu_host_storage_readiness(
+                    db,
+                    current_host,
+                    include_allocation=False,
+                )
+                storage_ready = bool(
+                    readiness.trusted_storage_ready and readiness.control_channel_eligible
+                )
+            runtime_session_ready = bool(
+                server is not None
+                and latest_attempt is not None
+                and server.gpu_runtime_session_attestation_id == latest_attempt.attestation_id
+                and server.gpu_runtime_session_expires_at is not None
+                and server.gpu_runtime_session_expires_at > datetime.now(timezone.utc)
+            )
+            server_control_ready = bool(
+                server is not None
+                and (
+                    (
+                        server.gpu_management_mode == "platform"
+                        and await is_agent_online(server.server_id)
+                    )
+                    or (server.gpu_management_mode == "miner" and runtime_session_ready)
+                )
+            )
+            logical_online = bool(
+                current_host is not None
+                and current_host.miner_hotkey == target.miner_hotkey
+                and online_by_host.get(target.host_id, False)
+                and server_control_ready
+            )
+            staged_for_role = (
+                ((current_host.staged_images or {}).get("gpu") or {}).get("sha256")
+                if current_host is not None
+                else None
+            )
+            exact_stage = bool(gpu_sha and staged_for_role == gpu_sha)
+            roll_outcomes = (
+                (current_host.staged_images or {}).get("roll_outcomes") or {}
+                if current_host is not None
+                else {}
+            )
+            role_roll = (roll_outcomes.get("roles") or {}).get("gpu") or {}
+            old_process_exit_confirmed = bool(
+                roll_outcomes.get("release_id") == release.release_id
+                and role_roll.get("sha256") == gpu_sha
+                and role_roll.get("old_processes_exited") is True
+            )
+            fresh_role_health = bool(
+                fresh_exact and logical_online and storage_ready and runtime_session_ready
+            )
+            target_complete = bool(fresh_role_health and exact_stage and old_process_exit_confirmed)
+            if target_complete:
+                logical_target_completed_counts[target.role] += 1
+            logical_target_rows.append(
+                {
+                    "target_id": target.target_id,
+                    "logical_host_id": target.host_id,
+                    "role": "gpu",
+                    "logical_online": logical_online,
+                    "launch_boot_generation": (
+                        reservation.host_boot_generation
+                        if reservation is not None
+                        else int(target.current_generation)
+                    ),
+                    "launch_reservation_consumed": bool(
+                        reservation is not None and reservation.guest_consumed_at is not None
+                    ),
+                    "fresh_exact_attestation": fresh_exact,
+                    "fresh_role_health": fresh_role_health,
+                    "exact_staged_digest": exact_stage,
+                    "old_process_exit_confirmed": old_process_exit_confirmed,
+                    "running_image_sha256": (
+                        reservation.image_sha256 if reservation is not None else None
+                    ),
+                    "running_image_version": (
+                        reservation.image_version if reservation is not None else None
+                    ),
+                    "running_process_incarnation": (
+                        reservation.process_incarnation if reservation is not None else None
+                    ),
+                    "running_storage_incarnation": None,
+                    "allocation_group_id": (
+                        reservation.allocation_group_id if reservation is not None else None
+                    ),
+                    "allocation_group_generation": (
+                        reservation.allocation_group_generation if reservation is not None else None
+                    ),
+                    "management_mode": (
+                        reservation.management_mode if reservation is not None else None
+                    ),
+                    "storage_sibling_ready": storage_ready,
+                    "runtime_session_ready": runtime_session_ready,
+                    "gpu_evidence_sha256": (
+                        latest_attempt.gpu_evidence_sha256 if latest_attempt is not None else None
+                    ),
+                    "host_credential_cloneable": True,
+                    "physical_placement_trusted": False,
+                    "server_id": (reservation.server_id if reservation is not None else None),
+                    "measurement_name": (
+                        latest_attempt.measurement_name if latest_attempt is not None else None
+                    ),
+                }
+            )
+            continue
         if reservation is None and target.consumed_at is not None:
             historical_config = loaded_by_name.get(target.consumed_measurement_name)
             reservation = SimpleNamespace(
@@ -1720,7 +2820,11 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
             and role_roll.get("old_processes_exited") is True
         )
         target_complete = bool(
-            fresh_role_health and logical_online and exact_stage and old_process_exit_confirmed
+            release.compute_type == "cpu"
+            and fresh_role_health
+            and logical_online
+            and exact_stage
+            and old_process_exit_confirmed
         )
         if target_complete:
             logical_target_completed_counts[target.role] += 1
@@ -1757,7 +2861,8 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         logical_target_counts[role] > 0 for role in required_roles
     )
     all_logical_targets_healthy = (
-        bool(targets)
+        _runtime_convergence_supported(release)
+        and bool(targets)
         and len(logical_target_rows) == len(targets)
         and all(
             row["fresh_exact_attestation"]
@@ -1783,9 +2888,20 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         "release_id": release.release_id,
         "status": release.status,
         "tee_type": release.tee_type,
+        "compute_type": release.compute_type,
         "required_roles": required_roles,
         "required_chute_measurement_names": chute_names,
         "required_storage_measurement_names": storage_names,
+        "required_gpu_measurement_names": gpu_names,
+        "gpu_storage_siblings": gpu_storage_siblings,
+        "all_gpu_storage_siblings_ready": bool(gpu_storage_siblings)
+        and all(
+            item["trusted_storage_ready"] and item["control_channel_eligible"]
+            for item in gpu_storage_siblings
+        ),
+        "runtime_convergence_supported": _runtime_convergence_supported(release),
+        "source_staged_only": not _runtime_convergence_supported(release),
+        "runtime_convergence_state": "tracked",
         "attestation_max_age_seconds": settings.release_attestation_max_age_seconds,
         "untrusted_hosts": host_rows,
         "trusted_measurement_counts": trusted_measurement_counts,
@@ -1821,6 +2937,7 @@ def to_response(release: GuestRelease) -> Dict:
         "release_id": release.release_id,
         "channel": release.channel,
         "tee_type": release.tee_type,
+        "compute_type": release.compute_type,
         "status": release.status,
         "images": release.images or {},
         "notes": release.notes,

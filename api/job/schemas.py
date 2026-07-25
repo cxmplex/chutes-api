@@ -12,6 +12,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     Double,
+    CheckConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from api.database import Base, generate_uuid
@@ -33,7 +34,16 @@ class Job(Base):
     miner_hotkey = Column(String, nullable=True)
     miner_coldkey = Column(String, nullable=True)
     instance_id = Column(
-        String, ForeignKey("instances.instance_id", ondelete="SET NULL"), nullable=True, unique=True
+        String,
+        ForeignKey("instances.instance_id", ondelete="SET NULL"),
+        nullable=True,
+        unique=True,
+    )
+    gpu_management_mode = Column(String, nullable=True)
+    gpu_launch_reservation_id = Column(
+        String,
+        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        nullable=True,
     )
 
     # State info.
@@ -78,3 +88,12 @@ class Job(Base):
     user = relationship("User", back_populates="jobs", lazy="joined")
     instance = relationship("Instance", back_populates="job", lazy="joined", uselist=False)
     launch_config = relationship("LaunchConfig", back_populates="job", uselist=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "(gpu_management_mode IS NULL AND gpu_launch_reservation_id IS NULL) OR "
+            "(gpu_management_mode IN ('platform', 'miner') "
+            "AND gpu_launch_reservation_id IS NOT NULL)",
+            name="ck_jobs_gpu_manager",
+        ),
+    )

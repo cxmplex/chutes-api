@@ -15,6 +15,7 @@ from sqlalchemy import (
     DateTime,
     Boolean,
     BigInteger,
+    CheckConstraint,
     func,
 )
 from sqlalchemy.orm import validates, relationship
@@ -74,6 +75,13 @@ class Node(Base):
     verification_port = Column(Integer, nullable=False)
     verification_error = Column(String)
     verified_at = Column(DateTime(timezone=True))
+    gpu_allocation_group_id = Column(
+        String,
+        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    gpu_allocation_group_generation = Column(Integer, nullable=True)
+    gpu_retired_at = Column(DateTime(timezone=True), nullable=True)
 
     server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=True)
 
@@ -89,6 +97,16 @@ class Node(Base):
     )
 
     server = relationship("Server", back_populates="nodes")
+
+    __table_args__ = (
+        CheckConstraint(
+            "(gpu_allocation_group_id IS NULL "
+            "AND gpu_allocation_group_generation IS NULL) OR "
+            "(gpu_allocation_group_id IS NOT NULL "
+            "AND gpu_allocation_group_generation > 0)",
+            name="ck_nodes_gpu_allocation_identity",
+        ),
+    )
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

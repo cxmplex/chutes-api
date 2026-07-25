@@ -27,6 +27,8 @@ from api.graval_worker import validate_gpus, broker
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.constants import HOTKEY_HEADER
+from api.host.locks import acquire_gpu_lifecycle_lock
+from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
 
 router = APIRouter()
 
@@ -291,6 +293,28 @@ async def check_verification_status(
     return {"status": "verified"}
 
 
+def require_generic_node_deletion(
+    node: Node,
+    group: Optional[GpuAllocationGroup] = None,
+    *,
+    active_reservation: bool = False,
+) -> None:
+    if node.gpu_allocation_group_id is not None and (
+        getattr(node, "gpu_retired_at", None) is None
+        or active_reservation
+        or group is None
+        or group.state not in {"available", "retired"}
+        or group.reservation_id is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Reservation-owned GPU nodes cannot use generic deletion; "
+                "retire the exact allocation group through teardown/reset."
+            ),
+        )
+
+
 @router.delete("/{node_id}")
 async def delete_node(
     node_id: str,
@@ -304,7 +328,8 @@ async def delete_node(
     """
     Remove a node from inventory.
     """
-    query = select(Node).where(Node.miner_hotkey == hotkey, Node.uuid == node_id)
+    await acquire_gpu_lifecycle_lock(db)
+    query = select(Node).where(Node.miner_hotkey == hotkey, Node.uuid == node_id).with_for_update()
     result = await db.execute(query)
     node = result.unique().scalar_one_or_none()
     if not node:
@@ -312,6 +337,32 @@ async def delete_node(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Node does not exist, or does not belong to you",
         )
+    group = (
+        await db.get(GpuAllocationGroup, node.gpu_allocation_group_id)
+        if node.gpu_allocation_group_id
+        else None
+    )
+    active_reservation = False
+    if node.gpu_allocation_group_id:
+        active_reservation = bool(
+            (
+                await db.execute(
+                    select(GpuLaunchReservation.reservation_id)
+                    .where(
+                        GpuLaunchReservation.allocation_group_id == node.gpu_allocation_group_id,
+                        GpuLaunchReservation.state.in_(
+                            {"reserved", "claimed", "launching", "running", "resetting"}
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        )
+    require_generic_node_deletion(
+        node,
+        group,
+        active_reservation=active_reservation,
+    )
     origin_ip = request.state.client_ip
     logger.info(f"NODE DELETION REQUEST: {hotkey=} {origin_ip=} {node_id=}")
     if (

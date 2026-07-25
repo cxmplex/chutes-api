@@ -3,6 +3,16 @@ from pathlib import Path
 import yaml
 
 
+class _ComposeLoader(yaml.SafeLoader):
+    pass
+
+
+_ComposeLoader.add_constructor(
+    "!override",
+    lambda loader, node: loader.construct_sequence(node),
+)
+
+
 def test_settings_importers_share_validator_dev_trust_posture():
     root = Path(__file__).resolve().parents[2]
     document = yaml.safe_load((root / "docker-compose.validator-dev.yml").read_text())
@@ -26,3 +36,19 @@ def test_settings_importers_share_validator_dev_trust_posture():
         service = document["services"][service_name]
         assert service["environment"] == required_environment
         assert set(service["volumes"]) == required_mounts
+
+
+def test_dev_gpu_scheduler_mounts_exact_l0_publisher_registry_contract():
+    root = Path(__file__).resolve().parents[2]
+    document = yaml.load(
+        (root / "docker-compose.dev.yml").read_text(),
+        Loader=_ComposeLoader,
+    )
+    scheduler = document["services"]["gpu_platform_scheduler"]
+    assert scheduler["environment"]["TRUSTED_L0_PUBLISHER_KEYS_PATH"] == (
+        "/etc/chutes/l0-publisher/keys.json"
+    )
+    assert (
+        "./config/l0-publisher-keys.json:/etc/chutes/l0-publisher/keys.json:ro"
+        in scheduler["volumes"]
+    )

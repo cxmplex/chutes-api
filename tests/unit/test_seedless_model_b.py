@@ -14,24 +14,35 @@ from fastapi.testclient import TestClient
 from api.constants import HOTKEY_HEADER
 from api.database import get_db_session
 from api.host.schemas import (
+    EnrollmentKeyChallengeRequestV1,
+    EnrollmentKeyChallengeRequestV2,
+    EnrollmentVoucherClaimsV1,
+    EnrollmentVoucherClaimsV2,
     HostSigningEnvelopeV1,
+    HostSigningEnvelopeV2,
     PcsMailboxAadV1,
+    PcsMailboxAadV2,
     PcsMailboxEnvelopeV1,
+    PcsMailboxEnvelopeV2,
     TdLaunchReservationClaimsV1,
     TdQuoteCommitmentV1,
     canonical_sha256,
 )
 from api.releases.bootstrap import (
     L0BootstrapVerificationError,
+    parse_signed_l0_manifest,
     verify_signed_l0_manifest,
 )
 from api.releases.schemas import (
     GuestRelease,
     L0ArtifactV1,
     L0BootstrapManifestV1,
+    L0BootstrapManifestV2,
     L0BootstrapPublication,
     SignedL0BootstrapManifestV1,
+    SignedL0BootstrapManifestV2,
 )
+from cross_repo_tests import repository_root
 from api.releases import service as release_service
 from api.releases.router import router as releases_router
 from api.host.schemas import RegistrySession, RegistrySessionRequestV1
@@ -104,6 +115,32 @@ def _signed_bootstrap(
     )
 
 
+def _gpu_storage_closure():
+    return {
+        "schema": "chutes.gpu-l0-storage-closure",
+        "version": 1,
+        "source_release_id": "cpu-storage-release",
+        "image_version": "1.10.0",
+        "image_sha256": "6" * 64,
+        "kernel_sha256": "7" * 64,
+        "initrd_sha256": "8" * 64,
+        "cmdline_sha256": "9" * 64,
+        "measurement_names": [
+            "storage-baremetal-tdx-1.10.0-2vcpu-8g",
+        ],
+        "launch_contract": {
+            "role": "storage",
+            "qemu_binary": "qemu-system-x86_64",
+            "qemu_package": "qemu-system-x86",
+            "qemu_package_version": "1:10.1.0+ds-5ubuntu2.7",
+            "qemu_binary_sha256": "a" * 64,
+            "machine_type": "pc-q35-10.1",
+            "firmware_filename": "OVMF.inteltdx.fd",
+            "firmware_sha256": "b" * 64,
+        },
+    }
+
+
 def test_l0_bootstrap_signature_and_tamper_rejection(tmp_path):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     private_key = Ed25519PrivateKey.generate()
@@ -121,6 +158,60 @@ def test_l0_bootstrap_signature_and_tamper_rejection(tmp_path):
     )
     with pytest.raises(L0BootstrapVerificationError, match="signature"):
         verify_signed_l0_manifest(tampered, registry, now=now)
+
+
+def test_gpu_l0_v2_is_compute_bound_without_reinterpreting_cpu_v1(tmp_path):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    private_key = Ed25519PrivateKey.generate()
+    registry = _publisher_registry(tmp_path, private_key, now)
+    cpu = _signed_bootstrap(private_key, now)
+    cpu_document = cpu.manifest.model_dump(mode="json", exclude_none=True)
+    assert cpu_document["version"] == 1
+    assert "compute_type" not in cpu_document
+
+    gpu_manifest = L0BootstrapManifestV2.model_validate(
+        {
+            **cpu_document,
+            "version": 2,
+            "compute_type": "gpu",
+            "storage_closure": _gpu_storage_closure(),
+            "gpu_profile_id": "b200-8gpu",
+            "gpu_qemu_sha256s": ["1" * 64],
+            "gpu_tdvf_sha256s": ["2" * 64],
+            "gpu_launch_public_key_id": "3" * 64,
+            "gpu_launch_public_key_epoch": 1,
+            "gpu_build_inputs_sha256": "4" * 64,
+        }
+    )
+    gpu = SignedL0BootstrapManifestV2(
+        manifest=gpu_manifest,
+        signature=base64.b64encode(private_key.sign(gpu_manifest.canonical_bytes())).decode(),
+    )
+    assert verify_signed_l0_manifest(gpu, registry, now=now) == gpu.manifest.digest()
+    assert (
+        parse_signed_l0_manifest(
+            gpu.model_dump(mode="json", exclude_none=True),
+            compute_type="gpu",
+        )
+        == gpu
+    )
+    with pytest.raises(ValueError):
+        parse_signed_l0_manifest(
+            gpu.model_dump(mode="json", exclude_none=True),
+            compute_type="cpu",
+        )
+    with pytest.raises(ValueError):
+        parse_signed_l0_manifest(
+            cpu.model_dump(mode="json", exclude_none=True),
+            compute_type="gpu",
+        )
+    with pytest.raises(ValueError, match="GPU TDX"):
+        L0BootstrapManifestV2.model_validate(
+            {
+                **gpu_manifest.model_dump(mode="json", exclude_none=True),
+                "tee_type": "sev-snp",
+            }
+        )
 
 
 def test_l0_bootstrap_expiry_rejected(tmp_path):
@@ -142,6 +233,22 @@ def test_l0_bootstrap_rejects_explicit_null_release_id():
 
     with pytest.raises(ValueError, match="omitted rather than null"):
         SignedL0BootstrapManifestV1.model_validate(document)
+
+
+def test_release_openapi_exposes_compute_scope_gpu_slot_and_l0_v2():
+    app = FastAPI()
+    app.include_router(releases_router, prefix="/releases")
+    schemas = app.openapi()["components"]["schemas"]
+
+    assert schemas["CreateReleaseRequest"]["properties"]["compute_type"]["enum"] == [
+        "cpu",
+        "gpu",
+    ]
+    assert "gpu" in schemas["CreateReleaseRequest"]["properties"]
+    assert "gpu" in schemas["ReleaseManifest"]["properties"]
+    assert "required_gpu_measurement_names" in schemas["ReleaseStatusResponse"]["properties"]
+    assert schemas["L0BootstrapManifestV2-Output"]["properties"]["compute_type"]["const"] == "gpu"
+    assert "storage_closure" in schemas["L0BootstrapManifestV2-Output"]["required"]
 
 
 @pytest.mark.asyncio
@@ -327,11 +434,7 @@ async def test_l0_publication_rejects_equivocation_and_backward_key_epoch(tmp_pa
 
 
 def test_real_asgi_bootstrap_response_verifies_in_miner_cli(tmp_path, monkeypatch):
-    miner_cli_source = (
-        Path(__file__).resolve().parents[3] / "chutes-miner" / "src" / "chutes-miner-cli"
-    )
-    if not miner_cli_source.is_dir():
-        pytest.skip("sibling chutes-miner repository is required")
+    miner_cli_source = repository_root("miner", start=Path(__file__)) / "src" / "chutes-miner-cli"
     now = datetime.now(timezone.utc).replace(microsecond=0)
     private_key = Ed25519PrivateKey.generate()
     registry_path = _publisher_registry(tmp_path, private_key, now)
@@ -453,6 +556,75 @@ def test_host_and_pcs_envelopes_are_strict_and_canonical():
     with pytest.raises(ValueError):
         PcsMailboxEnvelopeV1.model_validate({**envelope.model_dump(mode="json"), "unknown": True})
 
+    gpu_signing = HostSigningEnvelopeV2(
+        **signing.model_dump(mode="python", exclude={"version"}),
+        version=2,
+        compute_type="gpu",
+    )
+    assert b'"compute_type":"gpu"' in gpu_signing.signing_bytes()
+    gpu_aad = PcsMailboxAadV2(
+        **aad.model_dump(mode="python", exclude={"version"}),
+        version=2,
+        compute_type="gpu",
+    )
+    gpu_envelope = PcsMailboxEnvelopeV2(
+        sender_ephemeral_public_key=envelope.sender_ephemeral_public_key,
+        nonce=envelope.nonce,
+        ciphertext=envelope.ciphertext,
+        aad=gpu_aad,
+        miner_signature=envelope.miner_signature,
+    )
+    assert gpu_envelope.version == 2
+    assert gpu_envelope.kdf_label == "chutes/model-b/pcs-mailbox/v2"
+
+
+def test_cpu_enrollment_v1_bytes_remain_unchanged_and_gpu_uses_v2():
+    now = datetime(2026, 7, 23, tzinfo=timezone.utc)
+    cpu_claims = EnrollmentVoucherClaimsV1(
+        voucher_id="voucher-1",
+        owner_hotkey="owner",
+        host_id="host-1",
+        tee_type="tdx",
+        channel="stable",
+        enrollment_generation=1,
+        issued_at=now,
+        expires_at=now + timedelta(minutes=10),
+    )
+    cpu_document = cpu_claims.model_dump(mode="json", exclude_none=True)
+    assert cpu_document["version"] == 1
+    assert "compute_type" not in cpu_document
+    assert "storage_enabled" not in cpu_document
+
+    gpu_claims = EnrollmentVoucherClaimsV2(
+        **cpu_claims.model_dump(
+            mode="python",
+            exclude={"version", "tee_type"},
+        ),
+        version=2,
+        tee_type="tdx",
+        compute_type="gpu",
+        storage_enabled=True,
+    )
+    assert gpu_claims.model_dump(mode="json")["compute_type"] == "gpu"
+
+    public_key = base64.b64encode(b"k" * 32).decode()
+    signature = base64.b64encode(b"s" * 64).decode()
+    cpu_request = EnrollmentKeyChallengeRequestV1(
+        voucher="voucher-1." + "a" * 64,
+        ed25519_public_key=public_key,
+        x25519_public_key=public_key,
+        ed25519_signature=signature,
+    )
+    gpu_request = EnrollmentKeyChallengeRequestV2(
+        voucher=cpu_request.voucher,
+        compute_type="gpu",
+        ed25519_public_key=public_key,
+        x25519_public_key=public_key,
+        ed25519_signature=signature,
+    )
+    assert b"compute_type" not in cpu_request.signing_bytes()
+    assert b'"compute_type":"gpu"' in gpu_request.signing_bytes()
+
 
 def test_registry_session_enforces_repository_action_and_exact_manifest():
     assert (
@@ -465,6 +637,7 @@ def test_registry_session_enforces_repository_action_and_exact_manifest():
     manifests = [f"sha256:{'a' * 64}", f"sha256:{'c' * 64}"]
     blobs = [f"sha256:{'b' * 64}"]
     tags = [f"sha256-{'a' * 64}.sig"]
+    tag_digests = {tags[0]: manifests[1]}
     session = RegistrySession(
         repository="owner/image",
         actions=["pull"],
@@ -472,6 +645,7 @@ def test_registry_session_enforces_repository_action_and_exact_manifest():
         allowed_manifests=manifests,
         allowed_blobs=blobs,
         allowed_manifest_tags=tags,
+        manifest_tag_digests=tag_digests,
         descriptor_closure_sha256=canonical_sha256(
             {
                 "schema": "chutes.oci-descriptor-closure",
@@ -480,6 +654,7 @@ def test_registry_session_enforces_repository_action_and_exact_manifest():
                 "manifests": manifests,
                 "blobs": blobs,
                 "manifest_tags": tags,
+                "manifest_tag_digests": tag_digests,
             }
         ),
     )

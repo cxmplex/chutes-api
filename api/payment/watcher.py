@@ -254,7 +254,13 @@ class PaymentMonitor:
                 # Check if this is an agent registration payment.
                 if to_address in self._agent_payment_addresses:
                     await self._handle_agent_payment(
-                        to_address, from_address, amount, block, block_hash, fmv, extrinsic_idx
+                        to_address,
+                        from_address,
+                        amount,
+                        block,
+                        block_hash,
+                        fmv,
+                        extrinsic_idx,
                     )
                 else:
                     logger.warning(f"Failed to find user with payment address {to_address}")
@@ -426,7 +432,13 @@ class PaymentMonitor:
                     )
                     await session.close()
                     await self._handle_payment(
-                        to_address, from_address, amount, block, block_hash, fmv, extrinsic_idx
+                        to_address,
+                        from_address,
+                        amount,
+                        block,
+                        block_hash,
+                        fmv,
+                        extrinsic_idx,
                     )
                 else:
                     logger.warning(

@@ -1,0 +1,218 @@
+"""Real PostgreSQL coverage for the exact ORM-bootstrap migration ordering."""
+
+import asyncio
+import os
+import shutil
+import uuid
+from pathlib import Path
+
+import pytest
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+
+import api.database.orms  # noqa: F401
+from api.database import Base
+from api.database.migrations import (
+    TRACKED_MIGRATION_BASELINE,
+    historical_migration_versions,
+)
+
+
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.skipif(
+        not TEST_DATABASE_URL,
+        reason="TEST_DATABASE_URL is required for startup migration tests",
+    ),
+]
+MIGRATIONS = Path(__file__).resolve().parents[2] / "api/migrations"
+GPU_MIGRATION_FLOOR = "20260723030000"
+
+
+@pytest.fixture(autouse=True)
+def nv_attest():
+    yield
+
+
+def _migration_paths(*, floor: str = TRACKED_MIGRATION_BASELINE) -> list[Path]:
+    return sorted(
+        path
+        for path in MIGRATIONS.glob("*.sql")
+        if path.name.split("_", 1)[0].isdigit() and path.name.split("_", 1)[0] >= floor
+    )
+
+
+def _split(path: Path) -> tuple[str, str]:
+    return path.read_text(encoding="utf-8").split("-- migrate:down", 1)
+
+
+async def _execute(connection, sql: str) -> None:
+    raw = await connection.get_raw_connection()
+    await raw.driver_connection.execute(sql)
+
+
+async def _new_schema():
+    schema = f"startup_chain_{uuid.uuid4().hex}"
+    admin = create_async_engine(TEST_DATABASE_URL)
+    async with admin.begin() as connection:
+        await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(
+        TEST_DATABASE_URL,
+        connect_args={"server_settings": {"search_path": schema}},
+    )
+    return schema, admin, engine
+
+
+async def _drop_schema(schema, admin, engine):
+    await engine.dispose()
+    async with admin.begin() as connection:
+        await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+    await admin.dispose()
+
+
+async def _create_all_then_apply_ordered_migrations(engine) -> None:
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await connection.execute(
+            text("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY)")
+        )
+        for version in historical_migration_versions():
+            await connection.execute(
+                text(
+                    "INSERT INTO schema_migrations(version) VALUES (:version) "
+                    "ON CONFLICT (version) DO NOTHING"
+                ),
+                {"version": version},
+            )
+    for path in _migration_paths():
+        version = path.name.split("_", 1)[0]
+        up_sql, _down_sql = _split(path)
+        async with engine.begin() as connection:
+            await _execute(connection, up_sql)
+            await connection.execute(
+                text(
+                    "INSERT INTO schema_migrations(version) VALUES (:version) "
+                    "ON CONFLICT (version) DO NOTHING"
+                ),
+                {"version": version},
+            )
+
+
+async def _create_all_and_record_baseline(engine) -> None:
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await connection.execute(
+            text("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(255) PRIMARY KEY)")
+        )
+        for version in historical_migration_versions():
+            await connection.execute(
+                text(
+                    "INSERT INTO schema_migrations(version) VALUES (:version) "
+                    "ON CONFLICT (version) DO NOTHING"
+                ),
+                {"version": version},
+            )
+
+
+async def test_create_all_then_full_ordered_migration_chain_installs_invariants():
+    schema, admin, engine = await _new_schema()
+    try:
+        await _create_all_then_apply_ordered_migrations(engine)
+        async with engine.connect() as connection:
+            versions = set(
+                (await connection.execute(text("SELECT version FROM schema_migrations")))
+                .scalars()
+                .all()
+            )
+            triggers = set(
+                (
+                    await connection.execute(
+                        text("SELECT tgname FROM pg_trigger WHERE NOT tgisinternal")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert {path.name.split("_", 1)[0] for path in _migration_paths()} <= versions
+        assert {
+            "trg_prevent_user_delete_before_chutefs_erasure",
+            "trg_complete_launch_config_on_instance_terminal",
+            "trg_complete_launch_config_on_job_terminal",
+            "trg_launch_terminal_registry_scope",
+        } <= triggers
+    finally:
+        await _drop_schema(schema, admin, engine)
+
+
+async def test_exact_create_all_baseline_then_dbmate_startup_sequence():
+    dbmate = os.getenv("DBMATE_BIN") or shutil.which("dbmate")
+    if not dbmate:
+        pytest.skip("dbmate binary is required for the exact startup-sequence test")
+    schema, admin, engine = await _new_schema()
+    try:
+        await _create_all_and_record_baseline(engine)
+        sync_url = TEST_DATABASE_URL.replace("+asyncpg", "")
+        separator = "&" if "?" in sync_url else "?"
+        sync_url = f"{sync_url}{separator}search_path={schema}&sslmode=disable"
+        process = await asyncio.create_subprocess_exec(
+            dbmate,
+            "--url",
+            sync_url,
+            "--migrations-dir",
+            str(MIGRATIONS),
+            "--migrations-table",
+            "schema_migrations",
+            "--no-dump-schema",
+            "migrate",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        assert process.returncode == 0, stdout.decode(errors="replace") + stderr.decode(
+            errors="replace"
+        )
+        async with engine.connect() as connection:
+            versions = set(
+                (await connection.execute(text("SELECT version FROM schema_migrations")))
+                .scalars()
+                .all()
+            )
+        assert {path.name.split("_", 1)[0] for path in _migration_paths()} <= versions
+    finally:
+        await _drop_schema(schema, admin, engine)
+
+
+async def test_prechange_schema_accepts_new_migrations_sequentially_and_down_guards():
+    schema, admin, engine = await _new_schema()
+    try:
+        await _create_all_then_apply_ordered_migrations(engine)
+        paths = _migration_paths(floor=GPU_MIGRATION_FLOOR)
+        for path in reversed(paths):
+            _up_sql, down_sql = _split(path)
+            async with engine.begin() as connection:
+                await _execute(connection, down_sql)
+        for path in paths:
+            up_sql, _down_sql = _split(path)
+            async with engine.begin() as connection:
+                await _execute(connection, up_sql)
+        async with engine.connect() as connection:
+            completed = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = 'launch_configs' "
+                    "AND column_name = 'completed_at'"
+                )
+            )
+            registry_constraint = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM pg_constraint "
+                    "WHERE conname = 'ck_launch_config_registry_scope' "
+                    "AND connamespace = current_schema()::regnamespace"
+                )
+            )
+        assert completed == 1
+        assert registry_constraint == 1
+    finally:
+        await _drop_schema(schema, admin, engine)

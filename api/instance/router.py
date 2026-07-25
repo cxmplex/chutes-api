@@ -62,6 +62,8 @@ from api.instance.schemas import (
     LaunchConfig,
 )
 from api.job.schemas import Job
+from api.host.schemas import GpuLaunchReservation
+from api.host.locks import acquire_gpu_lifecycle_lock
 from api.instance.util import (
     _decode_chutes_jwt,
     create_launch_jwt_v2,
@@ -81,7 +83,9 @@ from api.server.service import (
     get_instance_evidence,
     verify_gpu_evidence,
 )
+from api.server.gpu_sessions import _current_attestation, _latest_attestation_attempt
 from api.server.schemas import TeeInstanceEvidence, BootAttestation, Server
+from api.storage.service import ensure_default_volume_binding
 from api.rate_limit import rate_limit
 from api.server.exceptions import (
     InstanceNotFoundError,
@@ -840,7 +844,13 @@ async def _check_scalable_private(db, chute, miner):
         )
 
 
-async def _validate_node(db, chute, node_id: str, hotkey: str) -> Node:
+async def _validate_node(
+    db,
+    chute,
+    node_id: str,
+    hotkey: str,
+    node_selector: NodeSelector,
+) -> Node:
     node = await get_node_by_id(node_id, db, hotkey)
     if not node:
         raise HTTPException(
@@ -867,7 +877,7 @@ async def _validate_node(db, chute, node_id: str, hotkey: str) -> Node:
         )
 
     # Valid GPU for this chute?
-    if not node.is_suitable(chute):
+    if node.gpu_identifier not in node_selector.supported_gpus:
         logger.warning(
             f"INSTANCEFAIL: attempt to post incompatible GPUs: {node.name} for {chute.node_selector} {hotkey=}"
         )
@@ -879,15 +889,20 @@ async def _validate_node(db, chute, node_id: str, hotkey: str) -> Node:
 
 
 async def _validate_nodes(
-    db, chute, node_ids: list[str], hotkey: str, instance: Instance
+    db,
+    chute,
+    node_ids: list[str],
+    hotkey: str,
+    instance: Instance,
+    node_selector: NodeSelector,
 ) -> list[Node]:
     host = instance.host
     # CPU (GPU-less) chutes have no GPU Node rows; the instance<->server linkage is by
     # host + miner_hotkey (see verify_tee_chute), so there is no node count to enforce or
     # instance_nodes association to create.
-    if str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu":
+    if node_selector.compute_type == "cpu":
         return []
-    gpu_count = chute.node_selector.get("gpu_count", 1)
+    gpu_count = node_selector.gpu_count or 0
     if len(set(node_ids)) != gpu_count:
         logger.warning(
             f"INSTANCEFAIL: Attempt to post incorrect GPU count: {len(node_ids)} vs {gpu_count} from {hotkey=}"
@@ -900,7 +915,7 @@ async def _validate_nodes(
     node_hosts = set()
     nodes = []
     for node_id in set(node_ids):
-        node = await _validate_node(db, chute, node_id, hotkey)
+        node = await _validate_node(db, chute, node_id, hotkey, node_selector)
         nodes.append(node)
         node_hosts.add(node.verification_host)
 
@@ -1009,7 +1024,11 @@ async def get_instance_compute_history_csv(
     )
 
 
-def _require_non_cpu_tee_claim_fields(chute: Chute, args: LaunchConfigArgs) -> None:
+def _require_non_cpu_tee_claim_fields(
+    chute: Chute,
+    args: LaunchConfigArgs,
+    launch_config: LaunchConfig,
+) -> None:
     """`gpus` and `env` were schema-required before CPU-TEE made them Optional. Only CPU-TEE
     chutes (no aegis envdump, no GPU nodes) may omit them; every other claim must still provide
     both, otherwise omitting `env` silently skips envdump verification and omitting `gpus`
@@ -1020,7 +1039,8 @@ def _require_non_cpu_tee_claim_fields(chute: Chute, args: LaunchConfigArgs) -> N
     )
     if cpu_tee:
         return
-    missing = [field for field in ("gpus", "env") if getattr(args, field) is None]
+    fields = ("gpus",) if launch_config.gpu_management_mode == "platform" else ("gpus", "env")
+    missing = [field for field in fields if getattr(args, field) is None]
     if missing:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -1263,9 +1283,28 @@ async def _validate_launch_config_instance(
     chute: Chute,
     log_prefix: str,
 ) -> Tuple[LaunchConfig, list[Node], Instance, Optional[str]]:
+    await acquire_gpu_lifecycle_lock(db)
     miner = await _check_blacklisted(db, launch_config.miner_hotkey)
 
     config_id = launch_config.config_id
+    launch_job = await db.get(Job, launch_config.job_id) if launch_config.job_id else None
+    if launch_config.job_id and (
+        launch_job is None
+        or launch_job.chute_id != chute.chute_id
+        or launch_job.version != chute.version
+        or launch_job.finished_at is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Job launch selector or workload lineage is no longer current.",
+        )
+    node_selector = NodeSelector(
+        **(
+            launch_job.node_selector
+            if launch_job is not None and launch_job.node_selector
+            else chute.node_selector
+        )
+    )
 
     # CPU-TEE chutes ship NO aegis/netnanny, so the validator cannot (and must not) require aegis
     # evidence from them: netnanny_hash, runtime-integrity commitment/nonce/pubkey, mTLS cert, cfsv
@@ -1273,9 +1312,108 @@ async def _validate_launch_config_instance(
     # the TD attestation (dm-verity + RTMR), verified at server registration and by verify_tee_chute
     # (which also short-circuits self-registered servers). Every other launch check (IP match,
     # scalability, run_path tampering, job claim, instance pricing) still applies.
-    cpu_tee = bool(chute.tee) and (
-        str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
-    )
+    cpu_tee = bool(chute.tee) and (node_selector.compute_type == "cpu")
+    platform_gpu = bool(chute.tee) and launch_config.gpu_management_mode == "platform"
+    managed_tee = cpu_tee or platform_gpu
+    platform_reservation = None
+    platform_server = None
+    if platform_gpu:
+        if not launch_config.gpu_launch_reservation_id or not launch_config.server_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Platform GPU launch config has no exact reservation/server binding.",
+            )
+        platform_reservation = (
+            await db.execute(
+                select(GpuLaunchReservation)
+                .where(
+                    GpuLaunchReservation.reservation_id == launch_config.gpu_launch_reservation_id
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        platform_server = (
+            await db.execute(
+                select(Server).where(Server.server_id == launch_config.server_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            platform_reservation is None
+            or platform_server is None
+            or platform_reservation.state != "running"
+            or platform_reservation.management_mode != "platform"
+            or platform_reservation.server_id != platform_server.server_id
+            or platform_reservation.reservation_id != platform_server.gpu_launch_reservation_id
+            or platform_reservation.chute_id != launch_config.chute_id
+            or platform_reservation.job_id != launch_config.job_id
+            or platform_reservation.container_repository != launch_config.container_repository
+            or platform_reservation.container_manifest_digest
+            != launch_config.container_manifest_digest
+            or platform_server.gpu_management_mode != "platform"
+            or platform_server.gpu_retired_at is not None
+            or platform_server.gpu_allocation_group_id != platform_reservation.allocation_group_id
+            or platform_server.gpu_allocation_group_generation
+            != platform_reservation.allocation_group_generation
+            or platform_server.gpu_process_incarnation != platform_reservation.process_incarnation
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Platform GPU launch config lineage is stale or miner-managed.",
+            )
+        try:
+            _current_attestation(
+                platform_server,
+                await _latest_attestation_attempt(db, platform_server.server_id),
+            )
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Platform GPU server has no current successful evidence.",
+            ) from exc
+    gpu_lineage_reservation = platform_reservation
+    if launch_config.gpu_management_mode == "miner":
+        gpu_lineage_reservation = (
+            await db.execute(
+                select(GpuLaunchReservation)
+                .where(
+                    GpuLaunchReservation.reservation_id == launch_config.gpu_launch_reservation_id
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        miner_server = (
+            await db.execute(
+                select(Server).where(Server.server_id == launch_config.server_id).with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            gpu_lineage_reservation is None
+            or miner_server is None
+            or gpu_lineage_reservation.state != "running"
+            or gpu_lineage_reservation.management_mode != "miner"
+            or miner_server.gpu_management_mode != "miner"
+            or miner_server.gpu_launch_reservation_id != gpu_lineage_reservation.reservation_id
+            or miner_server.gpu_retired_at is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Miner GPU launch config lineage is no longer current.",
+            )
+    if launch_job is not None:
+        expected_mode = launch_config.gpu_management_mode
+        if expected_mode in {"platform", "miner"} and (
+            launch_job.gpu_management_mode != expected_mode
+            or launch_job.gpu_launch_reservation_id != launch_config.gpu_launch_reservation_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Job is owned by a different GPU manager or reservation.",
+            )
+        if expected_mode is None and launch_job.gpu_management_mode is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Legacy launch config cannot claim a managed GPU job.",
+            )
 
     # Generate a tentative instance ID.
     new_instance_id = generate_uuid()
@@ -1345,7 +1483,7 @@ async def _validate_launch_config_instance(
 
         # NetNanny / Aegis verification (match egress config and hash).
         nn_valid = True
-        if cpu_tee:
+        if managed_tee:
             # CPU-TEE: no in-image netnanny/aegis; the TD attestation is the integrity proof.
             pass
         elif semcomp(chute.chutes_version or "0.0.0", "0.5.5") >= 0:
@@ -1414,7 +1552,7 @@ async def _validate_launch_config_instance(
             )
 
     # Runtime integrity (runint) verification for version >= 0.4.9 (aegis-backed; skipped for CPU-TEE).
-    if not cpu_tee and semcomp(chute.chutes_version, "0.4.9") >= 0:
+    if not managed_tee and semcomp(chute.chutes_version, "0.4.9") >= 0:
         if not launch_config.nonce or not args.rint_nonce:
             logger.error(f"{log_prefix} missing runint nonce in launch config")
             launch_config.failed_at = func.now()
@@ -1445,17 +1583,32 @@ async def _validate_launch_config_instance(
                 )
 
     # Filesystem (cfsv) verification is aegis-backed; CPU-TEE has no cfsv index to verify.
-    if not cpu_tee:
+    if not managed_tee:
         await _validate_launch_config_filesystem(db, launch_config, chute, args)
 
     # Assign the job to this launch config.
     if launch_config.job_id:
+        job_claim_conditions = [
+            Job.job_id == launch_config.job_id,
+            Job.miner_hotkey.is_(None),
+        ]
+        if launch_config.gpu_management_mode in {"platform", "miner"}:
+            job_claim_conditions.extend(
+                [
+                    Job.gpu_management_mode == launch_config.gpu_management_mode,
+                    Job.gpu_launch_reservation_id == launch_config.gpu_launch_reservation_id,
+                ]
+            )
+        else:
+            job_claim_conditions.extend(
+                [
+                    Job.gpu_management_mode.is_(None),
+                    Job.gpu_launch_reservation_id.is_(None),
+                ]
+            )
         stmt = (
             update(Job)
-            .where(
-                Job.job_id == launch_config.job_id,
-                Job.miner_hotkey.is_(None),
-            )
+            .where(*job_claim_conditions)
             .values(
                 miner_uid=launch_config.miner_uid,
                 miner_hotkey=launch_config.miner_hotkey,
@@ -1484,7 +1637,7 @@ async def _validate_launch_config_instance(
     tls_cert_sig = getattr(args, "tls_cert_sig", None)
     rint_commitment = getattr(args, "rint_commitment", None)
 
-    if is_v4 and not cpu_tee:
+    if is_v4 and not managed_tee:
         if not rint_commitment or rint_commitment[:2] != "04":
             logger.error(
                 f"{log_prefix} v4 instance (>= 0.5.5) must provide v4 (04-prefix) rint_commitment"
@@ -1521,7 +1674,7 @@ async def _validate_launch_config_instance(
     # server's registration TDX quote (verify_quote at /servers/cpu/register), so a host-forged cert
     # cannot match and the untrusted host (which routes the TD's traffic) cannot MITM/read/tamper it.
     # Fail closed: no attested cert on record => no provably-private channel, so refuse to launch.
-    if cpu_tee:
+    if managed_tee:
         server_row = None
         if getattr(launch_config, "server_id", None):
             server_row = (
@@ -1573,14 +1726,13 @@ async def _validate_launch_config_instance(
                 )
 
     # Create the instance now that we've verified the envdump/k8s env.
-    node_selector = NodeSelector(**chute.node_selector)
     is_cpu = node_selector.compute_type == "cpu"
     extra_fields = {
         "e2e_pubkey": getattr(args, "e2e_pubkey", None),
     }
     # CPU-TEE instances carry no aegis session key; mark them so the API sends plaintext (no cipher)
     # over the TD-secured transport instead of raising on a missing rint_session_key.
-    if cpu_tee:
+    if managed_tee:
         extra_fields["cpu_tee"] = True
     # Store CA cert for SSL verification (separate from server cert in cacert).
     tls_ca_cert = getattr(args, "tls_ca_cert", None)
@@ -1612,6 +1764,25 @@ async def _validate_launch_config_instance(
         # later instance<->server resolution (verify_tee_chute) must key off server_id, not host IP,
         # or it 409s on the shared IP. NULL for the legacy miner-run path (resolved by IP/GPUs).
         server_id=launch_config.server_id,
+        gpu_management_mode=launch_config.gpu_management_mode,
+        gpu_launch_reservation_id=(
+            gpu_lineage_reservation.reservation_id if gpu_lineage_reservation is not None else None
+        ),
+        gpu_allocation_group_id=(
+            gpu_lineage_reservation.allocation_group_id
+            if gpu_lineage_reservation is not None
+            else None
+        ),
+        gpu_allocation_group_generation=(
+            gpu_lineage_reservation.allocation_group_generation
+            if gpu_lineage_reservation is not None
+            else None
+        ),
+        gpu_process_incarnation=(
+            gpu_lineage_reservation.process_incarnation
+            if gpu_lineage_reservation is not None
+            else None
+        ),
         port_mappings=[item.model_dump() for item in args.port_mappings],
         compute_multiplier=node_selector.compute_multiplier,
         billed_to=None,
@@ -1646,7 +1817,7 @@ async def _validate_launch_config_instance(
             f"Adding private instance bonus value {bonus=} to {instance.instance_id} "
             f"for total {instance.compute_multiplier=} for {chute.name=} {chute.chute_id=} {integrated=}"
         )
-        instance.billed_to = chute.user_id
+        instance.billed_to = launch_job.user_id if launch_job is not None else chute.user_id
 
     # Track the warmup (base) multiplier separately — this is node_selector + private/tee bonus
     # + manual boost + TEE bonus, but WITHOUT urgency (chute.boost) or bounty.
@@ -1697,11 +1868,7 @@ async def _validate_launch_config_instance(
 
     # Mark the job as associated with this instance.
     if launch_config.job_id:
-        job = (
-            (await db.execute(select(Job).where(Job.job_id == launch_config.job_id)))
-            .unique()
-            .scalar_one_or_none()
-        )
+        job = launch_job
         if not job:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1747,7 +1914,22 @@ async def _validate_launch_config_instance(
             node_ids,
             launch_config.miner_hotkey,
             instance,
+            node_selector,
         )
+        if platform_reservation is not None and (
+            sorted(node.uuid for node in nodes) != platform_reservation.gpu_uuids
+            or any(
+                node.server_id != launch_config.server_id
+                or node.gpu_allocation_group_id != platform_reservation.allocation_group_id
+                or node.gpu_allocation_group_generation
+                != platform_reservation.allocation_group_generation
+                for node in nodes
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Platform workload GPU set differs from its reserved allocation group.",
+            )
     except Exception:
         await db.rollback()
         async with get_session() as error_session:
@@ -1766,7 +1948,7 @@ async def _validate_launch_config_instance(
         # Use the actual GPU's rate/multiplier instead of the
         # minimum across all supported GPUs in the node selector.
         actual_gpu = nodes[0].gpu_identifier
-        gpu_count = chute.node_selector.get("gpu_count", 1)
+        gpu_count = node_selector.gpu_count or 0
         actual_base = gpu_count * COMPUTE_MULTIPLIER[actual_gpu]
         ns_min_compute = node_selector.compute_multiplier
         ns_min_hourly = instance.hourly_rate
@@ -1790,7 +1972,7 @@ async def _validate_launch_config_instance(
     instance.extra["warmup_compute_multiplier"] = warmup_compute_multiplier
 
     # Enforce rint_pubkey for chutes >= 0.5.1 (aegis-backed; skipped for CPU-TEE).
-    if not cpu_tee and semcomp(instance.chutes_version or "0.0.0", "0.5.1") >= 0:
+    if not managed_tee and semcomp(instance.chutes_version or "0.0.0", "0.5.1") >= 0:
         if not instance.rint_pubkey or not instance.rint_nonce:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1823,7 +2005,7 @@ async def _validate_launch_config_instance(
     # CLLMV V2: decrypt miner's ephemeral HMAC session key from init blob
     cllmv_init = getattr(args, "cllmv_session_init", None)
     is_v4_instance = semcomp(instance.chutes_version or "0.0.0", "0.5.5") >= 0
-    if is_v4_instance and not cpu_tee:
+    if is_v4_instance and not managed_tee:
         if not cllmv_init:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1880,6 +2062,7 @@ async def _validate_graval_launch_config_instance(
     db: AsyncSession,
     authorization: str,
 ) -> Tuple[LaunchConfig, list[Node], Instance, Optional[str]]:
+    await acquire_gpu_lifecycle_lock(db)
     token = authorization.strip().split(" ")[-1]
     launch_config = await load_launch_config_from_jwt(db, config_id, token)
     chute = await _load_chute(db, launch_config.chute_id)
@@ -1898,7 +2081,7 @@ async def _validate_graval_launch_config_instance(
             detail="Can not claim a graval launch config for a TEE chute.",
         )
 
-    _require_non_cpu_tee_claim_fields(chute, args)
+    _require_non_cpu_tee_claim_fields(chute, args, launch_config)
 
     # This does change order from previous graval only implementation
     # If want to preserve order need to split up final shared config check
@@ -1918,6 +2101,7 @@ async def _validate_tee_launch_config_instance(
     db: AsyncSession,
     authorization: str,
 ) -> Tuple[LaunchConfig, list[Node], Instance, Optional[str]]:
+    await acquire_gpu_lifecycle_lock(db)
     token = authorization.strip().split(" ")[-1]
     launch_config = await load_launch_config_from_jwt(db, config_id, token)
     chute = await _load_chute(db, launch_config.chute_id)
@@ -1936,12 +2120,12 @@ async def _validate_tee_launch_config_instance(
             detail="Can not claim a TEE launch config for a non-TEE chute.",
         )
 
-    _require_non_cpu_tee_claim_fields(chute, args)
+    _require_non_cpu_tee_claim_fields(chute, args, launch_config)
 
     # Deny launches on servers in TEE maintenance mode before creating any instance/node records.
     # CPU (GPU-less) chutes have no GPU nodes, so the server is resolved by host + miner_hotkey.
     is_cpu = str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
-    if is_cpu:
+    if is_cpu or launch_config.gpu_management_mode == "platform":
         server = await get_cpu_server_for_host(
             db, args.host, launch_config.miner_hotkey, server_id=launch_config.server_id
         )
@@ -2047,9 +2231,14 @@ def _require_secure_source_delivery(chute: Chute) -> None:
         )
 
 
-@router.get("/launch_config", response_model=LaunchConfigResponse)
+@router.get(
+    "/launch_config",
+    response_model=LaunchConfigResponse,
+    response_model_exclude_none=True,
+)
 async def get_launch_config(
     chute_id: str,
+    request: Request,
     server_id: Optional[str] = None,
     job_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
@@ -2063,6 +2252,73 @@ async def get_launch_config(
     # Load the chute and check if it's scalable.
     chute = await _load_chute(db, chute_id)
     _require_secure_source_delivery(chute)
+    gpu_selector = str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "gpu"
+    if gpu_selector:
+        from api.gpu_scheduler import acquire_gpu_workload_lock
+
+        await acquire_gpu_workload_lock(db, chute_id, job_id)
+        if not job_id:
+            platform_active = (
+                await db.execute(
+                    select(GpuLaunchReservation.reservation_id)
+                    .where(
+                        GpuLaunchReservation.management_mode == "platform",
+                        GpuLaunchReservation.chute_id == chute_id,
+                        GpuLaunchReservation.job_id.is_(None),
+                        GpuLaunchReservation.state.in_(
+                            {
+                                "reserved",
+                                "claimed",
+                                "launching",
+                                "running",
+                                "resetting",
+                                "quarantined",
+                            }
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if platform_active is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_423_LOCKED,
+                    detail="TEE GPU chute demand is already platform-managed.",
+                )
+    runtime_server_id = getattr(request.state, "gpu_runtime_server_id", None)
+    registry_repository = None
+    registry_manifest_digest = None
+    if runtime_server_id is not None:
+        if server_id != runtime_server_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Launch config server differs from the attested GPU session.",
+            )
+        runtime_server = await db.get(Server, runtime_server_id)
+        if (
+            runtime_server is None
+            or runtime_server.compute_type != "gpu"
+            or runtime_server.gpu_management_mode != "miner"
+            or runtime_server.gpu_retired_at is not None
+            or runtime_server.miner_hotkey != hotkey
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Launch config requires the current attested miner GPU server.",
+            )
+        from api.cpu_scheduler import _container_intent
+
+        registry_intent = await _container_intent(chute)
+        if registry_intent is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Validator could not resolve the launch image descriptor.",
+            )
+        registry_repository, registry_manifest_digest = registry_intent
+    elif server_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Server-bound launch configs require an attested GPU session.",
+        )
 
     # CPU chutes are validator-scheduled: the cpu_scheduler mints their launch configs directly
     # (stamped with the target server_id). A miner-minted config could never claim (no attested
@@ -2093,6 +2349,7 @@ async def get_launch_config(
 
     # Associated with a job?
     disk_gb = None
+    job = None
     if job_id:
         job = (
             (await db.execute(select(Job).where(Job.chute_id == chute_id, Job.job_id == job_id)))
@@ -2103,6 +2360,11 @@ async def get_launch_config(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Job {job_id} for chute {chute_id} not found",
+            )
+        if job.gpu_management_mode == "platform":
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail=f"Job {job_id} is already platform-managed.",
             )
 
         # Don't allow too many miners to try to claim the job...
@@ -2127,6 +2389,9 @@ async def get_launch_config(
             ),
             {"job_id": job_id, "hotkey": hotkey},
         )
+        if runtime_server_id is not None:
+            job.gpu_management_mode = "miner"
+            job.gpu_launch_reservation_id = runtime_server.gpu_launch_reservation_id
         disk_gb = job.job_args["_disk_gb"]
 
     # Create the launch config and JWT.
@@ -2139,11 +2404,21 @@ async def get_launch_config(
         # Store in Redis with 2-hour TTL, keyed by config_id
         await settings.redis_client.set(f"rint_nonce:{config_id}", rint_nonce, ex=7200)
 
+    launch_owner_id = job.user_id if job is not None else chute.user_id
+    _, default_volume, _ = await ensure_default_volume_binding(
+        db,
+        launch_owner_id,
+        chute_id,
+    )
     try:
         launch_config = LaunchConfig(
             config_id=config_id,
             env_key=secrets.token_bytes(16).hex(),
             chute_id=chute_id,
+            user_id=launch_owner_id,
+            compute_type=chute.image.compute_type,
+            default_volume_id=default_volume.volume_id,
+            storage_session_exchange_allowed=runtime_server_id is not None,
             job_id=job_id,
             miner_hotkey=hotkey,
             miner_uid=miner.node_id,
@@ -2151,6 +2426,14 @@ async def get_launch_config(
             env_type="tee" if chute.tee else "graval",
             seed=0,
             nonce=rint_nonce,
+            server_id=runtime_server_id,
+            container_repository=registry_repository,
+            container_manifest_digest=registry_manifest_digest,
+            registry_scope_active=runtime_server_id is not None,
+            gpu_management_mode=("miner" if runtime_server_id is not None else None),
+            gpu_launch_reservation_id=(
+                runtime_server.gpu_launch_reservation_id if runtime_server_id is not None else None
+            ),
         )
         db.add(launch_config)
         await db.commit()
@@ -2193,10 +2476,16 @@ async def get_launch_config(
         disk_gb=disk_gb,
     )
 
-    return {
+    result = {
         "token": token,
         "config_id": launch_config.config_id,
     }
+    if registry_repository is not None:
+        result["registry"] = {
+            "repository": registry_repository,
+            "manifest_digest": registry_manifest_digest,
+        }
+    return result
 
 
 @router.get("/launch_config/{config_id}/nonce")
@@ -2285,13 +2574,10 @@ async def claim_tee_launch_config(
 
     # Store the launch config
     await db.commit()
+    await acquire_gpu_lifecycle_lock(db)
     await db.refresh(launch_config)
 
-    async with get_session() as session:
-        await session.execute(
-            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
-            {"config_id": config_id},
-        )
+    await _mark_launch_config_retrieved(config_id)
 
     # Send event. CPU (GPU-less) chutes have no GPU nodes (nodes == []).
     await db.refresh(instance)
@@ -2317,6 +2603,7 @@ async def claim_tee_launch_config(
         reason = detail if isinstance(detail, str) else str(detail)
         await db.rollback()
         async with get_session() as error_session:
+            await acquire_gpu_lifecycle_lock(error_session)
             await error_session.execute(
                 text(
                     "UPDATE launch_configs SET failed_at = NOW(), "
@@ -2329,6 +2616,7 @@ async def claim_tee_launch_config(
 
     instance.deployment_id = args.deployment_id
     await db.commit()
+    await acquire_gpu_lifecycle_lock(db)
     await db.refresh(instance)
 
     response = {"symmetric_key": instance.symmetric_key}
@@ -2354,6 +2642,15 @@ def _reject_cpu_tee_on_legacy_endpoint(instance) -> None:
                 "CPU-TEE instances must verify via /instances/launch_config/{config_id}/tee "
                 "(attested-cert bound); the graval/attest endpoints are GPU-only."
             ),
+        )
+
+
+async def _mark_launch_config_retrieved(config_id: str) -> None:
+    async with get_session() as session:
+        await acquire_gpu_lifecycle_lock(session)
+        await session.execute(
+            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
+            {"config_id": config_id},
         )
 
 
@@ -2388,13 +2685,10 @@ async def validate_tee_launch_config_instance(
 
     # Store the launch config
     await db.commit()
+    await acquire_gpu_lifecycle_lock(db)
     await db.refresh(launch_config)
 
-    async with get_session() as session:
-        await session.execute(
-            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
-            {"config_id": config_id},
-        )
+    await _mark_launch_config_retrieved(config_id)
 
     # Send event.
     await db.refresh(instance)
@@ -2426,7 +2720,9 @@ async def validate_tee_launch_config_instance(
     launch_config.verified_at = func.now()
     await _verify_job_ports(db, instance)
     await _mark_instance_verified(db, instance, launch_config)
-    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(
+        db, instance, launch_config, request
+    )
     return_value["symmetric_key"] = instance.symmetric_key
 
     # Include validator pubkey if ECDH was used (for miner to derive session key)
@@ -2492,14 +2788,11 @@ async def claim_graval_launch_config(
 
     # Store the launch config.
     await db.commit()
+    await acquire_gpu_lifecycle_lock(db)
     await db.refresh(launch_config)
 
     # Set timestamp in a fresh transaction so it's not affected by the long cipher gen time.
-    async with get_session() as session:
-        await session.execute(
-            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
-            {"config_id": config_id},
-        )
+    await _mark_launch_config_retrieved(config_id)
 
     # Send event.
     await db.refresh(instance)
@@ -2927,7 +3220,10 @@ async def _mark_instance_verified(
 
 
 async def _build_launch_config_verified_response(
-    db: AsyncSession, instance: Instance, launch_config: LaunchConfig
+    db: AsyncSession,
+    instance: Instance,
+    launch_config: LaunchConfig,
+    request: Request,
 ):
     _require_secure_source_delivery(instance.chute)
     return_value = {
@@ -2972,6 +3268,41 @@ async def _build_launch_config_verified_response(
         f"{(settings.launch_config_base_url or f'https://api.{settings.base_domain}').rstrip('/')}"
         f"/instances/launch_config/{launch_config.config_id}/activate"
     )
+    if launch_config.storage_session_exchange_allowed:
+        from api.storage.launch_sessions import issue_launch_storage_session
+
+        storage_config_id = launch_config.config_id
+        storage_instance_id = instance.instance_id
+        try:
+            launch_context, storage_session = await issue_launch_storage_session(
+                db,
+                storage_config_id,
+                request,
+            )
+        except Exception as exc:
+            await db.rollback()
+            await db.execute(
+                text(
+                    "UPDATE launch_configs "
+                    "SET failed_at = NOW(), verification_error = :reason "
+                    "WHERE config_id = :config_id"
+                ),
+                {
+                    "config_id": storage_config_id,
+                    "reason": f"Launch-bound ChuteFS session issuance failed: {exc}"[:2000],
+                },
+            )
+            await db.execute(
+                text(
+                    "UPDATE instances SET verified = false, active = false "
+                    "WHERE instance_id = :instance_id"
+                ),
+                {"instance_id": storage_instance_id},
+            )
+            await db.commit()
+            raise
+        return_value["launch_context"] = launch_context.model_dump()
+        return_value["storage_session"] = storage_session.model_dump()
 
     return return_value
 
@@ -3119,7 +3450,9 @@ async def verify_graval_launch_config_instance(
     launch_config.verified_at = func.now()
     await _verify_job_ports(db, instance)
     await _mark_instance_verified(db, instance, launch_config)
-    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(
+        db, instance, launch_config, request
+    )
 
     await db.refresh(instance)
     asyncio.create_task(notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type))
@@ -3176,7 +3509,9 @@ async def verify_tee_launch_config_instance(
     launch_config.verified_at = func.now()
     await _verify_job_ports(db, instance)
     await _mark_instance_verified(db, instance, launch_config)
-    return_value = await _build_launch_config_verified_response(db, instance, launch_config)
+    return_value = await _build_launch_config_verified_response(
+        db, instance, launch_config, request
+    )
 
     await db.refresh(instance)
     asyncio.create_task(notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type))
@@ -3479,6 +3814,8 @@ async def delete_instance(
 
     evict_instance_ssl(instance_id)
 
+    if instance.config is not None and instance.config.failed_at is None:
+        instance.config.completed_at = func.now()
     await db.delete(instance)
 
     # Update instance audit table.

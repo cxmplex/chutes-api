@@ -9,6 +9,7 @@ class NoncePurpose(str, Enum):
     INSTANCE_VERIFICATION = "instance_verification"
     # 1-click CPU TEE server self-registration (POST /servers/cpu/register).
     CPU_REGISTER = "cpu_register"
+    GPU_REGISTER = "gpu_register"
     # Model B: trigger a chute-guest-image refresh on an L0 host (POST /hosts/{id}/upgrade-image).
     # Owning-miner signature over "{hotkey}:{nonce}:host_upgrade"; sends the node-agent upgrade_image.
     HOST_UPGRADE = "host_upgrade"
@@ -22,6 +23,7 @@ class NoncePurpose(str, Enum):
     HOST_ENROLLMENT = "host_enrollment"
     HOST_PCS_MAILBOX = "host_pcs_mailbox"
     HOST_REVOCATION = "host_revocation"
+    GPU_RESERVATION = "gpu_reservation"
 
     L0_BOOTSTRAP = "l0_bootstrap"
 

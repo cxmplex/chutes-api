@@ -8,31 +8,92 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
+from api.agent_channel import (
+    send_agent_command,
+    send_gpu_reservation_teardown,
+    wait_for_agent_command_ack,
+)
 from api.constants import HOTKEY_HEADER, NoncePurpose
 from api.database import get_db_session
 from api.host import service as host_service
 from api.host.reservations import (
     LaunchReservationError,
     claim_storage_launch_intent,
+    gpu_host_storage_readiness,
+)
+from api.host.gpu_allocations import (
+    GpuAllocationError,
+    GpuAllocationQuarantinedError,
+    begin_gpu_teardown,
+    authorize_gpu_group_recovery,
+    claim_gpu_reservation,
+    complete_gpu_group_recovery,
+    complete_gpu_reset,
+    mark_gpu_launching,
+    quarantine_gpu_reservation,
+    reconcile_gpu_inventory,
+    request_gpu_teardown,
+    reserve_gpu_group,
+    sign_gpu_launch_claims,
+    start_gpu_group_recovery,
 )
 from api.host.schemas import (
     EnrollmentKeyChallengeRequestV1,
+    EnrollmentKeyChallengeRequestV2,
     EnrollmentKeyChallengeResponseV1,
+    EnrollmentKeyChallengeResponseV2,
     EnrollmentVoucherMintRequestV1,
+    EnrollmentVoucherMintRequestV2,
     EnrollmentVoucherResponseV1,
+    EnrollmentVoucherResponseV2,
     HostAuthChallengeV1,
     HostEnrollmentRedemptionV1,
+    HostEnrollmentRedemptionV2,
     HostEnrollmentResponseV1,
+    HostEnrollmentResponseV2,
     HostEnrollmentStatusV1,
+    HostEnrollmentStatusV2,
     HostIdentityDurabilityAckV1,
+    GpuHostStorageReadinessV1,
     HostKeyGeneration,
     HostProvisioningHeartbeatV1,
     HostProvisioningStatusV1,
     HostRevocationRequestV1,
     LaunchReservationResponseV1,
+    LaunchReservationResponseV2,
     PcsMailboxAckV1,
     PcsMailboxEnvelopeV1,
+    PcsMailboxEnvelopeV2,
     StorageLaunchIntentClaimV1,
+    GpuInventoryReconcileResponseV1,
+    GpuInventoryReportV1,
+    GpuAllocationGroup,
+    GpuLaunchReservationResponseV1,
+    GpuMinerReservationRequestV1,
+    GpuMinerStopRequestV1,
+    GpuMinerStopResponseV1,
+    GpuPlatformReservationRequestV1,
+    GpuReservationClaimRequestV1,
+    GpuReservationQuarantineRequestV1,
+    GpuReservationStateRequestV1,
+    GpuResetResultV1,
+    GpuSignedLaunchClaimsEnvelopeV1,
+    GpuRecoveryAuthorizationV1,
+    GpuRecoveryAuthorizeRequestV1,
+    GpuRecoveryResetResultV1,
+    GpuRecoveryStartRequestV1,
+)
+from api.server.gpu_infra import (
+    authorize_legacy_gpu_cutover,
+    confirm_legacy_sources_unowned,
+)
+from api.server.schemas import (
+    GpuLegacyCutoverAuthorizeRequestV1,
+    GpuLegacyCutoverAuthorizeResponseV1,
+    GpuLegacyMigration,
+    GpuLegacyHostConfirmRequestV1,
+    GpuLegacyHostConfirmResponseV1,
+    GpuMinerIdentity,
 )
 from api.miner.util import is_miner_blacklisted
 from api.server.exceptions import ServerRegistrationError
@@ -49,6 +110,7 @@ from api.server.service import (
 )
 from api.user.schemas import User
 from api.user.service import get_current_user
+from api.permissions import Permissioning
 
 router = APIRouter()
 
@@ -64,9 +126,21 @@ def _require_hotkey(hotkey: Optional[str]) -> str:
     return hotkey
 
 
-@router.post("/enrollment-vouchers", response_model=EnrollmentVoucherResponseV1)
+def _require_admin(current_user: Optional[User]) -> User:
+    if current_user is None or not current_user.has_role(Permissioning.chutes_support):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="GPU platform allocation requires a Chutes admin account.",
+        )
+    return current_user
+
+
+@router.post(
+    "/enrollment-vouchers",
+    response_model=EnrollmentVoucherResponseV1 | EnrollmentVoucherResponseV2,
+)
 async def mint_enrollment_voucher_endpoint(
-    body: EnrollmentVoucherMintRequestV1,
+    body: EnrollmentVoucherMintRequestV1 | EnrollmentVoucherMintRequestV2,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User | None = Depends(
@@ -90,9 +164,12 @@ async def mint_enrollment_voucher_endpoint(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
 
-@router.post("/enrollment/challenge", response_model=EnrollmentKeyChallengeResponseV1)
+@router.post(
+    "/enrollment/challenge",
+    response_model=EnrollmentKeyChallengeResponseV1 | EnrollmentKeyChallengeResponseV2,
+)
 async def enrollment_key_challenge_endpoint(
-    body: EnrollmentKeyChallengeRequestV1,
+    body: EnrollmentKeyChallengeRequestV1 | EnrollmentKeyChallengeRequestV2,
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
@@ -101,9 +178,12 @@ async def enrollment_key_challenge_endpoint(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
 
-@router.post("/enroll", response_model=HostEnrollmentResponseV1)
+@router.post(
+    "/enroll",
+    response_model=HostEnrollmentResponseV1 | HostEnrollmentResponseV2,
+)
 async def redeem_enrollment_voucher_endpoint(
-    body: HostEnrollmentRedemptionV1,
+    body: HostEnrollmentRedemptionV1 | HostEnrollmentRedemptionV2,
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
@@ -162,7 +242,10 @@ async def provisioning_heartbeat_endpoint(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
-@router.get("/enrollment-status", response_model=HostEnrollmentStatusV1)
+@router.get(
+    "/enrollment-status",
+    response_model=HostEnrollmentStatusV1 | HostEnrollmentStatusV2,
+)
 async def enrollment_status_endpoint(
     host_id: str = Query(..., min_length=1, max_length=256),
     db: AsyncSession = Depends(get_db_session),
@@ -193,6 +276,21 @@ async def enrollment_status_endpoint(
             status_code=status.HTTP_409_CONFLICT,
             detail="Host enrollment has no active key generation.",
         )
+    if (host.compute_type or "cpu") == "gpu":
+        return HostEnrollmentStatusV2(
+            host_id=host.host_id,
+            owner_hotkey=host.miner_hotkey,
+            tee_type="tdx",
+            compute_type="gpu",
+            storage_enabled=True,
+            channel=host.release_channel,
+            enrollment_generation=host.enrollment_generation,
+            key_generation=host.active_key_generation,
+            provisioning_state=host.provisioning_state,
+            x25519_public_key=key.x25519_public_key,
+            x25519_fingerprint=key.x25519_fingerprint,
+            enrolled_at=host.enrolled_at,
+        )
     return HostEnrollmentStatusV1(
         host_id=host.host_id,
         owner_hotkey=host.miner_hotkey,
@@ -221,7 +319,7 @@ async def host_auth_challenge_endpoint(
 
 @router.post("/pcs-mailbox", status_code=status.HTTP_204_NO_CONTENT)
 async def provision_pcs_mailbox_endpoint(
-    body: PcsMailboxEnvelopeV1,
+    body: PcsMailboxEnvelopeV1 | PcsMailboxEnvelopeV2,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User | None = Depends(
@@ -240,7 +338,10 @@ async def provision_pcs_mailbox_endpoint(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
 
 
-@router.post("/{host_id}/pcs-mailbox/consume", response_model=PcsMailboxEnvelopeV1)
+@router.post(
+    "/{host_id}/pcs-mailbox/consume",
+    response_model=PcsMailboxEnvelopeV1 | PcsMailboxEnvelopeV2,
+)
 async def consume_pcs_mailbox_endpoint(
     host_id: str,
     db: AsyncSession = Depends(get_db_session),
@@ -277,7 +378,7 @@ async def acknowledge_pcs_mailbox_endpoint(
 
 @router.post(
     "/{host_id}/launch-reservations/storage",
-    response_model=LaunchReservationResponseV1,
+    response_model=LaunchReservationResponseV1 | LaunchReservationResponseV2,
     response_model_exclude_none=True,
 )
 async def create_storage_launch_reservation_endpoint(
@@ -297,12 +398,531 @@ async def create_storage_launch_reservation_endpoint(
             current_host,
         )
         await db.commit()
-        return LaunchReservationResponseV1(
+        response_type = (
+            LaunchReservationResponseV2
+            if int(reservation.claims_version or 1) == 2
+            else LaunchReservationResponseV1
+        )
+        return response_type(
             token=token,
             claims=reservation.claims,
             claims_sha256=reservation.claims_sha256,
         )
     except LaunchReservationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.get(
+    "/{host_id}/storage-readiness",
+    response_model=GpuHostStorageReadinessV1,
+)
+async def gpu_storage_readiness_endpoint(
+    host_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the readiness path.",
+        )
+    readiness = await gpu_host_storage_readiness(db, current_host)
+    desired_capacity = (
+        int(current_host.reported_capacity or 0) if readiness.trusted_schedulable else 0
+    )
+    if current_host.capacity != desired_capacity:
+        current_host.capacity = desired_capacity
+        await db.commit()
+    return readiness
+
+
+@router.post(
+    "/{host_id}/gpu/migrations/{migration_id}/source-closed",
+    response_model=GpuLegacyHostConfirmResponseV1,
+)
+async def confirm_legacy_gpu_sources_endpoint(
+    host_id: str,
+    migration_id: str,
+    body: GpuLegacyHostConfirmRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the migration path.",
+        )
+    try:
+        result = await confirm_legacy_sources_unowned(
+            db,
+            current_host,
+            migration_id,
+            body,
+        )
+        await db.commit()
+        return result
+    except HTTPException:
+        await db.rollback()
+        raise
+
+
+@router.post(
+    "/{host_id}/gpu/inventory",
+    response_model=GpuInventoryReconcileResponseV1,
+)
+async def reconcile_gpu_inventory_endpoint(
+    host_id: str,
+    body: GpuInventoryReportV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU inventory path.",
+        )
+    try:
+        result = await reconcile_gpu_inventory(db, current_host, body)
+        await db.commit()
+        return result
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/reservations/platform",
+    response_model=GpuLaunchReservationResponseV1,
+    response_model_exclude_none=True,
+)
+async def create_platform_gpu_reservation_endpoint(
+    host_id: str,
+    body: GpuPlatformReservationRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(raise_not_found=False)),
+):
+    _require_admin(current_user)
+    try:
+        from api.chute.schemas import Chute
+        from api.gpu_scheduler import (
+            _demand_count,
+            _target_count,
+            acquire_gpu_workload_lock,
+        )
+        from api.job.schemas import Job
+
+        await acquire_gpu_workload_lock(db, body.chute_id, body.job_id)
+        chute = await db.get(Chute, body.chute_id)
+        job = await db.get(Job, body.job_id) if body.job_id else None
+        target = 1 if job is not None else await _target_count(body.chute_id)
+        if chute is None or (body.job_id is not None and job is None):
+            raise GpuAllocationError("Platform GPU workload no longer exists.")
+        if await _demand_count(db, chute, job) >= target:
+            raise GpuAllocationError(
+                "GPU workload demand was already claimed by a platform or miner manager."
+            )
+        result = await reserve_gpu_group(db, host_id, body)
+        await db.commit()
+        return result
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/migrations/legacy/authorize",
+    response_model=GpuLegacyCutoverAuthorizeResponseV1,
+)
+async def authorize_legacy_gpu_cutover_endpoint(
+    host_id: str,
+    body: GpuLegacyCutoverAuthorizeRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.GPU_RESERVATION.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
+    ),
+):
+    owner = _require_hotkey(hotkey)
+    try:
+        result = await authorize_legacy_gpu_cutover(
+            db,
+            host_id,
+            owner,
+            body,
+        )
+        await db.commit()
+        return result
+    except (GpuAllocationError, HTTPException):
+        await db.rollback()
+        raise
+
+
+@router.post(
+    "/{host_id}/gpu/reservations/miner",
+    response_model=GpuLaunchReservationResponseV1,
+    response_model_exclude_none=True,
+)
+async def create_miner_gpu_reservation_endpoint(
+    host_id: str,
+    body: GpuMinerReservationRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.GPU_RESERVATION.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
+    ),
+):
+    owner = _require_hotkey(hotkey)
+    try:
+        if body.legacy_vm_name is not None:
+            identity = await db.get(GpuMinerIdentity, host_id)
+            migration = (
+                (
+                    await db.execute(
+                        select(GpuLegacyMigration).where(
+                            GpuLegacyMigration.host_id == host_id,
+                            GpuLegacyMigration.legacy_vm_name == body.legacy_vm_name,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if identity is not None
+                else None
+            )
+            if identity is None or identity.owner_hotkey != owner or migration is None:
+                raise GpuAllocationError("Legacy migration closure has not been established.")
+            if migration.state == "guest_closed":
+                await db.rollback()
+                command = "confirm_gpu_legacy_sources"
+                command_id = f"gpu-legacy-confirm-{migration.migration_id}"
+                command_data = {
+                    "migration_id": migration.migration_id,
+                    "legacy_server_id": migration.legacy_server_id,
+                    "storage_luks_uuid": migration.storage_luks_uuid,
+                    "cache_luks_uuid": migration.cache_luks_uuid,
+                }
+                acknowledgement = None
+                for _attempt in range(2):
+                    await send_agent_command(
+                        host_id,
+                        command,
+                        command_data,
+                        command_id=command_id,
+                    )
+                    acknowledgement = await wait_for_agent_command_ack(
+                        host_id,
+                        command,
+                        command_id,
+                        timeout_seconds=15,
+                    )
+                    if acknowledgement is not None:
+                        break
+                if acknowledgement is None or acknowledgement.get("status") != "ok":
+                    raise GpuAllocationError(
+                        "Legacy source ownership is not yet closed on the target host."
+                    )
+        result = await reserve_gpu_group(
+            db,
+            host_id,
+            body,
+            expected_owner_hotkey=owner,
+        )
+        await db.commit()
+        from api.gpu_scheduler import _dispatch_launch
+
+        await _dispatch_launch(result.claims.reservation_id)
+        return result
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/gpu/miner/{server_id}/stop",
+    response_model=GpuMinerStopResponseV1,
+)
+async def stop_miner_gpu_server_endpoint(
+    server_id: str,
+    body: GpuMinerStopRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User | None = Depends(
+        get_current_user(
+            purpose=NoncePurpose.GPU_RESERVATION.value,
+            registered_to=_REGISTERED_TO,
+            raise_not_found=False,
+            require_v2=True,
+            force_hotkey_auth=True,
+        )
+    ),
+):
+    owner = _require_hotkey(hotkey)
+    server = await db.get(Server, server_id)
+    if (
+        server is None
+        or server.miner_hotkey != owner
+        or server.compute_type != "gpu"
+        or server.gpu_management_mode != "miner"
+        or not server.gpu_launch_reservation_id
+    ):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GPU server not found.")
+    try:
+        reservation = await request_gpu_teardown(
+            db,
+            server.gpu_launch_reservation_id,
+            reason=body.reason,
+        )
+        await db.commit()
+        if reservation.state not in {"released", "expired"}:
+            await send_gpu_reservation_teardown(
+                reservation.reservation_id,
+                reason=body.reason,
+            )
+        return GpuMinerStopResponseV1(
+            server_id=server.server_id,
+            reservation_id=reservation.reservation_id,
+            status=(
+                "released" if reservation.state in {"released", "expired"} else "teardown_requested"
+            ),
+        )
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/reservations/claim",
+    response_model=GpuSignedLaunchClaimsEnvelopeV1,
+    response_model_exclude_none=True,
+)
+async def claim_gpu_reservation_endpoint(
+    host_id: str,
+    body: GpuReservationClaimRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU claim path.",
+        )
+    try:
+        claims = await claim_gpu_reservation(db, current_host, body)
+        signed_claims = sign_gpu_launch_claims(claims)
+        await db.commit()
+        return signed_claims
+    except GpuAllocationQuarantinedError as exc:
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/reservations/launching",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def mark_gpu_launching_endpoint(
+    host_id: str,
+    body: GpuReservationStateRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU launch path.",
+        )
+    try:
+        await mark_gpu_launching(db, current_host, body)
+        await db.commit()
+    except GpuAllocationQuarantinedError as exc:
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/reservations/teardown",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def begin_gpu_teardown_endpoint(
+    host_id: str,
+    body: GpuReservationStateRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU teardown path.",
+        )
+    try:
+        await begin_gpu_teardown(db, current_host, body)
+        await db.commit()
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/reservations/quarantine",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def quarantine_gpu_reservation_endpoint(
+    host_id: str,
+    body: GpuReservationQuarantineRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU quarantine path.",
+        )
+    try:
+        await quarantine_gpu_reservation(
+            db,
+            current_host,
+            GpuReservationStateRequestV1(
+                reservation_id=body.reservation_id,
+                claims_sha256=body.claims_sha256,
+                process_incarnation=body.process_incarnation,
+            ),
+            code=body.failure_code,
+            reason=body.failure_reason,
+            metadata=body.evidence,
+        )
+        await db.commit()
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/reservations/reset-result",
+    response_model=bool,
+)
+async def complete_gpu_reset_endpoint(
+    host_id: str,
+    body: GpuResetResultV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU reset path.",
+        )
+    try:
+        released = await complete_gpu_reset(db, current_host, body)
+        await db.commit()
+        return released
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/gpu/groups/{allocation_group_id}/recovery/authorize",
+    response_model=GpuRecoveryAuthorizationV1,
+)
+async def authorize_gpu_group_recovery_endpoint(
+    allocation_group_id: str,
+    body: GpuRecoveryAuthorizeRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(raise_not_found=False)),
+):
+    _require_admin(current_user)
+    try:
+        group = await db.get(
+            GpuAllocationGroup,
+            allocation_group_id,
+        )
+        if group is None:
+            raise GpuAllocationError("GPU recovery group is unknown.")
+        host_id = group.host_id
+        result = await authorize_gpu_group_recovery(
+            db,
+            allocation_group_id,
+            body,
+            authorized_by=str(current_user.user_id),
+        )
+        await db.commit()
+        try:
+            await send_agent_command(
+                host_id,
+                "recover_gpu_group",
+                {"authorization": result.model_dump(mode="json")},
+            )
+        except Exception as dispatch_exc:  # noqa: BLE001
+            logger.error(
+                "GPU recovery authorization was persisted but host command "
+                f"dispatch failed for {allocation_group_id}: {dispatch_exc}"
+            )
+        return result
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/groups/recovery/start",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def start_gpu_group_recovery_endpoint(
+    host_id: str,
+    body: GpuRecoveryStartRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU recovery path.",
+        )
+    try:
+        await start_gpu_group_recovery(db, current_host, body)
+        await db.commit()
+    except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/groups/recovery/reset-result",
+    response_model=bool,
+)
+async def complete_gpu_group_recovery_endpoint(
+    host_id: str,
+    body: GpuRecoveryResetResultV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_ready_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU recovery path.",
+        )
+    try:
+        result = await complete_gpu_group_recovery(db, current_host, body)
+        await db.commit()
+        return result
+    except GpuAllocationError as exc:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
@@ -471,17 +1091,33 @@ async def list_hosts(
     used_by_host = {host_id: count for host_id, count in used_rows}
     out = []
     for h in hosts:
+        readiness = await gpu_host_storage_readiness(db, h) if h.compute_type == "gpu" else None
         out.append(
             {
                 "host_id": h.host_id,
                 "name": h.name,
                 "tee_type": h.tee_type,
+                "compute_type": h.compute_type,
                 "capacity": h.capacity,
+                "reported_capacity": h.reported_capacity,
                 "used": used_by_host.get(h.host_id, 0),
                 "external_host": h.external_host,
                 "cpu_cores": h.cpu_cores,
                 "ram_gb": h.ram_gb,
                 "specs": h.specs,
+                "storage_enabled": h.storage_enabled,
+                "trusted_storage_ready": (
+                    readiness.trusted_storage_ready if readiness is not None else None
+                ),
+                "control_channel_eligible": (
+                    readiness.control_channel_eligible if readiness is not None else None
+                ),
+                "trusted_schedulable": (
+                    readiness.trusted_schedulable if readiness is not None else None
+                ),
+                "trusted_storage_reason": (readiness.reason if readiness is not None else None),
+                "untrusted_gpu_inventory": h.untrusted_gpu_inventory,
+                "untrusted_gpu_inventory_ready": h.untrusted_gpu_inventory_ready,
             }
         )
     return out

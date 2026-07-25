@@ -91,6 +91,7 @@ class OciDescriptorClosure:
     blobs: tuple[str, ...]
     manifest_tags: tuple[str, ...]
     sha256: str
+    manifest_tag_digests: tuple[tuple[str, str], ...] = ()
 
 
 class _Resolver:
@@ -119,6 +120,7 @@ class _Resolver:
         self.manifests: set[str] = set()
         self.blobs: set[str] = set()
         self.manifest_tags: set[str] = set()
+        self.manifest_tag_digests: dict[str, str] = {}
 
     async def _bounded_payload(
         self,
@@ -331,6 +333,7 @@ class _Resolver:
         if signature_digest == root_digest:
             raise OciClosureError("cosign signature manifest aliases the root manifest")
         self.manifest_tags.add(signature_tag)
+        self.manifest_tag_digests[signature_tag] = signature_digest
         document = {
             "schema": "chutes.oci-descriptor-closure",
             "version": 1,
@@ -338,11 +341,13 @@ class _Resolver:
             "manifests": sorted(self.manifests),
             "blobs": sorted(self.blobs),
             "manifest_tags": sorted(self.manifest_tags),
+            "manifest_tag_digests": dict(sorted(self.manifest_tag_digests.items())),
         }
         return OciDescriptorClosure(
             manifests=tuple(document["manifests"]),
             blobs=tuple(document["blobs"]),
             manifest_tags=tuple(document["manifest_tags"]),
+            manifest_tag_digests=tuple(document["manifest_tag_digests"].items()),
             sha256=canonical_sha256(document),
         )
 
