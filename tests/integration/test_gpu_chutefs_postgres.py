@@ -496,12 +496,46 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         )
         is None
     )
-    with pytest.raises(HTTPException, match="replayed"):
+    _, replayed = await launch_sessions.refresh_launch_storage_session(
+        db,
+        f"Bearer {issued.refresh_token}",
+        request,
+    )
+    assert replayed.model_dump(mode="json") == rotated.model_dump(mode="json")
+    rows = list(
+        (
+            await db.execute(
+                select(ChuteFSLaunchSession)
+                .where(ChuteFSLaunchSession.config_id == config.config_id)
+                .order_by(ChuteFSLaunchSession.generation)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.generation for row in rows] == [issued.generation, rotated.generation]
+    assert sum(row.revoked_at is None for row in rows) == 1
+    rows[-1].response_replay_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await db.commit()
+    with pytest.raises(HTTPException, match="invalid, expired, replayed, or revoked"):
         await launch_sessions.refresh_launch_storage_session(
             db,
             f"Bearer {issued.refresh_token}",
             request,
         )
+    replay_rows = list(
+        (
+            await db.execute(
+                select(ChuteFSLaunchSession)
+                .where(ChuteFSLaunchSession.config_id == config.config_id)
+                .order_by(ChuteFSLaunchSession.generation)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.generation for row in replay_rows] == [issued.generation, rotated.generation]
+    assert sum(row.revoked_at is None for row in replay_rows) == 1
     with pytest.raises(HTTPException, match="invalid"):
         await launch_sessions.authorize_default_volume(
             db,
@@ -873,3 +907,73 @@ async def test_refresh_and_instance_disable_share_lifecycle_lock_without_deadloc
                 request,
                 "get",
             )
+
+
+async def test_refresh_and_account_erasure_share_lock_order_without_deadlock(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    chute = await _chute(db, storage_pg.USER_ID, f"erasure-lock-{uuid.uuid4().hex}")
+    _, cert = _identity("erasure-lock")
+    config, _ = await _cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"erasure-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(settings, "require_mtls_client_verify", True)
+    request = _mtls_request(cert)
+    _, issued = await launch_sessions.issue_launch_storage_session(
+        db,
+        config.config_id,
+        request,
+    )
+    config_id = config.config_id
+    sessions = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pause_after_lifecycle_rows(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        pause_after_lifecycle_rows,
+    )
+
+    async def refresh():
+        async with sessions() as candidate:
+            return await launch_sessions.refresh_launch_storage_session(
+                candidate,
+                f"Bearer {issued.refresh_token}",
+                request,
+            )
+
+    async def erase():
+        await entered.wait()
+        async with sessions() as candidate:
+            return await service.prepare_user_storage_erasure(
+                candidate,
+                storage_pg.USER_ID,
+            )
+
+    refresh_task = asyncio.create_task(refresh())
+    erasure_task = asyncio.create_task(erase())
+    await entered.wait()
+    release.set()
+    (_, rotated), erasure = await asyncio.wait_for(
+        asyncio.gather(refresh_task, erasure_task),
+        timeout=10,
+    )
+    assert rotated.generation == issued.generation + 1
+    assert erasure["ready"] is False
+    assert config_id in erasure["active_launches"]

@@ -2482,13 +2482,16 @@ class ChuteFSLaunchSession(Base):
         String,
         ForeignKey("launch_configs.config_id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
     )
     instance_id = Column(
         String,
         ForeignKey("instances.instance_id", ondelete="CASCADE"),
         nullable=False,
-        unique=True,
+    )
+    rotated_from_session_id = Column(
+        String,
+        ForeignKey("chutefs_launch_sessions.session_id", ondelete="RESTRICT"),
+        nullable=True,
     )
     binding_id = Column(
         String,
@@ -2518,6 +2521,10 @@ class ChuteFSLaunchSession(Base):
     refresh_token_hash = Column(String(64), nullable=False, unique=True)
     access_expires_at = Column(DateTime(timezone=True), nullable=False)
     refresh_expires_at = Column(DateTime(timezone=True), nullable=False)
+    rotation_request_sha256 = Column(String(64), nullable=True)
+    token_seed = Column(String(64), nullable=True)
+    token_key_id = Column(String, nullable=True)
+    response_replay_until = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     rotated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
@@ -2532,6 +2539,24 @@ class ChuteFSLaunchSession(Base):
             "idx_chutefs_launch_sessions_server",
             "server_id",
             postgresql_where=revoked_at.is_(None),
+        ),
+        Index(
+            "uq_chutefs_launch_session_active_config",
+            "config_id",
+            unique=True,
+            postgresql_where=revoked_at.is_(None),
+        ),
+        Index(
+            "uq_chutefs_launch_session_active_instance",
+            "instance_id",
+            unique=True,
+            postgresql_where=revoked_at.is_(None),
+        ),
+        Index(
+            "uq_chutefs_launch_session_successor",
+            "rotated_from_session_id",
+            unique=True,
+            postgresql_where=rotated_from_session_id.is_not(None),
         ),
         CheckConstraint(
             "compute_type IN ('cpu', 'gpu') "
@@ -2556,6 +2581,17 @@ class ChuteFSLaunchSession(Base):
         CheckConstraint(
             "refresh_token_hash ~ '^[0-9a-f]{64}$'",
             name="ck_chutefs_launch_session_refresh_hash",
+        ),
+        CheckConstraint(
+            "((token_seed IS NULL AND token_key_id IS NULL "
+            "AND rotation_request_sha256 IS NULL AND response_replay_until IS NULL "
+            "AND rotated_from_session_id IS NULL) OR "
+            "(token_seed ~ '^[0-9a-f]{64}$' AND token_key_id IS NOT NULL "
+            "AND token_key_id <> '' "
+            "AND rotation_request_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND response_replay_until IS NOT NULL "
+            "AND response_replay_until <= refresh_expires_at))",
+            name="ck_chutefs_launch_session_rotation_replay",
         ),
     )
 

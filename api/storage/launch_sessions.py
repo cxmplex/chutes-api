@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import secrets
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, Request, status
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, lazyload
 
@@ -35,20 +36,91 @@ from api.server.schemas import (
 )
 from api.server.util import _get_client_certificate, get_public_key_hash
 from api.storage.schemas import LaunchStorageContext, LaunchStorageSessionResponse
+from api.user.schemas import User
 
 ACCESS_TTL_SECONDS = 15 * 60
 REFRESH_TTL_SECONDS = 24 * 60 * 60
 ALLOWED_OPERATIONS = ["put", "get", "list", "delete"]
 _ACCESS_PREFIX = "cfsas_"
 _REFRESH_PREFIX = "cfsrs_"
+_TOKEN_DOMAIN = b"chutes.chutefs-session-token.v1\0"
+
+
+async def lock_launch_storage_configurations(
+    db: AsyncSession,
+    config_ids: list[str],
+) -> None:
+    """Lock user rows, then sorted configs and their launch identity rows.
+
+    The initial lookup is deliberately non-authoritative: it discovers only
+    which canonical users must be locked. Every value used for authorization
+    is force-refetched after the user locks are held.
+    """
+    ordered_ids = sorted(set(config_ids))
+    if not ordered_ids:
+        return
+    hints = list(
+        (
+            await db.execute(
+                select(LaunchConfig.config_id, LaunchConfig.user_id).where(
+                    LaunchConfig.config_id.in_(ordered_ids)
+                )
+            )
+        ).all()
+    )
+    if sorted(config_id for config_id, _user_id in hints) != ordered_ids:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Launch storage identity is inactive or incomplete.",
+        )
+    user_ids = sorted({user_id for _config_id, user_id in hints})
+    locked_users = list(
+        (
+            await db.execute(
+                select(User)
+                .where(User.user_id.in_(user_ids))
+                .order_by(User.user_id)
+                .with_for_update(of=User)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if [user.user_id for user in locked_users] != user_ids:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Launch storage owner is no longer current.",
+        )
+    await db.execute(
+        select(LaunchConfig)
+        .where(LaunchConfig.config_id.in_(ordered_ids))
+        .order_by(LaunchConfig.config_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    await db.execute(
+        select(Instance)
+        .where(Instance.config_id.in_(ordered_ids))
+        .order_by(Instance.config_id, Instance.instance_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    await db.execute(
+        select(ChuteFSLaunchSession)
+        .where(ChuteFSLaunchSession.config_id.in_(ordered_ids))
+        .order_by(
+            ChuteFSLaunchSession.config_id,
+            ChuteFSLaunchSession.generation,
+            ChuteFSLaunchSession.session_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
 
 
 async def lock_launch_storage_lifecycle(db: AsyncSession, config_id: str) -> None:
-    """Serialize every launch-storage transition before locking lifecycle rows."""
-    await db.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:config_id, 0))"),
-        {"config_id": config_id},
-    )
+    """Compatibility wrapper for one configuration using the shared order."""
+    await lock_launch_storage_configurations(db, [config_id])
 
 
 @dataclass(frozen=True)
@@ -69,8 +141,54 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def _new_token(prefix: str, session_id: str) -> str:
-    return f"{prefix}{session_id}.{secrets.token_urlsafe(48)}"
+def _canonical_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _token_key(key_id: str) -> bytes:
+    key = settings.chutefs_token_keys.get(key_id)
+    if key is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The ChuteFS session token key is unavailable.",
+        )
+    return key.encode("utf-8")
+
+
+def _derived_token(row: ChuteFSLaunchSession, prefix: str, purpose: str) -> str:
+    if (
+        not row.token_seed
+        or not row.token_key_id
+        or len(row.token_seed) != 64
+        or len(row.session_id) > 64
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The ChuteFS session response cannot be recovered.",
+        )
+    material = (
+        _TOKEN_DOMAIN
+        + purpose.encode("ascii")
+        + b"\0"
+        + row.session_id.encode("ascii")
+        + b"\0"
+        + str(row.generation).encode("ascii")
+        + b"\0"
+        + row.token_seed.encode("ascii")
+    )
+    secret = hmac.new(_token_key(row.token_key_id), material, hashlib.sha256).digest()
+    encoded = base64.urlsafe_b64encode(secret).rstrip(b"=").decode("ascii")
+    return f"{prefix}{row.session_id}.{encoded}"
+
+
+def _rotation_request_digest(session_id: str, refresh_token_hash: str) -> str:
+    return _canonical_digest(
+        f"chutes.chutefs-session-refresh.v1\0{session_id}\0{refresh_token_hash}"
+    )
+
+
+def _issue_request_digest(config_id: str, instance_id: str) -> str:
+    return _canonical_digest(f"chutes.chutefs-session-issue.v1\0{config_id}\0{instance_id}")
 
 
 def _session_id_from_token(token: str, prefix: str) -> str:
@@ -151,6 +269,7 @@ async def _load_current_lineage(
     request: Optional[Request],
     lock_session_id: Optional[str] = None,
     require_client_mtls: bool = True,
+    locks_held: bool = False,
 ) -> tuple[
     LaunchConfig,
     Instance,
@@ -161,14 +280,23 @@ async def _load_current_lineage(
     Optional[GpuAllocationGroup],
     Optional[str],
 ]:
-    await lock_launch_storage_lifecycle(db, config_id)
+    if not locks_held:
+        await lock_launch_storage_lifecycle(db, config_id)
     config_query = (
-        select(LaunchConfig).where(LaunchConfig.config_id == config_id).options(lazyload("*"))
+        select(LaunchConfig)
+        .where(LaunchConfig.config_id == config_id)
+        .options(lazyload("*"))
+        .execution_options(populate_existing=True)
     )
     if lock_session_id is not None:
         config_query = config_query.with_for_update()
     config = (await db.execute(config_query)).unique().scalar_one_or_none()
-    instance_query = select(Instance).where(Instance.config_id == config_id).options(lazyload("*"))
+    instance_query = (
+        select(Instance)
+        .where(Instance.config_id == config_id)
+        .options(lazyload("*"))
+        .execution_options(populate_existing=True)
+    )
     if lock_session_id is not None:
         instance_query = instance_query.with_for_update()
     instance = (await db.execute(instance_query)).unique().scalar_one_or_none()
@@ -232,15 +360,26 @@ async def _load_current_lineage(
 
     binding = (
         await db.execute(
-            select(DefaultChuteFSVolumeBinding).where(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
                 DefaultChuteFSVolumeBinding.user_id == config.user_id,
                 DefaultChuteFSVolumeBinding.chute_id == config.chute_id,
                 DefaultChuteFSVolumeBinding.volume_id == config.default_volume_id,
                 DefaultChuteFSVolumeBinding.lifecycle_state == "active",
             )
+            .order_by(DefaultChuteFSVolumeBinding.binding_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    volume = await db.get(StorageVolume, config.default_volume_id)
+    volume = (
+        await db.execute(
+            select(StorageVolume)
+            .where(StorageVolume.volume_id == config.default_volume_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if (
         binding is None
         or volume is None
@@ -390,9 +529,13 @@ def _context(
 
 def _session_response(
     row: ChuteFSLaunchSession,
-    access_token: str,
-    refresh_token: str,
+    access_token: Optional[str] = None,
+    refresh_token: Optional[str] = None,
 ) -> LaunchStorageSessionResponse:
+    if access_token is None:
+        access_token = _derived_token(row, _ACCESS_PREFIX, "access")
+    if refresh_token is None:
+        refresh_token = _derived_token(row, _REFRESH_PREFIX, "refresh")
     return LaunchStorageSessionResponse(
         access_token=access_token,
         access_expires_at=row.access_expires_at.isoformat(),
@@ -431,14 +574,14 @@ async def issue_launch_storage_session(
     row = (
         await db.execute(
             select(ChuteFSLaunchSession)
-            .where(ChuteFSLaunchSession.config_id == config_id)
+            .where(
+                ChuteFSLaunchSession.config_id == config_id,
+                ChuteFSLaunchSession.revoked_at.is_(None),
+            )
             .with_for_update()
         )
     ).scalar_one_or_none()
     now = _now()
-    session_id = row.session_id if row is not None else secrets.token_urlsafe(24)
-    access_token = _new_token(_ACCESS_PREFIX, session_id)
-    refresh_token = _new_token(_REFRESH_PREFIX, session_id)
     immutable_identity = {
         "config_id": config.config_id,
         "instance_id": instance.instance_id,
@@ -466,38 +609,55 @@ async def issue_launch_storage_session(
             else presented_cert_hash
         ),
     }
-    if row is None:
-        row = ChuteFSLaunchSession(
-            session_id=session_id,
-            **immutable_identity,
-            attestation_id=latest.attestation_id if latest is not None else None,
-            allowed_operations=list(ALLOWED_OPERATIONS),
-            generation=1,
-            access_token_hash=_token_hash(access_token),
-            refresh_token_hash=_token_hash(refresh_token),
-            access_expires_at=now + timedelta(seconds=ACCESS_TTL_SECONDS),
-            refresh_expires_at=now + timedelta(seconds=REFRESH_TTL_SECONDS),
-            rotated_at=now,
-        )
-        db.add(row)
-    else:
+    issue_digest = _issue_request_digest(config.config_id, instance.instance_id)
+    if row is not None:
         actual_identity = {field: getattr(row, field) for field in immutable_identity}
         if actual_identity != immutable_identity or row.allowed_operations != ALLOWED_OPERATIONS:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Existing ChuteFS launch session has different immutable identity.",
             )
-        row.attestation_id = latest.attestation_id if latest is not None else None
-        row.generation += 1
-        row.access_token_hash = _token_hash(access_token)
-        row.refresh_token_hash = _token_hash(refresh_token)
-        row.access_expires_at = now + timedelta(seconds=ACCESS_TTL_SECONDS)
-        row.refresh_expires_at = now + timedelta(seconds=REFRESH_TTL_SECONDS)
-        row.rotated_at = now
-        row.revoked_at = None
+        if (
+            row.token_seed is not None
+            and row.rotation_request_sha256 == issue_digest
+            and row.response_replay_until is not None
+            and row.response_replay_until > now
+        ):
+            response = _session_response(row)
+            await db.commit()
+            return _context(config, instance), response
+
+    successor = ChuteFSLaunchSession(
+        session_id=secrets.token_urlsafe(24),
+        rotated_from_session_id=row.session_id if row is not None else None,
+        **immutable_identity,
+        attestation_id=latest.attestation_id if latest is not None else None,
+        allowed_operations=list(ALLOWED_OPERATIONS),
+        generation=(row.generation + 1 if row is not None else 1),
+        access_token_hash="0" * 64,
+        refresh_token_hash="0" * 64,
+        access_expires_at=now + timedelta(seconds=ACCESS_TTL_SECONDS),
+        refresh_expires_at=now + timedelta(seconds=REFRESH_TTL_SECONDS),
+        rotation_request_sha256=issue_digest,
+        token_seed=secrets.token_hex(32),
+        token_key_id=settings.chutefs_token_key_id,
+        response_replay_until=now + timedelta(seconds=ACCESS_TTL_SECONDS),
+        rotated_at=now,
+    )
+    access_token = _derived_token(successor, _ACCESS_PREFIX, "access")
+    refresh_token = _derived_token(successor, _REFRESH_PREFIX, "refresh")
+    successor.access_token_hash = _token_hash(access_token)
+    successor.refresh_token_hash = _token_hash(refresh_token)
+    if row is not None:
+        row.revoked_at = now
+    db.add(successor)
     await db.commit()
-    await db.refresh(row)
-    return _context(config, instance), _session_response(row, access_token, refresh_token)
+    await db.refresh(successor)
+    return _context(config, instance), _session_response(
+        successor,
+        access_token,
+        refresh_token,
+    )
 
 
 async def exchange_launch_token(
@@ -506,7 +666,6 @@ async def exchange_launch_token(
     launch_token: str,
     request: Request,
 ) -> tuple[LaunchStorageContext, LaunchStorageSessionResponse]:
-    await lock_launch_storage_lifecycle(db, config_id)
     try:
         payload = _decode_chutes_jwt(launch_token, require_exp=True)
     except Exception as exc:
@@ -553,7 +712,27 @@ async def authorize_default_volume(
         )
     token = _bearer(authorization)
     session_id = _session_id_from_token(token, _ACCESS_PREFIX)
-    row = await db.get(ChuteFSLaunchSession, session_id)
+    config_id = (
+        await db.execute(
+            select(ChuteFSLaunchSession.config_id).where(
+                ChuteFSLaunchSession.session_id == session_id
+            )
+        )
+    ).scalar_one_or_none()
+    if config_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ChuteFS launch access session is invalid, expired, or revoked.",
+        )
+    await lock_launch_storage_lifecycle(db, config_id)
+    row = (
+        await db.execute(
+            select(ChuteFSLaunchSession)
+            .where(ChuteFSLaunchSession.session_id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     now = _now()
     if (
         row is None
@@ -575,7 +754,12 @@ async def authorize_default_volume(
         reservation,
         _group,
         _presented_cert_hash,
-    ) = await _load_current_lineage(db, row.config_id, request=request)
+    ) = await _load_current_lineage(
+        db,
+        row.config_id,
+        request=request,
+        locks_held=True,
+    )
     current = {
         "config_id": config.config_id,
         "instance_id": instance.instance_id,
@@ -624,7 +808,27 @@ async def validate_launch_bound_grant(
     generation: int,
 ) -> bool:
     """Revalidate a launch grant when an attested storage node presents it."""
-    row = await db.get(ChuteFSLaunchSession, session_id)
+    config_id = (
+        await db.execute(
+            select(ChuteFSLaunchSession.config_id).where(
+                ChuteFSLaunchSession.session_id == session_id
+            )
+        )
+    ).scalar_one_or_none()
+    if config_id is None:
+        return False
+    try:
+        await lock_launch_storage_lifecycle(db, config_id)
+    except HTTPException:
+        return False
+    row = (
+        await db.execute(
+            select(ChuteFSLaunchSession)
+            .where(ChuteFSLaunchSession.session_id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
     if (
         row is None
         or row.revoked_at is not None
@@ -649,6 +853,7 @@ async def validate_launch_bound_grant(
             row.config_id,
             request=None,
             require_client_mtls=False,
+            locks_held=True,
         )
     except HTTPException:
         return False
@@ -700,6 +905,66 @@ async def refresh_launch_storage_session(
             detail="ChuteFS launch refresh is invalid, expired, replayed, or revoked.",
         )
     await lock_launch_storage_lifecycle(db, config_id)
+    row = (
+        await db.execute(
+            select(ChuteFSLaunchSession)
+            .where(ChuteFSLaunchSession.session_id == session_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    now = _now()
+    token_digest = _token_hash(token)
+    if (
+        row is None
+        or row.refresh_expires_at <= now
+        or not hmac.compare_digest(row.refresh_token_hash, token_digest)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="ChuteFS launch refresh is invalid, expired, replayed, or revoked.",
+        )
+    request_digest = _rotation_request_digest(row.session_id, token_digest)
+    if row.revoked_at is not None:
+        successor = (
+            await db.execute(
+                select(ChuteFSLaunchSession)
+                .where(
+                    ChuteFSLaunchSession.rotated_from_session_id == row.session_id,
+                    ChuteFSLaunchSession.rotation_request_sha256 == request_digest,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            successor is None
+            or successor.revoked_at is not None
+            or successor.response_replay_until is None
+            or successor.response_replay_until <= now
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="ChuteFS launch refresh is invalid, expired, replayed, or revoked.",
+            )
+        (
+            config,
+            instance,
+            _binding,
+            _volume,
+            _server,
+            _reservation,
+            _group,
+            _presented_cert_hash,
+        ) = await _load_current_lineage(
+            db,
+            config_id,
+            request=request,
+            lock_session_id=session_id,
+            locks_held=True,
+        )
+        await db.commit()
+        return _context(config, instance), _session_response(successor)
+
     (
         config,
         instance,
@@ -714,40 +979,54 @@ async def refresh_launch_storage_session(
         config_id,
         request=request,
         lock_session_id=session_id,
+        locks_held=True,
     )
-    row = (
-        await db.execute(
-            select(ChuteFSLaunchSession)
-            .where(ChuteFSLaunchSession.session_id == session_id)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    now = _now()
-    if (
-        row is None
-        or row.revoked_at is not None
-        or row.refresh_expires_at <= now
-        or not hmac.compare_digest(row.refresh_token_hash, _token_hash(token))
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="ChuteFS launch refresh is invalid, expired, replayed, or revoked.",
-        )
     latest = (
         await _latest_attestation_attempt(db, server.server_id)
         if config.compute_type == "gpu"
         else None
     )
-    access_token = _new_token(_ACCESS_PREFIX, row.session_id)
-    refresh_token = _new_token(_REFRESH_PREFIX, row.session_id)
-    row.attestation_id = latest.attestation_id if latest is not None else None
-    row.generation += 1
-    row.access_token_hash = _token_hash(access_token)
-    row.refresh_token_hash = _token_hash(refresh_token)
-    row.access_expires_at = now + timedelta(seconds=ACCESS_TTL_SECONDS)
-    row.refresh_expires_at = now + timedelta(seconds=REFRESH_TTL_SECONDS)
-    row.rotated_at = now
-    row.revoked_at = None
+    successor = ChuteFSLaunchSession(
+        session_id=secrets.token_urlsafe(24),
+        config_id=row.config_id,
+        instance_id=row.instance_id,
+        rotated_from_session_id=row.session_id,
+        binding_id=row.binding_id,
+        user_id=row.user_id,
+        chute_id=row.chute_id,
+        job_id=row.job_id,
+        compute_type=row.compute_type,
+        management_mode=row.management_mode,
+        server_id=row.server_id,
+        volume_id=row.volume_id,
+        reservation_id=row.reservation_id,
+        allocation_group_id=row.allocation_group_id,
+        allocation_group_generation=row.allocation_group_generation,
+        process_incarnation=row.process_incarnation,
+        attestation_id=latest.attestation_id if latest is not None else None,
+        attested_cert_pubkey_hash=row.attested_cert_pubkey_hash,
+        allowed_operations=list(row.allowed_operations),
+        generation=row.generation + 1,
+        access_token_hash="0" * 64,
+        refresh_token_hash="0" * 64,
+        access_expires_at=now + timedelta(seconds=ACCESS_TTL_SECONDS),
+        refresh_expires_at=now + timedelta(seconds=REFRESH_TTL_SECONDS),
+        rotation_request_sha256=request_digest,
+        token_seed=secrets.token_hex(32),
+        token_key_id=settings.chutefs_token_key_id,
+        response_replay_until=now + timedelta(seconds=ACCESS_TTL_SECONDS),
+        rotated_at=now,
+    )
+    access_token = _derived_token(successor, _ACCESS_PREFIX, "access")
+    refresh_token = _derived_token(successor, _REFRESH_PREFIX, "refresh")
+    successor.access_token_hash = _token_hash(access_token)
+    successor.refresh_token_hash = _token_hash(refresh_token)
+    row.revoked_at = now
+    db.add(successor)
     await db.commit()
-    await db.refresh(row)
-    return _context(config, instance), _session_response(row, access_token, refresh_token)
+    await db.refresh(successor)
+    return _context(config, instance), _session_response(
+        successor,
+        access_token,
+        refresh_token,
+    )

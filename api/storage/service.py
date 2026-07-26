@@ -1600,6 +1600,20 @@ async def _retire_deleted_volume_batch(
 
 async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
     await _lock_storage_user(db, user_id)
+    config_ids = list(
+        (
+            await db.execute(
+                select(LaunchConfig.config_id)
+                .where(LaunchConfig.default_volume_id == volume_id)
+                .order_by(LaunchConfig.config_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from api.storage.launch_sessions import lock_launch_storage_configurations
+
+    await lock_launch_storage_configurations(db, config_ids)
     volume = (
         await db.execute(
             select(StorageVolume)
@@ -1660,9 +1674,9 @@ async def delete_default_volume_for_chute(
 ) -> Dict:
     """Explicit owner lifecycle operation that never accepts an arbitrary volume id."""
     await _lock_storage_user(db, user_id)
-    binding = (
+    volume_id = (
         await db.execute(
-            select(DefaultChuteFSVolumeBinding)
+            select(DefaultChuteFSVolumeBinding.volume_id)
             .where(
                 DefaultChuteFSVolumeBinding.user_id == user_id,
                 DefaultChuteFSVolumeBinding.chute_id == chute_id,
@@ -1673,20 +1687,34 @@ async def delete_default_volume_for_chute(
                 DefaultChuteFSVolumeBinding.binding_id.desc(),
             )
             .limit(1)
-            .with_for_update()
         )
     ).scalar_one_or_none()
-    if binding is None:
+    if volume_id is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Default ChuteFS volume not found for this owner and chute.",
         )
-    return await delete_volume(db, binding.volume_id, user_id)
+    return await delete_volume(db, volume_id, user_id)
 
 
 async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[str, Any]:
     """Stage every user volume for secure erase, then remove storage identity only when safe."""
     await _lock_storage_user(db, user_id)
+    configs = list(
+        (
+            await db.execute(
+                select(LaunchConfig.config_id)
+                .where(LaunchConfig.user_id == user_id)
+                .order_by(LaunchConfig.config_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from api.storage.launch_sessions import lock_launch_storage_configurations
+
+    await lock_launch_storage_configurations(db, configs)
+
     volumes = list(
         (
             await db.execute(
@@ -1699,21 +1727,6 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
         .scalars()
         .all()
     )
-    configs = list(
-        (
-            await db.execute(
-                select(LaunchConfig.config_id)
-                .where(LaunchConfig.user_id == user_id)
-                .order_by(LaunchConfig.config_id)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    from api.storage.launch_sessions import lock_launch_storage_lifecycle
-
-    for config_id in configs:
-        await lock_launch_storage_lifecycle(db, config_id)
 
     locked_configs = list(
         (

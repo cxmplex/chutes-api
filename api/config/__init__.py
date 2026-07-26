@@ -770,6 +770,7 @@ class Settings(BaseSettings):
             )
         if self.release_attestation_max_age_seconds <= 0:
             raise ValueError("RELEASE_ATTESTATION_MAX_AGE_SECONDS must be positive.")
+        _ = self.chutefs_token_keys
         if not 0 <= self.snp_crl_outage_grace_seconds <= MAX_SNP_CRL_OUTAGE_GRACE_SECONDS:
             raise ValueError(
                 "SNP_CRL_OUTAGE_GRACE_SECONDS must be between 0 and "
@@ -1098,7 +1099,53 @@ class Settings(BaseSettings):
     launch_config_key: str = hashlib.sha256(
         os.getenv("LAUNCH_CONFIG_KEY", "launch-secret").encode()
     ).hexdigest()
+    chutefs_token_key_id: str = os.getenv(
+        "CHUTEFS_TOKEN_KEY_ID",
+        "launch-config-key-v1",
+    )
+    chutefs_token_keys_json: Optional[str] = os.getenv("CHUTEFS_TOKEN_KEYS_JSON")
     gpu_launch_key_epoch: int = int(os.getenv("GPU_LAUNCH_KEY_EPOCH", "1"))
+
+    @property
+    def chutefs_token_keys(self) -> Dict[str, str]:
+        """Versioned response-recovery keys retained through referenced session expiry."""
+        if self.chutefs_token_keys_json is None:
+            keys = {"launch-config-key-v1": self.launch_config_key}
+        else:
+
+            def unique_keyring(pairs):
+                result = {}
+                for key_id, secret in pairs:
+                    if key_id in result:
+                        raise ValueError("CHUTEFS_TOKEN_KEYS_JSON contains a duplicate key ID")
+                    result[key_id] = secret
+                return result
+
+            try:
+                keys = json.loads(
+                    self.chutefs_token_keys_json,
+                    object_pairs_hook=unique_keyring,
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError("CHUTEFS_TOKEN_KEYS_JSON must be valid JSON") from exc
+        if (
+            not isinstance(keys, dict)
+            or not keys
+            or any(
+                not isinstance(key_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", key_id) is None
+                or not isinstance(secret, str)
+                or not 32 <= len(secret) <= 1024
+                or not secret.isascii()
+                for key_id, secret in keys.items()
+            )
+            or self.chutefs_token_key_id not in keys
+        ):
+            raise ValueError(
+                "ChuteFS token keys must be a non-empty ASCII keyring containing "
+                "CHUTEFS_TOKEN_KEY_ID"
+            )
+        return dict(keys)
 
     # New, asymmetric launch config keys.
     launch_config_private_key_bytes: Optional[bytes] = load_launch_config_private_key()
