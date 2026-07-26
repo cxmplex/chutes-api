@@ -34,6 +34,67 @@ else
 end
 """
 
+# SafeRedis shields timed-out operations, so the Lua script can finish after the
+# caller has received no response. Cache the exact atomic consume result long
+# enough for the persisted activation attempt to recover it on retry.
+ACTIVATION_REPLAY_TTL_SECONDS = 24 * 60 * 60
+
+CLAIM_BOUNTY_REPLAY_LUA = """
+local bounty_key = KEYS[1]
+local replay_key = KEYS[2]
+local cooldown_key = KEYS[3]
+local attempt_id = ARGV[1]
+local replay_ttl = ARGV[2]
+local cooldown_ttl = ARGV[3]
+local chute_id = ARGV[4]
+
+local cached = redis.call('GET', replay_key)
+if cached then
+    return cached
+end
+
+local bounty_data = redis.call('GET', bounty_key)
+local now = redis.call('TIME')
+local claimed_at = tonumber(now[1]) + (tonumber(now[2]) / 1000000)
+local envelope
+
+if bounty_data then
+    local created_at = tonumber(bounty_data)
+    if not created_at then
+        return redis.error_reply('invalid bounty timestamp')
+    end
+    local age_seconds = math.floor(claimed_at - created_at)
+    if age_seconds < 0 then
+        age_seconds = 0
+    end
+    local amount = math.min((3 * age_seconds) + 100, 86400)
+    envelope = cjson.encode({
+        schema = 'chutes.activation-bounty-result.v1',
+        attempt_id = attempt_id,
+        chute_id = chute_id,
+        claimed_at = claimed_at,
+        bounty = {
+            amount = amount,
+            created_at = created_at,
+            age_seconds = age_seconds
+        }
+    })
+    redis.call('DEL', bounty_key)
+    redis.call('SET', cooldown_key, '1', 'EX', cooldown_ttl)
+else
+    envelope = cjson.encode({
+        schema = 'chutes.activation-bounty-result.v1',
+        attempt_id = attempt_id,
+        chute_id = chute_id,
+        claimed_at = claimed_at,
+        bounty = cjson.null
+    })
+end
+
+redis.call('SET', replay_key, envelope, 'EX', replay_ttl)
+return envelope
+"""
+
 CREATE_BOUNTY_LUA = """
 local bounty_key = KEYS[1]
 local bounty_data = ARGV[1]
@@ -49,6 +110,42 @@ end
 
 def _bounty_key(chute_id: str) -> str:
     return f"{BOUNTY_KEY_PREFIX}{chute_id}"
+
+
+def _activation_bounty_replay_key(attempt_id: str) -> str:
+    return f"activation_bounty_result:{attempt_id}"
+
+
+def _parse_activation_claim_envelope(data, attempt_id: str, chute_id: str) -> dict:
+    if data is None:
+        raise RuntimeError(
+            "Activation bounty claim returned no durable result; retry the same attempt"
+        )
+    try:
+        if isinstance(data, bytes):
+            data = data.decode()
+        envelope = json.loads(data)
+    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            "Activation bounty claim returned an invalid envelope"
+        ) from exc
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("schema") != "chutes.activation-bounty-result.v1"
+        or envelope.get("attempt_id") != attempt_id
+        or envelope.get("chute_id") != chute_id
+        or "bounty" not in envelope
+    ):
+        raise RuntimeError("Activation bounty claim envelope identity mismatch")
+    bounty = envelope["bounty"]
+    if bounty is not None and (
+        not isinstance(bounty, dict)
+        or not isinstance(bounty.get("amount"), (int, float))
+        or not isinstance(bounty.get("created_at"), (int, float))
+        or not isinstance(bounty.get("age_seconds"), (int, float))
+    ):
+        raise RuntimeError("Activation bounty claim envelope payload is invalid")
+    return envelope
 
 
 def _parse_timestamp(data) -> Optional[float]:
@@ -106,7 +203,9 @@ async def bounty_lifetime_for(chute: Chute) -> int:
         and chute.user_id != await chutes_user_id()
     ):
         return (
-            BOUNTY_LIFETIME_AFFINE if "/affine" in chute.name.lower() else BOUNTY_LIFETIME_PRIVATE
+            BOUNTY_LIFETIME_AFFINE
+            if "/affine" in chute.name.lower()
+            else BOUNTY_LIFETIME_PRIVATE
         )
     return BOUNTY_LIFETIME_PUBLIC
 
@@ -143,7 +242,9 @@ async def create_bounty_if_not_exists(chute_id: str, lifetime: int = 86400) -> b
         )
         if result:
             # Set cooldown to prevent rapid bounty recreation
-            await settings.lite_redis_client.set(cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS)
+            await settings.lite_redis_client.set(
+                cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS
+            )
             # Record the demand signal (a newly created bounty means the chute is wanted hot).
             # The bounty's creation timestamp (stored above) is the request->hot start time, read
             # back at activation via claim_bounty()'s age_seconds.
@@ -154,12 +255,34 @@ async def create_bounty_if_not_exists(chute_id: str, lifetime: int = 86400) -> b
     return False
 
 
-async def claim_bounty(chute_id: str) -> Optional[dict]:
+async def claim_bounty(
+    chute_id: str,
+    *,
+    attempt_id: Optional[str] = None,
+) -> Optional[dict]:
     """
     Atomically claim a bounty. Returns dict with bounty info including age for boost calculation.
     Also sets the cooldown to prevent immediate bounty recreation.
+
+    Activation callers must supply their persisted attempt ID. In that mode the
+    Lua operation records and replays an exact result envelope, including the
+    no-bounty result, so a lost Redis response cannot consume authority twice.
     """
     key = _bounty_key(chute_id)
+    if attempt_id is not None:
+        data = await settings.lite_redis_client.eval(
+            CLAIM_BOUNTY_REPLAY_LUA,
+            3,
+            key,
+            _activation_bounty_replay_key(attempt_id),
+            f"bounty_cooldown:{chute_id}",
+            attempt_id,
+            ACTIVATION_REPLAY_TTL_SECONDS,
+            BOUNTY_COOLDOWN_SECONDS,
+            chute_id,
+        )
+        return _parse_activation_claim_envelope(data, attempt_id, chute_id)
+
     try:
         data = await settings.lite_redis_client.eval(
             CLAIM_BOUNTY_LUA,
@@ -173,7 +296,9 @@ async def claim_bounty(chute_id: str) -> Optional[dict]:
         # where a new bounty gets created while instances are still spinning up
         cooldown_key = f"bounty_cooldown:{chute_id}"
         try:
-            await settings.lite_redis_client.set(cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS)
+            await settings.lite_redis_client.set(
+                cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS
+            )
             # Extra delete in case there was a brief race condition
             await settings.lite_redis_client.delete(key)
         except Exception as exc:
