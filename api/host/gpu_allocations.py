@@ -852,12 +852,6 @@ async def _terminalize_lifecycle_before_quarantine(
     ).scalar_one_or_none()
     if operation is None:
         return None, None
-    operation.phase = "quarantined"
-    operation.reporting_state = "quarantined"
-    operation.failure_code = code[:128]
-    operation.failure_reason = reason[:2000]
-    operation.finalized_at = now
-    operation.updated_at = now
     reservation = (
         (
             await db.execute(
@@ -869,6 +863,28 @@ async def _terminalize_lifecycle_before_quarantine(
         if operation.reservation_id is not None
         else None
     )
+    if operation.phase == "physical_result":
+        from api.gpu_contracts import GpuResetReceiptV1
+
+        operation.result_outcome = "quarantined"
+        operation.receipt_id = f"gpu-reset-receipt-{generate_uuid()}"
+        operation.receipt_accepted_at = now
+        receipt = GpuResetReceiptV1(
+            operation_id=operation.operation_id,
+            receipt_id=operation.receipt_id,
+            result_sha256=operation.physical_result_sha256,
+            outcome="quarantined",
+            local_release_required=False,
+            phase="quarantined",
+            accepted_at=now,
+        )
+        operation.receipt_sha256 = canonical_sha256(receipt)
+    operation.phase = "quarantined"
+    operation.reporting_state = "quarantined"
+    operation.failure_code = code[:128]
+    operation.failure_reason = reason[:2000]
+    operation.finalized_at = now
+    operation.updated_at = now
     if operation.operation_type in {
         "ownerless_group_recovery",
         "forced_dead_guest_recovery",

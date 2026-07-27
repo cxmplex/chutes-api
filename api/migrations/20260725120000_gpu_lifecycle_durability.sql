@@ -302,9 +302,21 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
         OR (phase = 'quarantined' AND failure_code IS NOT NULL
          AND failure_reason IS NOT NULL AND finalized_at IS NOT NULL
          AND ((physical_result IS NULL AND physical_result_sha256 IS NULL
-          AND receipt_id IS NULL AND local_release_ack IS NULL)
+          AND result_outcome IS NULL AND receipt_id IS NULL
+          AND receipt_sha256 IS NULL AND receipt_accepted_at IS NULL
+          AND local_release_ack IS NULL)
           OR (physical_result IS NOT NULL
-           AND physical_result_sha256 ~ '^[0-9a-f]{64}$')))
+           AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
+           AND result_outcome IN ('accepted', 'quarantined')
+           AND receipt_id IS NOT NULL
+           AND receipt_sha256 ~ '^[0-9a-f]{64}$'
+           AND receipt_accepted_at IS NOT NULL
+           AND ((local_release_ack IS NULL
+             AND local_release_ack_sha256 IS NULL
+             AND local_release_acked_at IS NULL)
+            OR (local_release_ack IS NOT NULL
+             AND local_release_ack_sha256 ~ '^[0-9a-f]{64}$'
+             AND local_release_acked_at IS NOT NULL)))))
     )
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_lifecycle_active_group_generation
