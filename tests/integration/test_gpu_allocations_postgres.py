@@ -29,7 +29,7 @@ from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from starlette.requests import Request
 from api.database import Base
-from api.config import TeeMeasurementConfig
+from api.config import TeeMeasurementConfig, settings
 from api.host import gpu_allocations
 from api.host.locks import acquire_gpu_lifecycle_lock
 from api.gpu_contracts import (
@@ -98,6 +98,7 @@ from api.host.schemas import (
     HostKeyGeneration,
     GpuReservationClaimRequestV1,
     GpuReservationStateRequestV1,
+    canonical_json_bytes,
     canonical_sha256,
     GpuQuoteCommitmentV1,
     GpuRecoveryAuthorizeRequestV1,
@@ -173,9 +174,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 from tests.unit.test_release_provenance import _gpu_document
-
 import api.database.orms  # noqa: F401, E402
 from api import gpu_scheduler
+
+
+def _registration_recovery_envelope(payload) -> tuple[str, str]:
+    key_id = settings.gpu_registration_recovery_key_id
+    ciphertext = settings.gpu_registration_recovery_keys[key_id].encrypt(
+        canonical_json_bytes(payload)
+    )
+    return ciphertext.decode("ascii"), key_id
+
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 pytestmark = [
@@ -5670,6 +5679,9 @@ async def test_registration_claim_and_completed_replay_preserve_mode_owners(
         )
         assert lease_owner is not None
         assert conflict is None
+        assert attempt.request_payload_key_id == settings.gpu_registration_recovery_key_id
+        assert request.nonce not in attempt.request_payload_ciphertext
+        assert request.launch_reservation not in attempt.request_payload_ciphertext
         reservation = await session.get(
             gpu_allocations.GpuLaunchReservation, response.claims.reservation_id
         )
@@ -5695,9 +5707,20 @@ async def test_registration_claim_and_completed_replay_preserve_mode_owners(
             == timedelta(minutes=15)
         )
         assert completed.registration_replay_until > reservation.expires_at
+        nonce = await session.get(GpuRegistrationNonce, request.nonce_id)
+        assert nonce.state == "expired"
+        assert nonce.nonce_value is None
+        assert completed.request_payload_ciphertext is None
+        assert completed.request_payload_key_id is None
 
     async with sessions() as session:
         attempt = await session.get(GpuRegistrationAttempt, attempt.attempt_id)
+        replay_attempt, replay_lease, replay_conflict = await _claim_attempt(
+            session, "192.0.2.30", request, spki_sha256, cert_pem
+        )
+        assert replay_attempt.attempt_id == attempt.attempt_id
+        assert replay_lease is None
+        assert replay_conflict is None
         runtime_expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
         with patch(
             "api.server.gpu_sessions.latest_gpu_runtime_session",
@@ -6080,6 +6103,8 @@ async def test_duplicate_registration_while_processing_reuses_attempt(
             (await session.execute(select(GpuRegistrationAttempt))).scalars()
         )
         assert [item.attempt_id for item in attempts] == [attempt_id]
+        assert request.nonce not in attempts[0].request_payload_ciphertext
+        assert request.launch_reservation not in attempts[0].request_payload_ciphertext
 
 
 async def test_published_registration_requires_completed_attempt_before_authority(
@@ -6658,6 +6683,9 @@ async def test_registration_cleanup_scrubs_every_nonce_and_token_payload_copy(
             "launch_reservation": response.token,
             "audit": "transient-conflict",
         }
+        conflict_ciphertext, conflict_key_id = _registration_recovery_envelope(
+            conflict_payload
+        )
         nonce = GpuRegistrationNonce(
             nonce_id="registration-cleanup-nonce",
             client_request_id="registration-cleanup-request",
@@ -6678,7 +6706,6 @@ async def test_registration_cleanup_scrubs_every_nonce_and_token_payload_copy(
             nonce_id=nonce.nonce_id,
             reservation_id=response.claims.reservation_id,
             request_sha256=canonical_sha256(request_payload),
-            request_payload=request_payload,
             peer_certificate_pem="fixture-primary-certificate",
             peer_certificate_sha256=hashlib.sha256(
                 b"fixture-primary-certificate"
@@ -6701,7 +6728,8 @@ async def test_registration_cleanup_scrubs_every_nonce_and_token_payload_copy(
             attempt_id=attempt.attempt_id,
             nonce_id=nonce.nonce_id,
             request_sha256=canonical_sha256(conflict_payload),
-            request_payload=conflict_payload,
+            request_payload_ciphertext=conflict_ciphertext,
+            request_payload_key_id=conflict_key_id,
             peer_certificate_pem="fixture-conflict-certificate",
             peer_certificate_sha256=hashlib.sha256(
                 b"fixture-conflict-certificate"
@@ -6730,15 +6758,17 @@ async def test_registration_cleanup_scrubs_every_nonce_and_token_payload_copy(
         )
         assert nonce.state == "expired"
         assert nonce.nonce_value is None
-        assert attempt.request_payload is None
+        assert attempt.request_payload_ciphertext is None
+        assert attempt.request_payload_key_id is None
         assert attempt.request_sha256 == canonical_sha256(request_payload)
         assert conflict.state == "dismissed"
-        assert conflict.request_payload is None
+        assert conflict.request_payload_ciphertext is None
+        assert conflict.request_payload_key_id is None
         assert conflict.request_sha256 == canonical_sha256(conflict_payload)
         durable_values = (
             nonce.nonce_value,
-            attempt.request_payload,
-            conflict.request_payload,
+            attempt.request_payload_ciphertext,
+            conflict.request_payload_ciphertext,
         )
         assert nonce_value not in repr(durable_values)
         assert response.token not in repr(durable_values)
@@ -6767,6 +6797,9 @@ async def test_registration_cleanup_fails_only_expired_processor_on_ended_lineag
             "nonce": nonce_value,
             "launch_reservation": response.token,
         }
+        request_ciphertext, request_key_id = _registration_recovery_envelope(
+            request_payload
+        )
         nonce = GpuRegistrationNonce(
             nonce_id="registration-stale-processor-nonce",
             client_request_id="registration-stale-processor-request",
@@ -6787,7 +6820,8 @@ async def test_registration_cleanup_fails_only_expired_processor_on_ended_lineag
             nonce_id=nonce.nonce_id,
             reservation_id=reservation.reservation_id,
             request_sha256=canonical_sha256(request_payload),
-            request_payload=request_payload,
+            request_payload_ciphertext=request_ciphertext,
+            request_payload_key_id=request_key_id,
             peer_certificate_pem="fixture-processing-certificate",
             peer_certificate_sha256=hashlib.sha256(
                 b"fixture-processing-certificate"
@@ -6844,8 +6878,10 @@ async def test_registration_cleanup_fails_only_expired_processor_on_ended_lineag
         assert attempt.registration_replay_until - attempt.completed_at == timedelta(
             minutes=15
         )
-        assert nonce.state == "claimed"
-        assert nonce.nonce_value == nonce_value
+        assert nonce.state == "expired"
+        assert nonce.nonce_value is None
+        assert attempt.request_payload_ciphertext is None
+        assert attempt.request_payload_key_id is None
 
 
 async def test_verified_registration_conflict_cannot_fence_changed_lineage(
@@ -6909,12 +6945,14 @@ async def test_verified_registration_conflict_cannot_fence_changed_lineage(
         )
         session.add(nonce)
         await session.flush()
+        primary_ciphertext, primary_key_id = _registration_recovery_envelope(primary)
         attempt = GpuRegistrationAttempt(
             attempt_id="registration-conflict-attempt",
             nonce_id=nonce.nonce_id,
             reservation_id=claims.reservation_id,
             request_sha256=primary.request_sha256(),
-            request_payload=primary.model_dump(mode="json", exclude_none=True),
+            request_payload_ciphertext=primary_ciphertext,
+            request_payload_key_id=primary_key_id,
             peer_certificate_pem=cert_pem,
             peer_certificate_sha256=hashlib.sha256(cert_pem.encode()).hexdigest(),
             peer_spki_sha256=spki_sha256,
@@ -6927,12 +6965,16 @@ async def test_verified_registration_conflict_cannot_fence_changed_lineage(
         nonce.state = "claimed"
         nonce.claimed_attempt_id = attempt.attempt_id
         audit = _registration_request_audit(competitor, spki_sha256, cert_pem)
+        conflict_ciphertext, conflict_key_id = _registration_recovery_envelope(
+            competitor
+        )
         conflict = GpuRegistrationConflict(
             conflict_id="registration-conflict-row",
             attempt_id=attempt.attempt_id,
             nonce_id=nonce.nonce_id,
             request_sha256=audit["request_sha256"],
-            request_payload=audit["request_payload"],
+            request_payload_ciphertext=conflict_ciphertext,
+            request_payload_key_id=conflict_key_id,
             peer_certificate_pem=audit["peer_certificate_pem"],
             peer_certificate_sha256=audit["peer_certificate_sha256"],
             peer_spki_sha256=audit["peer_spki_sha256"],

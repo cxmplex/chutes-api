@@ -33,6 +33,7 @@ services:
       # Dev: let a self-registering CPU server's hotkey register without being on the metagraph.
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       # Dev-only opt-in for the committed/live SNP measurements, which intentionally describe
       # *-debug.qcow2 artifacts. The default production posture refuses to start with those pins.
       ALLOW_DEBUG_MEASUREMENTS: "true"
@@ -78,6 +79,7 @@ services:
       TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
       DB_SSL: disable
 
@@ -90,6 +92,7 @@ services:
       ALLOW_DEBUG_MEASUREMENTS: "true"
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
       DB_SSL: disable
 
@@ -98,6 +101,7 @@ services:
       ALLOW_DEBUG_MEASUREMENTS: "true"
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
 
   # Validator-side CPU placement loop (api/cpu_scheduler.py): places CPU chutes/jobs onto
@@ -126,6 +130,7 @@ services:
       VALIDATOR_SEED: 971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       ALLOW_DEBUG_MEASUREMENTS: "true"
       # Same dev posture as the api service: SKIP_METAGRAPH_CHECK with the mTLS marker required
       # fails closed at settings init, so the scheduler would crash-loop without this.
@@ -165,6 +170,7 @@ services:
       VALIDATOR_SEED: 971c2a6674d0861ade72297d11110ce21c93734210527c8f4c9190c00139ce20
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       ALLOW_DEBUG_MEASUREMENTS: "true"
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
       TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
@@ -209,6 +215,7 @@ services:
       ALLOW_DEBUG_MEASUREMENTS: "true"
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       REQUIRE_MTLS_CLIENT_VERIFY: "false"
       # forge.py hardcodes overlay storage opts (--storage-opt overlay.mountopt/mount_program), so the
       # base file's STORAGE_DRIVER=vfs is incompatible (vfs rejects those). Use the image's intended

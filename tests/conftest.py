@@ -19,6 +19,7 @@ def pytest_configure(config):
     os.environ["ALLOW_DEBUG_MEASUREMENTS"] = "true"
     os.environ["SKIP_METAGRAPH_CHECK"] = "true"
     os.environ["CHUTEFS_ALLOW_INSECURE_DEV_KEY"] = "true"
+    os.environ["GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY"] = "true"
     os.environ["ALLOW_DEV_ATTESTED_MTLS"] = "true"
     os.environ["REQUIRE_MTLS_CLIENT_VERIFY"] = "true"
 

@@ -2,10 +2,11 @@
 Application-wide settings.
 """
 
-import os
+import base64
 import hashlib
 import hmac
 import ipaddress
+import os
 import re
 from pathlib import Path
 import aioboto3
@@ -772,6 +773,7 @@ class Settings(BaseSettings):
         if self.release_attestation_max_age_seconds <= 0:
             raise ValueError("RELEASE_ATTESTATION_MAX_AGE_SECONDS must be positive.")
         _ = self.chutefs_token_keys
+        _ = self.gpu_registration_recovery_keys
         if not 0 <= self.snp_crl_outage_grace_seconds <= MAX_SNP_CRL_OUTAGE_GRACE_SECONDS:
             raise ValueError(
                 "SNP_CRL_OUTAGE_GRACE_SECONDS must be between 0 and "
@@ -1112,6 +1114,17 @@ class Settings(BaseSettings):
         "CHUTEFS_TOKEN_REPLICA_ID",
         os.getenv("HOSTNAME", "local-dev"),
     )
+    gpu_registration_recovery_key_id: str = os.getenv(
+        "GPU_REGISTRATION_RECOVERY_KEY_ID",
+        "gpu-registration-dev-key-v1",
+    )
+    gpu_registration_recovery_keys_json: Optional[str] = os.getenv(
+        "GPU_REGISTRATION_RECOVERY_KEYS_JSON"
+    )
+    gpu_registration_allow_insecure_dev_key: bool = (
+        os.getenv("GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY", "false").lower()
+        == "true"
+    )
     gpu_launch_key_epoch: int = int(os.getenv("GPU_LAUNCH_KEY_EPOCH", "1"))
 
     @property
@@ -1173,6 +1186,88 @@ class Settings(BaseSettings):
         ):
             raise ValueError("CHUTEFS_TOKEN_REPLICA_ID is malformed")
         return dict(keys)
+
+    @property
+    def gpu_registration_recovery_keys(self) -> Dict[str, Fernet]:
+        """Purpose-separated keys for short-lived Registration V2 recovery envelopes."""
+
+        if self.gpu_registration_recovery_keys_json is None:
+            if not self.gpu_registration_allow_insecure_dev_key:
+                raise ValueError(
+                    "GPU_REGISTRATION_RECOVERY_KEYS_JSON is required unless the dedicated "
+                    "GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY development opt-in is true"
+                )
+            dev_material = hashlib.sha256(
+                b"chutes.dev.gpu-registration-recovery.v1\0"
+                + self.launch_config_key.encode("ascii")
+            ).digest()
+            keys = {
+                "gpu-registration-dev-key-v1": base64.urlsafe_b64encode(
+                    dev_material
+                ).decode("ascii")
+            }
+        else:
+
+            def unique_keyring(pairs):
+                result = {}
+                for key_id, secret in pairs:
+                    if key_id in result:
+                        raise ValueError(
+                            "GPU_REGISTRATION_RECOVERY_KEYS_JSON contains a duplicate key ID"
+                        )
+                    result[key_id] = secret
+                return result
+
+            try:
+                keys = json.loads(
+                    self.gpu_registration_recovery_keys_json,
+                    object_pairs_hook=unique_keyring,
+                )
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "GPU_REGISTRATION_RECOVERY_KEYS_JSON must be valid JSON"
+                ) from exc
+        if (
+            not isinstance(keys, dict)
+            or not keys
+            or any(
+                not isinstance(key_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", key_id) is None
+                or not isinstance(secret, str)
+                or not secret.isascii()
+                for key_id, secret in keys.items()
+            )
+            or self.gpu_registration_recovery_key_id not in keys
+        ):
+            raise ValueError(
+                "GPU registration recovery keys must be a non-empty ASCII keyring "
+                "containing GPU_REGISTRATION_RECOVERY_KEY_ID"
+            )
+        cache_key = os.getenv("CACHE_PASSPHRASE_KEY")
+        if cache_key and any(
+            hmac.compare_digest(secret, cache_key) for secret in keys.values()
+        ):
+            raise ValueError(
+                "GPU registration recovery keys must not reuse CACHE_PASSPHRASE_KEY"
+            )
+        chutefs_keys = self.chutefs_token_keys
+        if any(
+            hmac.compare_digest(secret, chutefs_secret)
+            for secret in keys.values()
+            for chutefs_secret in chutefs_keys.values()
+        ):
+            raise ValueError(
+                "GPU registration recovery keys must not reuse a ChuteFS token key"
+            )
+        result = {}
+        for key_id, secret in keys.items():
+            try:
+                result[key_id] = Fernet(secret.encode("ascii"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"GPU registration recovery key {key_id!r} is not a valid Fernet key"
+                ) from exc
+        return result
 
     # New, asymmetric launch config keys.
     launch_config_private_key_bytes: Optional[bytes] = load_launch_config_private_key()

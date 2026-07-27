@@ -173,7 +173,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
     reservation_id VARCHAR NOT NULL REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT,
     registration_id VARCHAR UNIQUE,
     request_sha256 VARCHAR(64) NOT NULL,
-    request_payload JSONB,
+    request_payload_ciphertext TEXT,
+    request_payload_key_id VARCHAR(64),
     peer_certificate_pem TEXT NOT NULL,
     peer_certificate_sha256 VARCHAR(64) NOT NULL,
     peer_spki_sha256 VARCHAR(64) NOT NULL,
@@ -194,6 +195,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
         request_sha256 ~ '^[0-9a-f]{64}$'
         AND peer_certificate_sha256 ~ '^[0-9a-f]{64}$'
         AND peer_spki_sha256 ~ '^[0-9a-f]{64}$'
+        AND (request_payload_key_id IS NULL
+             OR request_payload_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
         AND (stable_response_sha256 IS NULL OR stable_response_sha256 ~ '^[0-9a-f]{64}$')
     ),
     CONSTRAINT ck_gpu_registration_attempt_lease CHECK (
@@ -201,7 +204,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
         OR (processing_lease_owner IS NOT NULL AND processing_lease_expires_at IS NOT NULL)
     ),
     CONSTRAINT ck_gpu_registration_attempt_result CHECK (
-        (state = 'processing' AND request_payload IS NOT NULL
+        (state = 'processing' AND request_payload_ciphertext IS NOT NULL
+         AND request_payload_key_id IS NOT NULL
          AND registration_id IS NULL AND attestation_id IS NULL
          AND stable_response IS NULL AND stable_response_sha256 IS NULL
          AND registration_replay_until IS NULL AND completed_at IS NULL
@@ -210,12 +214,14 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
          AND stable_response IS NOT NULL AND stable_response_sha256 ~ '^[0-9a-f]{64}$'
          AND registration_replay_until > completed_at AND completed_at IS NOT NULL
          AND processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL
+         AND request_payload_ciphertext IS NULL AND request_payload_key_id IS NULL
          AND failure_code IS NULL AND failure_detail IS NULL)
         OR (state = 'failed' AND registration_id IS NULL AND attestation_id IS NULL
          AND stable_response IS NULL AND stable_response_sha256 IS NULL
          AND failure_code IS NOT NULL AND failure_detail IS NOT NULL
          AND completed_at IS NOT NULL AND registration_replay_until > completed_at
-         AND processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL)
+         AND processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL
+         AND request_payload_ciphertext IS NULL AND request_payload_key_id IS NULL)
     )
 );
 ALTER TABLE gpu_registration_nonces
@@ -233,7 +239,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_conflicts (
     attempt_id VARCHAR NOT NULL REFERENCES gpu_registration_attempts(attempt_id) ON DELETE RESTRICT,
     nonce_id VARCHAR NOT NULL REFERENCES gpu_registration_nonces(nonce_id) ON DELETE RESTRICT,
     request_sha256 VARCHAR(64) NOT NULL,
-    request_payload JSONB,
+    request_payload_ciphertext TEXT,
+    request_payload_key_id VARCHAR(64),
     peer_certificate_pem TEXT NOT NULL,
     peer_certificate_sha256 VARCHAR(64) NOT NULL,
     peer_spki_sha256 VARCHAR(64) NOT NULL,
@@ -259,21 +266,26 @@ CREATE TABLE IF NOT EXISTS gpu_registration_conflicts (
         AND quote_sha256 ~ '^[0-9a-f]{64}$'
         AND evidence_sha256 ~ '^[0-9a-f]{64}$'
         AND signature_sha256 ~ '^[0-9a-f]{64}$'
+        AND (request_payload_key_id IS NULL
+             OR request_payload_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
     ),
     CONSTRAINT ck_gpu_registration_conflict_lease CHECK (
         (processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL)
         OR (processing_lease_owner IS NOT NULL AND processing_lease_expires_at IS NOT NULL)
     ),
     CONSTRAINT ck_gpu_registration_conflict_shape CHECK (
-        (state = 'recorded' AND request_payload IS NOT NULL
+        (state = 'recorded' AND request_payload_ciphertext IS NOT NULL
+         AND request_payload_key_id IS NOT NULL
          AND processing_lease_owner IS NULL
          AND processing_lease_expires_at IS NULL AND verified_at IS NULL
          AND verification_detail IS NULL)
-        OR (state = 'verifying' AND request_payload IS NOT NULL
+        OR (state = 'verifying' AND request_payload_ciphertext IS NOT NULL
+            AND request_payload_key_id IS NOT NULL
             AND processing_lease_owner IS NOT NULL
             AND processing_lease_expires_at IS NOT NULL AND verified_at IS NULL)
         OR (state IN ('invalid', 'verified_competitor', 'dismissed')
             AND processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL
+            AND request_payload_ciphertext IS NULL AND request_payload_key_id IS NULL
             AND verified_at IS NOT NULL AND verification_detail IS NOT NULL)
     )
 );

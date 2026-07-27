@@ -116,7 +116,8 @@ class GpuRegistrationAttempt(Base):
     )
     registration_id = Column(String, nullable=True, unique=True)
     request_sha256 = Column(String(64), nullable=False)
-    request_payload = Column(JSONB, nullable=True)
+    request_payload_ciphertext = Column(Text, nullable=True)
+    request_payload_key_id = Column(String(64), nullable=True)
     peer_certificate_pem = Column(Text, nullable=False)
     peer_certificate_sha256 = Column(String(64), nullable=False)
     peer_spki_sha256 = Column(String(64), nullable=False)
@@ -152,6 +153,8 @@ class GpuRegistrationAttempt(Base):
             "request_sha256 ~ '^[0-9a-f]{64}$' "
             "AND peer_certificate_sha256 ~ '^[0-9a-f]{64}$' "
             "AND peer_spki_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND (request_payload_key_id IS NULL OR "
+            "request_payload_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') "
             "AND (stable_response_sha256 IS NULL OR stable_response_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_gpu_registration_attempt_digests",
         ),
@@ -161,7 +164,8 @@ class GpuRegistrationAttempt(Base):
             name="ck_gpu_registration_attempt_lease",
         ),
         CheckConstraint(
-            "(state = 'processing' AND request_payload IS NOT NULL "
+            "(state = 'processing' AND request_payload_ciphertext IS NOT NULL "
+            "AND request_payload_key_id IS NOT NULL "
             "AND registration_id IS NULL AND attestation_id IS NULL "
             "AND stable_response IS NULL AND stable_response_sha256 IS NULL "
             "AND registration_replay_until IS NULL AND completed_at IS NULL "
@@ -172,6 +176,8 @@ class GpuRegistrationAttempt(Base):
             "AND registration_replay_until > completed_at AND completed_at IS NOT NULL "
             "AND processing_lease_owner IS NULL "
             "AND processing_lease_expires_at IS NULL "
+            "AND request_payload_ciphertext IS NULL "
+            "AND request_payload_key_id IS NULL "
             "AND failure_code IS NULL AND failure_detail IS NULL) OR "
             "(state = 'failed' AND registration_id IS NULL "
             "AND attestation_id IS NULL AND stable_response IS NULL "
@@ -179,7 +185,9 @@ class GpuRegistrationAttempt(Base):
             "AND failure_detail IS NOT NULL AND completed_at IS NOT NULL "
             "AND registration_replay_until > completed_at "
             "AND processing_lease_owner IS NULL "
-            "AND processing_lease_expires_at IS NULL)",
+            "AND processing_lease_expires_at IS NULL "
+            "AND request_payload_ciphertext IS NULL "
+            "AND request_payload_key_id IS NULL)",
             name="ck_gpu_registration_attempt_result",
         ),
         Index(
@@ -208,7 +216,8 @@ class GpuRegistrationConflict(Base):
         nullable=False,
     )
     request_sha256 = Column(String(64), nullable=False)
-    request_payload = Column(JSONB, nullable=True)
+    request_payload_ciphertext = Column(Text, nullable=True)
+    request_payload_key_id = Column(String(64), nullable=True)
     peer_certificate_pem = Column(Text, nullable=False)
     peer_certificate_sha256 = Column(String(64), nullable=False)
     peer_spki_sha256 = Column(String(64), nullable=False)
@@ -244,7 +253,9 @@ class GpuRegistrationConflict(Base):
             "AND peer_spki_sha256 ~ '^[0-9a-f]{64}$' "
             "AND quote_sha256 ~ '^[0-9a-f]{64}$' "
             "AND evidence_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND signature_sha256 ~ '^[0-9a-f]{64}$'",
+            "AND signature_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND (request_payload_key_id IS NULL OR "
+            "request_payload_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')",
             name="ck_gpu_registration_conflict_digests",
         ),
         CheckConstraint(
@@ -253,16 +264,20 @@ class GpuRegistrationConflict(Base):
             name="ck_gpu_registration_conflict_lease",
         ),
         CheckConstraint(
-            "(state = 'recorded' AND request_payload IS NOT NULL "
+            "(state = 'recorded' AND request_payload_ciphertext IS NOT NULL "
+            "AND request_payload_key_id IS NOT NULL "
             "AND processing_lease_owner IS NULL "
             "AND processing_lease_expires_at IS NULL AND verified_at IS NULL "
             "AND verification_detail IS NULL) OR "
-            "(state = 'verifying' AND request_payload IS NOT NULL "
+            "(state = 'verifying' AND request_payload_ciphertext IS NOT NULL "
+            "AND request_payload_key_id IS NOT NULL "
             "AND processing_lease_owner IS NOT NULL "
             "AND processing_lease_expires_at IS NOT NULL AND verified_at IS NULL) OR "
             "(state IN ('invalid', 'verified_competitor', 'dismissed') "
             "AND processing_lease_owner IS NULL "
             "AND processing_lease_expires_at IS NULL AND verified_at IS NOT NULL "
+            "AND request_payload_ciphertext IS NULL "
+            "AND request_payload_key_id IS NULL "
             "AND verification_detail IS NOT NULL)",
             name="ck_gpu_registration_conflict_shape",
         ),

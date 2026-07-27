@@ -6,6 +6,7 @@ services:
       REQUIRE_MTLS_CLIENT_VERIFY: "true"
       SKIP_METAGRAPH_CHECK: "true"
       CHUTEFS_ALLOW_INSECURE_DEV_KEY: "true"
+      GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY: "true"
       TEE_MEASUREMENT_CONFIG_REQUIRED: "true"
       # chutes-tls is the verified final hop and overwrites X-Resolved-IP with its direct peer.
       TRUSTED_PROXY_CIDRS: "172.18.0.10/32"

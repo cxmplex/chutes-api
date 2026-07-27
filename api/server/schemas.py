@@ -44,7 +44,7 @@ from api.constants import (
     ServerHealthStatus,
 )
 from api.database import Base, generate_uuid
-from api.host.schemas import GpuQuoteCommitmentV1, TdQuoteCommitmentV1
+from api.host.schemas import TdQuoteCommitmentV1
 from api.node.schemas import NodeArgs
 
 
@@ -991,77 +991,6 @@ class CpuServerRegistrationResponse(BaseModel):
     # call POST /{server_id}/luks/attest for its persistent data-volume key. Minted (and returned) only
     # for storage_role registrations.
     luks_quote_nonce: Optional[str] = None
-
-
-class GpuServerRegistrationArgs(BaseModel):
-    """Reservation-bound direct-TDX GPU guest registration."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    server_id: str
-    quote: str
-    gpu_evidence: List[Dict[str, Any]] = Field(..., min_length=1, max_length=64)
-    gpu_uuids: List[str] = Field(..., min_length=1, max_length=64)
-    launch_reservation: str = Field(..., min_length=1, max_length=4096)
-    quote_commitment: GpuQuoteCommitmentV1
-    td_signature: str = Field(..., min_length=1, max_length=2048)
-    external_host: Optional[str] = None
-    external_ports: Optional[Dict[str, int]] = None
-    endpoints: Optional[Dict[str, Any]] = None
-
-    @field_validator("gpu_uuids")
-    @classmethod
-    def _canonical_gpu_uuids(cls, value: List[str]) -> List[str]:
-        pattern = re.compile(
-            r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
-            r"[0-9a-f]{4}-[0-9a-f]{12}$"
-        )
-        if value != sorted(set(value)) or any(not pattern.fullmatch(item) for item in value):
-            raise ValueError("gpu_uuids must be sorted unique canonical NVIDIA UUIDs")
-        return value
-
-    @model_validator(mode="after")
-    def _matches_commitment(self) -> "GpuServerRegistrationArgs":
-        if (
-            self.server_id != self.quote_commitment.claims.server_id
-            or self.gpu_uuids != self.quote_commitment.claims.gpu_uuids
-        ):
-            raise ValueError("GPU registration request differs from its commitment")
-        return self
-
-
-class GpuServerRegistrationResponse(BaseModel):
-    server_id: str
-    owner_hotkey: str
-    reservation_id: str
-    claims_sha256: str = Field(..., pattern=r"^[0-9a-f]{64}$")
-    allocation_group_id: str
-    allocation_group_generation: int
-    process_incarnation: str
-    gpu_uuids: List[str]
-    gpu_identifiers: List[str]
-    management_mode: Literal["platform", "miner"]
-    measurement_version: str
-    measurement_name: str
-    measurement_config_fingerprint: str
-    trust_set_fingerprint: str
-    attestation_id: str
-    verified_at: str
-    runtime_session: Optional[str] = None
-    runtime_session_expires_at: Optional[str] = None
-    status: Literal["registered"] = "registered"
-
-    @model_validator(mode="after")
-    def _miner_session_shape(self) -> "GpuServerRegistrationResponse":
-        if not self.runtime_session or not self.runtime_session_expires_at:
-            raise ValueError("GPU registration requires an attested runtime session")
-        if (
-            not self.gpu_uuids
-            or len(self.gpu_uuids) != len(self.gpu_identifiers)
-            or len(set(self.gpu_uuids)) != len(self.gpu_uuids)
-        ):
-            raise ValueError("GPU registration requires an exact assigned device set")
-        return self
 
 
 class GpuRuntimeSessionResponse(BaseModel):

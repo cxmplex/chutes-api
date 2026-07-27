@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, status
+from cryptography.fernet import InvalidToken
 from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.config import settings
 from api.database import generate_uuid
 from api.gpu_contracts import (
     GpuRegistrationNonceRequestV2,
@@ -39,6 +42,7 @@ from api.host.schemas import (
     GpuInventoryReportV1,
     GpuLaunchReservation,
     GpuLaunchReservationClaimsV1,
+    canonical_json_bytes,
     canonical_sha256,
 )
 from api.server.exceptions import (
@@ -138,13 +142,100 @@ def _registration_request_audit(
     }
 
 
+def _encrypt_registration_request(
+    request: GpuRegistrationRequestV2,
+) -> tuple[str, str]:
+    key_id = settings.gpu_registration_recovery_key_id
+    cipher = settings.gpu_registration_recovery_keys.get(key_id)
+    if cipher is None:
+        raise ServerRegistrationError(
+            "The active GPU registration recovery key is unavailable."
+        )
+    ciphertext = cipher.encrypt(canonical_json_bytes(request)).decode("ascii")
+    return ciphertext, key_id
+
+
+def _decrypt_registration_request(
+    ciphertext: str | None,
+    key_id: str | None,
+    request_sha256: str,
+) -> GpuRegistrationRequestV2:
+    if not ciphertext or not key_id:
+        raise ServerRegistrationError(
+            "Persisted GPU registration recovery material is unavailable."
+        )
+    cipher = settings.gpu_registration_recovery_keys.get(key_id)
+    if cipher is None:
+        raise ServerRegistrationError(
+            "Persisted GPU registration recovery key is unavailable."
+        )
+    try:
+        plaintext = cipher.decrypt(ciphertext.encode("ascii"))
+        document = json.loads(plaintext)
+        request = GpuRegistrationRequestV2.model_validate(document)
+    except (InvalidToken, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ServerRegistrationError(
+            "Persisted GPU registration recovery envelope is invalid."
+        ) from exc
+    if (
+        plaintext != canonical_json_bytes(request)
+        or not secrets.compare_digest(request.request_sha256(), request_sha256)
+    ):
+        raise ServerRegistrationError(
+            "Persisted GPU registration recovery envelope changed identity."
+        )
+    return request
+
+
+def _scrub_attempt_request(attempt: GpuRegistrationAttempt) -> None:
+    attempt.request_payload_ciphertext = None
+    attempt.request_payload_key_id = None
+
+
+def _scrub_conflict_request(conflict: GpuRegistrationConflict) -> None:
+    conflict.request_payload_ciphertext = None
+    conflict.request_payload_key_id = None
+
+
+def _conflict_audit_matches(
+    conflict: GpuRegistrationConflict,
+    request: GpuRegistrationRequestV2,
+    audit: dict,
+) -> bool:
+    return bool(
+        conflict.nonce_id == request.nonce_id
+        and secrets.compare_digest(
+            conflict.request_sha256, str(audit["request_sha256"])
+        )
+        and conflict.peer_certificate_pem == audit["peer_certificate_pem"]
+        and secrets.compare_digest(
+            conflict.peer_certificate_sha256,
+            str(audit["peer_certificate_sha256"]),
+        )
+        and secrets.compare_digest(
+            conflict.peer_spki_sha256, str(audit["peer_spki_sha256"])
+        )
+        and secrets.compare_digest(
+            conflict.quote_sha256, str(audit["quote_sha256"])
+        )
+        and secrets.compare_digest(
+            conflict.evidence_sha256, str(audit["evidence_sha256"])
+        )
+        and secrets.compare_digest(
+            conflict.signature_sha256, str(audit["signature_sha256"])
+        )
+        and request.model_dump(mode="json", exclude_none=True)
+        == audit["request_payload"]
+    )
+
+
 async def _scrub_terminal_registration_material(
     db: AsyncSession,
     nonce: GpuRegistrationNonce,
     attempt: GpuRegistrationAttempt,
     now: datetime,
 ) -> bool:
-    """Remove every nonce/token-bearing payload after the bounded replay window."""
+    """Expire terminal audit rows after response replay has ended."""
 
     if (
         attempt.state not in {"completed", "failed"}
@@ -173,8 +264,8 @@ async def _scrub_terminal_registration_material(
                 "registration replay window expired before conflict completion"
             )
             conflict.verified_at = now
-        conflict.request_payload = None
-    attempt.request_payload = None
+        _scrub_conflict_request(conflict)
+    _scrub_attempt_request(attempt)
     nonce.state = "revoked" if nonce.state == "revoked" else "expired"
     nonce.nonce_value = None
     return True
@@ -214,6 +305,7 @@ async def _fail_stale_processing_attempt(
     attempt.completed_at = now
     attempt.updated_at = now
     attempt.registration_replay_until = now + timedelta(seconds=_REPLAY_SECONDS)
+    _scrub_attempt_request(attempt)
     conflicts = list(
         (
             await db.execute(
@@ -237,6 +329,17 @@ async def _fail_stale_processing_attempt(
         conflict.processing_lease_expires_at = None
         conflict.verification_detail = "primary registration lineage ended"
         conflict.verified_at = now
+        _scrub_conflict_request(conflict)
+    nonce = (
+        await db.execute(
+            select(GpuRegistrationNonce)
+            .where(GpuRegistrationNonce.nonce_id == attempt.nonce_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if nonce is not None:
+        nonce.state = "revoked" if nonce.state == "revoked" else "expired"
+        nonce.nonce_value = None
 
 
 async def cleanup_expired_gpu_registration_nonces(
@@ -387,6 +490,32 @@ async def cleanup_expired_gpu_registration_nonces(
             attempt.completed_at = now
             attempt.updated_at = now
             attempt.registration_replay_until = now + timedelta(seconds=_REPLAY_SECONDS)
+            _scrub_attempt_request(attempt)
+            row.state = "revoked"
+            row.nonce_value = None
+            conflicts = list(
+                (
+                    await db.execute(
+                        select(GpuRegistrationConflict)
+                        .where(
+                            GpuRegistrationConflict.attempt_id == attempt.attempt_id,
+                            GpuRegistrationConflict.state.in_(
+                                ("recorded", "verifying", "verified_competitor")
+                            ),
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for conflict in conflicts:
+                conflict.state = "dismissed"
+                conflict.processing_lease_owner = None
+                conflict.processing_lease_expires_at = None
+                conflict.verification_detail = "primary registration nonce was revoked"
+                conflict.verified_at = now
+                _scrub_conflict_request(conflict)
         if attempt is not None and await _scrub_terminal_registration_material(
             db, row, attempt, now
         ):
@@ -755,15 +884,26 @@ async def _claim_attempt(
     ).scalar_one_or_none()
     now = _now()
     reservation_id, token_hash = _parse_reservation_token(request.launch_reservation)
+    try:
+        supplied_nonce_hash = hashlib.sha256(bytes.fromhex(request.nonce)).hexdigest()
+    except ValueError:
+        supplied_nonce_hash = ""
     if (
         nonce is None
         or nonce.reservation_id != reservation_id
         or (nonce.state == "issued" and nonce.expires_at <= now)
-        or not nonce.nonce_value
-        or not secrets.compare_digest(nonce.nonce_value, request.nonce)
-        or not secrets.compare_digest(
-            nonce.nonce_hash,
-            hashlib.sha256(bytes.fromhex(request.nonce)).hexdigest(),
+        or nonce.state not in {"issued", "claimed", "expired"}
+        or not secrets.compare_digest(nonce.nonce_hash, supplied_nonce_hash)
+        or (
+            nonce.state == "issued"
+            and (
+                not nonce.nonce_value
+                or not secrets.compare_digest(nonce.nonce_value, request.nonce)
+            )
+        )
+        or (
+            nonce.nonce_value is not None
+            and not secrets.compare_digest(nonce.nonce_value, request.nonce)
         )
     ):
         raise HTTPException(
@@ -820,7 +960,7 @@ async def _claim_attempt(
     ).scalar_one_or_none()
     allowed_states = (
         {"launching", "running", "quarantined"}
-        if nonce.state == "claimed"
+        if nonce.state in {"claimed", "expired"}
         else {"launching"}
     )
     lineage_current = _registration_lineage_current(
@@ -853,7 +993,7 @@ async def _claim_attempt(
         )
     request_sha256 = request.request_sha256()
     certificate_sha256 = hashlib.sha256(cert_pem.encode("utf-8")).hexdigest()
-    if nonce.state == "claimed":
+    if nonce.state in {"claimed", "expired"}:
         attempt = (
             await db.execute(
                 select(GpuRegistrationAttempt)
@@ -864,6 +1004,15 @@ async def _claim_attempt(
         if attempt is None:
             raise HTTPException(
                 status_code=409, detail="Claimed GPU registration nonce is incomplete."
+            )
+        if nonce.state == "expired" and (
+            attempt.state == "processing"
+            or attempt.registration_replay_until is None
+            or attempt.registration_replay_until <= now
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="GPU registration nonce replay is no longer active.",
             )
         exact = (
             secrets.compare_digest(attempt.request_sha256, request_sha256)
@@ -890,12 +1039,14 @@ async def _claim_attempt(
                 )
             ).scalar_one_or_none()
             if conflict is None:
+                ciphertext, key_id = _encrypt_registration_request(request)
                 conflict = GpuRegistrationConflict(
                     conflict_id=generate_uuid(),
                     attempt_id=attempt.attempt_id,
                     nonce_id=nonce.nonce_id,
                     request_sha256=request_sha256,
-                    request_payload=request.model_dump(mode="json", exclude_none=True),
+                    request_payload_ciphertext=ciphertext,
+                    request_payload_key_id=key_id,
                     peer_certificate_pem=cert_pem,
                     peer_certificate_sha256=certificate_sha256,
                     peer_spki_sha256=expected_cert_hash.lower(),
@@ -934,12 +1085,14 @@ async def _claim_attempt(
             status_code=409, detail="GPU registration nonce is no longer claimable."
         )
     lease_owner = generate_uuid()
+    ciphertext, key_id = _encrypt_registration_request(request)
     attempt = GpuRegistrationAttempt(
         attempt_id=generate_uuid(),
         nonce_id=nonce.nonce_id,
         reservation_id=reservation_id,
         request_sha256=request_sha256,
-        request_payload=request.model_dump(mode="json", exclude_none=True),
+        request_payload_ciphertext=ciphertext,
+        request_payload_key_id=key_id,
         peer_certificate_pem=cert_pem,
         peer_certificate_sha256=certificate_sha256,
         peer_spki_sha256=expected_cert_hash.lower(),
@@ -1023,16 +1176,11 @@ async def _locked_processing_snapshot(
         raise GpuRegistrationLeaseLost(
             "GPU registration processing lease is no longer authoritative."
         )
-    if attempt.request_payload is None:
-        raise ServerRegistrationError(
-            "Persisted GPU registration processing request was prematurely scrubbed."
-        )
-    try:
-        request = GpuRegistrationRequestV2.model_validate(attempt.request_payload)
-    except ValueError as exc:
-        raise ServerRegistrationError(
-            "Persisted GPU registration request is malformed."
-        ) from exc
+    request = _decrypt_registration_request(
+        attempt.request_payload_ciphertext,
+        attempt.request_payload_key_id,
+        attempt.request_sha256,
+    )
     request_sha256 = request.request_sha256()
     certificate_sha256 = hashlib.sha256(
         attempt.peer_certificate_pem.encode("utf-8")
@@ -1196,6 +1344,7 @@ async def _mark_attempt_failed(
     attempt.failure_detail = detail[:2000]
     attempt.completed_at = now
     attempt.updated_at = now
+    _scrub_attempt_request(attempt)
     conflicts = list(
         (
             await db.execute(
@@ -1218,6 +1367,17 @@ async def _mark_attempt_failed(
         conflict.processing_lease_expires_at = None
         conflict.verification_detail = "primary registration attempt failed"
         conflict.verified_at = now
+        _scrub_conflict_request(conflict)
+    nonce = (
+        await db.execute(
+            select(GpuRegistrationNonce)
+            .where(GpuRegistrationNonce.nonce_id == attempt.nonce_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if nonce is not None:
+        nonce.state = "revoked" if nonce.state == "revoked" else "expired"
+        nonce.nonce_value = None
     await db.flush()
     return attempt
 
@@ -1258,6 +1418,17 @@ async def _complete_attempt(
     attempt.processing_lease_expires_at = None
     attempt.completed_at = now
     attempt.updated_at = now
+    _scrub_attempt_request(attempt)
+    nonce = (
+        await db.execute(
+            select(GpuRegistrationNonce)
+            .where(GpuRegistrationNonce.nonce_id == attempt.nonce_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if nonce is not None:
+        nonce.state = "revoked" if nonce.state == "revoked" else "expired"
+        nonce.nonce_value = None
     await db.flush()
     competitor_ids = list(
         (
@@ -1667,6 +1838,7 @@ async def _verify_recorded_conflict(
             row.processing_lease_expires_at = None
             row.verification_detail = "primary registration attempt failed"
             row.verified_at = now
+            _scrub_conflict_request(row)
         await db.commit()
         return row.state
     if row.state in {"invalid", "verified_competitor", "dismissed"}:
@@ -1679,20 +1851,18 @@ async def _verify_recorded_conflict(
     ):
         await db.commit()
         return "verifying"
-    immutable_conflict = bool(
-        row.attempt_id == attempt.attempt_id
-        and row.nonce_id == request.nonce_id
-        and row.request_payload == audit["request_payload"]
-        and secrets.compare_digest(row.request_sha256, str(audit["request_sha256"]))
-        and row.peer_certificate_pem == audit["peer_certificate_pem"]
-        and secrets.compare_digest(
-            row.peer_certificate_sha256,
-            str(audit["peer_certificate_sha256"]),
+    try:
+        persisted_request = _decrypt_registration_request(
+            row.request_payload_ciphertext,
+            row.request_payload_key_id,
+            row.request_sha256,
         )
-        and secrets.compare_digest(row.peer_spki_sha256, str(audit["peer_spki_sha256"]))
-        and secrets.compare_digest(row.quote_sha256, str(audit["quote_sha256"]))
-        and secrets.compare_digest(row.evidence_sha256, str(audit["evidence_sha256"]))
-        and secrets.compare_digest(row.signature_sha256, str(audit["signature_sha256"]))
+    except ServerRegistrationError:
+        persisted_request = None
+    immutable_conflict = bool(
+        persisted_request is not None
+        and row.attempt_id == attempt.attempt_id
+        and _conflict_audit_matches(row, persisted_request, audit)
     )
     if not immutable_conflict:
         row.state = "invalid"
@@ -1700,8 +1870,13 @@ async def _verify_recorded_conflict(
         row.processing_lease_expires_at = None
         row.verification_detail = "conflict audit bytes changed before verification"
         row.verified_at = now
+        _scrub_conflict_request(row)
         await db.commit()
         return row.state
+    ciphertext_snapshot = row.request_payload_ciphertext
+    key_id_snapshot = row.request_payload_key_id
+    certificate_snapshot = row.peer_certificate_pem
+    spki_snapshot = row.peer_spki_sha256
     row.state = "verifying"
     row.processing_lease_owner = lease_owner
     row.processing_lease_expires_at = now + timedelta(seconds=_PROCESSING_LEASE_SECONDS)
@@ -1711,10 +1886,10 @@ async def _verify_recorded_conflict(
     try:
         _, _, verified_gpu_evidence = await verify_gpu_registration_evidence(
             db,
-            request,
-            request.nonce,
-            expected_cert_hash,
-            cert_pem,
+            persisted_request,
+            persisted_request.nonce,
+            spki_snapshot,
+            certificate_snapshot,
         )
         evidence_valid = True
         detail = "conflicting request independently verified"
@@ -1812,35 +1987,101 @@ async def _verify_recorded_conflict(
         return row.state
 
     now = _now()
+    try:
+        current_request = _decrypt_registration_request(
+            row.request_payload_ciphertext,
+            row.request_payload_key_id,
+            row.request_sha256,
+        )
+    except ServerRegistrationError:
+        current_request = None
+    audit_unchanged = bool(
+        current_request is not None
+        and row.request_payload_ciphertext == ciphertext_snapshot
+        and row.request_payload_key_id == key_id_snapshot
+        and current_request.model_dump(mode="json", exclude_none=True)
+        == persisted_request.model_dump(mode="json", exclude_none=True)
+        and _conflict_audit_matches(row, current_request, audit)
+    )
+    request = current_request or persisted_request
+    try:
+        _, conflict_token_hash = _parse_reservation_token(
+            request.launch_reservation
+        )
+        nonce_hash = hashlib.sha256(bytes.fromhex(request.nonce)).hexdigest()
+    except (HTTPException, ValueError):
+        conflict_token_hash = ""
+        nonce_hash = ""
+    claims = request.quote_commitment.claims
+    claims_document = claims.model_dump(mode="json", exclude_none=True)
+    common_exact = bool(
+        evidence_valid
+        and audit_unchanged
+        and verified_gpu_evidence is not None
+        and nonce is not None
+        and reservation is not None
+        and group is not None
+        and report is not None
+        and host is not None
+        and row.attempt_id == attempt.attempt_id
+        and row.nonce_id == nonce.nonce_id == attempt.nonce_id
+        and request.nonce_id == nonce.nonce_id
+        and nonce.state in {"claimed", "expired"}
+        and nonce.claimed_attempt_id == attempt.attempt_id
+        and nonce.reservation_id
+        == attempt.reservation_id
+        == reservation.reservation_id
+        and secrets.compare_digest(nonce.nonce_hash, nonce_hash)
+        and (
+            nonce.nonce_value is None
+            or secrets.compare_digest(nonce.nonce_value, request.nonce)
+        )
+        and secrets.compare_digest(nonce.peer_spki_sha256, attempt.peer_spki_sha256)
+        and request.quote_commitment.attested_spki_sha256 == row.peer_spki_sha256
+        and not (
+            secrets.compare_digest(attempt.request_sha256, row.request_sha256)
+            and secrets.compare_digest(attempt.peer_spki_sha256, row.peer_spki_sha256)
+            and secrets.compare_digest(
+                attempt.peer_certificate_sha256,
+                row.peer_certificate_sha256,
+            )
+        )
+        and secrets.compare_digest(reservation.token_hash, conflict_token_hash)
+        and reservation.claims == claims_document
+        and secrets.compare_digest(
+            reservation.claims_sha256, canonical_sha256(claims_document)
+        )
+        and request.quote_commitment.reservation_sha256
+        == reservation.claims_sha256
+    )
     if attempt.state == "failed":
         final_state = "dismissed"
         detail = "primary registration attempt failed"
     elif not evidence_valid:
         final_state = "invalid"
     elif attempt.state == "processing":
-        primary_request = None
-        if attempt.request_payload is not None:
-            try:
-                primary_request = GpuRegistrationRequestV2.model_validate(
-                    attempt.request_payload
-                )
-            except ValueError:
-                primary_request = None
         try:
-            _, conflict_token_hash = _parse_reservation_token(
-                request.launch_reservation
+            primary_request = _decrypt_registration_request(
+                attempt.request_payload_ciphertext,
+                attempt.request_payload_key_id,
+                attempt.request_sha256,
             )
+        except ServerRegistrationError:
+            primary_request = None
+        try:
             _, primary_token_hash = (
                 _parse_reservation_token(primary_request.launch_reservation)
                 if primary_request is not None
                 else ("", "")
             )
+            primary_nonce_hash = (
+                hashlib.sha256(bytes.fromhex(primary_request.nonce)).hexdigest()
+                if primary_request is not None
+                else ""
+            )
         except HTTPException:
-            conflict_token_hash = ""
             primary_token_hash = ""
-        claims_document = request.quote_commitment.claims.model_dump(
-            mode="json", exclude_none=True
-        )
+            primary_nonce_hash = ""
         primary_claims_document = (
             primary_request.quote_commitment.claims.model_dump(
                 mode="json", exclude_none=True
@@ -1849,61 +2090,17 @@ async def _verify_recorded_conflict(
             else None
         )
         exact = bool(
-            nonce is not None
-            and reservation is not None
-            and group is not None
-            and report is not None
-            and host is not None
-            and verified_gpu_evidence is not None
-            and row.attempt_id == attempt.attempt_id
-            and row.nonce_id == nonce.nonce_id == attempt.nonce_id
-            and request.nonce_id == nonce.nonce_id
-            and nonce.state == "claimed"
-            and nonce.claimed_attempt_id == attempt.attempt_id
-            and nonce.reservation_id
-            == attempt.reservation_id
-            == reservation.reservation_id
-            and nonce.nonce_value is not None
+            common_exact
             and primary_request is not None
-            and secrets.compare_digest(nonce.nonce_value, request.nonce)
-            and secrets.compare_digest(nonce.nonce_value, primary_request.nonce)
-            and secrets.compare_digest(
-                nonce.nonce_hash,
-                hashlib.sha256(bytes.fromhex(request.nonce)).hexdigest(),
+            and secrets.compare_digest(nonce.nonce_hash, primary_nonce_hash)
+            and (
+                nonce.nonce_value is None
+                or secrets.compare_digest(nonce.nonce_value, primary_request.nonce)
             )
-            and secrets.compare_digest(nonce.peer_spki_sha256, attempt.peer_spki_sha256)
-            and row.request_payload == audit["request_payload"]
-            and secrets.compare_digest(row.request_sha256, str(audit["request_sha256"]))
-            and row.peer_certificate_pem == audit["peer_certificate_pem"]
-            and secrets.compare_digest(
-                row.peer_certificate_sha256,
-                str(audit["peer_certificate_sha256"]),
-            )
-            and secrets.compare_digest(
-                row.peer_spki_sha256, str(audit["peer_spki_sha256"])
-            )
-            and secrets.compare_digest(row.quote_sha256, str(audit["quote_sha256"]))
-            and secrets.compare_digest(
-                row.evidence_sha256, str(audit["evidence_sha256"])
-            )
-            and secrets.compare_digest(
-                row.signature_sha256, str(audit["signature_sha256"])
-            )
-            and attempt.request_payload
-            == primary_request.model_dump(mode="json", exclude_none=True)
-            and secrets.compare_digest(
-                attempt.request_sha256, primary_request.request_sha256()
-            )
-            and request.quote_commitment.attested_spki_sha256 == row.peer_spki_sha256
             and primary_request.quote_commitment.attested_spki_sha256
             == attempt.peer_spki_sha256
-            and not secrets.compare_digest(attempt.request_sha256, row.request_sha256)
-            and secrets.compare_digest(reservation.token_hash, conflict_token_hash)
             and secrets.compare_digest(reservation.token_hash, primary_token_hash)
             and reservation.claims == claims_document == primary_claims_document
-            and secrets.compare_digest(
-                reservation.claims_sha256, canonical_sha256(claims_document)
-            )
             and _registration_lineage_current(
                 host,
                 group,
@@ -1942,86 +2139,14 @@ async def _verify_recorded_conflict(
         final_state = "dismissed"
         detail = "primary registration attempt is not replayable"
     else:
-        primary_request = None
-        if attempt.request_payload is not None:
-            try:
-                primary_request = GpuRegistrationRequestV2.model_validate(
-                    attempt.request_payload
-                )
-            except ValueError:
-                primary_request = None
-        try:
-            _, conflict_token_hash = _parse_reservation_token(
-                request.launch_reservation
-            )
-            _, primary_token_hash = (
-                _parse_reservation_token(primary_request.launch_reservation)
-                if primary_request is not None
-                else ("", "")
-            )
-        except HTTPException:
-            conflict_token_hash = ""
-            primary_token_hash = ""
-        claims = request.quote_commitment.claims
-        claims_document = claims.model_dump(mode="json", exclude_none=True)
-        primary_claims_document = (
-            primary_request.quote_commitment.claims.model_dump(
-                mode="json", exclude_none=True
-            )
-            if primary_request is not None
-            else None
-        )
-        audit_unchanged = bool(
-            row.request_payload == audit["request_payload"]
-            and secrets.compare_digest(row.request_sha256, str(audit["request_sha256"]))
-            and row.peer_certificate_pem == audit["peer_certificate_pem"]
-            and secrets.compare_digest(
-                row.peer_certificate_sha256,
-                str(audit["peer_certificate_sha256"]),
-            )
-            and secrets.compare_digest(
-                row.peer_spki_sha256, str(audit["peer_spki_sha256"])
-            )
-            and secrets.compare_digest(row.quote_sha256, str(audit["quote_sha256"]))
-            and secrets.compare_digest(
-                row.evidence_sha256, str(audit["evidence_sha256"])
-            )
-            and secrets.compare_digest(
-                row.signature_sha256, str(audit["signature_sha256"])
-            )
-        )
+        stable = dict(attempt.stable_response or {})
         exact = bool(
-            attempt.registration_replay_until is not None
+            common_exact
+            and attempt.registration_replay_until is not None
             and attempt.registration_replay_until > now
-            and nonce is not None
-            and reservation is not None
-            and group is not None
-            and report is not None
-            and host is not None
             and server is not None
-            and row.attempt_id == attempt.attempt_id
-            and row.nonce_id == nonce.nonce_id == attempt.nonce_id
-            and request.nonce_id == nonce.nonce_id
-            and nonce.state == "claimed"
-            and nonce.claimed_attempt_id == attempt.attempt_id
-            and nonce.reservation_id
-            == attempt.reservation_id
-            == reservation.reservation_id
-            and nonce.nonce_value is not None
-            and primary_request is not None
-            and secrets.compare_digest(nonce.nonce_value, request.nonce)
-            and secrets.compare_digest(nonce.nonce_value, primary_request.nonce)
-            and secrets.compare_digest(
-                nonce.nonce_hash,
-                hashlib.sha256(bytes.fromhex(request.nonce)).hexdigest(),
-            )
-            and secrets.compare_digest(nonce.peer_spki_sha256, attempt.peer_spki_sha256)
-            and audit_unchanged
-            and attempt.request_payload
-            == primary_request.model_dump(mode="json", exclude_none=True)
-            and secrets.compare_digest(
-                attempt.request_sha256, primary_request.request_sha256()
-            )
+            and attempt.request_payload_ciphertext is None
+            and attempt.request_payload_key_id is None
             and attempt.peer_certificate_pem is not None
             and secrets.compare_digest(
                 attempt.peer_certificate_sha256,
@@ -2029,28 +2154,12 @@ async def _verify_recorded_conflict(
                     attempt.peer_certificate_pem.encode("utf-8")
                 ).hexdigest(),
             )
-            and primary_request.quote_commitment.attested_spki_sha256
-            == attempt.peer_spki_sha256
-            and request.quote_commitment.attested_spki_sha256 == row.peer_spki_sha256
-            and not (
-                secrets.compare_digest(attempt.request_sha256, row.request_sha256)
-                and secrets.compare_digest(
-                    attempt.peer_spki_sha256, row.peer_spki_sha256
-                )
-                and secrets.compare_digest(
-                    attempt.peer_certificate_sha256,
-                    row.peer_certificate_sha256,
-                )
-            )
-            and secrets.compare_digest(reservation.token_hash, conflict_token_hash)
-            and secrets.compare_digest(reservation.token_hash, primary_token_hash)
-            and reservation.claims == claims_document == primary_claims_document
+            and attempt.stable_response_sha256 is not None
             and secrets.compare_digest(
-                reservation.claims_sha256, canonical_sha256(claims_document)
+                attempt.stable_response_sha256, canonical_sha256(stable)
             )
-            and request.quote_commitment.reservation_sha256 == reservation.claims_sha256
-            and primary_request.quote_commitment.reservation_sha256
-            == reservation.claims_sha256
+            and attempt.registration_id == stable.get("registration_id")
+            and attempt.attestation_id == stable.get("attestation_id")
             and reservation.guest_consumed_at is not None
             and reservation.registration_attestation_id == attempt.attestation_id
             and _registration_lineage_current(
@@ -2100,6 +2209,7 @@ async def _verify_recorded_conflict(
     row.processing_lease_expires_at = None
     row.verification_detail = detail
     row.verified_at = _now()
+    _scrub_conflict_request(row)
     if final_state == "verified_competitor" and attempt.state == "completed":
         from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
