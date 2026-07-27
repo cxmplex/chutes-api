@@ -3153,6 +3153,9 @@ async def reserve_gpu_group(
         group.recovery_authorized_at = None
         group.recovery_started_at = None
         group.recovery_completed_at = None
+        group.last_report_id = current_report.report_id
+        group.host_key_generation = host.active_key_generation
+        group.host_boot_generation = host.boot_generation
     group.state = "reserved"
     group.management_mode = management_mode
     group.reservation_owner = workload_owner

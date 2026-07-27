@@ -3640,9 +3640,17 @@ async def test_initial_forced_recovery_reclaim_requires_host_latest_inventory(
                     )
                 )
             ).scalar_one()
+            reclaimed_group = await session.get(
+                GpuAllocationGroup,
+                reclaimed.claims.allocation_group_id,
+            )
+            host = await session.get(Host, "gpu-host")
             assert reclaimed.claims.allocation_group_id == operation.allocation_group_id
             assert reclaimed_event.current_inventory_report_id == latest_report_id
             assert reclaimed_event.current_inventory_report_id != registration_report_id
+            assert reclaimed_group.last_report_id == latest_report_id
+            assert reclaimed_group.host_key_generation == host.active_key_generation
+            assert reclaimed_group.host_boot_generation == host.boot_generation
             await session.commit()
 
     async with sessions() as session:
@@ -3667,6 +3675,55 @@ async def test_initial_forced_recovery_reclaim_requires_host_latest_inventory(
             completed_event.receipt_sha256,
             completed_event.local_release_ack_sha256,
         ) == immutable_audit
+
+    if latest_variant == "exact":
+        async with sessions() as session:
+            (
+                _response,
+                registration_request,
+                cert_pem,
+                spki_sha256,
+            ) = await _prepare_registration_request(
+                session,
+                "miner",
+                reserved_response=reclaimed,
+            )
+            attempt, lease_owner, conflict = await _claim_attempt(
+                session,
+                "192.0.2.30",
+                registration_request,
+                spki_sha256,
+                cert_pem,
+            )
+            assert lease_owner is not None
+            assert conflict is None
+            stable = await _publish_completed_registration_fixture(
+                session,
+                reclaimed,
+                registration_request,
+                cert_pem,
+                spki_sha256,
+            )
+            completed = await _complete_attempt(
+                session,
+                attempt.attempt_id,
+                lease_owner,
+                stable,
+            )
+            attempt_id = completed.attempt_id
+            registration_id = completed.registration_id
+            await session.commit()
+
+        async with sessions() as session:
+            attempt = await session.get(GpuRegistrationAttempt, attempt_id)
+            replay = await registration_attempt_response(
+                session,
+                attempt,
+                spki_sha256,
+            )
+            assert replay.state == "completed"
+            assert replay.registration_id == registration_id
+            assert replay.runtime_session is not None
 
 
 @pytest.mark.parametrize("recovery_mode", ["ownerless", "forced"])
@@ -5366,13 +5423,23 @@ async def test_miner_chutefs_session_rechecks_gpu_lineage_and_latest_attempt(
             )
 
 
-async def _prepare_registration_request(session, mode: str):
-    if mode == "platform":
+async def _prepare_registration_request(
+    session,
+    mode: str,
+    *,
+    reserved_response=None,
+):
+    if reserved_response is not None:
+        response = reserved_response
+    elif mode == "platform":
         response = await _reserve_platform_group(session)
-        selected_uuids = list(response.claims.gpu_uuids)
     else:
         response = await reserve_gpu_group(session, "gpu-host", _request())
-        selected_uuids = list(response.claims.gpu_uuids[:2])
+    selected_uuids = list(
+        response.claims.gpu_uuids
+        if mode == "platform"
+        else response.claims.gpu_uuids[:2]
+    )
     host = await session.get(Host, "gpu-host")
     await claim_gpu_reservation(
         session,
