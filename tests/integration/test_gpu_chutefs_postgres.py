@@ -435,6 +435,9 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         server_id=f"server-{uuid.uuid4().hex}",
         cert=cert,
     )
+    config_id = config.config_id
+    default_volume_id = config.default_volume_id
+    instance_id = instance.instance_id
     attestation_check = AsyncMock(return_value=None)
     monkeypatch.setattr(
         launch_sessions,
@@ -445,18 +448,19 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     request = _mtls_request(cert)
     context, issued = await launch_sessions.issue_launch_storage_session(
         db,
-        config.config_id,
+        config_id,
         request,
     )
     assert context.user_id == storage_pg.USER_ID
-    assert context.default_volume_id == config.default_volume_id
+    assert context.default_volume_id == default_volume_id
     authorized = await launch_sessions.authorize_default_volume(
         db,
         f"Bearer {issued.access_token}",
         request,
         "put",
     )
-    assert authorized.volume.volume_id == config.default_volume_id
+    assert authorized.volume.volume_id == default_volume_id
+    await db.commit()
     grant_response = await issue_default_volume_grant(
         DefaultGrantRequest(op="put"),
         request,
@@ -478,6 +482,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
             db=db,
         )
     )["auth_kind"] == "launch_default"
+    await db.commit()
 
     _, rotated = await launch_sessions.refresh_launch_storage_session(
         db,
@@ -490,12 +495,13 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     assert (
         await service.verify_grant(
             launch_grant,
-            config.default_volume_id,
+            default_volume_id,
             "put",
             db=db,
         )
         is None
     )
+    await db.commit()
     _, replayed = await launch_sessions.refresh_launch_storage_session(
         db,
         f"Bearer {issued.refresh_token}",
@@ -506,7 +512,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         (
             await db.execute(
                 select(ChuteFSLaunchSession)
-                .where(ChuteFSLaunchSession.config_id == config.config_id)
+                .where(ChuteFSLaunchSession.config_id == config_id)
                 .order_by(ChuteFSLaunchSession.generation)
             )
         )
@@ -523,11 +529,12 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
             f"Bearer {issued.refresh_token}",
             request,
         )
+    await db.rollback()
     replay_rows = list(
         (
             await db.execute(
                 select(ChuteFSLaunchSession)
-                .where(ChuteFSLaunchSession.config_id == config.config_id)
+                .where(ChuteFSLaunchSession.config_id == config_id)
                 .order_by(ChuteFSLaunchSession.generation)
             )
         )
@@ -543,6 +550,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
             request,
             "get",
         )
+    await db.rollback()
     assert (
         await launch_sessions.authorize_default_volume(
             db,
@@ -550,7 +558,8 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
             request,
             "get",
         )
-    ).instance.instance_id == instance.instance_id
+    ).instance.instance_id == instance_id
+    await db.commit()
 
     attestation_check.side_effect = HTTPException(
         status_code=403,
@@ -563,10 +572,13 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
             request,
             "list",
         )
+    await db.rollback()
     attestation_check.side_effect = None
     attestation_check.return_value = None
 
-    instance.active = False
+    current_instance = await db.get(Instance, instance_id)
+    assert current_instance is not None
+    current_instance.active = False
     await db.commit()
     with pytest.raises(HTTPException, match="inactive"):
         await launch_sessions.authorize_default_volume(
@@ -575,15 +587,130 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
             request,
             "get",
         )
+    await db.rollback()
     assert (
         await service.verify_grant(
             launch_grant,
-            config.default_volume_id,
+            default_volume_id,
             "put",
             db=db,
         )
         is None
     )
+    await db.commit()
+
+
+async def test_delayed_launch_exchange_cannot_replace_refreshed_session(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    chute = await _chute(db, storage_pg.USER_ID, f"stale-issue-{uuid.uuid4().hex}")
+    _, cert = _identity("stale-issue")
+    config, instance = await _cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"stale-issue-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(settings, "require_mtls_client_verify", True)
+    request = _mtls_request(cert)
+    launch_token = create_launch_jwt_v2(config)
+    config_id = config.config_id
+    instance_id = instance.instance_id
+
+    _, issued = await launch_sessions.exchange_launch_token(
+        db,
+        config_id,
+        launch_token,
+        request,
+    )
+    _, issue_replay = await launch_sessions.exchange_launch_token(
+        db,
+        config_id,
+        launch_token,
+        request,
+    )
+    assert issue_replay.model_dump(mode="json") == issued.model_dump(mode="json")
+
+    issued_session_id = launch_sessions._session_id_from_token(
+        issued.access_token,
+        launch_sessions._ACCESS_PREFIX,
+    )
+    issued_row = await db.get(ChuteFSLaunchSession, issued_session_id)
+    issued_row.response_replay_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    await db.commit()
+    with pytest.raises(HTTPException, match="advanced beyond this issue request"):
+        await launch_sessions.exchange_launch_token(
+            db,
+            config_id,
+            launch_token,
+            request,
+        )
+    await db.rollback()
+    pre_rotation_rows = list(
+        (
+            await db.execute(
+                select(ChuteFSLaunchSession).where(
+                    ChuteFSLaunchSession.config_id == config_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(pre_rotation_rows) == 1
+    assert pre_rotation_rows[0].session_id == issued_session_id
+    assert pre_rotation_rows[0].revoked_at is None
+
+    _, rotated = await launch_sessions.refresh_launch_storage_session(
+        db,
+        f"Bearer {issued.refresh_token}",
+        request,
+    )
+    with pytest.raises(HTTPException, match="advanced beyond this issue request"):
+        await launch_sessions.exchange_launch_token(
+            db,
+            config_id,
+            launch_token,
+            request,
+        )
+    await db.rollback()
+
+    rows = list(
+        (
+            await db.execute(
+                select(ChuteFSLaunchSession)
+                .where(ChuteFSLaunchSession.config_id == config_id)
+                .order_by(ChuteFSLaunchSession.generation)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 2
+    assert [row.generation for row in rows] == [issued.generation, rotated.generation]
+    assert rows[0].revoked_at is not None
+    assert rows[1].revoked_at is None
+    assert rows[0].rotated_from_session_id is None
+    assert rows[1].rotated_from_session_id == rows[0].session_id
+    assert rows[1].session_id == launch_sessions._session_id_from_token(
+        rotated.access_token,
+        launch_sessions._ACCESS_PREFIX,
+    )
+    authorized = await launch_sessions.authorize_default_volume(
+        db,
+        f"Bearer {rotated.access_token}",
+        request,
+        "get",
+    )
+    assert authorized.instance.instance_id == instance_id
 
 
 async def test_launch_exchange_denies_cross_config_and_requires_mtls(

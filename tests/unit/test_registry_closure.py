@@ -394,11 +394,8 @@ async def test_session_creation_persists_resolver_derived_closure(oci_graph):
     )
     existing_result = Mock()
     existing_result.scalar_one_or_none.return_value = None
-    locked_result = Mock()
-    locked_result.scalar_one.return_value = server
     db = AsyncMock()
-    db.get.return_value = reservation
-    db.execute.side_effect = [Mock(), locked_result, existing_result]
+    db.execute.return_value = existing_result
     db.add = Mock()
     closure = Mock(
         manifests=(
@@ -430,6 +427,21 @@ async def test_session_creation_persists_resolver_derived_closure(oci_graph):
         ),
         patch.object(
             registry_router,
+            "_cpu_registry_snapshot",
+            AsyncMock(return_value={"kind": "cpu"}),
+        ),
+        patch.object(
+            registry_router,
+            "acquire_gpu_lifecycle_lock",
+            AsyncMock(),
+        ),
+        patch.object(
+            registry_router,
+            "_locked_registry_authority",
+            AsyncMock(return_value=(server, reservation)),
+        ),
+        patch.object(
+            registry_router,
             "resolve_oci_descriptor_closure",
             AsyncMock(return_value=closure),
         ),
@@ -450,6 +462,7 @@ async def test_session_creation_persists_resolver_derived_closure(oci_graph):
     assert row.manifest_tag_digests == dict(closure.manifest_tag_digests)
     assert row.descriptor_closure_sha256 == closure.sha256
     assert response.expires_at > now
+    assert db.commit.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -506,13 +519,10 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
         issued_at=now,
         expires_at=now + timedelta(minutes=5),
     )
-    locked_result = Mock()
-    locked_result.scalar_one.return_value = server
     existing_result = Mock()
     existing_result.scalar_one_or_none.return_value = existing
     db = AsyncMock()
-    db.get.return_value = reservation
-    db.execute.side_effect = [Mock(), locked_result, existing_result]
+    db.execute.return_value = existing_result
     resolver = AsyncMock()
 
     with (
@@ -525,6 +535,21 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
             registry_router,
             "_current_attested_registry_server",
             AsyncMock(return_value=server),
+        ),
+        patch.object(
+            registry_router,
+            "_cpu_registry_snapshot",
+            AsyncMock(return_value={"kind": "cpu"}),
+        ),
+        patch.object(
+            registry_router,
+            "acquire_gpu_lifecycle_lock",
+            AsyncMock(),
+        ),
+        patch.object(
+            registry_router,
+            "_locked_registry_authority",
+            AsyncMock(return_value=(server, reservation)),
         ),
         patch.object(
             registry_router,
@@ -545,7 +570,7 @@ async def test_active_registry_session_is_reissued_after_lost_response(oci_graph
     assert isinstance(response.token, str)
     assert response.expires_at == existing.expires_at
     resolver.assert_awaited_once_with("owner/image", oci_graph["root_digest"])
-    db.commit.assert_not_awaited()
+    db.commit.assert_awaited_once()
 
 
 def test_registry_nginx_authenticates_probe_token_manifest_and_blob_paths():
@@ -573,6 +598,20 @@ def test_registry_scope_down_migration_refuses_ambiguous_server_sessions():
     assert "GROUP BY server_id" in migration
     assert "HAVING COUNT(*) > 1" in migration
     assert "cannot restore unique registry session per server" in migration
+    down = migration.split("-- migrate:down", maxsplit=1)[1]
+    guard_end = down.index("$$;", down.index("DO $$"))
+    lock_targets = [
+        line.split()[2]
+        for line in down[:guard_end].splitlines()
+        if line.startswith("LOCK TABLE ")
+    ]
+    assert lock_targets == [
+        "instances",
+        "jobs",
+        "launch_configs",
+        "registry_sessions",
+    ]
+    assert guard_end < down.index("DROP TRIGGER")
 
 
 @pytest.mark.asyncio
@@ -652,22 +691,12 @@ async def test_miner_launch_config_mints_and_uses_exact_registry_session(oci_gra
             "manifest_tag_digests": dict(closure.manifest_tag_digests),
         }
     )
-    locked_server = Mock()
-    locked_server.scalar_one.return_value = server
     locked_config = Mock()
     locked_config.unique.return_value.scalar_one_or_none.return_value = launch_config
     no_session = Mock()
     no_session.scalar_one_or_none.return_value = None
-    no_instance = Mock()
-    no_instance.unique.return_value.scalar_one_or_none.return_value = None
     db = AsyncMock()
-    db.execute.side_effect = [
-        Mock(),
-        locked_server,
-        locked_config,
-        no_instance,
-        no_session,
-    ]
+    db.execute.side_effect = [locked_config, no_session]
     db.add = Mock()
     body = registry_router.RegistrySessionRequestV1(
         repository="owner/image",
@@ -684,6 +713,21 @@ async def test_miner_launch_config_mints_and_uses_exact_registry_session(oci_gra
             registry_router,
             "validate_gpu_runtime_session",
             AsyncMock(return_value=(server, {"management_mode": "miner"})),
+        ),
+        patch.object(
+            registry_router,
+            "acquire_gpu_lifecycle_lock",
+            AsyncMock(),
+        ),
+        patch.object(
+            registry_router,
+            "_locked_registry_authority",
+            AsyncMock(return_value=(server, Mock())),
+        ),
+        patch.object(
+            registry_router,
+            "_miner_launch_scope_current",
+            AsyncMock(return_value=True),
         ),
         patch.object(
             registry_router,

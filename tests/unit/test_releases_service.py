@@ -1154,6 +1154,63 @@ async def test_empty_canary_list_targets_zero_hosts():
 
 
 @pytest.mark.asyncio
+async def test_already_captured_rollout_commits_lifecycle_lock_before_liveness():
+    measurements = _measurements()
+    release = _release(chute=_image())
+    release.status = RELEASE_STATUS_ACTIVE
+    release.targets_captured_at = datetime.now(timezone.utc)
+    host = Host(
+        host_id="captured-rollout-host",
+        miner_hotkey="miner",
+        tee_type=release.tee_type,
+        compute_type="cpu",
+        release_channel=release.channel,
+    )
+    target = rsvc.GuestReleaseTarget(
+        target_id="captured-rollout-target",
+        release_id=release.release_id,
+        host_id=host.host_id,
+        miner_hotkey=host.miner_hotkey,
+        tee_type=release.tee_type,
+        compute_type="cpu",
+        role="chute",
+        current_generation=1,
+        current_token_id="audit:captured-rollout-target",
+        issued_at=datetime.now(timezone.utc),
+    )
+    db = _db(release)
+    db.info = {}
+    advisory_result = Mock()
+    targets_result = Mock()
+    targets_result.scalars.return_value.all.return_value = [target]
+    hosts_result = Mock()
+    hosts_result.scalars.return_value.all.return_value = [host]
+    db.execute.side_effect = [advisory_result, targets_result, hosts_result]
+
+    async def commit_and_release_guard():
+        db.info.pop("gpu_lifecycle_lock_held", None)
+
+    db.commit.side_effect = commit_and_release_guard
+
+    async def assert_liveness_outside_lifecycle_lock(_host_id):
+        assert db.info.get("gpu_lifecycle_lock_held") is not True
+        return False
+
+    with (
+        _pinned(*measurements),
+        patch(
+            "api.agent_channel.is_agent_online",
+            AsyncMock(side_effect=assert_liveness_outside_lifecycle_lock),
+        ) as is_online,
+    ):
+        result = await rsvc.rollout_release(db, release.release_id)
+
+    assert result["dispatched"] == 0
+    is_online.assert_awaited_once_with(host.host_id)
+    assert db.commit.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_already_active_is_revalidated_before_idempotent_return():
     measurements = _measurements()
     release = _release(chute=_image())

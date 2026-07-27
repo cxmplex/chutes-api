@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import api.gpu_scheduler as gpu_scheduler
 from api.chute.schemas import NodeSelector
 from api.gpu_scheduler import (
     _create_platform_launch_config,
@@ -180,7 +181,6 @@ async def test_shared_job_uses_job_owner_with_chute_image_owner():
 
     db = AsyncMock()
     db.execute.side_effect = [
-        MagicMock(),
         scalar(chute),
         scalar(image),
         scalar(job),
@@ -338,7 +338,19 @@ async def test_platform_dispatch_rejects_miner_managed_server_before_config_crea
             server,
             SimpleNamespace(),
             None,
+            SimpleNamespace(),
         )
+
+
+def test_scheduler_binds_chutefs_before_gpu_lifecycle_and_workload_locks():
+    source = inspect.getsource(gpu_scheduler._dispatch_workload)
+    binding = source.index("await ensure_default_volume_binding")
+    lifecycle = source.index("await acquire_gpu_lifecycle_lock")
+    workload = source.index("await acquire_gpu_workload_lock")
+    assert binding < lifecycle < workload
+    assert "ensure_default_volume_binding" not in inspect.getsource(
+        gpu_scheduler._create_platform_launch_config
+    )
 
 
 def test_gpu_scheduler_has_chart_and_dev_lifecycle_wiring():
@@ -353,6 +365,10 @@ def test_gpu_scheduler_has_chart_and_dev_lifecycle_wiring():
     assert '"api.gpu_scheduler"' in compose
     assert "TRUSTED_L0_PUBLISHER_KEYS_PATH" in chart
     assert "l0-publisher-public-keys" in chart
+    assert "livenessProbe:" in chart
+    assert "--live" in chart
+    assert "readinessProbe:" in chart
+    assert "--schema-ready" in chart
     assert "TRUSTED_L0_PUBLISHER_KEYS_PATH" in compose
     assert "l0-publisher-keys.json" in compose
 
@@ -404,3 +420,100 @@ async def test_platform_teardown_survives_event_bus_failure():
         server_id="gpu-server",
         config_id="config",
     )
+
+
+class _SchemaResult:
+    def __init__(self, value):
+        self.value = value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+
+class _SchemaConnection:
+    def __init__(self, versions):
+        self.versions = versions
+        self.executions = []
+
+    async def execute(self, statement, parameters):
+        rendered = str(statement)
+        self.executions.append((rendered, parameters))
+        assert "MAX(" not in rendered.upper()
+        assert "version = :required_version" in rendered
+        required = parameters["required_version"]
+        return _SchemaResult(1 if required in self.versions else None)
+
+
+class _SchemaConnectContext:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _SchemaEngine:
+    def __init__(self, versions):
+        self.connection = _SchemaConnection(versions)
+
+    def connect(self):
+        return _SchemaConnectContext(self.connection)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_readiness_requires_exact_version_not_higher_unrelated():
+    higher_only = _SchemaEngine({"99999999999999"})
+    with patch.object(gpu_scheduler, "engine", higher_only):
+        assert await gpu_scheduler.required_gpu_schema_present() is False
+    exact = _SchemaEngine(
+        {"99999999999999", gpu_scheduler.REQUIRED_GPU_SCHEMA_VERSION}
+    )
+    with patch.object(gpu_scheduler, "engine", exact):
+        assert await gpu_scheduler.required_gpu_schema_present() is True
+    assert gpu_scheduler.scheduler_liveness_healthy() is True
+
+
+@pytest.mark.asyncio
+async def test_scheduler_does_not_elect_or_query_before_exact_schema_barrier():
+    class StopScheduler(BaseException):
+        pass
+
+    redis = AsyncMock()
+    tick = AsyncMock(side_effect=StopScheduler())
+    schedule = AsyncMock()
+    sleep = AsyncMock()
+    calls = 0
+
+    async def barrier():
+        nonlocal calls
+        calls += 1
+        assert tick.await_count == 0
+        assert schedule.await_count == 0
+        redis.set.assert_not_awaited()
+        return calls > 1
+
+    with (
+        patch.object(
+            gpu_scheduler,
+            "settings",
+            SimpleNamespace(redis_client=redis),
+        ),
+        patch.object(
+            gpu_scheduler, "required_gpu_schema_present", side_effect=barrier
+        ),
+        patch.object(gpu_scheduler, "_tick_with_lock", tick),
+        patch.object(gpu_scheduler, "schedule_once", schedule),
+        patch.object(gpu_scheduler.asyncio, "sleep", sleep),
+        patch.object(gpu_scheduler, "install_asyncio_exception_handler"),
+    ):
+        with pytest.raises(StopScheduler):
+            await gpu_scheduler.main()
+
+    assert calls == 2
+    sleep.assert_awaited_once_with(gpu_scheduler.SCHEMA_WAIT_SECONDS)
+    tick.assert_awaited_once()
+    schedule.assert_not_awaited()
+    redis.set.assert_not_awaited()
