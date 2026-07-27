@@ -9,6 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from api.chute.schemas import NodeSelector
+from api import agent_channel
 from api.host import gpu_allocations, router as host_router, service as host_service
 from api.host.locks import GPU_LIFECYCLE_LOCK_INFO_KEY
 from api.releases import service as release_service
@@ -217,6 +218,27 @@ def test_storage_external_adapters_are_guarded_and_observations_are_injected():
     locate_source = inspect.getsource(storage_service.locate_object)
     assert "observed_live_storage_ids=observed_live_storage_ids" in placement_source
     assert "observed_live_storage_ids=observed_live_storage_ids" in locate_source
+
+
+@pytest.mark.asyncio
+async def test_remaining_redis_adapters_trip_under_lifecycle_custody():
+    db = _BoundaryDb(locked=True)
+    with pytest.raises(RuntimeError, match="agent liveness Redis EXISTS"):
+        await agent_channel.is_agent_online("host-1", db=db)
+    with pytest.raises(RuntimeError, match="agent command Redis publish"):
+        await agent_channel.send_agent_command("host-1", "reboot", db=db)
+    with pytest.raises(RuntimeError, match="ChuteFS grant Redis GET"):
+        await storage_service.verify_grant("grant", "volume-1", "get", db=db)
+
+
+def test_host_control_dispatches_pass_the_guarded_database_context():
+    for function in (
+        server_service.request_host_image_upgrade,
+        server_service.request_host_reboot,
+    ):
+        source = inspect.getsource(function)
+        assert "assert_gpu_external_work_allowed" in source
+        assert "db=db" in source
 
 
 @pytest.mark.asyncio

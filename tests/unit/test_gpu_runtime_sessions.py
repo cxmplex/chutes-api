@@ -13,6 +13,7 @@ from api.server.gpu_sessions import (
     GPU_RUNTIME_SESSION_PURPOSES,
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
     _current_attestation,
+    _revocation_failed,
     _gpu_selection_matches_registration,
     latest_gpu_runtime_session,
     mint_gpu_runtime_session,
@@ -88,6 +89,19 @@ def test_miner_registration_mints_short_scoped_attested_session():
     assert payload["allowed_purposes"] == list(GPU_RUNTIME_SESSION_PURPOSES)
     assert payload["exp"] - payload["iat"] == 900
     assert int(expires_at.timestamp()) == payload["exp"]
+
+
+@pytest.mark.parametrize("value", ["future_status", "soft-pass", 7, True])
+def test_unknown_revocation_status_fails_closed(value):
+    assert _revocation_failed(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "good", "not_revoked", "authenticated_outage_grace", {}, []],
+)
+def test_explicit_nonfailure_revocation_status_remains_accepted(value):
+    assert _revocation_failed(value) is False
 
 
 @pytest.mark.asyncio

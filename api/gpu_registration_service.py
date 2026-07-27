@@ -415,6 +415,16 @@ async def issue_gpu_registration_nonce(
         expected_spki,
         request.request_generation,
     )
+    try:
+        request.client_request_id.encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "GPU registration client_request_id is not canonical for this "
+                "generation."
+            ),
+        ) from exc
     if not secrets.compare_digest(request.client_request_id, expected_request_id):
         raise HTTPException(
             status_code=409,

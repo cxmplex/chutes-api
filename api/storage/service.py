@@ -6257,6 +6257,10 @@ async def verify_grant(
     db: Optional[AsyncSession] = None,
 ) -> Optional[Dict]:
     """Verify a grant authorizes `op` on `volume_id`; returns the grant payload or None."""
+    if db is not None:
+        from api.host.locks import assert_gpu_external_work_allowed
+
+        assert_gpu_external_work_allowed(db, "ChuteFS grant Redis GET")
     raw = await settings.redis_client.get(f"storage:grant:{grant}")
     if not raw:
         return None

@@ -74,9 +74,9 @@ def _revocation_failed(value: Any) -> bool:
         "revocation_not_advertised",
     }:
         return False
-    return any(
-        marker in normalized for marker in ("revoked", "failed", "invalid", "expired")
-    )
+    # New verifier states must be explicitly classified before they can grant
+    # runtime authority. Unknown scalar values fail closed.
+    return True
 
 
 def _current_attestation(

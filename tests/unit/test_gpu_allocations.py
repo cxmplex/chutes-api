@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 from api.host import gpu_allocations, router as host_router
 from api.host.gpu_allocations import (
     GpuAllocationError,
@@ -20,6 +21,8 @@ from api.host.gpu_allocations import (
     sign_gpu_launch_claims,
 )
 from api.gpu_contracts import GpuPhysicalResultV1
+from api.gpu_contracts import GpuRegistrationNonceRequestV2
+from api.gpu_registration_service import issue_gpu_registration_nonce
 from api.host.schemas import (
     GpuInventoryGroupV1,
     GpuInventoryReportV1,
@@ -43,6 +46,24 @@ BDFS = [f"0000:{index:02x}:00.0" for index in range(1, 9)]
 GPU_CLAIM_FIXTURE_SHA256 = (
     "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197"
 )
+
+
+@pytest.mark.asyncio
+async def test_gpu_registration_nonce_rejects_non_ascii_request_id_before_db_work():
+    db = SimpleNamespace(execute=AsyncMock())
+    request = GpuRegistrationNonceRequestV2(
+        client_request_id="gpu-registration-v2-é",
+        request_generation=1,
+        launch_reservation="reservation-1." + "x" * 64,
+        claims_sha256="a" * 64,
+        server_id="server-1",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await issue_gpu_registration_nonce(db, "127.0.0.1", request, "b" * 64)
+
+    assert exc.value.status_code == 409
+    db.execute.assert_not_awaited()
 
 
 def test_gpu_claims_receive_measured_es256_envelope(monkeypatch):

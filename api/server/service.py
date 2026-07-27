@@ -2516,12 +2516,14 @@ async def request_host_image_upgrade(
         raise ServerRegistrationError(f"Host {host_id} is not registered")
     if host.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(f"Host {host_id} belongs to a different miner")
-    if not await is_agent_online(host_id):
+    assert_gpu_external_work_allowed(db, "host image upgrade liveness lookup")
+    if not await is_agent_online(host_id, db=db):
         raise ServerRegistrationError(
             f"Host {host_id} is not currently online (no control channel)"
         )
 
-    command_id = await send_agent_command(host_id, "upgrade_image", {})
+    assert_gpu_external_work_allowed(db, "host image upgrade command dispatch")
+    command_id = await send_agent_command(host_id, "upgrade_image", {}, db=db)
     logger.success(
         f"Dispatched upgrade_image to host {host_id} (command_id={command_id})"
     )
@@ -2553,7 +2555,8 @@ async def request_host_reboot(
         raise ServerRegistrationError(f"Host {host_id} is not registered")
     if host.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(f"Host {host_id} belongs to a different miner")
-    if not await is_agent_online(host_id):
+    assert_gpu_external_work_allowed(db, "host reboot liveness lookup")
+    if not await is_agent_online(host_id, db=db):
         raise ServerRegistrationError(
             f"Host {host_id} is not currently online (no control channel)"
         )
@@ -2562,6 +2565,7 @@ async def request_host_reboot(
         host_id,
         "reboot",
         {"target_l0_version": target_l0_version} if target_l0_version else {},
+        db=db,
     )
     logger.success(
         f"Dispatched reboot to host {host_id} (command_id={command_id} target_l0={target_l0_version})"

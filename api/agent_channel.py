@@ -47,8 +47,12 @@ async def mark_agent_offline(server_id: str) -> None:
     await settings.redis_client.delete(_online_key(server_id))
 
 
-async def is_agent_online(server_id: str) -> bool:
+async def is_agent_online(server_id: str, *, db=None) -> bool:
     """Whether an agent for this server is currently connected (within the heartbeat TTL)."""
+    if db is not None:
+        from api.host.locks import assert_gpu_external_work_allowed
+
+        assert_gpu_external_work_allowed(db, "agent liveness Redis EXISTS")
     return bool(await settings.redis_client.exists(_online_key(server_id)))
 
 
@@ -58,12 +62,17 @@ async def send_agent_command(
     data: Optional[dict] = None,
     *,
     command_id: Optional[str] = None,
+    db=None,
 ) -> str:
     """Publish an explicit command to a connected agent. Returns the generated command_id.
 
     The command is fanned out via redis pubsub; whichever socket-server replica holds the
     agent's session emits it to that session, others ignore it.
     """
+    if db is not None:
+        from api.host.locks import assert_gpu_external_work_allowed
+
+        assert_gpu_external_work_allowed(db, "agent command Redis publish")
     command_id = command_id or str(uuid.uuid4())
     payload = {
         "server_id": server_id,
