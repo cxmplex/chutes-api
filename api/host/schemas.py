@@ -1600,6 +1600,28 @@ class GpuRecoveryAuthorizeRequestV1(FrozenWireModel):
     reason: str = Field(..., min_length=1, max_length=2000)
 
 
+class GpuHostLossFinalizeRequestV1(FrozenWireModel):
+    """Administrator authorization to retire an unrecoverable phase-two host."""
+
+    schema: Literal["chutes.gpu-host-loss-finalize.v1"] = (
+        "chutes.gpu-host-loss-finalize.v1"
+    )
+    version: Literal[1] = 1
+    operation_id: str
+    allocation_group_id: str
+    allocation_group_generation: int = Field(..., ge=1)
+    receipt_sha256: str
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("receipt_sha256")
+    @classmethod
+    def _valid_receipt_sha256(cls, value: str) -> str:
+        value = value.lower()
+        if not _HEX_64_RE.fullmatch(value):
+            raise ValueError("receipt_sha256 must be 64 lowercase hexadecimal characters")
+        return value
+
+
 class TdQuoteCommitmentV1(FrozenWireModel):
     schema: Literal["chutes.td-quote-commitment"] = "chutes.td-quote-commitment"
     version: Literal[1] = 1

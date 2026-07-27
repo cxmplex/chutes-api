@@ -342,7 +342,9 @@ class GpuLifecycleOperation(Base):
         ),
         CheckConstraint(
             "reporting_state IN ('pending', 'physical_result', 'receipt_accepted', "
-            "'local_release_acked', 'finalized', 'quarantined')",
+            "'local_release_acked', 'finalized', 'quarantined') AND ("
+            "(phase = 'intent' AND reporting_state = 'pending') OR "
+            "(phase <> 'intent' AND reporting_state = phase))",
             name="ck_gpu_lifecycle_reporting_state",
         ),
         CheckConstraint(
@@ -377,18 +379,33 @@ class GpuLifecycleOperation(Base):
             "(phase = 'intent' AND physical_result IS NULL AND physical_result_sha256 IS NULL "
             "AND receipt_id IS NULL AND local_release_ack IS NULL AND finalized_at IS NULL) OR "
             "(phase = 'physical_result' AND physical_result IS NOT NULL "
-            "AND physical_result_sha256 ~ '^[0-9a-f]{64}$' AND receipt_id IS NULL "
+            "AND physical_result_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND result_outcome IS NULL AND receipt_id IS NULL "
+            "AND receipt_sha256 IS NULL AND receipt_accepted_at IS NULL "
             "AND local_release_ack IS NULL AND finalized_at IS NULL) OR "
             "(phase = 'receipt_accepted' AND physical_result IS NOT NULL "
+            "AND physical_result_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND result_outcome = 'accepted' "
             "AND receipt_id IS NOT NULL AND receipt_sha256 ~ '^[0-9a-f]{64}$' "
             "AND receipt_accepted_at IS NOT NULL AND local_release_ack IS NULL "
+            "AND local_release_ack_sha256 IS NULL AND local_release_acked_at IS NULL "
             "AND finalized_at IS NULL) OR "
-            "(phase = 'local_release_acked' AND receipt_id IS NOT NULL "
+            "(phase = 'local_release_acked' AND physical_result IS NOT NULL "
+            "AND physical_result_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND result_outcome = 'accepted' "
+            "AND receipt_id IS NOT NULL AND receipt_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND receipt_accepted_at IS NOT NULL "
             "AND local_release_ack IS NOT NULL "
             "AND local_release_ack_sha256 ~ '^[0-9a-f]{64}$' "
             "AND local_release_acked_at IS NOT NULL AND finalized_at IS NULL) OR "
-            "(phase = 'finalized' AND receipt_id IS NOT NULL "
-            "AND local_release_ack IS NOT NULL AND local_release_acked_at IS NOT NULL "
+            "(phase = 'finalized' AND physical_result IS NOT NULL "
+            "AND physical_result_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND result_outcome = 'accepted' "
+            "AND receipt_id IS NOT NULL AND receipt_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND receipt_accepted_at IS NOT NULL "
+            "AND local_release_ack IS NOT NULL "
+            "AND local_release_ack_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND local_release_acked_at IS NOT NULL "
             "AND finalized_at IS NOT NULL) OR "
             "(phase = 'quarantined' AND failure_code IS NOT NULL "
             "AND failure_reason IS NOT NULL AND finalized_at IS NOT NULL AND "
@@ -472,19 +489,13 @@ class GpuRecoveryAuthorization(Base):
     migration_id = Column(String, nullable=True)
     recovery_nonce = Column(String, nullable=False)
     recovery_nonce_hash = Column(String(64), nullable=False)
-    state = Column(String, nullable=False, default="issued", server_default="issued")
     authorized_by = Column(String, nullable=False)
     issued_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     expires_at = Column(DateTime(timezone=True), nullable=False)
-    consumed_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
-        CheckConstraint(
-            "state = 'issued' AND consumed_at IS NULL",
-            name="ck_gpu_recovery_authorization_state",
-        ),
         CheckConstraint(
             "host_key_generation > 0 AND host_boot_generation > 0 "
             "AND prior_host_key_generation > 0 "
@@ -510,7 +521,45 @@ class GpuRecoveryAuthorization(Base):
         Index(
             "idx_gpu_recovery_authorization_expiry",
             "expires_at",
-            postgresql_where=text("state = 'issued'"),
+        ),
+    )
+
+
+class GpuHostLossEvent(Base):
+    """Immutable administrator authorization for a permanently lost L0 host."""
+
+    __tablename__ = "gpu_host_loss_events"
+
+    event_id = Column(String, primary_key=True, default=generate_uuid)
+    operation_id = Column(
+        String,
+        ForeignKey("gpu_lifecycle_operations.operation_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    allocation_group_id = Column(
+        String,
+        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    allocation_group_generation = Column(Integer, nullable=False)
+    reservation_id = Column(
+        String,
+        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    receipt_sha256 = Column(String(64), nullable=False)
+    reason = Column(Text, nullable=False)
+    authorized_by = Column(String, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "allocation_group_generation > 0 "
+            "AND receipt_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND length(reason) BETWEEN 1 AND 2000",
+            name="ck_gpu_host_loss_event_shape",
         ),
     )
 
@@ -639,6 +688,11 @@ class GpuHotplugCommand(Base):
     dispatch_lease_owner = Column(String, nullable=True)
     dispatch_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    alerted_at = Column(DateTime(timezone=True), nullable=True)
+    last_dispatch_error = Column(Text, nullable=True)
     dispatched_at = Column(DateTime(timezone=True), nullable=True)
     ack = Column(JSONB, nullable=True)
     ack_sha256 = Column(String(64), nullable=True)
@@ -709,10 +763,111 @@ class GpuHotplugCommand(Base):
         Index(
             "idx_gpu_hotplug_dispatch",
             "state",
+            "next_attempt_at",
             "dispatch_lease_expires_at",
             "created_at",
         ),
     )
+
+
+_GPU_LIFECYCLE_TRANSITION_FUNCTION = DDL(
+    """
+    CREATE OR REPLACE FUNCTION enforce_gpu_lifecycle_transition()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF TG_OP = 'INSERT' THEN
+            IF NEW.phase <> 'intent' OR NEW.reporting_state <> 'pending' THEN
+                RAISE EXCEPTION 'GPU lifecycle operations must begin at intent';
+            END IF;
+            RETURN NEW;
+        END IF;
+        IF NEW.operation_id IS DISTINCT FROM OLD.operation_id
+           OR NEW.operation_type IS DISTINCT FROM OLD.operation_type
+           OR NEW.host_id IS DISTINCT FROM OLD.host_id
+           OR NEW.host_key_generation IS DISTINCT FROM OLD.host_key_generation
+           OR NEW.host_boot_generation IS DISTINCT FROM OLD.host_boot_generation
+           OR NEW.allocation_group_id IS DISTINCT FROM OLD.allocation_group_id
+           OR NEW.allocation_group_generation IS DISTINCT FROM OLD.allocation_group_generation
+           OR NEW.reservation_id IS DISTINCT FROM OLD.reservation_id
+           OR NEW.reservation_generation IS DISTINCT FROM OLD.reservation_generation
+           OR NEW.claims_sha256 IS DISTINCT FROM OLD.claims_sha256
+           OR NEW.process_incarnation IS DISTINCT FROM OLD.process_incarnation
+           OR NEW.topology_fingerprint IS DISTINCT FROM OLD.topology_fingerprint
+           OR NEW.gpu_bdfs IS DISTINCT FROM OLD.gpu_bdfs
+           OR NEW.gpu_uuids IS DISTINCT FROM OLD.gpu_uuids
+           OR NEW.owner_hotkey IS DISTINCT FROM OLD.owner_hotkey
+           OR NEW.stable_server_id IS DISTINCT FROM OLD.stable_server_id
+           OR NEW.management_mode IS DISTINCT FROM OLD.management_mode
+           OR NEW.migration_id IS DISTINCT FROM OLD.migration_id
+           OR NEW.recovery_authorization_id IS DISTINCT FROM OLD.recovery_authorization_id
+           OR NEW.intent IS DISTINCT FROM OLD.intent
+           OR NEW.intent_sha256 IS DISTINCT FROM OLD.intent_sha256
+           OR NEW.created_at IS DISTINCT FROM OLD.created_at
+        THEN
+            RAISE EXCEPTION 'GPU lifecycle intent identity is immutable';
+        END IF;
+        IF OLD.physical_result_sha256 IS NOT NULL AND (
+            NEW.physical_result IS DISTINCT FROM OLD.physical_result
+            OR NEW.physical_result_sha256 IS DISTINCT FROM OLD.physical_result_sha256
+        ) THEN
+            RAISE EXCEPTION 'GPU lifecycle physical result is immutable';
+        END IF;
+        IF OLD.receipt_sha256 IS NOT NULL AND (
+            NEW.result_outcome IS DISTINCT FROM OLD.result_outcome
+            OR NEW.receipt_id IS DISTINCT FROM OLD.receipt_id
+            OR NEW.receipt_sha256 IS DISTINCT FROM OLD.receipt_sha256
+            OR NEW.receipt_accepted_at IS DISTINCT FROM OLD.receipt_accepted_at
+        ) THEN
+            RAISE EXCEPTION 'GPU lifecycle receipt is immutable';
+        END IF;
+        IF OLD.local_release_ack_sha256 IS NOT NULL AND (
+            NEW.local_release_ack IS DISTINCT FROM OLD.local_release_ack
+            OR NEW.local_release_ack_sha256 IS DISTINCT FROM OLD.local_release_ack_sha256
+            OR NEW.local_release_acked_at IS DISTINCT FROM OLD.local_release_acked_at
+        ) THEN
+            RAISE EXCEPTION 'GPU lifecycle local-release ACK is immutable';
+        END IF;
+        IF OLD.finalized_at IS NOT NULL
+           AND NEW.finalized_at IS DISTINCT FROM OLD.finalized_at
+        THEN
+            RAISE EXCEPTION 'GPU lifecycle finalization time is immutable';
+        END IF;
+        IF OLD.failure_code IS NOT NULL AND (
+            NEW.failure_code IS DISTINCT FROM OLD.failure_code
+            OR NEW.failure_reason IS DISTINCT FROM OLD.failure_reason
+        ) THEN
+            RAISE EXCEPTION 'GPU lifecycle failure evidence is immutable';
+        END IF;
+        IF NEW.phase IS DISTINCT FROM OLD.phase AND NOT (
+            (OLD.phase = 'intent' AND NEW.phase IN ('physical_result', 'quarantined'))
+            OR (OLD.phase = 'physical_result' AND NEW.phase IN ('receipt_accepted', 'quarantined'))
+            OR (OLD.phase = 'receipt_accepted' AND NEW.phase IN ('local_release_acked', 'quarantined'))
+            OR (OLD.phase = 'local_release_acked' AND NEW.phase IN ('finalized', 'quarantined'))
+        ) THEN
+            RAISE EXCEPTION 'invalid GPU lifecycle phase transition %% -> %%', OLD.phase, NEW.phase;
+        END IF;
+        RETURN NEW;
+    END;
+    $$
+    """
+).execute_if(dialect="postgresql")
+
+event.listen(
+    GpuLifecycleOperation.__table__,
+    "after_create",
+    _GPU_LIFECYCLE_TRANSITION_FUNCTION,
+)
+event.listen(
+    GpuLifecycleOperation.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_gpu_lifecycle_transition
+        BEFORE INSERT OR UPDATE ON gpu_lifecycle_operations
+        FOR EACH ROW EXECUTE FUNCTION enforce_gpu_lifecycle_transition()
+        """
+    ).execute_if(dialect="postgresql"),
+)
 
 
 _GPU_RECOVERY_AUDIT_FUNCTION = DDL(
@@ -728,7 +883,7 @@ _GPU_RECOVERY_AUDIT_FUNCTION = DDL(
 
 
 event.listen(
-    GpuRecoveryAuthorization.__table__,
+    GpuLifecycleOperation.__table__,
     "after_create",
     _GPU_RECOVERY_AUDIT_FUNCTION,
 )
@@ -750,6 +905,17 @@ event.listen(
         """
         CREATE TRIGGER trg_gpu_recovery_events_immutable
         BEFORE UPDATE OR DELETE ON gpu_recovery_events
+        FOR EACH ROW EXECUTE FUNCTION forbid_gpu_recovery_audit_mutation()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    GpuHostLossEvent.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_gpu_host_loss_events_immutable
+        BEFORE UPDATE OR DELETE ON gpu_host_loss_events
         FOR EACH ROW EXECUTE FUNCTION forbid_gpu_recovery_audit_mutation()
         """
     ).execute_if(dialect="postgresql"),

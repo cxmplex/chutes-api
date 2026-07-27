@@ -1,32 +1,102 @@
 -- migrate:up
 
+-- Freeze the predecessor lineage while deriving the new exact node snapshot.
+LOCK TABLE gpu_allocation_groups IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE gpu_inventory_reports IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE gpu_launch_reservations IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE nodes IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE servers IN ACCESS EXCLUSIVE MODE;
+
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id VARCHAR;
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS gpu_process_incarnation VARCHAR;
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS gpu_inventory_report_id VARCHAR;
 
+-- Active rows must resolve through the exact current Server, reservation, and
+-- group projection. Merely sharing a group id/generation is not sufficient.
 UPDATE nodes AS node
    SET gpu_launch_reservation_id = server.gpu_launch_reservation_id,
        gpu_process_incarnation = server.gpu_process_incarnation,
        gpu_inventory_report_id = allocation_group.last_report_id
-  FROM servers AS server, gpu_allocation_groups AS allocation_group
+  FROM servers AS server,
+       gpu_allocation_groups AS allocation_group,
+       gpu_launch_reservations AS reservation
  WHERE node.server_id = server.server_id
    AND node.gpu_allocation_group_id = allocation_group.allocation_group_id
    AND node.gpu_allocation_group_generation = allocation_group.generation
    AND server.gpu_allocation_group_id = allocation_group.allocation_group_id
    AND server.gpu_allocation_group_generation = allocation_group.generation
+   AND reservation.reservation_id = server.gpu_launch_reservation_id
+   AND reservation.allocation_group_id = allocation_group.allocation_group_id
+   AND reservation.allocation_group_generation = allocation_group.generation
+   AND reservation.server_id = server.server_id
+   AND reservation.process_incarnation = server.gpu_process_incarnation
+   AND reservation.gpu_uuids ? node.uuid
+   AND node.gpu_retired_at IS NULL
    AND node.gpu_allocation_group_id IS NOT NULL
    AND node.gpu_launch_reservation_id IS NULL;
 
+-- A retired row is never schedulable, but retain its historical projection
+-- when one and only one immutable reservation resolves the old group/server/
+-- device lineage and the group is still at that generation.
+WITH retired_candidates AS (
+    SELECT node.uuid,
+           MIN(reservation.reservation_id) AS reservation_id,
+           MIN(reservation.process_incarnation) AS process_incarnation,
+           MIN(allocation_group.last_report_id) AS inventory_report_id,
+           COUNT(*) AS candidate_count
+      FROM nodes AS node
+      JOIN gpu_allocation_groups AS allocation_group
+        ON allocation_group.allocation_group_id = node.gpu_allocation_group_id
+       AND allocation_group.generation = node.gpu_allocation_group_generation
+      JOIN gpu_launch_reservations AS reservation
+        ON reservation.allocation_group_id = node.gpu_allocation_group_id
+       AND reservation.allocation_group_generation = node.gpu_allocation_group_generation
+       AND reservation.server_id = node.server_id
+       AND reservation.gpu_uuids ? node.uuid
+     WHERE node.gpu_retired_at IS NOT NULL
+       AND node.gpu_allocation_group_id IS NOT NULL
+       AND node.gpu_launch_reservation_id IS NULL
+     GROUP BY node.uuid
+)
+UPDATE nodes AS node
+   SET gpu_launch_reservation_id = candidate.reservation_id,
+       gpu_process_incarnation = candidate.process_incarnation,
+       gpu_inventory_report_id = candidate.inventory_report_id
+  FROM retired_candidates AS candidate
+ WHERE node.uuid = candidate.uuid
+   AND candidate.candidate_count = 1;
+
+-- An unresolved retired projection carries no live ownership and cannot be
+-- made exact without inventing history. Clear only that incomplete projection;
+-- active ambiguity remains a hard rollout failure below.
+UPDATE nodes
+   SET gpu_allocation_group_id = NULL,
+       gpu_allocation_group_generation = NULL,
+       gpu_launch_reservation_id = NULL,
+       gpu_process_incarnation = NULL,
+       gpu_inventory_report_id = NULL
+ WHERE gpu_retired_at IS NOT NULL
+   AND gpu_allocation_group_id IS NOT NULL
+   AND (gpu_launch_reservation_id IS NULL
+        OR gpu_process_incarnation IS NULL
+        OR gpu_inventory_report_id IS NULL);
+
 DO $$
+DECLARE
+    unresolved TEXT;
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM nodes
-         WHERE gpu_allocation_group_id IS NOT NULL
-           AND (gpu_launch_reservation_id IS NULL
-                OR gpu_process_incarnation IS NULL
-                OR gpu_inventory_report_id IS NULL)
-    ) THEN
-        RAISE EXCEPTION 'cannot establish exact GPU node reservation/process/inventory lineage';
+    SELECT string_agg(uuid::text, ', ' ORDER BY uuid::text)
+      INTO unresolved
+     FROM nodes
+     WHERE gpu_allocation_group_id IS NOT NULL
+       AND gpu_retired_at IS NULL
+       AND (gpu_launch_reservation_id IS NULL
+            OR gpu_process_incarnation IS NULL
+            OR gpu_inventory_report_id IS NULL);
+    IF unresolved IS NOT NULL THEN
+        RAISE EXCEPTION
+            'cannot establish exact GPU node reservation/process/inventory lineage for nodes: %',
+            unresolved;
     END IF;
 END
 $$;
@@ -259,6 +329,9 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
     CONSTRAINT ck_gpu_lifecycle_reporting_state CHECK (reporting_state IN (
         'pending', 'physical_result', 'receipt_accepted',
         'local_release_acked', 'finalized', 'quarantined'
+    ) AND (
+        (phase = 'intent' AND reporting_state = 'pending')
+        OR (phase <> 'intent' AND reporting_state = phase)
     )),
     CONSTRAINT ck_gpu_lifecycle_generations CHECK (
         host_key_generation > 0 AND host_boot_generation > 0
@@ -286,18 +359,33 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
         (phase = 'intent' AND physical_result IS NULL AND physical_result_sha256 IS NULL
          AND receipt_id IS NULL AND local_release_ack IS NULL AND finalized_at IS NULL)
         OR (phase = 'physical_result' AND physical_result IS NOT NULL
-         AND physical_result_sha256 ~ '^[0-9a-f]{64}$' AND receipt_id IS NULL
+         AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
+         AND result_outcome IS NULL AND receipt_id IS NULL
+         AND receipt_sha256 IS NULL AND receipt_accepted_at IS NULL
          AND local_release_ack IS NULL AND finalized_at IS NULL)
         OR (phase = 'receipt_accepted' AND physical_result IS NOT NULL
+         AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
+         AND result_outcome = 'accepted'
          AND receipt_id IS NOT NULL AND receipt_sha256 ~ '^[0-9a-f]{64}$'
          AND receipt_accepted_at IS NOT NULL AND local_release_ack IS NULL
+         AND local_release_ack_sha256 IS NULL AND local_release_acked_at IS NULL
          AND finalized_at IS NULL)
-        OR (phase = 'local_release_acked' AND receipt_id IS NOT NULL
+        OR (phase = 'local_release_acked' AND physical_result IS NOT NULL
+         AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
+         AND result_outcome = 'accepted'
+         AND receipt_id IS NOT NULL AND receipt_sha256 ~ '^[0-9a-f]{64}$'
+         AND receipt_accepted_at IS NOT NULL
          AND local_release_ack IS NOT NULL
          AND local_release_ack_sha256 ~ '^[0-9a-f]{64}$'
          AND local_release_acked_at IS NOT NULL AND finalized_at IS NULL)
-        OR (phase = 'finalized' AND receipt_id IS NOT NULL
-         AND local_release_ack IS NOT NULL AND local_release_acked_at IS NOT NULL
+        OR (phase = 'finalized' AND physical_result IS NOT NULL
+         AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
+         AND result_outcome = 'accepted'
+         AND receipt_id IS NOT NULL AND receipt_sha256 ~ '^[0-9a-f]{64}$'
+         AND receipt_accepted_at IS NOT NULL
+         AND local_release_ack IS NOT NULL
+         AND local_release_ack_sha256 ~ '^[0-9a-f]{64}$'
+         AND local_release_acked_at IS NOT NULL
          AND finalized_at IS NOT NULL)
         OR (phase = 'quarantined' AND failure_code IS NOT NULL
          AND failure_reason IS NOT NULL AND finalized_at IS NOT NULL
@@ -319,6 +407,93 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
              AND local_release_acked_at IS NOT NULL)))))
     )
 );
+
+CREATE OR REPLACE FUNCTION enforce_gpu_lifecycle_transition()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.phase <> 'intent' OR NEW.reporting_state <> 'pending' THEN
+            RAISE EXCEPTION 'GPU lifecycle operations must begin at intent';
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF NEW.operation_id IS DISTINCT FROM OLD.operation_id
+       OR NEW.operation_type IS DISTINCT FROM OLD.operation_type
+       OR NEW.host_id IS DISTINCT FROM OLD.host_id
+       OR NEW.host_key_generation IS DISTINCT FROM OLD.host_key_generation
+       OR NEW.host_boot_generation IS DISTINCT FROM OLD.host_boot_generation
+       OR NEW.allocation_group_id IS DISTINCT FROM OLD.allocation_group_id
+       OR NEW.allocation_group_generation IS DISTINCT FROM OLD.allocation_group_generation
+       OR NEW.reservation_id IS DISTINCT FROM OLD.reservation_id
+       OR NEW.reservation_generation IS DISTINCT FROM OLD.reservation_generation
+       OR NEW.claims_sha256 IS DISTINCT FROM OLD.claims_sha256
+       OR NEW.process_incarnation IS DISTINCT FROM OLD.process_incarnation
+       OR NEW.topology_fingerprint IS DISTINCT FROM OLD.topology_fingerprint
+       OR NEW.gpu_bdfs IS DISTINCT FROM OLD.gpu_bdfs
+       OR NEW.gpu_uuids IS DISTINCT FROM OLD.gpu_uuids
+       OR NEW.owner_hotkey IS DISTINCT FROM OLD.owner_hotkey
+       OR NEW.stable_server_id IS DISTINCT FROM OLD.stable_server_id
+       OR NEW.management_mode IS DISTINCT FROM OLD.management_mode
+       OR NEW.migration_id IS DISTINCT FROM OLD.migration_id
+       OR NEW.recovery_authorization_id IS DISTINCT FROM OLD.recovery_authorization_id
+       OR NEW.intent IS DISTINCT FROM OLD.intent
+       OR NEW.intent_sha256 IS DISTINCT FROM OLD.intent_sha256
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'GPU lifecycle intent identity is immutable';
+    END IF;
+
+    IF OLD.physical_result_sha256 IS NOT NULL AND (
+        NEW.physical_result IS DISTINCT FROM OLD.physical_result
+        OR NEW.physical_result_sha256 IS DISTINCT FROM OLD.physical_result_sha256
+    ) THEN
+        RAISE EXCEPTION 'GPU lifecycle physical result is immutable';
+    END IF;
+    IF OLD.receipt_sha256 IS NOT NULL AND (
+        NEW.result_outcome IS DISTINCT FROM OLD.result_outcome
+        OR NEW.receipt_id IS DISTINCT FROM OLD.receipt_id
+        OR NEW.receipt_sha256 IS DISTINCT FROM OLD.receipt_sha256
+        OR NEW.receipt_accepted_at IS DISTINCT FROM OLD.receipt_accepted_at
+    ) THEN
+        RAISE EXCEPTION 'GPU lifecycle receipt is immutable';
+    END IF;
+    IF OLD.local_release_ack_sha256 IS NOT NULL AND (
+        NEW.local_release_ack IS DISTINCT FROM OLD.local_release_ack
+        OR NEW.local_release_ack_sha256 IS DISTINCT FROM OLD.local_release_ack_sha256
+        OR NEW.local_release_acked_at IS DISTINCT FROM OLD.local_release_acked_at
+    ) THEN
+        RAISE EXCEPTION 'GPU lifecycle local-release ACK is immutable';
+    END IF;
+    IF OLD.finalized_at IS NOT NULL
+       AND NEW.finalized_at IS DISTINCT FROM OLD.finalized_at
+    THEN
+        RAISE EXCEPTION 'GPU lifecycle finalization time is immutable';
+    END IF;
+    IF OLD.failure_code IS NOT NULL AND (
+        NEW.failure_code IS DISTINCT FROM OLD.failure_code
+        OR NEW.failure_reason IS DISTINCT FROM OLD.failure_reason
+    ) THEN
+        RAISE EXCEPTION 'GPU lifecycle failure evidence is immutable';
+    END IF;
+
+    IF NEW.phase IS DISTINCT FROM OLD.phase AND NOT (
+        (OLD.phase = 'intent' AND NEW.phase IN ('physical_result', 'quarantined'))
+        OR (OLD.phase = 'physical_result' AND NEW.phase IN ('receipt_accepted', 'quarantined'))
+        OR (OLD.phase = 'receipt_accepted' AND NEW.phase IN ('local_release_acked', 'quarantined'))
+        OR (OLD.phase = 'local_release_acked' AND NEW.phase IN ('finalized', 'quarantined'))
+    ) THEN
+        RAISE EXCEPTION 'invalid GPU lifecycle phase transition % -> %', OLD.phase, NEW.phase;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS trg_gpu_lifecycle_transition ON gpu_lifecycle_operations;
+CREATE TRIGGER trg_gpu_lifecycle_transition
+BEFORE INSERT OR UPDATE ON gpu_lifecycle_operations
+FOR EACH ROW EXECUTE FUNCTION enforce_gpu_lifecycle_transition();
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_lifecycle_active_group_generation
     ON gpu_lifecycle_operations(allocation_group_id, allocation_group_generation)
     WHERE phase NOT IN ('finalized', 'quarantined');
@@ -350,14 +525,9 @@ CREATE TABLE IF NOT EXISTS gpu_recovery_authorizations (
     migration_id VARCHAR,
     recovery_nonce VARCHAR(128) NOT NULL,
     recovery_nonce_hash VARCHAR(64) NOT NULL,
-    state VARCHAR NOT NULL DEFAULT 'issued',
     authorized_by VARCHAR NOT NULL,
     issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL,
-    consumed_at TIMESTAMPTZ,
-    CONSTRAINT ck_gpu_recovery_authorization_state CHECK (
-        state = 'issued' AND consumed_at IS NULL
-    ),
     CONSTRAINT ck_gpu_recovery_authorization_generations CHECK (
         host_key_generation > 0 AND host_boot_generation > 0
         AND prior_host_key_generation > 0 AND prior_host_boot_generation > 0
@@ -375,7 +545,28 @@ CREATE TABLE IF NOT EXISTS gpu_recovery_authorizations (
     )
 );
 CREATE INDEX IF NOT EXISTS idx_gpu_recovery_authorization_expiry
-    ON gpu_recovery_authorizations(expires_at) WHERE state = 'issued';
+    ON gpu_recovery_authorizations(expires_at);
+
+CREATE TABLE IF NOT EXISTS gpu_host_loss_events (
+    event_id VARCHAR PRIMARY KEY,
+    operation_id VARCHAR NOT NULL UNIQUE
+        REFERENCES gpu_lifecycle_operations(operation_id) ON DELETE RESTRICT,
+    host_id VARCHAR NOT NULL REFERENCES hosts(host_id) ON DELETE RESTRICT,
+    allocation_group_id VARCHAR NOT NULL
+        REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT,
+    allocation_group_generation INTEGER NOT NULL,
+    reservation_id VARCHAR
+        REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT,
+    receipt_sha256 VARCHAR(64) NOT NULL,
+    reason TEXT NOT NULL,
+    authorized_by VARCHAR NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_gpu_host_loss_event_shape CHECK (
+        allocation_group_generation > 0
+        AND receipt_sha256 ~ '^[0-9a-f]{64}$'
+        AND length(reason) BETWEEN 1 AND 2000
+    )
+);
 
 CREATE TABLE IF NOT EXISTS gpu_recovery_events (
     event_id VARCHAR PRIMARY KEY,
@@ -463,6 +654,16 @@ BEGIN
             BEFORE UPDATE OR DELETE ON gpu_recovery_events
             FOR EACH ROW EXECUTE FUNCTION forbid_gpu_recovery_audit_mutation();
     END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+        WHERE tgname = 'trg_gpu_host_loss_events_immutable'
+          AND tgrelid = 'gpu_host_loss_events'::regclass
+          AND NOT tgisinternal
+    ) THEN
+        CREATE TRIGGER trg_gpu_host_loss_events_immutable
+            BEFORE UPDATE OR DELETE ON gpu_host_loss_events
+            FOR EACH ROW EXECUTE FUNCTION forbid_gpu_recovery_audit_mutation();
+    END IF;
 END
 $$;
 
@@ -485,6 +686,9 @@ CREATE TABLE IF NOT EXISTS gpu_hotplug_commands (
     dispatch_lease_owner VARCHAR,
     dispatch_lease_expires_at TIMESTAMPTZ,
     attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    alerted_at TIMESTAMPTZ,
+    last_dispatch_error TEXT,
     dispatched_at TIMESTAMPTZ,
     ack JSONB,
     ack_sha256 VARCHAR(64),
@@ -535,7 +739,7 @@ CREATE TABLE IF NOT EXISTS gpu_hotplug_commands (
     )
 );
 CREATE INDEX IF NOT EXISTS idx_gpu_hotplug_dispatch
-    ON gpu_hotplug_commands(state, dispatch_lease_expires_at, created_at);
+    ON gpu_hotplug_commands(state, next_attempt_at, dispatch_lease_expires_at, created_at);
 
 ALTER TABLE gpu_allocation_groups DROP CONSTRAINT IF EXISTS ck_gpu_allocation_group_state;
 ALTER TABLE gpu_allocation_groups ADD CONSTRAINT ck_gpu_allocation_group_state CHECK (
@@ -562,6 +766,7 @@ ALTER TABLE gpu_allocation_groups ADD CONSTRAINT ck_gpu_allocation_group_owner C
 LOCK TABLE gpu_allocation_groups IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE nodes IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE gpu_hotplug_commands IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE gpu_host_loss_events IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE gpu_lifecycle_operations IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE gpu_recovery_authorizations IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE gpu_recovery_events IN ACCESS EXCLUSIVE MODE;
@@ -577,6 +782,7 @@ BEGIN
        OR EXISTS (SELECT 1 FROM gpu_lifecycle_operations)
        OR EXISTS (SELECT 1 FROM gpu_recovery_authorizations)
        OR EXISTS (SELECT 1 FROM gpu_recovery_events)
+       OR EXISTS (SELECT 1 FROM gpu_host_loss_events)
        OR EXISTS (SELECT 1 FROM gpu_hotplug_commands)
        OR EXISTS (
            SELECT 1 FROM nodes
@@ -627,8 +833,11 @@ ALTER TABLE nodes DROP COLUMN gpu_inventory_report_id;
 
 DROP TABLE gpu_hotplug_commands;
 DROP TABLE gpu_recovery_events;
+DROP TABLE gpu_host_loss_events;
 DROP TABLE gpu_recovery_authorizations;
 DROP FUNCTION forbid_gpu_recovery_audit_mutation();
+DROP TRIGGER IF EXISTS trg_gpu_lifecycle_transition ON gpu_lifecycle_operations;
+DROP FUNCTION IF EXISTS enforce_gpu_lifecycle_transition();
 DROP TABLE gpu_lifecycle_operations;
 ALTER TABLE gpu_registration_nonces DROP CONSTRAINT fk_gpu_registration_nonce_attempt;
 DROP TABLE gpu_registration_conflicts;

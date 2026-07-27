@@ -21,6 +21,7 @@ from api.gpu_contracts import (
     GpuResetReceiptV1,
 )
 from api.gpu_models import (
+    GpuHostLossEvent,
     GpuLifecycleOperation,
     GpuRecoveryAuthorization,
     GpuRecoveryEvent,
@@ -37,6 +38,7 @@ from api.host.schemas import (
     GpuInventoryReport,
     GpuInventoryReportV1,
     GpuLaunchReservation,
+    GpuHostLossFinalizeRequestV1,
     GpuRecoveryAuthorizeRequestV1,
     canonical_sha256,
 )
@@ -377,7 +379,6 @@ def _assert_recovery_inventory(
         or claims.host_boot_id != host.boot_id
         or claims.gpu_release_id != group.gpu_release_id
         or claims.profile_contract_sha256 != group.profile_contract_sha256
-        or group.last_report_id != report.report_id
         or report.topology_fingerprint != group.topology_fingerprint
     ):
         raise GpuLifecycleError(
@@ -960,7 +961,7 @@ async def _validate_recovery_authorization(
             )
         )
     ).scalar_one_or_none()
-    if authorization.state != "issued" or revoked is not None:
+    if revoked is not None:
         raise GpuLifecycleError("GPU recovery authorization is revoked.")
     started = (
         await db.execute(
@@ -1967,6 +1968,125 @@ async def record_gpu_local_release_ack(
     )
     await db.commit()
     return response
+
+
+async def finalize_gpu_host_loss(
+    db: AsyncSession,
+    operation_id: str,
+    request: GpuHostLossFinalizeRequestV1,
+    *,
+    authorized_by: str,
+) -> GpuLifecycleOperationV1:
+    """Permanently fence custody when a phase-two L0 can never ACK again."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    row = await _locked_operation(db, operation_id)
+    existing = (
+        await db.execute(
+            select(GpuHostLossEvent)
+            .where(GpuHostLossEvent.operation_id == operation_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        expected = {
+            "operation_id": request.operation_id,
+            "allocation_group_id": request.allocation_group_id,
+            "allocation_group_generation": request.allocation_group_generation,
+            "receipt_sha256": request.receipt_sha256,
+            "reason": request.reason,
+            "authorized_by": authorized_by,
+        }
+        actual = {key: getattr(existing, key) for key in expected}
+        if actual != expected or row.phase != "quarantined":
+            raise GpuLifecycleError(
+                "Permanent GPU host-loss authorization replay changed audit bytes."
+            )
+        return await gpu_lifecycle_operation_response(db, row)
+
+    if (
+        request.operation_id != row.operation_id
+        or request.allocation_group_id != row.allocation_group_id
+        or request.allocation_group_generation != row.allocation_group_generation
+        or request.receipt_sha256 != row.receipt_sha256
+        or row.phase not in {"receipt_accepted", "local_release_acked"}
+        or row.result_outcome != "accepted"
+        or row.physical_result_sha256 is None
+        or row.receipt_id is None
+        or row.receipt_accepted_at is None
+    ):
+        raise GpuLifecycleError(
+            "Permanent GPU host-loss authorization differs from the phase-two receipt."
+        )
+    group = await _locked_group(db, row.allocation_group_id)
+    reservation = await _locked_reservation(db, row.reservation_id)
+    if (
+        group.state != "release_pending"
+        or group.generation != row.allocation_group_generation
+        or group.reservation_id != row.reservation_id
+        or group.process_incarnation != row.process_incarnation
+        or (
+            reservation is not None
+            and (
+                reservation.allocation_group_id != row.allocation_group_id
+                or reservation.allocation_group_generation
+                != row.allocation_group_generation
+                or reservation.process_incarnation != row.process_incarnation
+            )
+        )
+    ):
+        raise GpuLifecycleError(
+            "Permanent GPU host-loss authorization no longer matches exact custody."
+        )
+
+    now = _now()
+    reason = request.reason[:2000]
+    metadata = {
+        "lifecycle_operation_id": row.operation_id,
+        "receipt_id": row.receipt_id,
+        "receipt_sha256": row.receipt_sha256,
+        "authorized_by": authorized_by,
+    }
+    if reservation is not None:
+        _quarantine_reservation(
+            reservation,
+            group,
+            code="gpu_host_permanently_lost",
+            reason=reason,
+            metadata=metadata,
+            now=now,
+        )
+        await _retire_gpu_runtime_lineage(db, reservation, now, reason=reason)
+    else:
+        _quarantine_group(
+            group,
+            code="gpu_host_permanently_lost",
+            reason=reason,
+            metadata=metadata,
+            now=now,
+        )
+    row.phase = "quarantined"
+    row.reporting_state = "quarantined"
+    row.failure_code = "gpu_host_permanently_lost"
+    row.failure_reason = reason
+    row.finalized_at = now
+    row.updated_at = now
+    db.add(
+        GpuHostLossEvent(
+            event_id=f"gpu-host-loss-{generate_uuid()}",
+            operation_id=row.operation_id,
+            host_id=row.host_id,
+            allocation_group_id=row.allocation_group_id,
+            allocation_group_generation=row.allocation_group_generation,
+            reservation_id=row.reservation_id,
+            receipt_sha256=row.receipt_sha256,
+            reason=reason,
+            authorized_by=authorized_by,
+            created_at=now,
+        )
+    )
+    await db.flush()
+    return await gpu_lifecycle_operation_response(db, row, group=group)
 
 
 def lifecycle_http_error(exc: GpuLifecycleError) -> HTTPException:

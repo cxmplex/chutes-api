@@ -599,12 +599,27 @@ async def test_failed_target_cutover_rebinds_same_migration_after_exact_reset(st
         ),
         SimpleNamespace(gpu_retired_at=datetime.now(timezone.utc)),
         SimpleNamespace(
+            reservation_id="prior",
             state="quarantined",
             failure_metadata={
                 "qemu_absent": True,
                 "reset_succeeded": True,
                 "original_drivers_restored": True,
             },
+        ),
+        SimpleNamespace(
+            physical_result={
+                "qemu_absent": True,
+                "reset_succeeded": True,
+                "original_drivers_restored": True,
+            },
+            physical_result_sha256=canonical_sha256(
+                {
+                    "qemu_absent": True,
+                    "reset_succeeded": True,
+                    "original_drivers_restored": True,
+                }
+            ),
         ),
         SimpleNamespace(
             volume_passphrases={},
@@ -618,6 +633,12 @@ async def test_failed_target_cutover_rebinds_same_migration_after_exact_reset(st
             self.value = value
 
         def scalar_one_or_none(self):
+            return self.value
+
+        def scalars(self):
+            return self
+
+        def first(self):
             return self.value
 
     db = SimpleNamespace(
@@ -666,8 +687,23 @@ async def test_failed_target_cutover_rejects_ambiguous_qemu_reset():
         ),
         SimpleNamespace(gpu_retired_at=datetime.now(timezone.utc)),
         SimpleNamespace(
+            reservation_id="prior",
             state="quarantined",
             failure_metadata={"qemu_absent": False},
+        ),
+        SimpleNamespace(
+            physical_result={
+                "qemu_absent": False,
+                "reset_succeeded": True,
+                "original_drivers_restored": True,
+            },
+            physical_result_sha256=canonical_sha256(
+                {
+                    "qemu_absent": False,
+                    "reset_succeeded": True,
+                    "original_drivers_restored": True,
+                }
+            ),
         ),
         SimpleNamespace(
             volume_passphrases={},
@@ -681,6 +717,12 @@ async def test_failed_target_cutover_rejects_ambiguous_qemu_reset():
             self.value = value
 
         def scalar_one_or_none(self):
+            return self.value
+
+        def scalars(self):
+            return self
+
+        def first(self):
             return self.value
 
     db = SimpleNamespace(

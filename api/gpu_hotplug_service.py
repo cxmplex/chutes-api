@@ -24,6 +24,8 @@ from api.server.schemas import GpuLegacyMigration, Host
 
 _DISPATCH_LEASE_SECONDS = 90
 _RETRY_SECONDS = 30
+_MAX_RETRY_SECONDS = 15 * 60
+_ALERT_ATTEMPT_COUNT = 10
 
 
 class GpuHotplugError(ValueError):
@@ -38,6 +40,13 @@ class GpuHotplugGoneError(GpuHotplugError):
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _retry_delay(attempt_count: int) -> timedelta:
+    exponent = max(0, min(int(attempt_count or 0) - 1, 20))
+    return timedelta(
+        seconds=min(_RETRY_SECONDS * (2**exponent), _MAX_RETRY_SECONDS)
+    )
 
 
 def _command_from_row(row: GpuHotplugCommand) -> GpuHotplugCommandV1:
@@ -272,6 +281,7 @@ async def ensure_gpu_hotplug_command(
             payload_sha256=command.payload_sha256,
             state="pending",
             attempt_count=0,
+            next_attempt_at=now,
             created_at=now,
             updated_at=now,
         )
@@ -388,6 +398,8 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
         if row.state in {"acked", "failed"}:
             return False
         now = _now()
+        if row.state != "leased" and row.next_attempt_at > now:
+            return False
         if (
             row.state == "leased"
             and row.dispatch_lease_expires_at is not None
@@ -441,7 +453,7 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
             command.model_dump(mode="json", exclude_none=True),
             command_id=command.command_id,
         )
-    except Exception:
+    except Exception as exc:
         async with get_session() as db:
             await acquire_gpu_lifecycle_lock(db)
             row = (
@@ -460,6 +472,10 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
                 row.dispatch_lease_owner = None
                 row.dispatch_lease_expires_at = None
                 row.updated_at = _now()
+                row.next_attempt_at = row.updated_at + _retry_delay(row.attempt_count)
+                row.last_dispatch_error = str(exc)[:2000]
+                if row.attempt_count >= _ALERT_ATTEMPT_COUNT:
+                    row.alerted_at = row.alerted_at or row.updated_at
                 await db.commit()
         raise
 
@@ -482,13 +498,17 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
         row.dispatch_lease_owner = None
         row.dispatch_lease_expires_at = None
         row.dispatched_at = _now()
+        row.next_attempt_at = row.dispatched_at + _retry_delay(row.attempt_count)
+        row.last_dispatch_error = None
+        if row.attempt_count >= _ALERT_ATTEMPT_COUNT:
+            row.alerted_at = row.alerted_at or row.dispatched_at
         row.updated_at = row.dispatched_at
         await db.commit()
     return True
 
 
 async def retry_due_gpu_hotplug_commands() -> None:
-    cutoff = _now() - timedelta(seconds=_RETRY_SECONDS)
+    now = _now()
     async with get_session() as db:
         command_ids = list(
             (
@@ -506,11 +526,15 @@ async def retry_due_gpu_hotplug_commands() -> None:
                             ),
                             (
                                 (GpuHotplugCommand.state == "dispatched")
-                                & (GpuHotplugCommand.dispatched_at <= cutoff)
+                                & (GpuHotplugCommand.next_attempt_at <= now)
                             ),
                         )
+                        & (GpuHotplugCommand.next_attempt_at <= now)
                     )
-                    .order_by(GpuHotplugCommand.created_at)
+                    .order_by(
+                        GpuHotplugCommand.next_attempt_at,
+                        GpuHotplugCommand.created_at,
+                    )
                     .limit(100)
                 )
             )

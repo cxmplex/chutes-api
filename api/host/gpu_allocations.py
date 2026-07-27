@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from sqlalchemy import delete, or_, select, text, update
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
@@ -235,22 +235,48 @@ async def _require_resumable_legacy_migration(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    failure_metadata = (
-        dict(prior_reservation.failure_metadata or {})
+    from api.gpu_models import GpuLifecycleOperation
+
+    accepted_reset = (
+        (
+            await db.execute(
+                select(GpuLifecycleOperation)
+                .where(
+                    GpuLifecycleOperation.reservation_id
+                    == (
+                        prior_reservation.reservation_id
+                        if prior_reservation is not None
+                        else None
+                    ),
+                    GpuLifecycleOperation.result_outcome == "accepted",
+                    GpuLifecycleOperation.phase.in_(("finalized", "quarantined")),
+                    GpuLifecycleOperation.physical_result.isnot(None),
+                    GpuLifecycleOperation.physical_result_sha256.isnot(None),
+                    GpuLifecycleOperation.receipt_id.isnot(None),
+                    GpuLifecycleOperation.receipt_sha256.isnot(None),
+                    GpuLifecycleOperation.local_release_ack.isnot(None),
+                    GpuLifecycleOperation.local_release_ack_sha256.isnot(None),
+                )
+                .order_by(GpuLifecycleOperation.created_at.desc())
+                .with_for_update()
+            )
+        ).scalars().first()
         if prior_reservation is not None
+        else None
+    )
+    physical_result = (
+        dict(accepted_reset.physical_result or {})
+        if accepted_reset is not None
         else {}
     )
     qemu_reset_proven = bool(
         prior_reservation is not None
-        and (
-            prior_reservation.state == "released"
-            or (
-                prior_reservation.state == "quarantined"
-                and failure_metadata.get("qemu_absent") is True
-                and failure_metadata.get("reset_succeeded") is True
-                and failure_metadata.get("original_drivers_restored") is True
-            )
-        )
+        and accepted_reset is not None
+        and canonical_sha256(physical_result)
+        == accepted_reset.physical_result_sha256
+        and physical_result.get("qemu_absent") is True
+        and physical_result.get("reset_succeeded") is True
+        and physical_result.get("original_drivers_restored") is True
     )
     legacy_config = (
         await db.execute(
@@ -822,11 +848,21 @@ def _quarantine_group(
     now: Optional[datetime] = None,
 ) -> None:
     now = now or _utcnow()
+    failure_metadata = metadata or {}
+    if (
+        group.state == "quarantined"
+        and group.failure_code == code
+        and group.failure_reason == reason
+        and dict(group.failure_metadata or {}) == failure_metadata
+    ):
+        # Reconciliation runs frequently. An exact replay must not rewrite the
+        # first fence time or churn the durable diagnostic projection.
+        return
     group.state = "quarantined"
     group.quarantined_at = now
     group.failure_code = code
     group.failure_reason = reason
-    group.failure_metadata = metadata or {}
+    group.failure_metadata = failure_metadata
     group.updated_at = now
 
 
@@ -840,11 +876,19 @@ def _quarantine_reservation(
     now: Optional[datetime] = None,
 ) -> None:
     now = now or _utcnow()
-    reservation.state = "quarantined"
-    reservation.quarantined_at = now
-    reservation.failure_code = code
-    reservation.failure_reason = reason
-    reservation.failure_metadata = metadata or {}
+    failure_metadata = metadata or {}
+    reservation_replay = bool(
+        reservation.state == "quarantined"
+        and reservation.failure_code == code
+        and reservation.failure_reason == reason
+        and dict(reservation.failure_metadata or {}) == failure_metadata
+    )
+    if not reservation_replay:
+        reservation.state = "quarantined"
+        reservation.quarantined_at = now
+        reservation.failure_code = code
+        reservation.failure_reason = reason
+        reservation.failure_metadata = failure_metadata
     _quarantine_group(group, code=code, reason=reason, metadata=metadata, now=now)
 
 
@@ -1977,11 +2021,8 @@ async def reconcile_gpu_inventory(
                         "GPU allocation group remains quarantined; exact fresh "
                         "inventory is retained only for explicit recovery."
                     )
-                    # A signed report can advance current-host evidence without
-                    # changing quarantine custody, generation, topology, or owner.
-                    allocation_group.host_key_generation = report.host_key_generation
-                    allocation_group.host_boot_generation = report.host_boot_generation
-                    allocation_group.last_report_id = report.report_id
+                    # Keep old key/boot/report custody immutable. Recovery binds
+                    # this current signed report separately before advancing it.
                     allocation_group.last_seen_at = now
                     allocation_group.updated_at = now
                 else:
@@ -3590,7 +3631,7 @@ async def _retire_gpu_runtime_lineage(
                 active=False,
                 verified=False,
                 verification_error="GPU allocation reset and retired",
-                stop_billing_at=naive_now,
+                stop_billing_at=func.coalesce(Instance.stop_billing_at, naive_now),
             )
         )
         await db.execute(

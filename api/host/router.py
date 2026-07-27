@@ -36,6 +36,7 @@ from api.gpu_lifecycle_service import (
     authorize_gpu_recovery,
     create_gpu_lifecycle_operation,
     get_gpu_lifecycle_operation,
+    finalize_gpu_host_loss,
     record_gpu_local_release_ack,
     record_gpu_physical_result,
     start_gpu_recovery,
@@ -78,6 +79,7 @@ from api.host.schemas import (
     HostEnrollmentStatusV1,
     HostEnrollmentStatusV2,
     HostIdentityDurabilityAckV1,
+    GpuHostLossFinalizeRequestV1,
     GpuHostStorageReadinessV1,
     HostKeyGeneration,
     HostProvisioningHeartbeatV1,
@@ -1133,6 +1135,43 @@ async def authorize_gpu_group_recovery_endpoint(
                 "GPU recovery authorization was persisted but host command "
                 f"dispatch failed for {allocation_group_id}: {dispatch_exc}"
             )
+        return result
+    except GpuLifecycleError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/gpu/groups/{allocation_group_id}/lifecycle/operations/{operation_id}/host-lost",
+    response_model=GpuLifecycleOperationV1,
+    response_model_exclude_none=True,
+)
+async def finalize_gpu_host_loss_endpoint(
+    allocation_group_id: str,
+    operation_id: str,
+    body: GpuHostLossFinalizeRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(raise_not_found=False)),
+):
+    """Permanently fence a phase-two group whose original L0 cannot return."""
+
+    _require_admin(current_user)
+    if (
+        body.operation_id != operation_id
+        or body.allocation_group_id != allocation_group_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="GPU host-loss request identity differs from its path.",
+        )
+    try:
+        result = await finalize_gpu_host_loss(
+            db,
+            operation_id,
+            body,
+            authorized_by=str(current_user.user_id),
+        )
+        await db.commit()
         return result
     except GpuLifecycleError as exc:
         await db.rollback()
