@@ -3001,9 +3001,12 @@ async def process_runtime_attestation(
             assert claims_snapshot is not None
             evidence_count = len(args.gpu_evidence or [])
             expected_count = len(claims_snapshot.gpu_uuids)
-            if evidence_count != expected_count:
+            if evidence_count == 0 or (
+                claims_snapshot.management_mode == "platform"
+                and evidence_count != expected_count
+            ):
                 raise InvalidGpuEvidenceError(
-                    "GPU operational attestation requires exact whole-reservation evidence."
+                    "GPU operational evidence does not match its management-mode selection."
                 )
             assert_gpu_external_work_allowed(db, "runtime NVIDIA evidence verification")
             verified_gpu_evidence = await verify_gpu_evidence(
@@ -3011,7 +3014,9 @@ async def process_runtime_attestation(
                 runtime_evidence_nonce,
             )
             _assert_reserved_nvidia_devices(
-                claims_snapshot, verified_gpu_evidence, require_exact=True
+                claims_snapshot,
+                verified_gpu_evidence,
+                require_exact=claims_snapshot.management_mode == "platform",
             )
 
         # Compare-and-set phase: refetch every trust-bearing row after external
@@ -3061,9 +3066,25 @@ async def process_runtime_attestation(
                 raise NonceError(
                     "GPU launch claims changed during evidence verification."
                 )
-            await _validate_runtime_gpu_selection(
+            selected_uuids = await _validate_runtime_gpu_selection(
                 db, server, reservation, claims, verified_gpu_evidence
             )
+            from api.server.gpu_sessions import require_completed_gpu_registration
+
+            registration = await require_completed_gpu_registration(
+                db, reservation, None, server
+            )
+            runtime_certificates = tuple(
+                item.attestation_certificate_sha256
+                for item in verified_gpu_evidence.devices
+            )
+            if (
+                tuple(selected_uuids) != registration.gpu_uuids
+                or runtime_certificates != registration.gpu_certificate_sha256s
+            ):
+                raise InvalidGpuEvidenceError(
+                    "GPU runtime evidence differs from the immutable registered selection."
+                )
             gpu_lineage = _gpu_attestation_lineage(
                 reservation,
                 claims,

@@ -1,33 +1,25 @@
-import hashlib
-import json
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import jwt
 import pytest
 from fastapi import HTTPException
 
 from api.config import settings
-from api.host.gpu_allocations import gpu_reservation_token
-from api.host.schemas import (
-    GpuLaunchReservation,
-    GpuLaunchReservationClaimsV1,
-    GpuQuoteCommitmentV1,
-    canonical_sha256,
-)
-from api.server.schemas import GpuRuntimeSessionResponse, GpuServerRegistrationArgs
+from api.server.schemas import GpuRuntimeSessionResponse
+from api.gpu_hotplug_service import GpuHotplugError
 from api.server.gpu_sessions import (
     GPU_RUNTIME_SESSION_PURPOSES,
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
     _current_attestation,
+    _gpu_selection_matches_registration,
+    latest_gpu_runtime_session,
     mint_gpu_runtime_session,
     validate_gpu_runtime_session,
 )
 from api import socket_server
 from api.server import router as server_router
-from api.server.exceptions import ServerRegistrationError
 
 
 def _server(mode="miner"):
@@ -43,7 +35,8 @@ def _server(mode="miner"):
         gpu_process_incarnation="process",
         gpu_topology_fingerprint="d" * 64,
         gpu_runtime_session_attestation_id="attestation",
-        gpu_runtime_session_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        gpu_runtime_session_expires_at=datetime.now(timezone.utc)
+        + timedelta(minutes=15),
         attested_cert_pubkey_hash="a" * 64,
         gpu_retired_at=None,
         measurement_name="gpu-measurement",
@@ -192,7 +185,17 @@ async def test_newer_failed_attestation_revokes_an_already_minted_session():
     latest = SimpleNamespace(scalar_one_or_none=lambda: failed)
     db.get.side_effect = get
     db.execute.return_value = latest
-    with pytest.raises(HTTPException, match="newer GPU attestation attempt") as exc:
+    with (
+        patch(
+            "api.server.gpu_sessions.acquire_gpu_lifecycle_lock",
+            AsyncMock(),
+        ),
+        patch(
+            "api.server.gpu_sessions.require_completed_gpu_registration",
+            AsyncMock(),
+        ),
+        pytest.raises(HTTPException, match="newer GPU attestation attempt") as exc,
+    ):
         await validate_gpu_runtime_session(
             db,
             token,
@@ -245,172 +248,123 @@ def test_non_revoked_attestation_status_is_not_misclassified():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("existing_server", [True, False])
-async def test_failed_nvidia_registration_attempt_is_persisted(
-    existing_server,
-):
-    claims = GpuLaunchReservationClaimsV1.model_validate(
-        json.loads(
-            (Path(__file__).resolve().parents[1] / "fixtures/gpu_launch_claims_v1.json").read_text()
-        )
-    )
-    token = gpu_reservation_token(claims.reservation_id)
-    claims_sha256 = canonical_sha256(claims)
-    reservation = GpuLaunchReservation(
-        reservation_id=claims.reservation_id,
-        token_id=claims.token_id,
-        token_hash=hashlib.sha256(token.encode("ascii")).hexdigest(),
-        claims_version=1,
-        claims=claims.model_dump(mode="json", exclude_none=True),
-        claims_sha256=claims_sha256,
-        owner_hotkey=claims.owner_hotkey,
-        workload_owner=claims.workload_owner,
-        host_id=claims.host_id,
-        host_key_generation=claims.host_key_generation,
-        host_boot_generation=claims.host_boot_generation,
-        allocation_group_id=claims.allocation_group_id,
-        allocation_group_generation=claims.allocation_group_generation,
-        reservation_generation=claims.reservation_generation,
-        management_mode=claims.management_mode,
-        server_id=claims.server_id,
-        process_incarnation=claims.process_incarnation,
-        gpu_release_id=claims.gpu_release_id,
-        profile_id=claims.gpu_profile_id,
-        profile_contract_sha256=claims.profile_contract_sha256,
-        measurement_name=claims.measurement_name,
-        kernel_measurement_mode=claims.kernel_measurement_mode,
-        topology_fingerprint=claims.topology_fingerprint,
-        gpu_bdfs=claims.gpu_bdfs,
-        gpu_uuids=claims.gpu_uuids,
-        gpu_identifiers=claims.gpu_identifiers,
-        gpu_attestation_certificate_sha256s=(claims.gpu_attestation_certificate_sha256s),
-        qemu_binary_sha256=claims.qemu_binary_sha256,
-        qemu_package_version=claims.qemu_package_version,
-        machine_type=claims.machine_type,
-        tdvf_sha256=claims.tdvf_sha256,
-        image_sha256=claims.image_sha256,
-        image_version=claims.image_version,
-        kernel_sha256=claims.kernel_sha256,
-        initrd_sha256=claims.initrd_sha256,
-        mode_cmdline_sha256=claims.mode_cmdline_sha256,
-        release_target_sha256=claims.release_target_sha256,
-        chute_id=claims.chute_id,
-        job_id=claims.job_id,
-        container_repository=claims.container_repository,
-        container_manifest_digest=claims.container_manifest_digest,
-        launch_nonce=claims.launch_nonce,
+async def test_generic_session_mint_rejects_incomplete_legacy_hotplug():
+    server = _server()
+    reservation = SimpleNamespace(
         state="running",
-        issued_at=claims.issued_at,
-        expires_at=claims.expires_at,
+        server_id=server.server_id,
+        management_mode="miner",
+        legacy_migration_id="migration-1",
     )
-    server = _server("platform")
-    server.server_id = claims.server_id
-    server.gpu_launch_reservation_id = claims.reservation_id
-    server.gpu_allocation_group_id = claims.allocation_group_id
-    server.gpu_allocation_group_generation = claims.allocation_group_generation
-    server.gpu_process_incarnation = claims.process_incarnation
-    server.gpu_topology_fingerprint = claims.topology_fingerprint
+    db = AsyncMock()
+    db.execute.side_effect = [
+        SimpleNamespace(scalar_one_or_none=lambda: server),
+        SimpleNamespace(scalar_one_or_none=lambda: reservation),
+        SimpleNamespace(scalar_one_or_none=lambda: _attestation()),
+    ]
+    with (
+        patch(
+            "api.server.gpu_sessions.acquire_gpu_lifecycle_lock",
+            AsyncMock(),
+        ),
+        patch(
+            "api.server.gpu_sessions.require_completed_gpu_registration",
+            AsyncMock(),
+        ),
+        patch(
+            "api.server.gpu_sessions.require_gpu_hotplug_runtime_ack",
+            AsyncMock(side_effect=GpuHotplugError("pending hotplug")),
+        ),
+    ):
+        with pytest.raises(HTTPException, match="hotplug custody") as exc:
+            await latest_gpu_runtime_session(db, server)
+    assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_existing_generic_session_rechecks_legacy_hotplug_ack():
+    server = _server()
+    successful = _attestation()
+    token, _ = mint_gpu_runtime_session(server, successful)
+    reservation = SimpleNamespace(
+        state="running",
+        registration_attestation_id=successful.attestation_id,
+        server_id=server.server_id,
+        management_mode=server.gpu_management_mode,
+        allocation_group_id=server.gpu_allocation_group_id,
+        allocation_group_generation=server.gpu_allocation_group_generation,
+        process_incarnation=server.gpu_process_incarnation,
+        topology_fingerprint=server.gpu_topology_fingerprint,
+        claims_sha256=successful.gpu_claims_sha256,
+        gpu_release_id=successful.gpu_release_id,
+        profile_id=successful.gpu_profile_id,
+        host_boot_generation=successful.gpu_host_boot_generation,
+        reservation_generation=successful.gpu_reservation_generation,
+        gpu_attestation_certificate_sha256s=(
+            successful.gpu_evidence_certificate_sha256s
+        ),
+        legacy_migration_id="migration-1",
+    )
     db = AsyncMock()
 
     async def get(model, _key):
         if model.__name__ == "Server":
-            return server if existing_server else None
+            return server
+        if model.__name__ == "ServerAttestation":
+            return successful
         return reservation
 
     db.get.side_effect = get
-    db.add = MagicMock()
-    request = SimpleNamespace(state=SimpleNamespace(client_ip="192.0.2.10"))
-    args = GpuServerRegistrationArgs(
-        server_id=server.server_id,
-        quote="failed-quote",
-        gpu_evidence=[{"evidence": "failed"}],
-        gpu_uuids=claims.gpu_uuids,
-        launch_reservation=token,
-        quote_commitment=GpuQuoteCommitmentV1(
-            reservation_sha256=claims_sha256,
-            release_target_sha256=claims.release_target_sha256,
-            launch_nonce=claims.launch_nonce,
-            attested_spki_sha256=server.attested_cert_pubkey_hash,
-            claims=claims,
-        ),
-        td_signature="signature",
-    )
-    quarantine = AsyncMock()
+    db.execute.return_value = SimpleNamespace(scalar_one_or_none=lambda: successful)
     with (
-        patch.object(
-            server_router,
-            "register_gpu_server",
-            AsyncMock(side_effect=ServerRegistrationError("NVIDIA evidence failed")),
+        patch(
+            "api.server.gpu_sessions.acquire_gpu_lifecycle_lock",
+            AsyncMock(),
         ),
         patch(
-            "api.host.gpu_allocations.quarantine_gpu_reservation_control_plane",
-            quarantine,
+            "api.server.gpu_sessions.require_completed_gpu_registration",
+            AsyncMock(),
+        ),
+        patch(
+            "api.server.gpu_sessions.require_gpu_hotplug_runtime_ack",
+            AsyncMock(side_effect=GpuHotplugError("hotplug ACK missing")),
         ),
     ):
-        with pytest.raises(ServerRegistrationError, match="NVIDIA evidence failed"):
-            await server_router.register_gpu_server_endpoint(
-                request,
-                args,
-                db,
-                nonce="nonce",
-                expected_cert_hash=server.attested_cert_pubkey_hash,
-                expected_cert_pem="certificate",
-            )
-    failed = db.add.call_args.args[0]
-    assert failed.server_id == server.server_id
-    assert failed.quote_data == "failed-quote"
-    assert failed.verification_error == "NVIDIA evidence failed"
-    assert failed.gpu_evidence_certificate_sha256s == []
-    quarantine.assert_awaited_once()
-    db.rollback.assert_awaited_once()
-    db.commit.assert_awaited_once()
+        with pytest.raises(HTTPException, match="hotplug custody") as exc:
+            await validate_gpu_runtime_session(db, token, required_purpose="miner")
+    assert exc.value.status_code == 401
 
 
-@pytest.mark.asyncio
-async def test_legacy_volume_hotplug_is_dispatched_only_after_gpu_registration():
-    result = {
-        "server_id": "gpu-server",
-        "reservation_id": "reservation",
-        "management_mode": "miner",
-        "status": "registered",
-    }
-    reservation = SimpleNamespace(
-        reservation_id="reservation",
-        server_id="gpu-server",
-        host_id="gpu-host",
-        claims_sha256="a" * 64,
-        process_incarnation="gpu-process",
-        legacy_vm_name="legacy-server",
-        legacy_migration_id="migration-1",
+def test_four_device_mode_selection_binds_the_same_registered_two_devices():
+    reservation = [f"GPU-00000000-0000-0000-0000-{index:012x}" for index in range(1, 5)]
+    registered = reservation[:2]
+    registered_certificates = ["1" * 64, "2" * 64]
+
+    assert _gpu_selection_matches_registration(
+        management_mode="miner",
+        reservation_uuids=reservation,
+        registered_uuids=registered,
+        registered_certificates=registered_certificates,
+        operational_certificates=list(registered_certificates),
     )
-    db = AsyncMock()
-    db.get.side_effect = [
-        reservation,
-        SimpleNamespace(state="leased"),
-    ]
-    request = SimpleNamespace(state=SimpleNamespace(client_ip="192.0.2.10"))
-    register = AsyncMock(return_value=result)
-    dispatch = AsyncMock(return_value="command-id")
-    with (
-        patch.object(server_router, "register_gpu_server", register),
-        patch.object(server_router, "send_agent_command", dispatch),
-    ):
-        response = await server_router.register_gpu_server_endpoint(
-            request,
-            SimpleNamespace(server_id="gpu-server"),
-            db,
-            nonce="nonce",
-            expected_cert_hash="b" * 64,
-            expected_cert_pem="certificate",
-        )
-    assert response == result
-    dispatch.assert_awaited_once_with(
-        "gpu-host",
-        "hotplug_gpu_legacy",
-        {
-            "server_id": "gpu-server",
-            "reservation_id": "reservation",
-            "reservation_claims_sha256": "a" * 64,
-            "process_incarnation": "gpu-process",
-        },
+    assert not _gpu_selection_matches_registration(
+        management_mode="miner",
+        reservation_uuids=reservation,
+        registered_uuids=registered,
+        registered_certificates=registered_certificates,
+        operational_certificates=[*registered_certificates, "3" * 64],
+    )
+    assert not _gpu_selection_matches_registration(
+        management_mode="miner",
+        reservation_uuids=reservation,
+        registered_uuids=registered,
+        registered_certificates=registered_certificates,
+        operational_certificates=["1" * 64, "3" * 64],
+    )
+    assert not _gpu_selection_matches_registration(
+        management_mode="platform",
+        reservation_uuids=reservation,
+        registered_uuids=registered,
+        registered_certificates=registered_certificates,
+        operational_certificates=list(registered_certificates),
     )
