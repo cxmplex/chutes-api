@@ -7,7 +7,10 @@ CPU size matrix or GPU profile-by-management-mode matrix before desired state ca
 
 import hashlib
 import re
+import shutil
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional
 
@@ -63,9 +66,105 @@ from api.releases.schemas import (
 )
 from api.server.schemas import Host, Server, ServerAttestation
 from api.host.locks import (
+    GPU_LIFECYCLE_LOCK_INFO_KEY,
     acquire_gpu_lifecycle_lock,
     assert_gpu_external_work_allowed,
 )
+
+
+_PROVENANCE_VERIFICATION_CACHE_MAX = 256
+_PROVENANCE_VERIFICATION_CACHE: OrderedDict[tuple[str, ...], dict] = OrderedDict()
+_PROVENANCE_SNAPSHOT_INFO_KEY = "release_provenance_verification_snapshot_keys"
+
+
+def _provenance_verifier_identity() -> str:
+    configured = str(settings.provenance_cosign_binary)
+    resolved = shutil.which(configured)
+    if resolved is None and "/" in configured:
+        resolved = str(Path(configured).resolve())
+    if resolved is None:
+        return f"unresolved:{configured}"
+    try:
+        stat = Path(resolved).stat()
+    except OSError:
+        return f"unavailable:{resolved}"
+    return ":".join(
+        str(value)
+        for value in (
+            resolved,
+            stat.st_dev,
+            stat.st_ino,
+            stat.st_size,
+            stat.st_mtime_ns,
+            stat.st_ctime_ns,
+        )
+    )
+
+
+def _provenance_verification_key(payload: str, signature: str) -> tuple[str, ...]:
+    """Bind one cached cosign result to exact payload, signature, key, and verifier path."""
+
+    key_path = Path(settings.trusted_provenance_public_key_path)
+    try:
+        key_sha256 = hashlib.sha256(key_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ProvenanceError(
+            f"trusted provenance public key is unavailable: {key_path}"
+        ) from exc
+    return (
+        hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        hashlib.sha256(signature.encode("utf-8")).hexdigest(),
+        str(key_path.resolve()),
+        key_sha256,
+        _provenance_verifier_identity(),
+    )
+
+
+def _verified_provenance_document(
+    db: Optional[AsyncSession],
+    *,
+    image_role: str,
+    payload: str,
+    signature: str,
+) -> dict:
+    """Return an exact cached verification or run cosign only outside lifecycle locks."""
+
+    if db is None:
+        return verify_provenance_signature(
+            payload,
+            signature,
+            settings.trusted_provenance_public_key_path,
+            cosign_binary=settings.provenance_cosign_binary,
+        )
+    key = _provenance_verification_key(payload, signature)
+    snapshot_keys = db.info.setdefault(_PROVENANCE_SNAPSHOT_INFO_KEY, set())
+    cached = _PROVENANCE_VERIFICATION_CACHE.get(key)
+    if db.info.get(GPU_LIFECYCLE_LOCK_INFO_KEY):
+        if key not in snapshot_keys or cached is None:
+            raise ProvenanceError(
+                "release provenance snapshot is absent or was evicted before locked refetch"
+            )
+        _PROVENANCE_VERIFICATION_CACHE.move_to_end(key)
+        return cached
+    if cached is not None:
+        snapshot_keys.add(key)
+        _PROVENANCE_VERIFICATION_CACHE.move_to_end(key)
+        return cached
+    assert_gpu_external_work_allowed(
+        db, f"{image_role} release provenance cosign verification"
+    )
+    document = verify_provenance_signature(
+        payload,
+        signature,
+        settings.trusted_provenance_public_key_path,
+        cosign_binary=settings.provenance_cosign_binary,
+    )
+    _PROVENANCE_VERIFICATION_CACHE[key] = document
+    snapshot_keys.add(key)
+    _PROVENANCE_VERIFICATION_CACHE.move_to_end(key)
+    while len(_PROVENANCE_VERIFICATION_CACHE) > _PROVENANCE_VERIFICATION_CACHE_MAX:
+        _PROVENANCE_VERIFICATION_CACHE.popitem(last=False)
+    return document
 
 
 class ReleaseError(Exception):
@@ -235,6 +334,8 @@ def _validate_gpu_image_provenance(
     release: GuestRelease,
     image: dict,
     loaded_by_name: dict,
+    *,
+    db: Optional[AsyncSession] = None,
 ) -> None:
     """Require one strict direct-TDX GPU provenance and complete profile/mode pin matrix."""
 
@@ -280,11 +381,11 @@ def _validate_gpu_image_provenance(
         raise ReleaseError("GPU release activation requires canonical schema-version 3 provenance.")
     try:
         if signature:
-            provenance = verify_provenance_signature(
-                payload,
-                signature,
-                settings.trusted_provenance_public_key_path,
-                cosign_binary=settings.provenance_cosign_binary,
+            provenance = _verified_provenance_document(
+                db,
+                image_role="gpu",
+                payload=payload,
+                signature=signature,
             )
         elif unsigned_debug_allowed:
             provenance = load_canonical_provenance(payload)
@@ -406,6 +507,8 @@ def _validate_image_provenance(
     image_role: str,
     image: dict,
     loaded_by_name: dict,
+    *,
+    db: Optional[AsyncSession] = None,
 ) -> None:
     """Require one image to match signed build provenance and a complete CPU pin matrix."""
     names = image.get("measurement_names") or []
@@ -571,11 +674,11 @@ def _validate_image_provenance(
     if payload:
         try:
             if signature:
-                provenance = verify_provenance_signature(
-                    payload,
-                    signature,
-                    settings.trusted_provenance_public_key_path,
-                    cosign_binary=settings.provenance_cosign_binary,
+                provenance = _verified_provenance_document(
+                    db,
+                    image_role=image_role,
+                    payload=payload,
+                    signature=signature,
                 )
             elif unsigned_debug_allowed:
                 provenance = load_canonical_provenance(payload)
@@ -954,6 +1057,52 @@ async def _lock_release_streams(
     return {row.compute_type: row for row in active_rows}
 
 
+def _release_validation_view(
+    release: GuestRelease,
+    *,
+    images: Optional[dict] = None,
+) -> SimpleNamespace:
+    """Detached release input used only for pre-lock provenance verification."""
+
+    return SimpleNamespace(
+        release_id=release.release_id,
+        channel=release.channel,
+        tee_type=release.tee_type,
+        compute_type=release.compute_type or "cpu",
+        images=(images if images is not None else release.images),
+    )
+
+
+def _preverify_release_images(
+    db: AsyncSession,
+    release: GuestRelease,
+    *,
+    current_active: Optional[GuestRelease] = None,
+) -> None:
+    """Verify detached signatures only; locked refetch reruns every semantic check."""
+
+    view = _release_validation_view(release)
+    view.images = _merged_release_images(view, current_active)
+    for image_role in _release_image_roles(view):
+        image = (view.images or {}).get(image_role)
+        if not isinstance(image, dict):
+            continue
+        payload = image.get("provenance_payload")
+        signature = image.get("provenance_signature")
+        if isinstance(payload, str) and payload and isinstance(signature, str) and signature:
+            try:
+                _verified_provenance_document(
+                    db,
+                    image_role=image_role,
+                    payload=payload,
+                    signature=signature,
+                )
+            except ProvenanceError as exc:
+                raise ReleaseError(
+                    f"Refusing to activate {image_role} image: untrusted provenance: {exc}"
+                ) from exc
+
+
 async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     """Make a release the ACTIVE desired state for its compute-scoped stream.
 
@@ -962,8 +1111,41 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     fleet-wide -- so refuse activation until the measurements are pinned (committed yaml / ConfigMap).
     Supersedes the prior active release for the same (channel, tee_type, compute_type).
     """
+    preflight_release = await db.get(GuestRelease, release_id)
+    if preflight_release is None:
+        raise ReleaseError(f"Release {release_id} not found")
+    preflight_compute_type = preflight_release.compute_type or "cpu"
+    preflight_current = await get_active_release(
+        db,
+        preflight_release.tee_type,
+        preflight_release.channel,
+        preflight_compute_type,
+    )
+    if not isinstance(preflight_current, GuestRelease):
+        preflight_current = None
+    _preverify_release_images(
+        db,
+        preflight_release,
+        current_active=preflight_current,
+    )
+    if preflight_compute_type == "gpu":
+        preflight_cpu = await get_active_release(
+            db,
+            "tdx",
+            preflight_release.channel,
+            "cpu",
+        )
+        if isinstance(preflight_cpu, GuestRelease):
+            _validate_active_release(preflight_cpu, db)
+    await db.commit()
+
     await acquire_gpu_lifecycle_lock(db)
-    release = await db.get(GuestRelease, release_id)
+    release = await db.get(
+        GuestRelease,
+        release_id,
+        with_for_update=True,
+        populate_existing=True,
+    )
     if release is None:
         raise ReleaseError(f"Release {release_id} not found")
     if release.compute_type is None:
@@ -1008,9 +1190,13 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
             image = (release.images or {}).get(image_role)
             if image:
                 if image_role == "gpu":
-                    _validate_gpu_image_provenance(release, image, loaded_by_name)
+                    _validate_gpu_image_provenance(
+                        release, image, loaded_by_name, db=db
+                    )
                 else:
-                    _validate_image_provenance(release, image_role, image, loaded_by_name)
+                    _validate_image_provenance(
+                        release, image_role, image, loaded_by_name, db=db
+                    )
         await _validate_gpu_storage_stream(db, release)
         publication = await _validate_l0_bootstrap(db, release)
         await _mark_l0_publication_active(db, release, publication)
@@ -1288,7 +1474,7 @@ async def _validate_gpu_storage_stream(
             "GPU activation requires an independently active CPU/storage TDX release "
             f"for channel {gpu_release.channel!r}."
         )
-    _validate_active_release(active_cpu)
+    _validate_active_release(active_cpu, db)
     storage = (active_cpu.images or {}).get("storage")
     if not isinstance(storage, dict):
         raise ReleaseError("Active CPU TDX release has no storage role to compose with GPU L0.")
@@ -1407,7 +1593,7 @@ async def _gpu_storage_sibling_for_host(
             "GPU desired state requires an independently active CPU/storage TDX release "
             f"for channel {gpu_release.channel!r}."
         )
-    _validate_active_release(active_cpu)
+    _validate_active_release(active_cpu, db)
     storage = (active_cpu.images or {}).get("storage")
     if not isinstance(storage, dict):
         raise ReleaseError("Active CPU TDX desired state has no storage image.")
@@ -1953,7 +2139,10 @@ async def _manifest_for_logical_host(
     return manifest
 
 
-def _validate_active_release(release: GuestRelease) -> None:
+def _validate_active_release(
+    release: GuestRelease,
+    db: Optional[AsyncSession] = None,
+) -> None:
     """Revalidate desired state against the current trust set before serving or dispatching it."""
     _compute_type(release)
     _validate_release_stream_slots(release)
@@ -2015,9 +2204,66 @@ def _validate_active_release(release: GuestRelease) -> None:
         image = images.get(role)
         if image:
             if role == "gpu":
-                _validate_gpu_image_provenance(release, image, loaded_by_name)
+                _validate_gpu_image_provenance(
+                    release, image, loaded_by_name, db=db
+                )
             else:
-                _validate_image_provenance(release, role, image, loaded_by_name)
+                _validate_image_provenance(
+                    release, role, image, loaded_by_name, db=db
+                )
+
+
+async def preverify_active_gpu_release_for_host(
+    db: AsyncSession,
+    host_id: str,
+) -> None:
+    """Snapshot the host stream's exact GPU signature before lifecycle acquisition."""
+
+    identity = (
+        await db.execute(
+            select(Host.release_channel, Host.compute_type, Host.tee_type).where(
+                Host.host_id == host_id
+            )
+        )
+    ).one_or_none()
+    if (
+        identity is None
+        or identity.compute_type != "gpu"
+        or identity.tee_type != "tdx"
+    ):
+        raise ReleaseError("GPU host has no eligible release stream identity.")
+    release = await get_active_release(
+        db,
+        "tdx",
+        identity.release_channel,
+        "gpu",
+    )
+    if release is None:
+        raise ReleaseError("GPU host has no active exact GPU release.")
+    _validate_active_release(release, db)
+    await db.commit()
+
+
+async def _preverify_active_release_closure(
+    db: AsyncSession,
+    release: GuestRelease,
+) -> None:
+    """Prewarm exact release and composed CPU/storage signatures before any later lock."""
+
+    _validate_active_release(release, db)
+    if _compute_type(release) != "gpu":
+        return
+    active_cpu = await get_active_release(
+        db,
+        "tdx",
+        release.channel,
+        "cpu",
+    )
+    if active_cpu is None:
+        raise ReleaseError(
+            "GPU desired state requires an independently active CPU/storage release."
+        )
+    _validate_active_release(active_cpu, db)
 
 
 async def active_manifest_for_host(
@@ -2046,7 +2292,7 @@ async def active_manifest_for_host(
     )
     if release is None:
         return None
-    _validate_active_release(release)
+    await _preverify_active_release_closure(db, release)
     if host_id is None:
         return release_manifest(release)
     host = await db.get(Host, host_id)
@@ -2096,7 +2342,7 @@ async def rollout_release(
         raise ReleaseError(
             f"Release {release_id} is '{release.status}', not active; activate it before rollout."
         )
-    _validate_active_release(release)
+    await _preverify_active_release_closure(db, release)
 
     l0_spec = (release.images or {}).get("l0") or {}
     l0_version = l0_spec.get("version")
@@ -2181,7 +2427,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
     release = await db.get(GuestRelease, release_id)
     if release is None:
         raise ReleaseError(f"Release {release_id} not found")
-    _validate_active_release(release)
+    await _preverify_active_release_closure(db, release)
 
     chute_img = (release.images or {}).get("chute") or {}
     storage_img = (release.images or {}).get("storage") or {}

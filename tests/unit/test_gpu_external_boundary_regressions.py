@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from api.host.locks import GPU_LIFECYCLE_LOCK_INFO_KEY
 from api.host import router as host_router
 from api.releases import service as release_service
+from api.releases.provenance import ProvenanceError
 from api.server import router as server_router
 from api.storage import launch_sessions, router as storage_router, service as storage_service
 
@@ -212,3 +213,70 @@ def test_storage_external_adapters_are_guarded_and_observations_are_injected():
     locate_source = inspect.getsource(storage_service.locate_object)
     assert "observed_live_storage_ids=observed_live_storage_ids" in placement_source
     assert "observed_live_storage_ids=observed_live_storage_ids" in locate_source
+
+
+@pytest.mark.asyncio
+async def test_provenance_locked_refetch_is_cache_only_and_eviction_rejects(
+    monkeypatch, tmp_path
+):
+    key_path = tmp_path / "cosign.pub"
+    key_path.write_bytes(b"trusted-key-bytes")
+    monkeypatch.setattr(
+        release_service.settings,
+        "trusted_provenance_public_key_path",
+        key_path,
+    )
+    monkeypatch.setattr(release_service.settings, "provenance_cosign_binary", "cosign-test")
+    calls = []
+    document = {"schema_version": 3}
+
+    def _verify(payload, signature, public_key_path, *, cosign_binary):
+        calls.append((payload, signature, public_key_path, cosign_binary))
+        return document
+
+    monkeypatch.setattr(release_service, "verify_provenance_signature", _verify)
+    release_service._PROVENANCE_VERIFICATION_CACHE.clear()
+    db = _BoundaryDb()
+
+    first = release_service._verified_provenance_document(
+        db,
+        image_role="gpu",
+        payload="canonical-payload",
+        signature="detached-signature",
+    )
+    assert first is document
+    assert len(calls) == 1
+
+    db.info[GPU_LIFECYCLE_LOCK_INFO_KEY] = True
+    replay = release_service._verified_provenance_document(
+        db,
+        image_role="gpu",
+        payload="canonical-payload",
+        signature="detached-signature",
+    )
+    assert replay is document
+    assert len(calls) == 1
+
+    release_service._PROVENANCE_VERIFICATION_CACHE.clear()
+    with pytest.raises(ProvenanceError, match="absent or was evicted"):
+        release_service._verified_provenance_document(
+            db,
+            image_role="gpu",
+            payload="canonical-payload",
+            signature="detached-signature",
+        )
+    assert len(calls) == 1
+
+
+def test_release_provenance_preflight_precedes_activation_locks():
+    activation_source = inspect.getsource(release_service.activate_release)
+    assert activation_source.index("_preverify_release_images") < activation_source.index(
+        "await acquire_gpu_lifecycle_lock"
+    )
+    validator_source = inspect.getsource(
+        release_service._verified_provenance_document
+    )
+    locked_branch = validator_source.index("GPU_LIFECYCLE_LOCK_INFO_KEY")
+    verifier_call = validator_source.rindex("verify_provenance_signature")
+    assert locked_branch < verifier_call
+    assert "key not in snapshot_keys or cached is None" in validator_source
