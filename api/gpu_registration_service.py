@@ -1396,15 +1396,71 @@ async def registration_attempt_response(
         .all()
     )
     node_uuids = [item.uuid for item in nodes]
+    registration_report_ids = {
+        item.gpu_inventory_report_id
+        for item in nodes
+        if item.gpu_inventory_report_id is not None
+    }
+    registration_report_id = (
+        next(iter(registration_report_ids))
+        if len(registration_report_ids) == 1
+        else None
+    )
+    registration_report = (
+        (
+            await db.execute(
+                select(GpuInventoryReport)
+                .where(GpuInventoryReport.report_id == registration_report_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if registration_report_id is not None
+        else None
+    )
+    current_report = (
+        (
+            await db.execute(
+                select(GpuInventoryReport)
+                .where(GpuInventoryReport.report_id == group.last_report_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if group is not None
+        else None
+    )
+    from api.server.gpu_sessions import _gpu_inventory_report_matches_group
+
     exact_nodes = bool(
-        node_uuids == stable.get("gpu_uuids")
+        reservation is not None
+        and group is not None
+        and host is not None
+        and node_uuids == stable.get("gpu_uuids")
+        and len(registration_report_ids) == 1
+        and _gpu_inventory_report_matches_group(
+            host=host,
+            group=group,
+            report=registration_report,
+            expected_host_key_generation=reservation.host_key_generation,
+            expected_host_boot_generation=reservation.host_boot_generation,
+            require_host_latest=False,
+            require_group_report_link=False,
+        )
+        and _gpu_inventory_report_matches_group(
+            host=host,
+            group=group,
+            report=current_report,
+            expected_host_key_generation=host.active_key_generation,
+            expected_host_boot_generation=host.boot_generation,
+            require_host_latest=True,
+            require_group_report_link=True,
+        )
         and all(
             item.gpu_allocation_group_id == stable.get("allocation_group_id")
             and item.gpu_allocation_group_generation
             == stable.get("allocation_group_generation")
             and item.gpu_launch_reservation_id == reservation.reservation_id
             and item.gpu_process_incarnation == reservation.process_incarnation
-            and item.gpu_inventory_report_id == group.last_report_id
+            and item.gpu_inventory_report_id == registration_report_id
             for item in nodes
         )
     )

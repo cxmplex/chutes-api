@@ -21,9 +21,15 @@ from api.gpu_hotplug_service import (
 )
 from api.gpu_models import GpuRegistrationAttempt
 from api.host.locks import acquire_gpu_lifecycle_lock
-from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation, canonical_sha256
+from api.host.schemas import (
+    GpuAllocationGroup,
+    GpuInventoryReport,
+    GpuInventoryReportV1,
+    GpuLaunchReservation,
+    canonical_sha256,
+)
 from api.node.schemas import Node
-from api.server.schemas import Server, ServerAttestation
+from api.server.schemas import Host, Server, ServerAttestation
 
 GPU_RUNTIME_SESSION_HEADER = "X-Chutes-Attested-Session"
 GPU_RUNTIME_SESSION_PURPOSES = (
@@ -134,6 +140,69 @@ async def _latest_attestation_attempt(
     return (await db.execute(query)).scalar_one_or_none()
 
 
+def _gpu_inventory_report_matches_group(
+    *,
+    host: Host,
+    group: GpuAllocationGroup,
+    report: GpuInventoryReport | None,
+    expected_host_key_generation: int,
+    expected_host_boot_generation: int,
+    require_host_latest: bool,
+    require_group_report_link: bool,
+) -> bool:
+    """Validate immutable registration evidence or the mutable current closure."""
+
+    if report is None:
+        return False
+    try:
+        claims = GpuInventoryReportV1.model_validate(report.claims)
+    except ValueError:
+        return False
+    matching_groups = [
+        item
+        for item in claims.groups
+        if item.topology_fingerprint == group.topology_fingerprint
+        and [device.bdf for device in item.devices] == list(group.gpu_bdfs)
+        and [device.uuid for device in item.devices] == list(group.gpu_uuids)
+        and [device.gpu_identifier for device in item.devices]
+        == list(group.gpu_identifiers)
+        and [device.attestation_certificate_sha256 for device in item.devices]
+        == list(group.gpu_attestation_certificate_sha256s)
+    ]
+    return bool(
+        len(matching_groups) == 1
+        and report.reconciliation_status == "accepted"
+        and secrets.compare_digest(report.claims_sha256, canonical_sha256(claims))
+        and report.report_id == claims.report_id
+        and report.report_generation == claims.report_generation
+        and report.host_id == claims.host_id == host.host_id == group.host_id
+        and report.host_key_generation
+        == claims.host_key_generation
+        == expected_host_key_generation
+        and report.host_boot_generation
+        == claims.host_boot_generation
+        == expected_host_boot_generation
+        and claims.host_boot_id == host.boot_id
+        and report.gpu_release_id == claims.gpu_release_id == group.gpu_release_id
+        and report.profile_contract_sha256
+        == claims.profile_contract_sha256
+        == group.profile_contract_sha256
+        and report.topology_fingerprint == group.topology_fingerprint
+        and (
+            not require_group_report_link
+            or group.last_report_id == report.report_id
+        )
+        and (
+            not require_host_latest
+            or (
+                expected_host_key_generation == host.active_key_generation
+                and expected_host_boot_generation == host.boot_generation
+                and report.report_generation == host.gpu_inventory_report_generation
+            )
+        )
+    )
+
+
 async def require_completed_gpu_registration(
     db: AsyncSession,
     reservation: GpuLaunchReservation,
@@ -186,6 +255,13 @@ async def require_completed_gpu_registration(
                 GpuAllocationGroup.allocation_group_id
                 == reservation.allocation_group_id
             )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    host = (
+        await db.execute(
+            select(Host)
+            .where(Host.host_id == reservation.host_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -268,9 +344,61 @@ async def require_completed_gpu_registration(
         ).scalars()
     )
     nodes_by_uuid = {node.uuid: node for node in nodes}
+    registration_report_ids = {
+        node.gpu_inventory_report_id
+        for node in nodes
+        if node.gpu_inventory_report_id is not None
+    }
+    registration_report_id = (
+        next(iter(registration_report_ids))
+        if len(registration_report_ids) == 1
+        else None
+    )
+    registration_report = (
+        (
+            await db.execute(
+                select(GpuInventoryReport)
+                .where(GpuInventoryReport.report_id == registration_report_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if registration_report_id is not None
+        else None
+    )
+    current_report = (
+        (
+            await db.execute(
+                select(GpuInventoryReport)
+                .where(GpuInventoryReport.report_id == group.last_report_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if group is not None
+        else None
+    )
     nodes_current = bool(
         group is not None
+        and host is not None
         and len(nodes_by_uuid) == len(selection_uuids)
+        and len(registration_report_ids) == 1
+        and _gpu_inventory_report_matches_group(
+            host=host,
+            group=group,
+            report=registration_report,
+            expected_host_key_generation=reservation.host_key_generation,
+            expected_host_boot_generation=reservation.host_boot_generation,
+            require_host_latest=False,
+            require_group_report_link=False,
+        )
+        and _gpu_inventory_report_matches_group(
+            host=host,
+            group=group,
+            report=current_report,
+            expected_host_key_generation=host.active_key_generation,
+            expected_host_boot_generation=host.boot_generation,
+            require_host_latest=True,
+            require_group_report_link=True,
+        )
         and all(
             (node := nodes_by_uuid.get(gpu_uuid)) is not None
             and node.server_id == server.server_id
@@ -281,7 +409,7 @@ async def require_completed_gpu_registration(
             == reservation.allocation_group_generation
             and node.gpu_launch_reservation_id == reservation.reservation_id
             and node.gpu_process_incarnation == reservation.process_incarnation
-            and node.gpu_inventory_report_id == group.last_report_id
+            and node.gpu_inventory_report_id == registration_report_id
             and node.gpu_retired_at is None
             for index, gpu_uuid in enumerate(selection_uuids)
         )

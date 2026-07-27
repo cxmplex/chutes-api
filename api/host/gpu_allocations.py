@@ -2833,7 +2833,20 @@ async def reserve_gpu_group(
         authorization = reclaim_context["authorization"]
         operation = reclaim_context["operation"]
         old_reservation = reclaim_context["old_reservation"]
-        current_report = await db.get(GpuInventoryReport, group.last_report_id)
+        current_report = (
+            await db.execute(
+                select(GpuInventoryReport)
+                .where(
+                    GpuInventoryReport.host_id == host.host_id,
+                    GpuInventoryReport.host_key_generation
+                    == host.active_key_generation,
+                    GpuInventoryReport.host_boot_generation == host.boot_generation,
+                    GpuInventoryReport.report_generation
+                    == host.gpu_inventory_report_generation,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         if (
             group.state != "recovery_required"
             or group.allocation_group_id != authorization.allocation_group_id
@@ -2841,13 +2854,12 @@ async def reserve_gpu_group(
             or group.host_id != authorization.host_id
             or group.host_key_generation != host.active_key_generation
             or group.host_boot_generation != host.boot_generation
-            or current_report is None
-            or current_report.report_id != group.last_report_id
-            or current_report.host_id != host.host_id
-            or current_report.host_key_generation != host.active_key_generation
-            or current_report.host_boot_generation != host.boot_generation
-            or current_report.reconciliation_status != "accepted"
-            or current_report.topology_fingerprint != authorization.topology_fingerprint
+            or not _latest_gpu_inventory_matches_group(
+                host,
+                group,
+                current_report,
+                require_group_report_link=False,
+            )
             or group.recovery_authorization_id != authorization.authorization_id
             or group.recovery_report_id != authorization.inventory_report_id
             or group.recovery_nonce_hash != authorization.recovery_nonce_hash

@@ -119,6 +119,7 @@ from api.node.schemas import Node
 from api.server.exceptions import InvalidGpuEvidenceError, InvalidQuoteError
 from api.server.gpu_sessions import (
     latest_gpu_runtime_session,
+    require_completed_gpu_registration,
     validate_gpu_runtime_session,
 )
 from api.server.schemas import Host, NvidiaVerificationResultV1
@@ -3476,6 +3477,198 @@ async def test_same_boot_inventory_preserves_recovery_authorization_report(
         await session.commit()
 
 
+@pytest.mark.parametrize("latest_variant", ["exact", "contradictory"])
+async def test_initial_forced_recovery_reclaim_requires_host_latest_inventory(
+    postgres_schema,
+    latest_variant,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    operation, result, _receipt, _ack, authorization_id = (
+        await _seed_recovery_lifecycle_phase(
+            sessions,
+            "forced",
+            "physical_result",
+        )
+    )
+    async with sessions() as session:
+        host = await session.get(Host, "gpu-host")
+        group = await session.get(GpuAllocationGroup, operation.allocation_group_id)
+        authorization = await session.get(
+            GpuRecoveryAuthorization,
+            authorization_id,
+        )
+        registration_report_id = authorization.inventory_report_id
+        exact_report = _current_host_report(
+            host,
+            f"forced-reclaim-host-latest-{latest_variant}",
+        )
+        reconciled = await gpu_allocations.reconcile_gpu_inventory(
+            session,
+            host,
+            exact_report,
+        )
+        assert reconciled.status == "accepted"
+        assert host.gpu_inventory_report_generation == exact_report.report_generation
+        assert group.last_report_id == registration_report_id
+        receipt = await record_gpu_physical_result(
+            session,
+            host,
+            operation.operation_id,
+            result,
+        )
+        ack = GpuLocalReleaseAckV1(
+            operation_id=operation.operation_id,
+            receipt_id=receipt.receipt_id,
+            result_sha256=receipt.result_sha256,
+            allocation_group_id=operation.allocation_group_id,
+            allocation_group_generation=operation.allocation_group_generation,
+            reservation_id=operation.reservation_id,
+            process_incarnation=operation.process_incarnation,
+            local_owner_absent=True,
+            local_claim_absent=True,
+            local_slot_absent=True,
+            local_state_sha256="d" * 64,
+            observed_at=datetime.now(timezone.utc),
+        )
+        finalized = await record_gpu_local_release_ack(
+            session,
+            host,
+            operation.operation_id,
+            ack,
+        )
+        assert finalized.group_state == "recovery_required"
+        assert group.last_report_id == registration_report_id
+        completed_event = (
+            await session.execute(
+                select(GpuRecoveryEvent).where(
+                    GpuRecoveryEvent.operation_id == operation.operation_id,
+                    GpuRecoveryEvent.state == "completed",
+                )
+            )
+        ).scalar_one()
+        immutable_audit = (
+            authorization.inventory_report_id,
+            authorization.inventory_report_sha256,
+            authorization.recovery_nonce_hash,
+            completed_event.event_id,
+            completed_event.reset_result_sha256,
+            completed_event.receipt_sha256,
+            completed_event.local_release_ack_sha256,
+        )
+        await session.commit()
+
+    latest_report_id = exact_report.report_id
+    if latest_variant == "contradictory":
+        async with sessions() as session:
+            host = await session.get(Host, "gpu-host")
+            report_data = _current_host_report(
+                host,
+                "forced-reclaim-contradictory-latest",
+            ).model_dump(mode="json")
+            changed_group = _inventory_group()
+            changed_group.pop("topology_fingerprint", None)
+            changed_group["devices"][0][
+                "attestation_certificate_sha256"
+            ] = "f" * 64
+            changed_group["topology_fingerprint"] = canonical_sha256(changed_group)
+            report_data["groups"] = [changed_group]
+            contradictory = GpuInventoryReportV1.model_validate(report_data)
+            reported_group = contradictory.groups[0]
+            now = datetime.now(timezone.utc)
+            session.add(
+                GpuInventoryReport(
+                    report_id=contradictory.report_id,
+                    host_id=contradictory.host_id,
+                    host_key_generation=contradictory.host_key_generation,
+                    host_boot_generation=contradictory.host_boot_generation,
+                    report_generation=contradictory.report_generation,
+                    gpu_release_id=contradictory.gpu_release_id,
+                    profile_contract_sha256=(
+                        contradictory.profile_contract_sha256
+                    ),
+                    topology_fingerprint=reported_group.topology_fingerprint,
+                    claims=contradictory.model_dump(mode="json"),
+                    claims_sha256=canonical_sha256(contradictory),
+                    reconciliation_status="accepted",
+                    accepted_at=now,
+                )
+            )
+            host.gpu_inventory_report_generation = contradictory.report_generation
+            host.gpu_inventory_fingerprint = reported_group.topology_fingerprint
+            host.gpu_inventory_reconciled_at = now
+            latest_report_id = contradictory.report_id
+            await session.commit()
+
+    async with sessions() as session:
+        authorization = await session.get(
+            GpuRecoveryAuthorization,
+            authorization_id,
+        )
+        completed_event = (
+            await session.execute(
+                select(GpuRecoveryEvent).where(
+                    GpuRecoveryEvent.operation_id == operation.operation_id,
+                    GpuRecoveryEvent.state == "completed",
+                )
+            )
+        ).scalar_one()
+        if latest_variant == "contradictory":
+            with pytest.raises(
+                GpuAllocationError,
+                match="changed before exact reclaim",
+            ):
+                await reserve_gpu_group(
+                    session,
+                    "gpu-host",
+                    _request(),
+                    recovery_authorization_id=authorization_id,
+                )
+            await session.rollback()
+        else:
+            reclaimed = await reserve_gpu_group(
+                session,
+                "gpu-host",
+                _request(),
+                recovery_authorization_id=authorization_id,
+            )
+            reclaimed_event = (
+                await session.execute(
+                    select(GpuRecoveryEvent).where(
+                        GpuRecoveryEvent.operation_id == operation.operation_id,
+                        GpuRecoveryEvent.state == "reclaimed",
+                    )
+                )
+            ).scalar_one()
+            assert reclaimed.claims.allocation_group_id == operation.allocation_group_id
+            assert reclaimed_event.current_inventory_report_id == latest_report_id
+            assert reclaimed_event.current_inventory_report_id != registration_report_id
+            await session.commit()
+
+    async with sessions() as session:
+        authorization = await session.get(
+            GpuRecoveryAuthorization,
+            authorization_id,
+        )
+        completed_event = (
+            await session.execute(
+                select(GpuRecoveryEvent).where(
+                    GpuRecoveryEvent.operation_id == operation.operation_id,
+                    GpuRecoveryEvent.state == "completed",
+                )
+            )
+        ).scalar_one()
+        assert (
+            authorization.inventory_report_id,
+            authorization.inventory_report_sha256,
+            authorization.recovery_nonce_hash,
+            completed_event.event_id,
+            completed_event.reset_result_sha256,
+            completed_event.receipt_sha256,
+            completed_event.local_release_ack_sha256,
+        ) == immutable_audit
+
+
 @pytest.mark.parametrize("recovery_mode", ["ownerless", "forced"])
 @pytest.mark.parametrize(
     "phase", ["physical_result", "receipt_accepted", "local_release_acked"]
@@ -5454,6 +5647,162 @@ async def test_registration_claim_and_completed_replay_preserve_mode_owners(
         assert replay.management_mode == mode
         assert replay.runtime_session == f"runtime-{mode}-session"
         assert replay.registration_replay_until == attempt.registration_replay_until
+
+
+@pytest.mark.parametrize("latest_variant", ["exact", "contradictory"])
+async def test_completed_registration_replay_separates_registration_and_current_reports(
+    postgres_schema,
+    latest_variant,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        response, request, cert_pem, spki_sha256 = await _prepare_registration_request(
+            session,
+            "miner",
+        )
+        attempt, lease_owner, conflict = await _claim_attempt(
+            session,
+            "192.0.2.30",
+            request,
+            spki_sha256,
+            cert_pem,
+        )
+        assert lease_owner is not None
+        assert conflict is None
+        stable = await _publish_completed_registration_fixture(
+            session,
+            response,
+            request,
+            cert_pem,
+            spki_sha256,
+        )
+        completed = await _complete_attempt(
+            session,
+            attempt.attempt_id,
+            lease_owner,
+            stable,
+        )
+        attempt_id = completed.attempt_id
+        registration_id = completed.registration_id
+        attestation_id = completed.attestation_id
+        registration_report_ids = set(
+            (
+                await session.execute(
+                    select(Node.gpu_inventory_report_id).where(
+                        Node.server_id == response.claims.server_id
+                    )
+                )
+            ).scalars()
+        )
+        assert len(registration_report_ids) == 1
+        registration_report_id = next(iter(registration_report_ids))
+        await session.commit()
+
+    async with sessions() as session:
+        host = await session.get(Host, "gpu-host")
+        report_data = _current_host_report(
+            host,
+            f"registration-current-{latest_variant}",
+        ).model_dump(mode="json")
+        if latest_variant == "contradictory":
+            changed_group = _inventory_group()
+            changed_group.pop("topology_fingerprint", None)
+            changed_group["devices"][0][
+                "attestation_certificate_sha256"
+            ] = "f" * 64
+            changed_group["topology_fingerprint"] = canonical_sha256(changed_group)
+            report_data["groups"] = [changed_group]
+        current_report = GpuInventoryReportV1.model_validate(report_data)
+        reconciled = await gpu_allocations.reconcile_gpu_inventory(
+            session,
+            host,
+            current_report,
+        )
+        group = await session.get(
+            GpuAllocationGroup,
+            response.claims.allocation_group_id,
+        )
+        nodes = list(
+            (
+                await session.execute(
+                    select(Node)
+                    .where(Node.server_id == response.claims.server_id)
+                    .order_by(Node.uuid)
+                )
+            ).scalars()
+        )
+        assert {node.gpu_inventory_report_id for node in nodes} == {
+            registration_report_id
+        }
+        if latest_variant == "exact":
+            assert reconciled.status == "accepted"
+            assert group.state == "running"
+            assert group.last_report_id == current_report.report_id
+            assert group.last_report_id != registration_report_id
+        else:
+            assert reconciled.status == "quarantined"
+        await session.commit()
+
+    async with sessions() as session:
+        attempt = await session.get(GpuRegistrationAttempt, attempt_id)
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            response.claims.reservation_id,
+        )
+        server = await session.get(Server, response.claims.server_id)
+        registration_attestation = await session.get(
+            ServerAttestation,
+            attestation_id,
+        )
+        if latest_variant == "contradictory":
+            with pytest.raises(
+                HTTPException, match="completion audit|lineage is not current"
+            ):
+                await require_completed_gpu_registration(
+                    session,
+                    reservation,
+                    registration_attestation,
+                    server,
+                )
+            await session.rollback()
+            attempt = await session.get(GpuRegistrationAttempt, attempt_id)
+            with pytest.raises(HTTPException, match="lineage is no longer active"):
+                await registration_attempt_response(
+                    session,
+                    attempt,
+                    spki_sha256,
+                )
+            await session.rollback()
+            return
+
+        authority = await require_completed_gpu_registration(
+            session,
+            reservation,
+            registration_attestation,
+            server,
+        )
+        assert authority.attempt.registration_id == registration_id
+        first = await registration_attempt_response(session, attempt, spki_sha256)
+        assert first.state == "completed"
+        assert first.registration_id == registration_id
+        assert first.attestation_id == attestation_id
+        assert first.runtime_session is not None
+        first_stable = first.model_dump(
+            mode="json",
+            exclude={"runtime_session", "runtime_session_expires_at"},
+        )
+
+    async with sessions() as session:
+        attempt = await session.get(GpuRegistrationAttempt, attempt_id)
+        second = await registration_attempt_response(session, attempt, spki_sha256)
+        assert second.state == "completed"
+        assert second.runtime_session is not None
+        assert second.runtime_session != first.runtime_session
+        assert second.model_dump(
+            mode="json",
+            exclude={"runtime_session", "runtime_session_expires_at"},
+        ) == first_stable
 
 
 async def test_failed_gpu_runtime_attestation_persists_normal_delete_intent(
