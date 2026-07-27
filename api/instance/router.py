@@ -3,8 +3,10 @@ Routes for instances.
 """
 
 import csv
+import hashlib
 from io import StringIO
 import os
+import re
 import uuid
 import ctypes
 import traceback
@@ -93,7 +95,14 @@ from api.server.service import (
     verify_gpu_evidence,
 )
 from api.server.gpu_sessions import _current_attestation, _latest_attestation_attempt
-from api.server.schemas import TeeInstanceEvidence, BootAttestation, Server
+from api.server.schemas import (
+    TeeInstanceEvidence,
+    BootAttestation,
+    DefaultChuteFSVolumeBinding,
+    Server,
+    StorageVolume,
+    StorageVolumeKey,
+)
 from api.storage.service import ensure_default_volume_binding
 from api.rate_limit import rate_limit
 from api.server.exceptions import (
@@ -3010,6 +3019,688 @@ async def _lock_default_volume_before_gpu_workload(
     return default_volume
 
 
+def _canonical_miner_launch_request_id(value: str | None) -> str:
+    if not isinstance(value, str):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Attested GPU miner launches require miner_launch_request_id.",
+        )
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="miner_launch_request_id must be a canonical UUID.",
+        ) from exc
+    if str(parsed) != value:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="miner_launch_request_id must be a canonical lowercase UUID.",
+        )
+    return value
+
+
+def _miner_launch_replay_conflict(detail: str) -> None:
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"Durable miner launch replay rejected: {detail}",
+    )
+
+
+def _miner_launch_jwt_policy(chute: Chute, job: Job | None) -> dict:
+    disk_gb = None
+    if job is not None:
+        if not isinstance(job.job_args, dict) or "_disk_gb" not in job.job_args:
+            _miner_launch_replay_conflict("job disk policy is unavailable")
+        disk_gb = job.job_args["_disk_gb"]
+    return {
+        "egress": chute.allow_external_egress,
+        "lock_modules": (
+            True
+            if chute.standard_template
+            else (chute.lock_modules if chute.lock_modules is not None else False)
+        ),
+        "disk_gb": disk_gb,
+        "launch_config_base_url": (
+            settings.launch_config_base_url or f"https://api.{settings.base_domain}"
+        ).rstrip("/"),
+    }
+
+
+def _miner_launch_secret_sha256(label: str, value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        _miner_launch_replay_conflict(f"launch config {label} secret is unavailable")
+    return hashlib.sha256(
+        b"chutes.miner-launch-config-request.v1\x00"
+        + label.encode("ascii")
+        + b"\x00"
+        + value.encode("utf-8")
+    ).hexdigest()
+
+
+def _miner_launch_request_document(
+    *,
+    request_id: str,
+    config: LaunchConfig,
+    miner,
+    chute: Chute,
+    job: Job | None,
+    server: Server,
+    reservation: GpuLaunchReservation,
+    group: GpuAllocationGroup,
+    binding: DefaultChuteFSVolumeBinding,
+    volume: StorageVolume,
+    policy: dict,
+) -> dict:
+    """Canonical authority accepted for one miner launch response.
+
+    All mutable values which can change a fresh launch JWT or transfer custody are
+    represented here.  Replay recomputes this document from locked current rows;
+    the stored digest is not trusted as a substitute for those checks.
+    """
+
+    return {
+        "schema": "chutes.miner-launch-config-request",
+        "version": 1,
+        "miner_launch_request_id": request_id,
+        "miner": {
+            "hotkey": config.miner_hotkey,
+            "uid": config.miner_uid,
+            "coldkey": config.miner_coldkey,
+            "current_uid": miner.node_id,
+            "current_coldkey": miner.coldkey,
+        },
+        "chute": {
+            "chute_id": chute.chute_id,
+            "user_id": chute.user_id,
+            "version": chute.version,
+            "revision": chute.revision,
+            "image_id": chute.image_id,
+            "image_compute_type": getattr(chute.image, "compute_type", None),
+            "chutes_version": chute.chutes_version,
+            "node_selector": chute.node_selector,
+            "tee": bool(chute.tee),
+            "disabled": bool(chute.disabled),
+        },
+        "job": (
+            {
+                "job_id": job.job_id,
+                "user_id": job.user_id,
+                "chute_id": job.chute_id,
+                "version": job.version,
+                "chutes_version": job.chutes_version,
+                "status": job.status,
+                "node_selector": job.node_selector,
+                "finished": job.finished_at is not None,
+                "miner_terminated": bool(job.miner_terminated),
+                "gpu_management_mode": job.gpu_management_mode,
+                "gpu_launch_reservation_id": job.gpu_launch_reservation_id,
+            }
+            if job is not None
+            else None
+        ),
+        "server": {
+            "server_id": server.server_id,
+            "miner_hotkey": server.miner_hotkey,
+            "compute_type": server.compute_type,
+            "tee_type": server.tee_type,
+            "gpu_launch_reservation_id": server.gpu_launch_reservation_id,
+            "gpu_allocation_group_id": server.gpu_allocation_group_id,
+            "gpu_allocation_group_generation": (server.gpu_allocation_group_generation),
+            "gpu_management_mode": server.gpu_management_mode,
+            "gpu_process_incarnation": server.gpu_process_incarnation,
+            "gpu_topology_fingerprint": server.gpu_topology_fingerprint,
+            "attested_cert_pubkey_hash": server.attested_cert_pubkey_hash,
+        },
+        "reservation": {
+            "reservation_id": reservation.reservation_id,
+            "claims_sha256": reservation.claims_sha256,
+            "owner_hotkey": reservation.owner_hotkey,
+            "workload_owner": reservation.workload_owner,
+            "host_id": reservation.host_id,
+            "host_key_generation": reservation.host_key_generation,
+            "host_boot_generation": reservation.host_boot_generation,
+            "allocation_group_id": reservation.allocation_group_id,
+            "allocation_group_generation": (reservation.allocation_group_generation),
+            "reservation_generation": reservation.reservation_generation,
+            "management_mode": reservation.management_mode,
+            "server_id": reservation.server_id,
+            "process_incarnation": reservation.process_incarnation,
+            "topology_fingerprint": reservation.topology_fingerprint,
+            "state": reservation.state,
+        },
+        "group": {
+            "allocation_group_id": group.allocation_group_id,
+            "host_id": group.host_id,
+            "host_key_generation": group.host_key_generation,
+            "host_boot_generation": group.host_boot_generation,
+            "generation": group.generation,
+            "topology_fingerprint": group.topology_fingerprint,
+            "state": group.state,
+            "management_mode": group.management_mode,
+            "reservation_owner": group.reservation_owner,
+            "reservation_id": group.reservation_id,
+            "reservation_generation": group.reservation_generation,
+            "process_incarnation": group.process_incarnation,
+        },
+        "storage": {
+            "user_id": binding.user_id,
+            "chute_id": binding.chute_id,
+            "binding_id": binding.binding_id,
+            "volume_id": volume.volume_id,
+            "lifecycle_state": binding.lifecycle_state,
+            "volume_deleted": bool(volume.deleted),
+        },
+        "registry": {
+            "active": bool(config.registry_scope_active),
+            "repository": config.container_repository,
+            "manifest_digest": config.container_manifest_digest,
+        },
+        "launch": {
+            "config_id": config.config_id,
+            "user_id": config.user_id,
+            "compute_type": config.compute_type,
+            "job_id": config.job_id,
+            "server_id": config.server_id,
+            "gpu_management_mode": config.gpu_management_mode,
+            "gpu_launch_reservation_id": config.gpu_launch_reservation_id,
+            "default_volume_id": config.default_volume_id,
+            "storage_session_exchange_allowed": bool(
+                config.storage_session_exchange_allowed
+            ),
+            "env_type": config.env_type,
+            "env_key_sha256": _miner_launch_secret_sha256("env-key", config.env_key),
+            "runtime_nonce_sha256": _miner_launch_secret_sha256(
+                "runtime-nonce", config.nonce
+            ),
+        },
+        "jwt_policy": policy,
+    }
+
+
+async def _lock_current_miner_launch_custody(
+    db: AsyncSession,
+    *,
+    server: Server,
+    hotkey: str,
+) -> tuple[GpuLaunchReservation, GpuAllocationGroup]:
+    reservation = (
+        await db.execute(
+            select(GpuLaunchReservation)
+            .where(
+                GpuLaunchReservation.reservation_id == server.gpu_launch_reservation_id
+            )
+            .with_for_update(of=GpuLaunchReservation)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    group = (
+        await db.execute(
+            select(GpuAllocationGroup)
+            .where(
+                GpuAllocationGroup.allocation_group_id == server.gpu_allocation_group_id
+            )
+            .with_for_update(of=GpuAllocationGroup)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    runtime_expiry = server.gpu_runtime_session_expires_at
+    if runtime_expiry is not None and runtime_expiry.tzinfo is None:
+        runtime_expiry = runtime_expiry.replace(tzinfo=timezone.utc)
+    if (
+        reservation is None
+        or group is None
+        or server.compute_type != "gpu"
+        or server.tee_type != "tdx"
+        or server.gpu_management_mode != "miner"
+        or server.gpu_retired_at is not None
+        or server.miner_hotkey != hotkey
+        or not server.gpu_runtime_session_attestation_id
+        or runtime_expiry is None
+        or runtime_expiry <= datetime.now(timezone.utc)
+        or reservation.state != "running"
+        or reservation.management_mode != "miner"
+        or reservation.owner_hotkey != hotkey
+        or reservation.workload_owner != hotkey
+        or reservation.server_id != server.server_id
+        or reservation.allocation_group_id != server.gpu_allocation_group_id
+        or reservation.allocation_group_generation
+        != server.gpu_allocation_group_generation
+        or reservation.process_incarnation != server.gpu_process_incarnation
+        or reservation.topology_fingerprint != server.gpu_topology_fingerprint
+        or group.state != "running"
+        or group.management_mode != "miner"
+        or group.reservation_owner != hotkey
+        or group.reservation_id != reservation.reservation_id
+        or group.reservation_generation != reservation.reservation_generation
+        or group.generation != reservation.allocation_group_generation
+        or group.host_id != reservation.host_id
+        or group.host_key_generation != reservation.host_key_generation
+        or group.host_boot_generation != reservation.host_boot_generation
+        or group.process_incarnation != reservation.process_incarnation
+        or group.topology_fingerprint != reservation.topology_fingerprint
+    ):
+        _miner_launch_replay_conflict(
+            "GPU server, reservation, or allocation-group custody is no longer current"
+        )
+    return reservation, group
+
+
+async def _existing_miner_launch_identity(
+    db: AsyncSession,
+    *,
+    hotkey: str,
+    request_id: str,
+):
+    return (
+        await db.execute(
+            select(
+                LaunchConfig.config_id,
+                LaunchConfig.user_id,
+                LaunchConfig.chute_id,
+                LaunchConfig.job_id,
+                LaunchConfig.server_id,
+            ).where(
+                LaunchConfig.miner_hotkey == hotkey,
+                LaunchConfig.miner_launch_request_id == request_id,
+            )
+        )
+    ).one_or_none()
+
+
+async def _lock_existing_miner_launch_storage(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    chute_id: str,
+    hotkey: str,
+    request_id: str,
+) -> tuple[LaunchConfig, DefaultChuteFSVolumeBinding, StorageVolume]:
+    user = (
+        await db.execute(
+            select(User)
+            .where(User.user_id == user_id)
+            .options(lazyload("*"))
+            .with_for_update(of=User)
+        )
+    ).scalar_one_or_none()
+    if user is None:
+        _miner_launch_replay_conflict("launch owner no longer exists")
+    config = (
+        (
+            await db.execute(
+                select(LaunchConfig)
+                .where(
+                    LaunchConfig.miner_hotkey == hotkey,
+                    LaunchConfig.miner_launch_request_id == request_id,
+                )
+                .options(lazyload("*"))
+                .with_for_update(of=LaunchConfig)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    if config is None or config.user_id != user_id or config.chute_id != chute_id:
+        _miner_launch_replay_conflict(
+            "the persisted request changed before its configuration lock"
+        )
+    binding = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.user_id == user_id,
+                DefaultChuteFSVolumeBinding.chute_id == chute_id,
+                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+            )
+            .with_for_update(of=DefaultChuteFSVolumeBinding)
+        )
+    ).scalar_one_or_none()
+    volume = (
+        (
+            await db.execute(
+                select(StorageVolume)
+                .where(StorageVolume.volume_id == binding.volume_id)
+                .with_for_update(of=StorageVolume)
+            )
+        ).scalar_one_or_none()
+        if binding is not None
+        else None
+    )
+    key = (
+        await db.get(StorageVolumeKey, binding.volume_id, with_for_update=True)
+        if binding is not None and volume is not None
+        else None
+    )
+    if (
+        binding is None
+        or volume is None
+        or key is None
+        or volume.user_id != user_id
+        or volume.deleted
+    ):
+        _miner_launch_replay_conflict(
+            "the exact active ChuteFS binding or volume is unavailable"
+        )
+    return config, binding, volume
+
+
+async def _lock_new_miner_launch_storage_before_gpu_workload(
+    db: AsyncSession,
+    *,
+    launch_owner_id: str,
+    chute_id: str,
+    job_id: str | None,
+    hotkey: str,
+    request_id: str,
+) -> tuple[StorageVolume, LaunchConfig | None]:
+    # ChuteFS rotation uses User -> LaunchConfig -> Binding -> Volume.  Preserve
+    # that order even when another request publishes this UUID while external
+    # launch resolution is in flight.
+    user = (
+        await db.execute(
+            select(User)
+            .where(User.user_id == launch_owner_id)
+            .options(lazyload("*"))
+            .with_for_update(of=User)
+        )
+    ).scalar_one_or_none()
+    if user is None:
+        _miner_launch_replay_conflict("launch owner no longer exists")
+    existing = (
+        (
+            await db.execute(
+                select(LaunchConfig)
+                .where(
+                    LaunchConfig.miner_hotkey == hotkey,
+                    LaunchConfig.miner_launch_request_id == request_id,
+                )
+                .options(lazyload("*"))
+                .with_for_update(of=LaunchConfig)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    _, default_volume, _ = await ensure_default_volume_binding(
+        db,
+        launch_owner_id,
+        chute_id,
+    )
+    from api.gpu_scheduler import acquire_gpu_workload_lock
+
+    await acquire_gpu_workload_lock(db, chute_id, job_id)
+    return default_volume, existing
+
+
+async def _locked_binding_for_new_launch(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    chute_id: str,
+    volume_id: str,
+) -> DefaultChuteFSVolumeBinding:
+    binding = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.user_id == user_id,
+                DefaultChuteFSVolumeBinding.chute_id == chute_id,
+                DefaultChuteFSVolumeBinding.volume_id == volume_id,
+                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+            )
+            .with_for_update(of=DefaultChuteFSVolumeBinding)
+        )
+    ).scalar_one_or_none()
+    if binding is None:
+        _miner_launch_replay_conflict(
+            "the locked default ChuteFS binding changed before launch creation"
+        )
+    return binding
+
+
+async def _render_replayed_miner_launch_response(
+    db: AsyncSession,
+    *,
+    config: LaunchConfig,
+    policy: dict,
+) -> dict:
+    repository = config.container_repository
+    manifest_digest = config.container_manifest_digest
+    await db.commit()
+    if config.nonce is not None:
+        assert_gpu_external_work_allowed(
+            db, "replayed launch runtime-integrity nonce publish"
+        )
+        await settings.redis_client.set(
+            f"rint_nonce:{config.config_id}", config.nonce, ex=7200
+        )
+    result = {
+        "token": create_launch_jwt_v2(
+            config,
+            egress=policy["egress"],
+            lock_modules=policy["lock_modules"],
+            disk_gb=policy["disk_gb"],
+        ),
+        "config_id": config.config_id,
+        "registry": {
+            "repository": repository,
+            "manifest_digest": manifest_digest,
+        },
+    }
+    return result
+
+
+async def _validate_locked_miner_launch_replay(
+    db: AsyncSession,
+    *,
+    miner,
+    hotkey: str,
+    request_id: str,
+    requested_chute_id: str,
+    requested_job_id: str | None,
+    requested_server_id: str,
+    binding: DefaultChuteFSVolumeBinding,
+    volume: StorageVolume,
+) -> dict:
+    config = (
+        (
+            await db.execute(
+                select(LaunchConfig)
+                .where(
+                    LaunchConfig.miner_hotkey == hotkey,
+                    LaunchConfig.miner_launch_request_id == request_id,
+                )
+                .options(lazyload("*"))
+                .with_for_update(of=LaunchConfig)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    if config is None:
+        _miner_launch_replay_conflict("the persisted request disappeared")
+    chute = (
+        (
+            await db.execute(
+                select(Chute)
+                .where(Chute.chute_id == config.chute_id)
+                .options(lazyload("*"), joinedload(Chute.image))
+                .with_for_update(of=Chute)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    job = (
+        (
+            await db.execute(
+                select(Job)
+                .where(Job.job_id == config.job_id)
+                .options(lazyload("*"))
+                .with_for_update(of=Job)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if config.job_id is not None
+        else None
+    )
+    server = (
+        await db.execute(
+            select(Server)
+            .where(Server.server_id == config.server_id)
+            .options(lazyload("*"))
+            .with_for_update(of=Server)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if chute is None or server is None:
+        _miner_launch_replay_conflict("chute or server no longer exists")
+    _require_secure_source_delivery(chute)
+    if (
+        config.chute_id != requested_chute_id
+        or config.job_id != requested_job_id
+        or config.server_id != requested_server_id
+        or config.user_id != binding.user_id
+        or config.default_volume_id != binding.volume_id
+        or config.default_volume_id != volume.volume_id
+        or config.compute_type != "gpu"
+        or config.gpu_management_mode != "miner"
+        or not config.storage_session_exchange_allowed
+        or config.miner_uid != miner.node_id
+        or config.miner_coldkey != miner.coldkey
+        or chute.chute_id != config.chute_id
+        or chute.user_id != config.user_id
+        or chute.image is None
+        or chute.image.compute_type != "gpu"
+        or chute.disabled
+        or config.retrieved_at is not None
+        or config.verified_at is not None
+        or config.failed_at is not None
+        or config.completed_at is not None
+        or config.verification_error is not None
+        or config.registry_scope_active is not True
+        or config.registry_scope_revoked_at is not None
+        or not isinstance(config.container_repository, str)
+        or not config.container_repository
+        or not isinstance(config.container_manifest_digest, str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", config.container_manifest_digest)
+    ):
+        _miner_launch_replay_conflict(
+            "request, workload, storage, or registry authority changed"
+        )
+    if (
+        await db.execute(
+            select(Instance.instance_id)
+            .where(Instance.config_id == config.config_id)
+            .limit(1)
+        )
+    ).scalar_one_or_none() is not None:
+        _miner_launch_replay_conflict("launch config has already been consumed")
+    if config.job_id is not None and (
+        job is None
+        or job.user_id != config.user_id
+        or job.chute_id != config.chute_id
+        or job.finished_at is not None
+        or bool(job.miner_terminated)
+        or job.gpu_management_mode != "miner"
+        or job.gpu_launch_reservation_id != config.gpu_launch_reservation_id
+        or hotkey not in (job.miner_history or [])
+    ):
+        _miner_launch_replay_conflict("job authority is no longer current")
+    reservation, group = await _lock_current_miner_launch_custody(
+        db,
+        server=server,
+        hotkey=hotkey,
+    )
+    if config.gpu_launch_reservation_id != reservation.reservation_id:
+        _miner_launch_replay_conflict("launch config reservation is no longer current")
+    policy = _miner_launch_jwt_policy(chute, job)
+    expected_sha256 = canonical_sha256(
+        _miner_launch_request_document(
+            request_id=request_id,
+            config=config,
+            miner=miner,
+            chute=chute,
+            job=job,
+            server=server,
+            reservation=reservation,
+            group=group,
+            binding=binding,
+            volume=volume,
+            policy=policy,
+        )
+    )
+    if not isinstance(
+        config.miner_launch_request_sha256, str
+    ) or not secrets.compare_digest(
+        config.miner_launch_request_sha256,
+        expected_sha256,
+    ):
+        _miner_launch_replay_conflict(
+            "canonical request or response-shaping JWT policy changed"
+        )
+    return await _render_replayed_miner_launch_response(
+        db,
+        config=config,
+        policy=policy,
+    )
+
+
+async def _try_replay_miner_launch_config(
+    db: AsyncSession,
+    *,
+    miner,
+    hotkey: str,
+    request_id: str,
+    chute_id: str,
+    job_id: str | None,
+    server_id: str,
+) -> dict | None:
+    identity = await _existing_miner_launch_identity(
+        db,
+        hotkey=hotkey,
+        request_id=request_id,
+    )
+    if identity is None:
+        return None
+    if (
+        identity.chute_id != chute_id
+        or identity.job_id != job_id
+        or identity.server_id != server_id
+    ):
+        _miner_launch_replay_conflict(
+            "request UUID is already bound to different launch parameters"
+        )
+    _config, binding, volume = await _lock_existing_miner_launch_storage(
+        db,
+        user_id=identity.user_id,
+        chute_id=identity.chute_id,
+        hotkey=hotkey,
+        request_id=request_id,
+    )
+    from api.gpu_scheduler import acquire_gpu_workload_lock
+
+    await acquire_gpu_workload_lock(db, identity.chute_id, identity.job_id)
+    return await _validate_locked_miner_launch_replay(
+        db,
+        miner=miner,
+        hotkey=hotkey,
+        request_id=request_id,
+        requested_chute_id=chute_id,
+        requested_job_id=job_id,
+        requested_server_id=server_id,
+        binding=binding,
+        volume=volume,
+    )
+
+
 @router.get(
     "/launch_config",
     response_model=LaunchConfigResponse,
@@ -3020,6 +3711,7 @@ async def get_launch_config(
     request: Request,
     server_id: Optional[str] = None,
     job_id: Optional[str] = None,
+    miner_launch_request_id: Optional[str] = None,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User = Depends(
@@ -3029,6 +3721,26 @@ async def get_launch_config(
     ),
 ):
     miner = await _check_blacklisted(db, hotkey)
+    runtime_server_id = getattr(request.state, "gpu_runtime_server_id", None)
+    durable_request_id = None
+    if runtime_server_id is not None:
+        if server_id != runtime_server_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Launch config server differs from the attested GPU session.",
+            )
+        durable_request_id = _canonical_miner_launch_request_id(miner_launch_request_id)
+        replay = await _try_replay_miner_launch_config(
+            db,
+            miner=miner,
+            hotkey=hotkey,
+            request_id=durable_request_id,
+            chute_id=chute_id,
+            job_id=job_id,
+            server_id=runtime_server_id,
+        )
+        if replay is not None:
+            return replay
 
     # Resolve external demand telemetry and registry intent before acquiring the
     # global/workload lifecycle locks, then bind the results to an exact chute snapshot.
@@ -3042,7 +3754,6 @@ async def get_launch_config(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="CPU chutes are scheduled by the validator; miners cannot request launch configs for them.",
         )
-    runtime_server_id = getattr(request.state, "gpu_runtime_server_id", None)
     if job_id is None:
         launch_owner_id = chute.user_id
     else:
@@ -3083,12 +3794,53 @@ async def get_launch_config(
     )
     demand_result_sha256 = canonical_sha256(demand_external)
 
-    default_volume = await _lock_default_volume_before_gpu_workload(
+    concurrent = None
+    if durable_request_id is not None:
+        (
+            default_volume,
+            concurrent,
+        ) = await _lock_new_miner_launch_storage_before_gpu_workload(
+            db,
+            launch_owner_id=launch_owner_id,
+            chute_id=chute_id,
+            job_id=job_id,
+            hotkey=hotkey,
+            request_id=durable_request_id,
+        )
+    else:
+        default_volume = await _lock_default_volume_before_gpu_workload(
+            db,
+            launch_owner_id=launch_owner_id,
+            chute_id=chute_id,
+            job_id=job_id,
+        )
+    default_binding = await _locked_binding_for_new_launch(
         db,
-        launch_owner_id=launch_owner_id,
+        user_id=launch_owner_id,
         chute_id=chute_id,
-        job_id=job_id,
+        volume_id=default_volume.volume_id,
     )
+    if durable_request_id is not None and concurrent is not None:
+        if (
+            concurrent.user_id != launch_owner_id
+            or concurrent.chute_id != chute_id
+            or concurrent.job_id != job_id
+            or concurrent.server_id != runtime_server_id
+        ):
+            _miner_launch_replay_conflict(
+                "request UUID was concurrently bound to different launch parameters"
+            )
+        return await _validate_locked_miner_launch_replay(
+            db,
+            miner=miner,
+            hotkey=hotkey,
+            request_id=durable_request_id,
+            requested_chute_id=chute_id,
+            requested_job_id=job_id,
+            requested_server_id=runtime_server_id,
+            binding=default_binding,
+            volume=default_volume,
+        )
     chute = (
         (
             await db.execute(
@@ -3149,12 +3901,9 @@ async def get_launch_config(
             )
     registry_repository = demand_external["registry_repository"]
     registry_manifest_digest = demand_external["registry_manifest_digest"]
+    runtime_reservation = None
+    runtime_group = None
     if runtime_server_id is not None:
-        if server_id != runtime_server_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Launch config server differs from the attested GPU session.",
-            )
         runtime_server = (
             await db.execute(
                 select(Server)
@@ -3174,6 +3923,11 @@ async def get_launch_config(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Launch config requires the current attested miner GPU server.",
             )
+        runtime_reservation, runtime_group = await _lock_current_miner_launch_custody(
+            db,
+            server=runtime_server,
+            hotkey=hotkey,
+        )
     elif server_id is not None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -3207,7 +3961,6 @@ async def get_launch_config(
     await _verify_tee_version_support(db, chute, hotkey)
 
     # Associated with a job?
-    disk_gb = None
     job = None
     if job_id:
         job = (
@@ -3258,7 +4011,7 @@ async def get_launch_config(
         if runtime_server_id is not None:
             job.gpu_management_mode = "miner"
             job.gpu_launch_reservation_id = runtime_server.gpu_launch_reservation_id
-        disk_gb = job.job_args["_disk_gb"]
+    jwt_policy = _miner_launch_jwt_policy(chute, job)
 
     # Create the launch config and JWT.
     config_id = str(uuid.uuid4())
@@ -3282,6 +4035,7 @@ async def get_launch_config(
             miner_hotkey=hotkey,
             miner_uid=miner.node_id,
             miner_coldkey=miner.coldkey,
+            miner_launch_request_id=durable_request_id,
             env_type="tee" if chute.tee else "graval",
             seed=0,
             nonce=rint_nonce,
@@ -3296,6 +4050,26 @@ async def get_launch_config(
                 else None
             ),
         )
+        if durable_request_id is not None:
+            if runtime_reservation is None or runtime_group is None:
+                _miner_launch_replay_conflict(
+                    "attested GPU launch custody was not locked"
+                )
+            launch_config.miner_launch_request_sha256 = canonical_sha256(
+                _miner_launch_request_document(
+                    request_id=durable_request_id,
+                    config=launch_config,
+                    miner=miner,
+                    chute=chute,
+                    job=job,
+                    server=runtime_server,
+                    reservation=runtime_reservation,
+                    group=runtime_group,
+                    binding=default_binding,
+                    volume=default_volume,
+                    policy=jwt_policy,
+                )
+            )
         db.add(launch_config)
         await db.commit()
         await db.refresh(launch_config)
@@ -3307,6 +4081,23 @@ async def get_launch_config(
                 f"rint_nonce:{config_id}", rint_nonce, ex=7200
             )
     except IntegrityError as exc:
+        await db.rollback()
+        if durable_request_id is not None:
+            # The failed flush expires ORM state in this session.  Refetch the
+            # miner after rollback so replay validates current metagraph
+            # identity instead of dereferencing the expired pre-race object.
+            replay_miner = await _check_blacklisted(db, hotkey)
+            replay = await _try_replay_miner_launch_config(
+                db,
+                miner=replay_miner,
+                hotkey=hotkey,
+                request_id=durable_request_id,
+                chute_id=chute_id,
+                job_id=job_id,
+                server_id=runtime_server_id,
+            )
+            if replay is not None:
+                return replay
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Launch config conflict/unique constraint error: {exc}",
@@ -3338,11 +4129,9 @@ async def get_launch_config(
     # Generate the JWT.
     token = create_launch_jwt_v2(
         launch_config,
-        egress=chute.allow_external_egress,
-        lock_modules=True
-        if chute.standard_template
-        else (chute.lock_modules if chute.lock_modules is not None else False),
-        disk_gb=disk_gb,
+        egress=jwt_policy["egress"],
+        lock_modules=jwt_policy["lock_modules"],
+        disk_gb=jwt_policy["disk_gb"],
     )
 
     result = {

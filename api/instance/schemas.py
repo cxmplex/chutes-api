@@ -21,6 +21,7 @@ from sqlalchemy import (
     Double,
     UniqueConstraint,
     CheckConstraint,
+    DDL,
     event,
     text,
 )
@@ -258,6 +259,12 @@ class LaunchConfig(Base):
     miner_uid = Column(Integer, nullable=False)
     miner_hotkey = Column(String, nullable=False)
     miner_coldkey = Column(String, nullable=False)
+    # Durable idempotency identity for the miner-managed GPU launch response.  The
+    # request UUID is generated and persisted by Gepetto before it contacts the
+    # validator; the digest binds that UUID to the exact launch authority and JWT
+    # policy accepted by the validator.
+    miner_launch_request_id = Column(String(36), nullable=True)
+    miner_launch_request_sha256 = Column(String(64), nullable=True)
     # Target self-registered server for 1-click CPU deployments (stamped by the scheduler);
     # propagated to the created Instance. NULL for the legacy miner-run path.
     server_id = Column(
@@ -321,6 +328,21 @@ class LaunchConfig(Base):
             "compute_type IN ('cpu', 'gpu')",
             name="ck_launch_config_compute_type",
         ),
+        CheckConstraint(
+            "(miner_launch_request_id IS NULL "
+            "AND miner_launch_request_sha256 IS NULL) OR "
+            "(miner_launch_request_id ~ "
+            "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "
+            "AND miner_launch_request_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_launch_config_miner_request_replay",
+        ),
+        Index(
+            "uq_launch_configs_miner_request",
+            "miner_hotkey",
+            "miner_launch_request_id",
+            unique=True,
+            postgresql_where=text("miner_launch_request_id IS NOT NULL"),
+        ),
         Index(
             "uq_launch_configs_gpu_reservation",
             "gpu_launch_reservation_id",
@@ -330,6 +352,43 @@ class LaunchConfig(Base):
             ),
         ),
     )
+
+
+_MINER_LAUNCH_REQUEST_IMMUTABLE_FUNCTION = DDL(
+    """
+    CREATE OR REPLACE FUNCTION enforce_miner_launch_request_immutable()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF OLD.miner_launch_request_id IS DISTINCT FROM NEW.miner_launch_request_id
+           OR OLD.miner_launch_request_sha256
+              IS DISTINCT FROM NEW.miner_launch_request_sha256 THEN
+            RAISE EXCEPTION
+                'miner launch request identity is immutable for launch config %%',
+                OLD.config_id;
+        END IF;
+        RETURN NEW;
+    END;
+    $$
+    """
+).execute_if(dialect="postgresql")
+
+event.listen(
+    LaunchConfig.__table__,
+    "after_create",
+    _MINER_LAUNCH_REQUEST_IMMUTABLE_FUNCTION,
+)
+event.listen(
+    LaunchConfig.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_miner_launch_request_immutable
+        BEFORE UPDATE OF miner_launch_request_id, miner_launch_request_sha256
+        ON launch_configs
+        FOR EACH ROW EXECUTE FUNCTION enforce_miner_launch_request_immutable()
+        """
+    ).execute_if(dialect="postgresql"),
+)
 
 
 # ---------------------------------------------------------------------------
