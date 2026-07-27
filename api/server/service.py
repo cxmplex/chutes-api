@@ -2089,7 +2089,6 @@ async def register_gpu_server(
             raise ServerRegistrationError(
                 "Consumed GPU registration retry differs from the prior exact success."
             )
-        await db.commit()
         return {
             "server_id": server.server_id,
             "owner_hotkey": claims.owner_hotkey,
@@ -2264,7 +2263,6 @@ async def register_gpu_server(
         target.consumed_measurement_version = measurement_config.version
         target.consumed_measurement_config_fingerprint = config_fingerprint
         target.consumed_trust_set_fingerprint = trust_set_fingerprint
-    await db.commit()
     return {
         "server_id": server.server_id,
         "owner_hotkey": claims.owner_hotkey,

@@ -121,6 +121,37 @@ def _failed_response(attempt: GpuRegistrationAttempt) -> GpuRegistrationResponse
     )
 
 
+def _start_registration_response_replay(
+    attempt: GpuRegistrationAttempt,
+    *,
+    ready_at: datetime,
+) -> None:
+    """Start the one response-recovery window after all launch side effects ACK."""
+
+    if attempt.state != "completed":
+        raise ServerRegistrationError(
+            "Only a completed GPU registration can become response-ready."
+        )
+    if attempt.response_ready_at is None:
+        if attempt.registration_replay_until is not None:
+            raise ServerRegistrationError(
+                "GPU registration response readiness audit is inconsistent."
+            )
+        attempt.response_ready_at = ready_at
+        attempt.registration_replay_until = ready_at + timedelta(
+            seconds=_REPLAY_SECONDS
+        )
+        attempt.updated_at = ready_at
+        return
+    if (
+        attempt.registration_replay_until is None
+        or attempt.registration_replay_until <= attempt.response_ready_at
+    ):
+        raise ServerRegistrationError(
+            "GPU registration response readiness audit is inconsistent."
+        )
+
+
 def _registration_request_audit(
     request: GpuRegistrationRequestV2,
     expected_cert_hash: str,
@@ -1005,10 +1036,18 @@ async def _claim_attempt(
             raise HTTPException(
                 status_code=409, detail="Claimed GPU registration nonce is incomplete."
             )
+        replay_closed = bool(
+            attempt.registration_replay_until is None
+            or attempt.registration_replay_until <= now
+        )
         if nonce.state == "expired" and (
             attempt.state == "processing"
-            or attempt.registration_replay_until is None
-            or attempt.registration_replay_until <= now
+            or (attempt.state == "failed" and replay_closed)
+            or (
+                attempt.state == "completed"
+                and attempt.response_ready_at is not None
+                and replay_closed
+            )
         ):
             raise HTTPException(
                 status_code=409,
@@ -1387,6 +1426,8 @@ async def _complete_attempt(
     attempt_id: str,
     lease_owner: str,
     result: dict,
+    *,
+    response_ready: bool = True,
 ) -> GpuRegistrationAttempt:
     await acquire_gpu_lifecycle_lock(db)
     attempt = (
@@ -1413,7 +1454,10 @@ async def _complete_attempt(
     attempt.attestation_id = result["attestation_id"]
     attempt.stable_response = stable
     attempt.stable_response_sha256 = canonical_sha256(stable)
-    attempt.registration_replay_until = now + timedelta(seconds=_REPLAY_SECONDS)
+    attempt.response_ready_at = now if response_ready else None
+    attempt.registration_replay_until = (
+        now + timedelta(seconds=_REPLAY_SECONDS) if response_ready else None
+    )
     attempt.processing_lease_owner = None
     attempt.processing_lease_expires_at = None
     attempt.completed_at = now
@@ -1480,10 +1524,15 @@ async def registration_attempt_response(
     if attempt.state == "processing":
         return _processing_response(attempt)
     now = _now()
-    if (
-        attempt.registration_replay_until is None
-        or attempt.registration_replay_until <= now
-    ):
+    replay_expired = bool(
+        attempt.registration_replay_until is not None
+        and attempt.registration_replay_until <= now
+    )
+    replay_missing = bool(
+        attempt.state == "failed"
+        or (attempt.state == "completed" and attempt.response_ready_at is not None)
+    ) and attempt.registration_replay_until is None
+    if replay_missing or replay_expired:
         nonce = (
             await db.execute(
                 select(GpuRegistrationNonce)
@@ -1500,6 +1549,14 @@ async def registration_attempt_response(
         )
     if attempt.state == "failed":
         return _failed_response(attempt)
+    if (
+        attempt.response_ready_at is None
+        and attempt.registration_replay_until is not None
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="GPU registration response readiness audit is invalid.",
+        )
 
     stable = dict(attempt.stable_response or {})
     if (
@@ -1763,6 +1820,17 @@ async def registration_attempt_response(
             status_code=409,
             detail="GPU legacy hotplug acknowledgement is incomplete.",
         )
+    if attempt.response_ready_at is None:
+        if hotplug is None:
+            raise HTTPException(
+                status_code=409,
+                detail="GPU registration response readiness is incomplete.",
+            )
+        _start_registration_response_replay(
+            attempt,
+            ready_at=_now(),
+        )
+        await db.flush()
 
     from api.server.gpu_sessions import latest_gpu_runtime_session
 
@@ -2254,7 +2322,6 @@ async def _run_registration_attempt(
                 db, snapshot
             ),
         )
-        attempt = await _complete_attempt(db, attempt_id, lease_owner, result)
         completed_reservation = (
             (
                 await db.execute(
@@ -2266,8 +2333,6 @@ async def _run_registration_attempt(
                     .with_for_update()
                 )
             ).scalar_one_or_none()
-            if attempt.state == "completed"
-            else None
         )
         completed_group = (
             (
@@ -2290,13 +2355,20 @@ async def _run_registration_attempt(
             and completed_reservation.state == "running"
             and completed_group.state == "running"
             and completed_reservation.registration_attestation_id
-            == attempt.attestation_id
+            == result["attestation_id"]
             and completed_group.reservation_id == completed_reservation.reservation_id
             and completed_group.reservation_generation
             == completed_reservation.reservation_generation
             and completed_group.process_incarnation
             == completed_reservation.process_incarnation
             else None
+        )
+        attempt = await _complete_attempt(
+            db,
+            attempt_id,
+            lease_owner,
+            result,
+            response_ready=hotplug_command is None,
         )
         await db.commit()
         if hotplug_command is not None and attempt.state == "completed":

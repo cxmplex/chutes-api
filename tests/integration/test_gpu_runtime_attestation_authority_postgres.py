@@ -75,6 +75,7 @@ async def _completed_registration(session, mode: str):
         result,
     )
     completed.completed_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+    completed.response_ready_at = completed.completed_at
     completed.registration_replay_until = completed.completed_at + timedelta(minutes=15)
     await session.commit()
     return response, request, cert_pem, spki_sha256, registration_a, completed

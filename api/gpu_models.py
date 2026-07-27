@@ -133,6 +133,7 @@ class GpuRegistrationAttempt(Base):
     )
     stable_response = Column(JSONB, nullable=True)
     stable_response_sha256 = Column(String(64), nullable=True)
+    response_ready_at = Column(DateTime(timezone=True), nullable=True)
     registration_replay_until = Column(DateTime(timezone=True), nullable=True)
     failure_code = Column(String, nullable=True)
     failure_detail = Column(Text, nullable=True)
@@ -168,12 +169,17 @@ class GpuRegistrationAttempt(Base):
             "AND request_payload_key_id IS NOT NULL "
             "AND registration_id IS NULL AND attestation_id IS NULL "
             "AND stable_response IS NULL AND stable_response_sha256 IS NULL "
+            "AND response_ready_at IS NULL "
             "AND registration_replay_until IS NULL AND completed_at IS NULL "
             "AND failure_code IS NULL AND failure_detail IS NULL) OR "
             "(state = 'completed' AND registration_id IS NOT NULL "
             "AND attestation_id IS NOT NULL AND stable_response IS NOT NULL "
             "AND stable_response_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND registration_replay_until > completed_at AND completed_at IS NOT NULL "
+            "AND completed_at IS NOT NULL "
+            "AND ((response_ready_at IS NULL AND registration_replay_until IS NULL) "
+            "OR (response_ready_at IS NOT NULL "
+            "AND response_ready_at >= completed_at "
+            "AND registration_replay_until > response_ready_at)) "
             "AND processing_lease_owner IS NULL "
             "AND processing_lease_expires_at IS NULL "
             "AND request_payload_ciphertext IS NULL "
@@ -184,6 +190,7 @@ class GpuRegistrationAttempt(Base):
             "AND stable_response_sha256 IS NULL AND failure_code IS NOT NULL "
             "AND failure_detail IS NOT NULL AND completed_at IS NOT NULL "
             "AND registration_replay_until > completed_at "
+            "AND response_ready_at IS NULL "
             "AND processing_lease_owner IS NULL "
             "AND processing_lease_expires_at IS NULL "
             "AND request_payload_ciphertext IS NULL "

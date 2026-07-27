@@ -33,6 +33,7 @@ from api.config import TeeMeasurementConfig, settings
 from api.host import gpu_allocations
 from api.host.locks import acquire_gpu_lifecycle_lock
 from api.gpu_contracts import (
+    GpuHotplugCommandAckV1,
     GpuLocalReleaseAckV1,
     GpuPhysicalResultV1,
     GpuRegistrationRequestV2,
@@ -64,11 +65,13 @@ from api.gpu_hotplug_service import (
     _new_command,
     dispatch_gpu_hotplug_command,
     get_gpu_hotplug_command,
+    record_gpu_hotplug_ack,
 )
 from api.gpu_registration_service import (
     _claim_attempt,
     _complete_attempt,
     _registration_request_audit,
+    _run_registration_attempt,
     _verify_recorded_conflict,
     cleanup_expired_gpu_registration_nonces,
     process_gpu_registration,
@@ -6202,6 +6205,315 @@ async def test_duplicate_registration_while_processing_reuses_attempt(
         assert request.launch_reservation not in attempts[0].request_payload_ciphertext
 
 
+async def test_registration_publication_and_attempt_completion_commit_atomically(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        response, request, cert_pem, spki_sha256 = await _prepare_registration_request(
+            session, "miner"
+        )
+        attempt, lease_owner, conflict = await _claim_attempt(
+            session, "192.0.2.30", request, spki_sha256, cert_pem
+        )
+        assert lease_owner is not None
+        assert conflict is None
+        await session.commit()
+        attempt_id = attempt.attempt_id
+
+        measurement = SimpleNamespace(
+            version=response.claims.image_version,
+            name=response.claims.measurement_name,
+            config_fingerprint="a" * 64,
+            trust_set_fingerprint="b" * 64,
+        )
+        original_commit = session.commit
+        commit_spy = AsyncMock(side_effect=original_commit)
+        with (
+            patch.object(session, "commit", commit_spy),
+            patch(
+                "api.server.service.verify_gpu_registration_evidence",
+                AsyncMock(
+                    return_value=(
+                        SimpleNamespace(revocation_status={}),
+                        measurement,
+                        _verified_gpu_subset(1, 2),
+                    )
+                ),
+            ),
+            patch(
+                "api.releases.service.preverify_active_gpu_release_for_host",
+                AsyncMock(),
+            ),
+            patch(
+                "api.gpu_registration_service.registration_attempt_response",
+                AsyncMock(side_effect=RuntimeError("response was lost")),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="response was lost"):
+                await _run_registration_attempt(
+                    session,
+                    attempt_id,
+                    lease_owner,
+                    spki_sha256,
+                )
+        # One commit releases the pre-verification snapshot; the second publishes
+        # Server/Node/attestation/running custody and the completed attempt together.
+        assert commit_spy.await_count == 2
+
+    async with sessions() as session:
+        completed = await session.get(GpuRegistrationAttempt, attempt_id)
+        assert completed.state == "completed"
+        registration_id = completed.registration_id
+        attestation_id = completed.attestation_id
+        unavailable_verifier = AsyncMock(
+            side_effect=AssertionError("completed replay must not reverify evidence")
+        )
+        with patch(
+            "api.gpu_registration_service.register_gpu_server",
+            unavailable_verifier,
+        ):
+            replay, response_status = await process_gpu_registration(
+                session,
+                "192.0.2.30",
+                request,
+                spki_sha256,
+                cert_pem,
+            )
+        assert response_status == 200
+        assert replay.state == "completed"
+        assert replay.registration_id == registration_id
+        assert replay.attestation_id == attestation_id
+        assert replay.runtime_session is not None
+        unavailable_verifier.assert_not_awaited()
+
+
+async def test_legacy_hotplug_starts_full_replay_window_only_when_response_ready(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        now = datetime.now(timezone.utc)
+        legacy_server = Server(
+            server_id="focused-registration-legacy-source",
+            netuid=64,
+            name="focused-legacy-vm",
+            ip="192.0.2.40",
+            miner_hotkey="owner",
+            is_tee=True,
+            self_registered=True,
+            compute_type="gpu",
+            tee_type="tdx",
+            host_id="gpu-host",
+            storage_role=False,
+            version="1.10.0",
+            attested_cert_pubkey_hash="d" * 64,
+            measurement_name="legacy-gpu",
+            measurement_config_fingerprint="a" * 64,
+            trust_set_fingerprint="b" * 64,
+            attestation_revocation_status={},
+        )
+        session.add(legacy_server)
+        await session.flush()
+        close_attestation = ServerAttestation(
+            quote_data="focused-legacy-close-quote",
+            server_id=legacy_server.server_id,
+            created_at=now,
+            verified_at=now,
+            measurement_version=legacy_server.version,
+            measurement_name=legacy_server.measurement_name,
+            measurement_config_fingerprint=(
+                legacy_server.measurement_config_fingerprint
+            ),
+            trust_set_fingerprint=legacy_server.trust_set_fingerprint,
+            revocation_status={},
+        )
+        session.add(close_attestation)
+        session.add(
+            GpuMinerIdentity(
+                host_id="gpu-host",
+                server_id="focused-registration-legacy-target",
+                owner_hotkey="owner",
+                legacy_vm_name="focused-legacy-vm",
+            )
+        )
+        await session.flush()
+        session.add(
+            GpuLegacyMigration(
+                migration_id="focused-registration-hotplug-migration",
+                host_id="gpu-host",
+                owner_hotkey="owner",
+                legacy_server_id=legacy_server.server_id,
+                legacy_vm_name="focused-legacy-vm",
+                target_server_id="focused-registration-legacy-target",
+                state="ready",
+                close_attestation_id=close_attestation.attestation_id,
+                close_cert_hash="d" * 64,
+                storage_luks_uuid="11111111-1111-1111-1111-111111111111",
+                storage_filesystem_uuid="22222222-2222-2222-2222-222222222222",
+                storage_generation=1,
+                cache_luks_uuid="33333333-3333-3333-3333-333333333333",
+                cache_filesystem_uuid="44444444-4444-4444-4444-444444444444",
+                cache_filesystem_type="xfs",
+                cache_generation=1,
+                required_entries=["storage", "tdx-cache"],
+                optional_entries=[],
+                guest_closed_at=now,
+                host_confirmed_at=now,
+            )
+        )
+        await session.flush()
+        reserved = await reserve_gpu_group(
+            session,
+            "gpu-host",
+            GpuMinerReservationRequestV1(
+                gpu_identifier="b200",
+                gpu_count=8,
+                minimum_vram_mib=196608,
+                miner_hourly_cost=12.5,
+                legacy_vm_name="focused-legacy-vm",
+            ),
+        )
+        response, request, cert_pem, spki_sha256 = await _prepare_registration_request(
+            session,
+            "miner",
+            reserved_response=reserved,
+        )
+        attempt, lease_owner, conflict = await _claim_attempt(
+            session, "192.0.2.30", request, spki_sha256, cert_pem
+        )
+        assert lease_owner is not None
+        assert conflict is None
+        result = await _publish_completed_registration_fixture(
+            session, response, request, cert_pem, spki_sha256
+        )
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            response.claims.reservation_id,
+        )
+        command = _new_command(reservation)
+        session.add(
+            GpuHotplugCommand(
+                command_id=command.command_id,
+                host_id=command.host_id,
+                host_key_generation=command.host_key_generation,
+                host_boot_generation=command.host_boot_generation,
+                reservation_id=command.reservation_id,
+                reservation_generation=command.reservation_generation,
+                claims_sha256=command.claims_sha256,
+                allocation_group_id=command.allocation_group_id,
+                allocation_group_generation=command.allocation_group_generation,
+                process_incarnation=command.process_incarnation,
+                stable_server_id=command.stable_server_id,
+                migration_id=command.migration_id,
+                payload=command.payload.model_dump(mode="json"),
+                payload_sha256=command.payload_sha256,
+                state="pending",
+                attempt_count=0,
+                next_attempt_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        completed = await _complete_attempt(
+            session,
+            attempt.attempt_id,
+            lease_owner,
+            result,
+            response_ready=False,
+        )
+        completed.completed_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        await session.commit()
+        assert completed.response_ready_at is None
+        assert completed.registration_replay_until is None
+
+    async with sessions() as session:
+        completed = await session.get(GpuRegistrationAttempt, attempt.attempt_id)
+        pending = await registration_attempt_response(
+            session,
+            completed,
+            spki_sha256,
+        )
+        assert pending.state == "processing"
+        assert pending.retry_after_seconds == 2
+        assert completed.response_ready_at is None
+        assert completed.registration_replay_until is None
+        await session.rollback()
+
+    async with sessions() as session:
+        host = await session.get(Host, response.claims.host_id)
+        ack_document = {
+            "schema": "chutes.gpu-hotplug-command-ack.v1",
+            "version": 1,
+            "command_id": command.command_id,
+            "payload_sha256": command.payload_sha256,
+            "state": "acked",
+            "objects": [
+                {
+                    "namespace": namespace,
+                    "block_node_name": f"focused-{namespace}-node",
+                    "device_id": f"focused-{namespace}-device",
+                    "serial": f"focused-{namespace}-serial",
+                    "source_path_sha256": hashlib.sha256(
+                        namespace.encode("ascii")
+                    ).hexdigest(),
+                    "block_node_present": True,
+                    "device_present": True,
+                    "device_bound": True,
+                }
+                for namespace in ("storage", "tdx-cache")
+            ],
+        }
+        ack = GpuHotplugCommandAckV1(
+            **ack_document,
+            ack_sha256=canonical_sha256(ack_document),
+        )
+        await record_gpu_hotplug_ack(
+            session,
+            host,
+            command.command_id,
+            ack,
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        completed = await session.get(GpuRegistrationAttempt, attempt.attempt_id)
+        registration_id = completed.registration_id
+        attestation_id = completed.attestation_id
+        first = await registration_attempt_response(
+            session,
+            completed,
+            spki_sha256,
+        )
+        assert first.state == "completed"
+        assert first.registration_id == registration_id
+        assert first.attestation_id == attestation_id
+        assert first.runtime_session is not None
+        assert first.registration_replay_until - completed.response_ready_at == timedelta(
+            minutes=15
+        )
+        assert completed.response_ready_at - completed.completed_at > timedelta(
+            minutes=15
+        )
+        first_runtime = first.runtime_session
+        await session.commit()
+
+    async with sessions() as session:
+        completed = await session.get(GpuRegistrationAttempt, attempt.attempt_id)
+        second = await registration_attempt_response(
+            session,
+            completed,
+            spki_sha256,
+        )
+        assert second.registration_id == registration_id
+        assert second.attestation_id == attestation_id
+        assert second.registration_replay_until == first.registration_replay_until
+        assert second.runtime_session is not None
+        assert second.runtime_session != first_runtime
+
+
 async def test_published_registration_requires_completed_attempt_before_authority(
     postgres_schema,
 ):
@@ -6262,6 +6574,7 @@ async def test_published_registration_requires_completed_attempt_before_authorit
         )
         # Response replay expiry is independent of durable runtime authority.
         completed.completed_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        completed.response_ready_at = completed.completed_at
         completed.registration_replay_until = datetime.now(timezone.utc) - timedelta(
             minutes=5
         )
