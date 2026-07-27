@@ -5,12 +5,15 @@ import os
 import shutil
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 import api.database.orms  # noqa: F401
+import api.gpu_scheduler as gpu_scheduler
 from api.database import Base
 from api.database.migrations import (
     TRACKED_MIGRATION_BASELINE,
@@ -134,6 +137,34 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
                 .scalars()
                 .all()
             )
+            node_gpu_foreign_keys = {
+                row.column_name: (row.constraint_count, row.constraint_names)
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT attribute.attname AS column_name, "
+                            "COUNT(*) AS constraint_count, "
+                            "ARRAY_AGG(constraint_row.conname ORDER BY "
+                            "constraint_row.conname) AS constraint_names "
+                            "FROM pg_constraint AS constraint_row "
+                            "JOIN pg_class AS relation "
+                            "ON relation.oid = constraint_row.conrelid "
+                            "JOIN pg_namespace AS namespace "
+                            "ON namespace.oid = relation.relnamespace "
+                            "JOIN pg_attribute AS attribute "
+                            "ON attribute.attrelid = relation.oid "
+                            "AND attribute.attnum = ANY(constraint_row.conkey) "
+                            "WHERE namespace.oid = current_schema()::regnamespace "
+                            "AND relation.relname = 'nodes' "
+                            "AND constraint_row.contype = 'f' "
+                            "AND attribute.attname IN "
+                            "('gpu_launch_reservation_id', "
+                            "'gpu_inventory_report_id') "
+                            "GROUP BY attribute.attname"
+                        )
+                    )
+                )
+            }
         assert {path.name.split("_", 1)[0] for path in _migration_paths()} <= versions
         assert {
             "trg_prevent_user_delete_before_chutefs_erasure",
@@ -141,6 +172,16 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
             "trg_complete_launch_config_on_job_terminal",
             "trg_launch_terminal_registry_scope",
         } <= triggers
+        assert node_gpu_foreign_keys == {
+            "gpu_launch_reservation_id": (
+                1,
+                ["fk_nodes_gpu_launch_reservation"],
+            ),
+            "gpu_inventory_report_id": (
+                1,
+                ["fk_nodes_gpu_inventory_report"],
+            ),
+        }
     finally:
         await _drop_schema(schema, admin, engine)
 
@@ -215,4 +256,108 @@ async def test_prechange_schema_accepts_new_migrations_sequentially_and_down_gua
         assert completed == 1
         assert registry_constraint == 1
     finally:
+        await _drop_schema(schema, admin, engine)
+
+
+async def test_scheduler_readiness_stays_false_until_exact_schema_commit():
+    schema, admin, engine = await _new_schema()
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "CREATE TABLE schema_migrations "
+                    "(version VARCHAR(255) PRIMARY KEY)"
+                )
+            )
+            await connection.execute(
+                text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                {"version": "99999999999999"},
+            )
+        with patch.object(gpu_scheduler, "engine", engine):
+            assert await gpu_scheduler.required_gpu_schema_present() is False
+            async with engine.connect() as migration_connection:
+                migration = await migration_connection.begin()
+                await migration_connection.execute(
+                    text(
+                        "INSERT INTO schema_migrations(version) VALUES (:version)"
+                    ),
+                    {"version": gpu_scheduler.REQUIRED_GPU_SCHEMA_VERSION},
+                )
+                # The exact row remains invisible to the readiness connection until
+                # the migration owner's transaction commits its whole schema change.
+                assert await gpu_scheduler.required_gpu_schema_present() is False
+                await migration.commit()
+            assert await gpu_scheduler.required_gpu_schema_present() is True
+            assert gpu_scheduler.scheduler_liveness_healthy() is True
+    finally:
+        await _drop_schema(schema, admin, engine)
+
+
+async def test_scheduler_main_does_no_election_or_orm_work_before_real_schema_barrier():
+    class StopScheduler(BaseException):
+        pass
+
+    schema, admin, engine = await _new_schema()
+    migration_connection = None
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "CREATE TABLE schema_migrations "
+                    "(version VARCHAR(255) PRIMARY KEY)"
+                )
+            )
+            await connection.execute(
+                text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+                {"version": "99999999999999"},
+            )
+
+        migration_connection = await engine.connect()
+        migration = await migration_connection.begin()
+        await migration_connection.execute(
+            text("INSERT INTO schema_migrations(version) VALUES (:version)"),
+            {"version": gpu_scheduler.REQUIRED_GPU_SCHEMA_VERSION},
+        )
+
+        tick = AsyncMock(side_effect=StopScheduler())
+        schedule = AsyncMock()
+        redis = AsyncMock()
+        schema_committed = False
+
+        async def release_schema(_delay):
+            nonlocal schema_committed
+            assert not schema_committed
+            assert await gpu_scheduler.required_gpu_schema_present() is False
+            assert gpu_scheduler.scheduler_liveness_healthy() is True
+            tick.assert_not_awaited()
+            schedule.assert_not_awaited()
+            redis.set.assert_not_awaited()
+            redis.eval.assert_not_awaited()
+            await migration.commit()
+            schema_committed = True
+
+        with (
+            patch.object(gpu_scheduler, "engine", engine),
+            patch.object(
+                gpu_scheduler,
+                "settings",
+                SimpleNamespace(redis_client=redis),
+            ),
+            patch.object(gpu_scheduler, "_tick_with_lock", tick),
+            patch.object(gpu_scheduler, "schedule_once", schedule),
+            patch.object(gpu_scheduler.asyncio, "sleep", side_effect=release_schema),
+            pytest.raises(StopScheduler),
+        ):
+            await gpu_scheduler.main()
+
+        assert schema_committed
+        with patch.object(gpu_scheduler, "engine", engine):
+            assert await gpu_scheduler.required_gpu_schema_present() is True
+        tick.assert_awaited_once_with()
+        schedule.assert_not_awaited()
+        redis.set.assert_not_awaited()
+        redis.eval.assert_not_awaited()
+    finally:
+        if migration_connection is not None:
+            await migration_connection.close()
         await _drop_schema(schema, admin, engine)

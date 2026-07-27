@@ -61,6 +61,12 @@ def test_instance_and_job_terminal_events_revoke_registry_sessions():
             CREATE TABLE registry_sessions (
                 session_id TEXT PRIMARY KEY,
                 server_id TEXT NOT NULL,
+                repository TEXT,
+                manifest_digest TEXT,
+                allowed_manifests JSONB NOT NULL DEFAULT '[]'::jsonb,
+                allowed_blobs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                allowed_manifest_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+                descriptor_closure_sha256 TEXT,
                 revoked_at TIMESTAMPTZ,
                 CONSTRAINT uq_registry_session_server UNIQUE (server_id)
             );
@@ -83,6 +89,22 @@ def test_instance_and_job_terminal_events_revoke_registry_sessions():
         assert baseline.returncode == 0, baseline.stderr.decode()
         migrated = _psql(up_sql, schema)
         assert migrated.returncode == 0, migrated.stderr.decode()
+        legacy = _psql(
+            f"""
+            INSERT INTO registry_sessions (
+                session_id, server_id, scope_id, repository, manifest_digest,
+                allowed_manifests, allowed_blobs, allowed_manifest_tags,
+                descriptor_closure_sha256
+            ) VALUES (
+                'legacy-session', 'legacy-server', 'legacy:legacy-session',
+                'owner/legacy',
+                'sha256:{"c" * 64}', '["sha256:{"c" * 64}"]'::jsonb,
+                '["sha256:{"d" * 64}"]'::jsonb, '[]'::jsonb, '{"e" * 64}'
+            );
+            """,
+            schema,
+        )
+        assert legacy.returncode == 0, legacy.stderr.decode()
 
         instance_lifecycle = _psql(
             f"""
@@ -150,13 +172,51 @@ def test_instance_and_job_terminal_events_revoke_registry_sessions():
             if "|" in line or line in {"t", "f"}
         ][-2:] == ["f|t", "t"]
 
+        guarded = _psql(f"BEGIN;\n{down_sql}\nCOMMIT;", schema)
+        assert guarded.returncode != 0
+        assert b"cannot discard" in guarded.stderr or b"cannot restore" in guarded.stderr
+        catalog = _psql(
+            """
+            SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'registry_sessions'
+               AND column_name IN ('scope_id', 'launch_config_id');
+            SELECT COUNT(*) FROM pg_trigger
+             WHERE NOT tgisinternal
+               AND tgname = 'trg_launch_terminal_registry_scope';
+            """,
+            schema,
+        )
+        assert catalog.returncode == 0, catalog.stderr.decode()
+        assert [line for line in catalog.stdout.decode().splitlines() if line] == [
+            "2",
+            "1",
+        ]
+
         cleanup = _psql(
-            "DELETE FROM registry_sessions WHERE session_id = 'session-job';",
+            """
+            DELETE FROM instances;
+            DELETE FROM registry_sessions WHERE launch_config_id IS NOT NULL;
+            DELETE FROM launch_configs;
+            DELETE FROM jobs;
+            """,
             schema,
         )
         assert cleanup.returncode == 0, cleanup.stderr.decode()
-        reverted = _psql(down_sql, schema)
+        reverted = _psql(f"BEGIN;\n{down_sql}\nCOMMIT;", schema)
         assert reverted.returncode == 0, reverted.stderr.decode()
+        preserved = _psql(
+            """
+            SELECT repository, manifest_digest, descriptor_closure_sha256
+              FROM registry_sessions
+             WHERE session_id = 'legacy-session';
+            """,
+            schema,
+        )
+        assert preserved.returncode == 0, preserved.stderr.decode()
+        assert preserved.stdout.decode().strip() == (
+            f"owner/legacy|sha256:{'c' * 64}|{'e' * 64}"
+        )
     finally:
         dropped = _psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;', "public")
         assert dropped.returncode == 0, dropped.stderr.decode()
