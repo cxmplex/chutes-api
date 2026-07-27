@@ -2451,7 +2451,15 @@ class ChuteFSLaunchSession(Base):
     refresh_expires_at = Column(DateTime(timezone=True), nullable=False)
     rotation_request_sha256 = Column(String(64), nullable=True)
     token_seed = Column(String(64), nullable=True)
-    token_key_id = Column(String, nullable=True)
+    token_key_id = Column(
+        String,
+        ForeignKey(
+            "chutefs_token_key_epochs.key_id",
+            name="fk_chutefs_launch_session_token_key",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
     response_replay_until = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     rotated_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

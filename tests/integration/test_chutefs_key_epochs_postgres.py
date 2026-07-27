@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from cryptography.fernet import Fernet
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
 
 from api.config import settings
 from api.server.schemas import (
@@ -22,7 +26,7 @@ from api.server.schemas import (
     DefaultChuteFSVolumeBinding,
     Server,
 )
-from api.storage import key_epochs
+from api.storage import key_epochs, launch_sessions
 from api.storage import startup as storage_startup
 from api.storage.launch_sessions import ALLOWED_OPERATIONS
 from tests.integration import test_gpu_chutefs_postgres as chutefs_pg
@@ -420,3 +424,158 @@ async def test_retirement_requires_access_refresh_and_response_replay_expiry(
         await db.commit()
     await db.rollback()
     assert (await db.get(ChuteFSTokenKeyEpoch, "old-key")).state == "retiring"
+
+
+async def test_paused_mint_fences_activation_retirement_and_stale_direct_insert(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    await _install_rotation_migration(db)
+    monkeypatch.setattr(storage_startup, "engine", db.bind)
+
+    _configure(
+        monkeypatch,
+        replica_id="bootstrap-pod",
+        keys={"old-key": "o" * 32},
+    )
+    await storage_startup.require_chutefs_token_key_retention()
+    _configure(monkeypatch, replica_id="pod-a")
+    await storage_startup.require_chutefs_token_key_retention()
+    await key_epochs.stage_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="new-key",
+        required_replica_ids=["pod-a"],
+    )
+    await storage_startup.require_chutefs_token_key_retention()
+
+    chute = await chutefs_pg._chute(
+        db,
+        storage_pg.USER_ID,
+        f"mint-epoch-fence-{uuid.uuid4().hex}",
+    )
+    _, cert = chutefs_pg._identity("mint-epoch-fence")
+    config, _instance = await chutefs_pg._cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"mint-epoch-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    await db.commit()
+
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(settings, "require_mtls_client_verify", True)
+    request = chutefs_pg._mtls_request(cert)
+    active_key_read = asyncio.Event()
+    release_mint = asyncio.Event()
+    original_active_key = launch_sessions._active_token_key_id
+
+    async def paused_active_key(candidate: AsyncSession) -> str:
+        key_id = await original_active_key(candidate)
+        active_key_read.set()
+        await release_mint.wait()
+        return key_id
+
+    monkeypatch.setattr(launch_sessions, "_active_token_key_id", paused_active_key)
+    sessions = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+
+    async def mint():
+        async with sessions() as candidate:
+            return await launch_sessions.issue_launch_storage_session(
+                candidate,
+                config.config_id,
+                request,
+            )
+
+    async def activate():
+        async with sessions() as candidate:
+            return await key_epochs.activate_token_key_epoch(
+                candidate,
+                administrator_id="support-user",
+                request_id=str(uuid.uuid4()),
+                key_id="new-key",
+            )
+
+    mint_task = asyncio.create_task(mint())
+    await asyncio.wait_for(active_key_read.wait(), timeout=10)
+    activation_task = asyncio.create_task(activate())
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(activation_task), timeout=0.1)
+    release_mint.set()
+    (_context, minted), activated = await asyncio.wait_for(
+        asyncio.gather(mint_task, activation_task),
+        timeout=10,
+    )
+    assert activated["active_key_id"] == "new-key"
+
+    async with sessions() as candidate:
+        minted_row = await candidate.scalar(
+            select(ChuteFSLaunchSession).where(
+                ChuteFSLaunchSession.access_token_hash
+                == launch_sessions._token_hash(minted.access_token)
+            )
+        )
+        assert minted_row.token_key_id == "old-key"
+        minted_session_id = minted_row.session_id
+        assert (await candidate.get(ChuteFSTokenKeyEpoch, "old-key")).state == "retiring"
+        assert (await candidate.get(ChuteFSTokenKeyEpoch, "new-key")).state == "active"
+
+        with pytest.raises(HTTPException, match="unexpired session authority"):
+            await key_epochs.retire_token_key_epoch(
+                candidate,
+                administrator_id="support-user",
+                request_id=str(uuid.uuid4()),
+                key_id="old-key",
+            )
+        await candidate.rollback()
+
+    async with sessions() as candidate:
+        with pytest.raises(DBAPIError, match="not database-active"):
+            await candidate.execute(
+                text(
+                    """
+                    INSERT INTO chutefs_launch_sessions(
+                        session_id, config_id, instance_id,
+                        rotated_from_session_id, rotated_from_session_sha256,
+                        binding_id, user_id, chute_id, job_id, compute_type,
+                        management_mode, server_id, volume_id, reservation_id,
+                        allocation_group_id, allocation_group_generation,
+                        process_incarnation, attestation_id,
+                        attested_cert_pubkey_hash, allowed_operations, generation,
+                        access_token_hash, refresh_token_hash, access_expires_at,
+                        refresh_expires_at, rotation_request_sha256, token_seed,
+                        token_key_id, response_replay_until, created_at,
+                        rotated_at, revoked_at
+                    )
+                    SELECT :new_session_id, config_id, instance_id,
+                           NULL, NULL, binding_id, user_id, chute_id, job_id,
+                           compute_type, management_mode, server_id, volume_id,
+                           reservation_id, allocation_group_id,
+                           allocation_group_generation, process_incarnation,
+                           attestation_id, attested_cert_pubkey_hash,
+                           allowed_operations, generation, :access_hash,
+                           :refresh_hash, access_expires_at, refresh_expires_at,
+                           :request_hash, :token_seed, 'old-key',
+                           response_replay_until, NOW(), NOW(), NOW()
+                      FROM chutefs_launch_sessions
+                     WHERE session_id = :source_session_id
+                    """
+                ),
+                {
+                    "new_session_id": f"stale-key-{uuid.uuid4().hex}",
+                    "source_session_id": minted_session_id,
+                    "access_hash": "1" * 64,
+                    "refresh_hash": "2" * 64,
+                    "request_hash": "3" * 64,
+                    "token_seed": "4" * 64,
+                },
+            )
+            await candidate.commit()
+        await candidate.rollback()

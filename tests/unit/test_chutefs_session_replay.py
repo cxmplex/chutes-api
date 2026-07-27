@@ -291,7 +291,21 @@ def test_rotation_migration_locks_and_guards_only_its_state():
     ).read_text()
     down = migration.split("-- migrate:down", maxsplit=1)[1]
 
-    assert down.lstrip().startswith("LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;")
+    assert "SELECT pg_advisory_xact_lock(" in down
+    advisory = down.index("chutes.chutefs-token-key-epochs.v1")
+    epoch_lock = down.index(
+        "LOCK TABLE chutefs_token_key_epochs IN ACCESS EXCLUSIVE MODE;"
+    )
+    ack_lock = down.index(
+        "LOCK TABLE chutefs_token_key_replica_acks IN ACCESS EXCLUSIVE MODE;"
+    )
+    operation_lock = down.index(
+        "LOCK TABLE chutefs_token_key_epoch_operations IN ACCESS EXCLUSIVE MODE;"
+    )
+    session_lock = down.index(
+        "LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;"
+    )
+    assert advisory < epoch_lock < ack_lock < operation_lock < session_lock
     assert "LOCK TABLE chutefs_token_key_epochs IN ACCESS EXCLUSIVE MODE;" in down
     assert "LOCK TABLE chutefs_token_key_replica_acks IN ACCESS EXCLUSIVE MODE;" in down
     for column in (
@@ -328,6 +342,9 @@ def test_rotation_migration_locks_and_guards_only_its_state():
         assert f"NEW.{field} IS DISTINCT FROM OLD.{field}" in up
     assert "acknowledged_keyring_sha256 IS DISTINCT FROM expected_keyring_sha256" in up
     assert "acknowledged_key_fingerprints IS DISTINCT FROM expected_key_fingerprints" in up
+    assert "fk_chutefs_launch_session_token_key" in up
+    assert "require_active_chutefs_token_key_on_session_insert" in up
+    assert "FOR SHARE" in up
 
 
 def test_key_epoch_bootstrap_orders_stage_ack_then_activation():
@@ -361,6 +378,8 @@ def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
     first_drop = down.index("DROP TRIGGER")
 
     assert guard_end < first_drop
+    assert "SELECT pg_advisory_xact_lock(" in down
+    assert down.index("chutes.chutefs-schema-fence.v1") < down.index("LOCK TABLE ")
     lock_targets = [
         line.split()[2]
         for line in down[:guard_end].splitlines()

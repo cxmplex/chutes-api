@@ -343,6 +343,7 @@ CREATE TABLE chutefs_launch_sessions (
     session_id VARCHAR PRIMARY KEY,
     config_id VARCHAR NOT NULL,
     instance_id VARCHAR NOT NULL,
+    access_expires_at TIMESTAMPTZ NOT NULL,
     refresh_expires_at TIMESTAMPTZ NOT NULL,
     revoked_at TIMESTAMPTZ,
     CONSTRAINT chutefs_launch_sessions_config_id_key UNIQUE (config_id),
@@ -564,16 +565,34 @@ CREATE TABLE chutefs_launch_sessions (
             "rotation_down",
             ROTATION_PREDECESSOR,
             f"""
+            INSERT INTO chutefs_token_key_epochs(
+                key_id, state, required_replica_ids
+            ) VALUES ('key-v1', 'staged', '["test-replica"]');
+            INSERT INTO chutefs_token_key_replica_acks(
+                replica_id, key_id, key_ids, key_fingerprints, keyring_sha256
+            ) VALUES (
+                'test-replica', 'key-v1', '["key-v1"]',
+                '{{"key-v1":"{"a" * 64}"}}', '{"b" * 64}'
+            );
+            UPDATE chutefs_token_key_epochs
+               SET state = 'active', activated_at = NOW()
+             WHERE key_id = 'key-v1';
             INSERT INTO chutefs_launch_sessions(
-                session_id, config_id, instance_id, refresh_expires_at,
+                session_id, config_id, instance_id,
+                access_expires_at, refresh_expires_at,
                 rotation_request_sha256, token_seed, token_key_id,
                 response_replay_until
             ) VALUES (
-                'session', 'config', 'instance', NOW() + INTERVAL '1 hour',
+                'session', 'config', 'instance', NOW() + INTERVAL '5 minutes',
+                NOW() + INTERVAL '1 hour',
                 '{"d" * 64}', '{"e" * 64}', 'key-v1', NOW() + INTERVAL '15 minutes'
             );
             """,
-            ("chutefs_launch_sessions",),
+            (
+                "chutefs_launch_sessions",
+                "chutefs_token_key_epochs",
+                "chutefs_token_key_replica_acks",
+            ),
             b"cannot remove ChuteFS rotation replay state",
         ),
         (
@@ -582,10 +601,13 @@ CREATE TABLE chutefs_launch_sessions (
             ROTATION_PREDECESSOR,
             """
             INSERT INTO chutefs_launch_sessions(
-                session_id, config_id, instance_id, refresh_expires_at, revoked_at
+                session_id, config_id, instance_id,
+                access_expires_at, refresh_expires_at, revoked_at
             ) VALUES
-                ('old', 'config', 'old-instance', NOW() + INTERVAL '1 hour', NOW()),
-                ('active', 'config', 'active-instance', NOW() + INTERVAL '1 hour', NULL);
+                ('old', 'config', 'old-instance', NOW() + INTERVAL '5 minutes',
+                 NOW() + INTERVAL '1 hour', NOW()),
+                ('active', 'config', 'active-instance', NOW() + INTERVAL '5 minutes',
+                 NOW() + INTERVAL '1 hour', NULL);
             """,
             ("chutefs_launch_sessions",),
             b"cannot restore one-session uniqueness while session history exists",
@@ -673,8 +695,12 @@ def test_migration_specific_down_guard_preserves_catalog_and_data(
             ROTATION_PREDECESSOR,
             """
             INSERT INTO chutefs_launch_sessions(
-                session_id, config_id, instance_id, refresh_expires_at
-            ) VALUES ('session', 'config', 'instance', NOW() + INTERVAL '1 hour');
+                session_id, config_id, instance_id,
+                access_expires_at, refresh_expires_at
+            ) VALUES (
+                'session', 'config', 'instance', NOW() + INTERVAL '5 minutes',
+                NOW() + INTERVAL '1 hour'
+            );
             """,
             "SELECT session_id || '|' || config_id || '|' || instance_id "
             "FROM chutefs_launch_sessions;",
@@ -850,6 +876,117 @@ async def _assert_writer_cannot_cross_down(
         await observer.close()
 
 
+async def _assert_runtime_advisory_fence_precedes_down_tables(
+    schema: str,
+    migration: str,
+    *,
+    advisory_name: str,
+    before_down_sql: str,
+    after_down_wait_sql: str,
+) -> None:
+    _up, down = _migration(migration)
+    runtime = await _connect(schema, "chutefs-runtime")
+    down_connection = await _connect(schema, "chutefs-down")
+    observer = await _connect(schema, "chutefs-observer")
+    runtime_transaction = runtime.transaction()
+    await runtime_transaction.start()
+    runtime_committed = False
+    await runtime.execute(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))",
+        advisory_name,
+    )
+    await runtime.execute(before_down_sql)
+
+    async def run_down():
+        transaction = down_connection.transaction()
+        await transaction.start()
+        try:
+            await down_connection.execute(down)
+        except BaseException:
+            await transaction.rollback()
+            raise
+        await transaction.commit()
+
+    try:
+        down_task = asyncio.create_task(run_down())
+        await _wait_for_lock(observer, down_connection.get_server_pid())
+        await runtime.execute(after_down_wait_sql)
+        await runtime_transaction.commit()
+        runtime_committed = True
+        await asyncio.wait_for(down_task, timeout=10)
+    finally:
+        if not runtime_committed:
+            await runtime_transaction.rollback()
+        await runtime.close()
+        await down_connection.close()
+        await observer.close()
+
+
+@pytest.mark.asyncio
+async def test_default_volume_down_waits_on_schema_fence_before_runtime_rows():
+    schema = _create_schema("chutefs_schema_fence", CHUTEFS_PREDECESSOR)
+    try:
+        seeded = _psql(
+            """
+            INSERT INTO users(user_id) VALUES ('user');
+            INSERT INTO chutes(chute_id, user_id, node_selector)
+            VALUES ('chute', 'user', '{"compute_type":"cpu"}');
+            INSERT INTO launch_configs(config_id, chute_id, failed_at)
+            VALUES ('config', 'chute', NOW());
+            """,
+            schema,
+        )
+        assert seeded.returncode == 0, seeded.stderr.decode()
+        up, _down = _migration(CHUTEFS)
+        migrated = _apply(up, schema)
+        assert migrated.returncode == 0, migrated.stderr.decode()
+        await _assert_runtime_advisory_fence_precedes_down_tables(
+            schema,
+            CHUTEFS,
+            advisory_name="chutes.chutefs-schema-fence.v1",
+            before_down_sql="SELECT 1 FROM users WHERE user_id = 'user' FOR UPDATE",
+            after_down_wait_sql=(
+                "SELECT 1 FROM launch_configs WHERE config_id = 'config' FOR UPDATE"
+            ),
+        )
+    finally:
+        _drop_schema(schema)
+
+
+@pytest.mark.asyncio
+async def test_rotation_down_waits_on_epoch_fence_before_session_rows():
+    schema = _create_schema("chutefs_epoch_fence", ROTATION_PREDECESSOR)
+    try:
+        seeded = _psql(
+            """
+            INSERT INTO chutefs_launch_sessions(
+                session_id, config_id, instance_id,
+                access_expires_at, refresh_expires_at
+            ) VALUES (
+                'session', 'config', 'instance', NOW() + INTERVAL '5 minutes',
+                NOW() + INTERVAL '1 hour'
+            );
+            """,
+            schema,
+        )
+        assert seeded.returncode == 0, seeded.stderr.decode()
+        up, _down = _migration(ROTATION)
+        migrated = _apply(up, schema)
+        assert migrated.returncode == 0, migrated.stderr.decode()
+        await _assert_runtime_advisory_fence_precedes_down_tables(
+            schema,
+            ROTATION,
+            advisory_name="chutes.chutefs-token-key-epochs.v1",
+            before_down_sql="SELECT 1",
+            after_down_wait_sql=(
+                "SELECT 1 FROM chutefs_launch_sessions "
+                "WHERE session_id = 'session' FOR UPDATE"
+            ),
+        )
+    finally:
+        _drop_schema(schema)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
@@ -924,8 +1061,12 @@ async def _assert_writer_cannot_cross_down(
             ROTATION_PREDECESSOR,
             """
             INSERT INTO chutefs_launch_sessions(
-                session_id, config_id, instance_id, refresh_expires_at
-            ) VALUES ('session', 'config', 'instance', NOW() + INTERVAL '1 hour');
+                session_id, config_id, instance_id,
+                access_expires_at, refresh_expires_at
+            ) VALUES (
+                'session', 'config', 'instance', NOW() + INTERVAL '5 minutes',
+                NOW() + INTERVAL '1 hour'
+            );
             """,
             "chutefs_launch_sessions",
             f"""

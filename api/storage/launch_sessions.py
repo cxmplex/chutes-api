@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, Request, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, lazyload
 
@@ -42,6 +42,7 @@ from api.server.schemas import (
 )
 from api.server.util import _get_client_certificate, get_public_key_hash
 from api.storage.schemas import LaunchStorageContext, LaunchStorageSessionResponse
+from api.storage.key_epochs import lock_token_key_epoch_for_session
 from api.user.schemas import User
 
 ACCESS_TTL_SECONDS = 15 * 60
@@ -50,6 +51,7 @@ ALLOWED_OPERATIONS = ["put", "get", "list", "delete"]
 _ACCESS_PREFIX = "cfsas_"
 _REFRESH_PREFIX = "cfsrs_"
 _TOKEN_DOMAIN = b"chutes.chutefs-session-token.v1\0"
+_SCHEMA_FENCE_ADVISORY_LOCK = "chutes.chutefs-schema-fence.v1"
 
 
 async def lock_launch_storage_configurations(
@@ -95,6 +97,18 @@ async def lock_launch_storage_configurations(
     )
     for instance_id in instance_ids:
         await _require_not_disabled(db, instance_id)
+    # Every runtime path takes these shared transaction fences before its first
+    # trust-bearing row lock. Destructive schema rollback and token-key epoch
+    # transitions take the matching exclusive advisory lock first, so neither
+    # can invert the User/config/session lock hierarchy.
+    await db.execute(
+        text(
+            "SELECT pg_advisory_xact_lock_shared("
+            "hashtextextended(:lock_name, 0))"
+        ),
+        {"lock_name": _SCHEMA_FENCE_ADVISORY_LOCK},
+    )
+    await lock_token_key_epoch_for_session(db)
     user_ids = sorted(
         {user_id for _config_id, user_id in hints} | set(additional_user_ids)
     )

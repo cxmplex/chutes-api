@@ -552,6 +552,9 @@ FOR EACH ROW EXECUTE FUNCTION prevent_user_delete_before_chutefs_erasure();
 -- migrate:down
 
 -- Match the shared destructive-down order before either the guard or trigger/DDL changes.
+SELECT pg_advisory_xact_lock(
+    hashtextextended('chutes.chutefs-schema-fence.v1', 0)
+);
 LOCK TABLE gpu_launch_reservations IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE instances IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE;

@@ -20,7 +20,7 @@ from api.server.schemas import (
 )
 from api.storage.startup import TOKEN_KEY_ACK_MAX_AGE_SECONDS
 
-_KEY_EPOCH_ADVISORY_LOCK = "chutes.chutefs-token-key-epochs.v1"
+TOKEN_KEY_EPOCH_ADVISORY_LOCK = "chutes.chutefs-token-key-epochs.v1"
 _OPERATION_SCHEMA = "chutes.chutefs-token-key-epoch-operation.v1"
 
 
@@ -53,7 +53,16 @@ def _request_document(
 async def _lock_epoch_stream(db: AsyncSession) -> None:
     await db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:name, 0))"),
-        {"name": _KEY_EPOCH_ADVISORY_LOCK},
+        {"name": TOKEN_KEY_EPOCH_ADVISORY_LOCK},
+    )
+
+
+async def lock_token_key_epoch_for_session(db: AsyncSession) -> None:
+    """Fence one session transaction against activation and retirement."""
+
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:name, 0))"),
+        {"name": TOKEN_KEY_EPOCH_ADVISORY_LOCK},
     )
 
 

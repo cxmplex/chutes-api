@@ -282,12 +282,62 @@ CREATE TRIGGER trg_chutefs_token_key_epoch_transition
 BEFORE INSERT OR UPDATE ON chutefs_token_key_epochs
 FOR EACH ROW EXECUTE FUNCTION enforce_chutefs_token_key_epoch_transition();
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'fk_chutefs_launch_session_token_key'
+           AND conrelid = 'chutefs_launch_sessions'::regclass
+    ) THEN
+        ALTER TABLE chutefs_launch_sessions
+            ADD CONSTRAINT fk_chutefs_launch_session_token_key
+            FOREIGN KEY (token_key_id)
+            REFERENCES chutefs_token_key_epochs(key_id) ON DELETE RESTRICT;
+    END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION require_active_chutefs_token_key_on_session_insert()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    active_key_id VARCHAR;
+BEGIN
+    IF NEW.token_key_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT epoch.key_id
+      INTO active_key_id
+      FROM chutefs_token_key_epochs epoch
+     WHERE epoch.key_id = NEW.token_key_id
+       AND epoch.state = 'active'
+       FOR SHARE;
+    IF active_key_id IS NULL THEN
+        RAISE EXCEPTION
+            'ChuteFS launch session token key % is not database-active',
+            NEW.token_key_id;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS trg_chutefs_session_active_token_key
+    ON chutefs_launch_sessions;
+CREATE TRIGGER trg_chutefs_session_active_token_key
+BEFORE INSERT ON chutefs_launch_sessions
+FOR EACH ROW EXECUTE FUNCTION require_active_chutefs_token_key_on_session_insert();
+
 -- migrate:down
 
-LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;
+SELECT pg_advisory_xact_lock(
+    hashtextextended('chutes.chutefs-token-key-epochs.v1', 0)
+);
 LOCK TABLE chutefs_token_key_epochs IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE chutefs_token_key_replica_acks IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE chutefs_token_key_epoch_operations IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 BEGIN
@@ -329,6 +379,11 @@ $$;
 DROP TRIGGER IF EXISTS trg_chutefs_token_key_epoch_transition
     ON chutefs_token_key_epochs;
 DROP FUNCTION IF EXISTS enforce_chutefs_token_key_epoch_transition();
+DROP TRIGGER IF EXISTS trg_chutefs_session_active_token_key
+    ON chutefs_launch_sessions;
+DROP FUNCTION IF EXISTS require_active_chutefs_token_key_on_session_insert();
+ALTER TABLE chutefs_launch_sessions
+    DROP CONSTRAINT IF EXISTS fk_chutefs_launch_session_token_key;
 DROP TRIGGER IF EXISTS trg_chutefs_token_key_operation_immutable
     ON chutefs_token_key_epoch_operations;
 DROP FUNCTION IF EXISTS prevent_chutefs_token_key_operation_mutation();
