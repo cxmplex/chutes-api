@@ -540,6 +540,42 @@ FOR EACH ROW EXECUTE FUNCTION prevent_user_delete_before_chutefs_erasure();
 
 -- migrate:down
 
+-- Match the shared destructive-down order before either the guard or trigger/DDL changes.
+LOCK TABLE gpu_launch_reservations IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE instances IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE launch_configs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE servers IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE storage_volumes IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE default_chutefs_volume_bindings IN ACCESS EXCLUSIVE MODE;
+
+DO $$
+BEGIN
+    IF EXISTS (
+           SELECT 1
+             FROM default_chutefs_volume_bindings binding
+             JOIN storage_volumes volume ON volume.volume_id = binding.volume_id
+            WHERE volume.purged_at IS NULL
+               OR volume.key_shredded_at IS NULL
+       )
+       OR EXISTS (SELECT 1 FROM default_chutefs_volume_bindings)
+       OR EXISTS (SELECT 1 FROM chutefs_launch_sessions)
+       OR EXISTS (
+           SELECT 1
+             FROM launch_configs
+            WHERE default_volume_id IS NOT NULL
+               OR storage_session_exchange_allowed
+               OR completed_at IS NOT NULL
+       )
+    THEN
+        RAISE EXCEPTION
+            'cannot roll back default ChuteFS volumes while migration-owned state exists';
+    END IF;
+END
+$$;
+
 DROP TRIGGER IF EXISTS trg_revoke_chutefs_session_on_reservation_change
     ON gpu_launch_reservations;
 DROP FUNCTION IF EXISTS revoke_chutefs_session_on_reservation_change();

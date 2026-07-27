@@ -81,6 +81,25 @@ class Node(Base):
         nullable=True,
     )
     gpu_allocation_group_generation = Column(Integer, nullable=True)
+    gpu_launch_reservation_id = Column(
+        String,
+        ForeignKey(
+            "gpu_launch_reservations.reservation_id",
+            ondelete="RESTRICT",
+            name="fk_nodes_gpu_launch_reservation",
+        ),
+        nullable=True,
+    )
+    gpu_process_incarnation = Column(String, nullable=True)
+    gpu_inventory_report_id = Column(
+        String,
+        ForeignKey(
+            "gpu_inventory_reports.report_id",
+            ondelete="RESTRICT",
+            name="fk_nodes_gpu_inventory_report",
+        ),
+        nullable=True,
+    )
     gpu_retired_at = Column(DateTime(timezone=True), nullable=True)
 
     server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=True)
@@ -101,9 +120,15 @@ class Node(Base):
     __table_args__ = (
         CheckConstraint(
             "(gpu_allocation_group_id IS NULL "
-            "AND gpu_allocation_group_generation IS NULL) OR "
+            "AND gpu_allocation_group_generation IS NULL "
+            "AND gpu_launch_reservation_id IS NULL "
+            "AND gpu_process_incarnation IS NULL "
+            "AND gpu_inventory_report_id IS NULL) OR "
             "(gpu_allocation_group_id IS NOT NULL "
-            "AND gpu_allocation_group_generation > 0)",
+            "AND gpu_allocation_group_generation > 0 "
+            "AND gpu_launch_reservation_id IS NOT NULL "
+            "AND gpu_process_incarnation IS NOT NULL "
+            "AND gpu_inventory_report_id IS NOT NULL)",
             name="ck_nodes_gpu_allocation_identity",
         ),
     )

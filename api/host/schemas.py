@@ -1593,126 +1593,11 @@ class GpuReservationQuarantineRequestV1(FrozenWireModel):
         return GpuLaunchReservationResponseV1._valid_digest(value)
 
 
-class GpuResetResultV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-reset-result"] = "chutes.gpu-reset-result"
-    version: Literal[1] = 1
-    reservation_id: str
-    claims_sha256: str
-    process_incarnation: str
-    qemu_absent: bool
-    reset_succeeded: bool
-    gpu_bdfs: List[str]
-    gpu_uuids: List[str]
-    topology_fingerprint: str
-    original_drivers_restored: bool
-    guest_shutdown_clean: Optional[bool] = None
-    failure_code: Optional[str] = Field(None, min_length=1, max_length=128)
-    failure_reason: Optional[str] = Field(None, min_length=1, max_length=2000)
-    evidence: Dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("claims_sha256", "topology_fingerprint")
-    @classmethod
-    def _valid_digest(cls, value: str) -> str:
-        return GpuLaunchReservationResponseV1._valid_digest(value)
-
-    @field_validator("gpu_bdfs")
-    @classmethod
-    def _canonical_bdfs(cls, value: List[str]) -> List[str]:
-        return GpuLaunchReservationClaimsV1._canonical_bdfs(value)
-
-    @field_validator("gpu_uuids")
-    @classmethod
-    def _canonical_uuids(cls, value: List[str]) -> List[str]:
-        return GpuLaunchReservationClaimsV1._canonical_gpu_uuids(value)
-
-    @model_validator(mode="after")
-    def _result_consistency(self) -> "GpuResetResultV1":
-        success = self.qemu_absent and self.reset_succeeded and self.original_drivers_restored
-        if success and (self.failure_code is not None or self.failure_reason is not None):
-            raise ValueError("successful reset cannot carry failure metadata")
-        if not success and (not self.failure_code or not self.failure_reason):
-            raise ValueError("ambiguous or failed reset requires exact failure metadata")
-        return self
-
-
 class GpuRecoveryAuthorizeRequestV1(FrozenWireModel):
     schema: Literal["chutes.gpu-recovery-authorize"] = "chutes.gpu-recovery-authorize"
     version: Literal[1] = 1
     report_id: str
     reason: str = Field(..., min_length=1, max_length=2000)
-
-
-class GpuRecoveryAuthorizationV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-recovery-authorization"] = "chutes.gpu-recovery-authorization"
-    version: Literal[1] = 1
-    authorization_id: str
-    allocation_group_id: str
-    allocation_group_generation: int = Field(..., ge=1)
-    report_id: str
-    topology_fingerprint: str
-    recovery_nonce: str
-
-    @field_validator("topology_fingerprint")
-    @classmethod
-    def _valid_topology(cls, value: str) -> str:
-        return GpuLaunchReservationResponseV1._valid_digest(value)
-
-    @field_validator("recovery_nonce")
-    @classmethod
-    def _valid_nonce(cls, value: str) -> str:
-        return _validate_b64(value, "recovery_nonce", 32, 32)
-
-
-class GpuRecoveryStartRequestV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-recovery-start"] = "chutes.gpu-recovery-start"
-    version: Literal[1] = 1
-    authorization_id: str
-    allocation_group_id: str
-    allocation_group_generation: int = Field(..., ge=1)
-    report_id: str
-    topology_fingerprint: str
-    recovery_nonce: str
-
-    @field_validator("topology_fingerprint")
-    @classmethod
-    def _valid_topology(cls, value: str) -> str:
-        return GpuLaunchReservationResponseV1._valid_digest(value)
-
-    @field_validator("recovery_nonce")
-    @classmethod
-    def _valid_nonce(cls, value: str) -> str:
-        return _validate_b64(value, "recovery_nonce", 32, 32)
-
-
-class GpuRecoveryResetResultV1(GpuRecoveryStartRequestV1):
-    schema: Literal["chutes.gpu-recovery-reset-result"] = "chutes.gpu-recovery-reset-result"
-    qemu_absent: bool
-    reset_succeeded: bool
-    original_drivers_restored: bool
-    gpu_bdfs: List[str]
-    gpu_uuids: List[str]
-    failure_code: Optional[str] = Field(None, min_length=1, max_length=128)
-    failure_reason: Optional[str] = Field(None, min_length=1, max_length=2000)
-    evidence: Dict[str, Any] = Field(default_factory=dict)
-
-    @field_validator("gpu_bdfs")
-    @classmethod
-    def _canonical_bdfs(cls, value: List[str]) -> List[str]:
-        return GpuLaunchReservationClaimsV1._canonical_bdfs(value)
-
-    @field_validator("gpu_uuids")
-    @classmethod
-    def _canonical_uuids(cls, value: List[str]) -> List[str]:
-        return GpuLaunchReservationClaimsV1._canonical_gpu_uuids(value)
-
-    @model_validator(mode="after")
-    def _failure_shape(self) -> "GpuRecoveryResetResultV1":
-        success = self.qemu_absent and self.reset_succeeded and self.original_drivers_restored
-        if success and (self.failure_code or self.failure_reason):
-            raise ValueError("successful recovery reset cannot carry failure")
-        if not success and (not self.failure_code or not self.failure_reason):
-            raise ValueError("failed recovery reset requires failure metadata")
-        return self
 
 
 class TdQuoteCommitmentV1(FrozenWireModel):
@@ -2333,7 +2218,7 @@ class GpuAllocationGroup(Base):
     recovery_completed_at = Column(DateTime(timezone=True), nullable=True)
     failure_code = Column(String, nullable=True)
     failure_reason = Column(Text, nullable=True)
-    failure_metadata = Column(JSONB, nullable=True)
+    failure_metadata = Column(JSONB(none_as_null=True), nullable=True)
     discovered_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     available_at = Column(DateTime(timezone=True), nullable=True)
     reserved_at = Column(DateTime(timezone=True), nullable=True)
@@ -2386,7 +2271,8 @@ class GpuAllocationGroup(Base):
         ),
         CheckConstraint(
             "state IN ('discovered', 'available', 'reserved', 'launching', "
-            "'running', 'resetting', 'quarantined', 'retired')",
+            "'running', 'resetting', 'release_pending', 'recovery_required', "
+            "'quarantined', 'retired')",
             name="ck_gpu_allocation_group_state",
         ),
         CheckConstraint(
@@ -2394,13 +2280,14 @@ class GpuAllocationGroup(Base):
             "AND management_mode IS NULL AND reservation_owner IS NULL "
             "AND reservation_id IS NULL AND process_incarnation IS NULL) "
             "OR state = 'quarantined' OR "
-            "(state IN ('reserved', 'launching', 'running', 'resetting') "
+            "(state IN ('reserved', 'launching', 'running', 'resetting', "
+            "'release_pending', 'recovery_required') "
             "AND management_mode IN ('platform', 'miner') "
             "AND reservation_owner IS NOT NULL AND reservation_id IS NOT NULL "
             "AND reservation_generation > 0 AND process_incarnation IS NOT NULL) OR "
-            "(state = 'resetting' AND management_mode IS NULL "
+            "(state IN ('resetting', 'release_pending') AND management_mode IS NULL "
             "AND reservation_owner IS NULL AND reservation_id IS NULL "
-            "AND process_incarnation IS NULL AND recovery_started_at IS NOT NULL)",
+            "AND process_incarnation IS NULL)",
             name="ck_gpu_allocation_group_owner",
         ),
         CheckConstraint(
@@ -2542,7 +2429,7 @@ class GpuLaunchReservation(Base):
     last_reconciled_at = Column(DateTime(timezone=True), nullable=True)
     failure_code = Column(String, nullable=True)
     failure_reason = Column(Text, nullable=True)
-    failure_metadata = Column(JSONB, nullable=True)
+    failure_metadata = Column(JSONB(none_as_null=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint(

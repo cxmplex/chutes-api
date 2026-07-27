@@ -370,46 +370,42 @@ async def send_gpu_reservation_teardown(
     reservation_id: str,
     *,
     reason: str,
+    operation_type: Optional[str] = None,
 ) -> Optional[str]:
     """Request and retry one exact platform GPU reset command safely."""
 
     try:
         from api.database import get_session
+        from api.gpu_lifecycle_service import (
+            ensure_reservation_lifecycle_operation,
+        )
         from api.host.gpu_allocations import (
             record_gpu_command_dispatch,
             request_gpu_teardown,
         )
+        from api.host.locks import assert_gpu_external_work_allowed
 
         async with get_session() as session:
             reservation = await request_gpu_teardown(
                 session,
                 reservation_id,
                 reason=reason,
+                operation_type=operation_type,
             )
             host_id = reservation.host_id
             state = reservation.state
+            if state in {"released", "expired"}:
+                await session.commit()
+                return None
+            operation = await ensure_reservation_lifecycle_operation(
+                session,
+                reservation_id,
+                operation_type=operation_type,
+            )
+            if operation.phase != "intent":
+                await session.commit()
+                return None
             command_id = reservation.teardown_command_id or str(uuid.uuid4())
-            claims_sha256 = reservation.claims_sha256
-            process_incarnation = reservation.process_incarnation
-            allocation_group_id = reservation.allocation_group_id
-            topology_fingerprint = reservation.topology_fingerprint
-            await session.commit()
-        if state in {"released", "expired"}:
-            return None
-        command_id = await send_agent_command(
-            host_id,
-            "delete_gpu",
-            {
-                "reservation_id": reservation_id,
-                "claims_sha256": claims_sha256,
-                "process_incarnation": process_incarnation,
-                "allocation_group_id": allocation_group_id,
-                "topology_fingerprint": topology_fingerprint,
-                "reason": reason,
-            },
-            command_id=command_id,
-        )
-        async with get_session() as session:
             await record_gpu_command_dispatch(
                 session,
                 reservation_id,
@@ -417,6 +413,22 @@ async def send_gpu_reservation_teardown(
                 command_id=command_id,
             )
             await session.commit()
+            assert_gpu_external_work_allowed(
+                session,
+                "durable GPU lifecycle command dispatch",
+            )
+        command_id = await send_agent_command(
+            host_id,
+            "delete_gpu",
+            {
+                "reservation_id": reservation_id,
+                "lifecycle_operation": operation.model_dump(
+                    mode="json", exclude_none=True
+                ),
+                "reason": reason,
+            },
+            command_id=command_id,
+        )
         logger.info(
             f"Dispatched exact GPU teardown reservation={reservation_id} "
             f"host={host_id} command_id={command_id}"
@@ -686,15 +698,23 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
                 f"Reconcile: host {host_id} runs TD {slot_server_id} for deleted chute "
                 f"{slot_chute_id}; tearing down"
             )
-            await send_agent_command(
-                host_id,
-                "delete_gpu" if slot_compute_type == "gpu" else "delete_chute",
-                (
-                    {"reservation_id": slot_reservation_id}
-                    if slot_compute_type == "gpu"
-                    else {"chute_id": slot_chute_id, "server_id": slot_server_id}
-                ),
-            )
+            if slot_compute_type == "gpu":
+                if slot_reservation_id:
+                    await send_gpu_reservation_teardown(
+                        slot_reservation_id,
+                        reason="slot references a deleted GPU chute",
+                    )
+                else:
+                    logger.error(
+                        f"Refusing ownerless raw GPU delete for slot {slot_server_id}; "
+                        "explicit inventory-bound recovery is required"
+                    )
+            else:
+                await send_agent_command(
+                    host_id,
+                    "delete_chute",
+                    {"chute_id": slot_chute_id, "server_id": slot_server_id},
+                )
             continue
         if server_exists is None and slot_chute_id:
             # No Server row: either the TD is still booting/registering (launch in-flight, keyed
@@ -735,15 +755,23 @@ async def _reconcile_host_slots(host_id: str, slots: list) -> None:
                 f"Reconcile: host {host_id} TD {slot_server_id} (chute {slot_chute_id}) never "
                 "self-registered within the launch window; tearing down"
             )
-            await send_agent_command(
-                host_id,
-                "delete_gpu" if slot_compute_type == "gpu" else "delete_chute",
-                (
-                    {"reservation_id": slot_reservation_id}
-                    if slot_compute_type == "gpu"
-                    else {"chute_id": slot_chute_id, "server_id": slot_server_id}
-                ),
-            )
+            if slot_compute_type == "gpu":
+                if slot_reservation_id:
+                    await send_gpu_reservation_teardown(
+                        slot_reservation_id,
+                        reason="GPU guest never established validator server lineage",
+                    )
+                else:
+                    logger.error(
+                        f"Refusing ownerless raw GPU delete for slot {slot_server_id}; "
+                        "explicit inventory-bound recovery is required"
+                    )
+            else:
+                await send_agent_command(
+                    host_id,
+                    "delete_chute",
+                    {"chute_id": slot_chute_id, "server_id": slot_server_id},
+                )
 
 
 async def send_job_instance_teardown(instance_id: Optional[str]) -> Optional[str]:

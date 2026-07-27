@@ -150,6 +150,13 @@ FOR EACH ROW EXECUTE FUNCTION revoke_registry_scope_on_job_terminal();
 
 -- migrate:down
 
+-- Shared destructive-down lock order: GPU custody, workload rows, launch/session rows,
+-- attestation/server rows, storage/account rows, then migration-owned child tables.
+LOCK TABLE instances IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE launch_configs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE registry_sessions IN ACCESS EXCLUSIVE MODE;
+
 DO $$
 BEGIN
     IF EXISTS (
@@ -160,6 +167,24 @@ BEGIN
     ) THEN
         RAISE EXCEPTION
             'cannot restore unique registry session per server while multiple scoped sessions exist';
+    ELSIF EXISTS (
+        SELECT 1
+          FROM registry_sessions
+         WHERE scope_id IS DISTINCT FROM ('legacy:' || session_id)
+            OR launch_config_id IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION
+            'cannot discard non-legacy registry launch scopes';
+    ELSIF EXISTS (
+        SELECT 1
+          FROM launch_configs
+         WHERE container_repository IS NOT NULL
+            OR container_manifest_digest IS NOT NULL
+            OR registry_scope_active
+            OR registry_scope_revoked_at IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION
+            'cannot discard launch-scoped registry state';
     END IF;
 END
 $$;

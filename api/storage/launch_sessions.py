@@ -17,6 +17,7 @@ from sqlalchemy.orm import joinedload, lazyload
 
 from api.chute.schemas import Chute
 from api.config import settings
+from api.host.locks import acquire_gpu_lifecycle_lock
 from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import (
@@ -49,15 +50,18 @@ _TOKEN_DOMAIN = b"chutes.chutefs-session-token.v1\0"
 async def lock_launch_storage_configurations(
     db: AsyncSession,
     config_ids: list[str],
+    *,
+    additional_user_ids: Optional[list[str]] = None,
 ) -> None:
-    """Lock user rows, then sorted configs and their launch identity rows.
+    """Preflight revocation, then lock users, lifecycle, and launch identity rows.
 
     The initial lookup is deliberately non-authoritative: it discovers only
     which canonical users must be locked. Every value used for authorization
-    is force-refetched after the user locks are held.
+    is force-refetched after the user and lifecycle locks are held.
     """
     ordered_ids = sorted(set(config_ids))
-    if not ordered_ids:
+    additional_user_ids = sorted(set(additional_user_ids or []))
+    if not ordered_ids and not additional_user_ids:
         return
     hints = list(
         (
@@ -73,7 +77,22 @@ async def lock_launch_storage_configurations(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Launch storage identity is inactive or incomplete.",
         )
-    user_ids = sorted({user_id for _config_id, user_id in hints})
+    # Redis is only a revocation preflight. Perform it before any trust-bearing
+    # row lock is acquired, then force-refetch every database identity below.
+    instance_ids = list(
+        (
+            await db.execute(
+                select(Instance.instance_id)
+                .where(Instance.config_id.in_(ordered_ids))
+                .order_by(Instance.config_id, Instance.instance_id)
+            )
+        ).scalars()
+    )
+    for instance_id in instance_ids:
+        await _require_not_disabled(instance_id)
+    user_ids = sorted(
+        {user_id for _config_id, user_id in hints} | set(additional_user_ids)
+    )
     locked_users = list(
         (
             await db.execute(
@@ -91,18 +110,43 @@ async def lock_launch_storage_configurations(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Launch storage owner is no longer current.",
         )
-    await db.execute(
-        select(LaunchConfig)
-        .where(LaunchConfig.config_id.in_(ordered_ids))
-        .order_by(LaunchConfig.config_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    # The shared order is user rows first, then the lifecycle advisory lock,
+    # then launch configuration and identity rows. This matches binding
+    # creation, scheduling, and launch activation without holding row locks
+    # across the Redis revocation preflight above.
+    await acquire_gpu_lifecycle_lock(db)
+    locked_configs = list(
+        (
+            await db.execute(
+                select(LaunchConfig)
+                .where(LaunchConfig.config_id.in_(ordered_ids))
+                .order_by(LaunchConfig.config_id)
+                .options(lazyload("*"))
+                .with_for_update(of=LaunchConfig)
+                .execution_options(populate_existing=True)
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
     )
+    expected_config_owners = sorted(
+        (config_id, user_id) for config_id, user_id in hints
+    )
+    actual_config_owners = sorted(
+        (config.config_id, config.user_id) for config in locked_configs
+    )
+    if actual_config_owners != expected_config_owners:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Launch storage configuration ownership is no longer current.",
+        )
     await db.execute(
         select(Instance)
         .where(Instance.config_id.in_(ordered_ids))
         .order_by(Instance.config_id, Instance.instance_id)
-        .with_for_update()
+        .options(lazyload("*"))
+        .with_for_update(of=Instance)
         .execution_options(populate_existing=True)
     )
     await db.execute(
@@ -113,7 +157,8 @@ async def lock_launch_storage_configurations(
             ChuteFSLaunchSession.generation,
             ChuteFSLaunchSession.session_id,
         )
-        .with_for_update()
+        .options(lazyload("*"))
+        .with_for_update(of=ChuteFSLaunchSession)
         .execution_options(populate_existing=True)
     )
 
@@ -320,8 +365,6 @@ async def _load_current_lineage(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Launch storage identity is inactive or incomplete.",
         )
-    await _require_not_disabled(instance.instance_id)
-
     chute = (
         (
             await db.execute(
@@ -358,41 +401,14 @@ async def _load_current_lineage(
             detail="Launch owner, chute, job, or compute identity is no longer current.",
         )
 
-    binding = (
+    server = (
         await db.execute(
-            select(DefaultChuteFSVolumeBinding)
-            .where(
-                DefaultChuteFSVolumeBinding.user_id == config.user_id,
-                DefaultChuteFSVolumeBinding.chute_id == config.chute_id,
-                DefaultChuteFSVolumeBinding.volume_id == config.default_volume_id,
-                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
-            )
-            .order_by(DefaultChuteFSVolumeBinding.binding_id)
+            select(Server)
+            .where(Server.server_id == config.server_id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    volume = (
-        await db.execute(
-            select(StorageVolume)
-            .where(StorageVolume.volume_id == config.default_volume_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
-    if (
-        binding is None
-        or volume is None
-        or volume.user_id != config.user_id
-        or volume.deleted
-        or volume.purged_at is not None
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="The launch default-volume binding is no longer active.",
-        )
-
-    server = await db.get(Server, config.server_id)
     if (
         server is None
         or instance.server_id != server.server_id
@@ -423,13 +439,37 @@ async def _load_current_lineage(
                 )
             presented_cert_hash = await _require_presented_attested_cert(request, server)
     else:
-        reservation = await db.get(GpuLaunchReservation, config.gpu_launch_reservation_id)
+        reservation = (
+            await db.execute(
+                select(GpuLaunchReservation)
+                .where(
+                    GpuLaunchReservation.reservation_id
+                    == config.gpu_launch_reservation_id
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
         group = (
-            await db.get(GpuAllocationGroup, reservation.allocation_group_id)
+            (
+                await db.execute(
+                    select(GpuAllocationGroup)
+                    .where(
+                        GpuAllocationGroup.allocation_group_id
+                        == reservation.allocation_group_id
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
             if reservation is not None
             else None
         )
-        latest = await _latest_attestation_attempt(db, server.server_id)
+        latest = await _latest_attestation_attempt(
+            db,
+            server.server_id,
+            for_update=True,
+        )
         try:
             _current_attestation(
                 server,
@@ -496,6 +536,42 @@ async def _load_current_lineage(
                     detail="Current launch mTLS possession is required.",
                 )
             presented_cert_hash = await _require_presented_attested_cert(request, server)
+
+    # Binding and volume custody are locked last, after token/session callers
+    # and all launch, operation, lineage, and latest-attestation checks.
+    binding = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.user_id == config.user_id,
+                DefaultChuteFSVolumeBinding.chute_id == config.chute_id,
+                DefaultChuteFSVolumeBinding.volume_id == config.default_volume_id,
+                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+            )
+            .order_by(DefaultChuteFSVolumeBinding.binding_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    volume = (
+        await db.execute(
+            select(StorageVolume)
+            .where(StorageVolume.volume_id == config.default_volume_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        binding is None
+        or volume is None
+        or volume.user_id != config.user_id
+        or volume.deleted
+        or volume.purged_at is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="The launch default-volume binding is no longer active.",
+        )
 
     return (
         config,
@@ -618,7 +694,9 @@ async def issue_launch_storage_session(
                 detail="Existing ChuteFS launch session has different immutable identity.",
             )
         if (
-            row.token_seed is not None
+            row.rotated_from_session_id is None
+            and row.generation == 1
+            and row.token_seed is not None
             and row.rotation_request_sha256 == issue_digest
             and row.response_replay_until is not None
             and row.response_replay_until > now
@@ -626,14 +704,18 @@ async def issue_launch_storage_session(
             response = _session_response(row)
             await db.commit()
             return _context(config, instance), response
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The active ChuteFS launch session has advanced beyond this issue request.",
+        )
 
     successor = ChuteFSLaunchSession(
         session_id=secrets.token_urlsafe(24),
-        rotated_from_session_id=row.session_id if row is not None else None,
+        rotated_from_session_id=None,
         **immutable_identity,
         attestation_id=latest.attestation_id if latest is not None else None,
         allowed_operations=list(ALLOWED_OPERATIONS),
-        generation=(row.generation + 1 if row is not None else 1),
+        generation=1,
         access_token_hash="0" * 64,
         refresh_token_hash="0" * 64,
         access_expires_at=now + timedelta(seconds=ACCESS_TTL_SECONDS),
@@ -648,8 +730,6 @@ async def issue_launch_storage_session(
     refresh_token = _derived_token(successor, _REFRESH_PREFIX, "refresh")
     successor.access_token_hash = _token_hash(access_token)
     successor.refresh_token_hash = _token_hash(refresh_token)
-    if row is not None:
-        row.revoked_at = now
     db.add(successor)
     await db.commit()
     await db.refresh(successor)
@@ -687,6 +767,7 @@ async def exchange_launch_token(
         config_id,
         launch_token,
         allow_retrieved=True,
+        acquire_lifecycle_lock=False,
     )
     if launch_identity_claims(config) != {
         key: payload.get("sub") if key == "config_id" else payload.get(key)
@@ -696,6 +777,9 @@ async def exchange_launch_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Launch token identity is stale.",
         )
+    # Release any ORM transaction established by the non-authoritative lookup before
+    # ChuteFS checks Redis and acquires its user/configuration lock hierarchy.
+    await db.commit()
     return await issue_launch_storage_session(db, config_id, request)
 
 

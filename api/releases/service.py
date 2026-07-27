@@ -62,7 +62,10 @@ from api.releases.schemas import (
     RoleLaunchBinaryContract,
 )
 from api.server.schemas import Host, Server, ServerAttestation
-from api.host.locks import acquire_gpu_lifecycle_lock
+from api.host.locks import (
+    acquire_gpu_lifecycle_lock,
+    assert_gpu_external_work_allowed,
+)
 
 
 class ReleaseError(Exception):
@@ -2099,11 +2102,11 @@ async def rollout_release(
     l0_version = l0_spec.get("version")
     if reboot_l0 and not l0_version:
         raise ReleaseError("reboot_l0 requested but the release carries no l0 slot.")
-    capture_needed = release.targets_captured_at is None
     targets = await _capture_release_targets(db, release)
-    if capture_needed:
-        await db.commit()
-        await db.refresh(release)
+    # Capture and intent repair both acquire lifecycle custody, including the
+    # already-captured replay. Always commit it before agent liveness/dispatch.
+    await db.commit()
+    await db.refresh(release)
     captured_host_ids = {target.host_id for target in targets}
     if host_ids is not None:
         captured_host_ids &= set(host_ids)
@@ -2113,10 +2116,12 @@ async def rollout_release(
         Host.host_id.in_(captured_host_ids),
     )
     hosts = (await db.execute(q)).scalars().all()
+    await db.commit()
 
     results = []
     dispatched = 0
     for host in hosts:
+        assert_gpu_external_work_allowed(db, "release rollout agent liveness")
         if not await is_agent_online(host.host_id):
             results.append(
                 {
@@ -2128,6 +2133,8 @@ async def rollout_release(
             continue
         try:
             manifest = (await _manifest_for_logical_host(db, release, host)).model_dump()
+            await db.commit()
+            assert_gpu_external_work_allowed(db, "release rollout agent dispatch")
             command_id = await send_agent_command(
                 host.host_id, "upgrade_image", {"manifest": manifest}
             )
@@ -2135,6 +2142,9 @@ async def rollout_release(
             # Opt-in L0 re-netboot: send reboot AFTER the image nudge so the box comes up on the new
             # guest images too. target_l0_version makes an already-updated host skip the reboot.
             if reboot_l0 and (getattr(host, "l0_version", None) != l0_version):
+                assert_gpu_external_work_allowed(
+                    db, "release rollout reboot dispatch"
+                )
                 rid = await send_agent_command(
                     host.host_id, "reboot", {"target_l0_version": l0_version}
                 )

@@ -111,7 +111,13 @@ async def mark_storage_online(server_id: str) -> None:
         logger.warning(f"Failed to mark storage TD {server_id} online")
 
 
-async def _live_storage_ids(server_ids: Sequence[str]) -> Set[str]:
+async def _live_storage_ids(
+    db: AsyncSession,
+    server_ids: Sequence[str],
+) -> Set[str]:
+    from api.host.locks import assert_gpu_external_work_allowed
+
+    assert_gpu_external_work_allowed(db, "storage Redis liveness lookup")
     if not server_ids:
         return set()
     live: Set[str] = set()
@@ -261,7 +267,7 @@ async def _attested_live_peers(
     """Filter servers to attested + live + reachable storage peers, as StoragePeer objects."""
     ids = [s.server_id for s in servers]
     verified = await _verified_storage_ids(db, ids)
-    live = await _live_storage_ids(ids)
+    live = await _live_storage_ids(db, ids)
     peers: List[StoragePeer] = []
     for s in servers:
         if s.server_id not in verified or s.server_id not in live:
@@ -1599,7 +1605,6 @@ async def _retire_deleted_volume_batch(
 
 
 async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
-    await _lock_storage_user(db, user_id)
     config_ids = list(
         (
             await db.execute(
@@ -1613,7 +1618,11 @@ async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
     )
     from api.storage.launch_sessions import lock_launch_storage_configurations
 
-    await lock_launch_storage_configurations(db, config_ids)
+    await lock_launch_storage_configurations(
+        db,
+        config_ids,
+        additional_user_ids=[user_id],
+    )
     volume = (
         await db.execute(
             select(StorageVolume)
@@ -1673,7 +1682,6 @@ async def delete_default_volume_for_chute(
     chute_id: str,
 ) -> Dict:
     """Explicit owner lifecycle operation that never accepts an arbitrary volume id."""
-    await _lock_storage_user(db, user_id)
     volume_id = (
         await db.execute(
             select(DefaultChuteFSVolumeBinding.volume_id)
@@ -1699,7 +1707,6 @@ async def delete_default_volume_for_chute(
 
 async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[str, Any]:
     """Stage every user volume for secure erase, then remove storage identity only when safe."""
-    await _lock_storage_user(db, user_id)
     configs = list(
         (
             await db.execute(
@@ -1713,7 +1720,11 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
     )
     from api.storage.launch_sessions import lock_launch_storage_configurations
 
-    await lock_launch_storage_configurations(db, configs)
+    await lock_launch_storage_configurations(
+        db,
+        configs,
+        additional_user_ids=[user_id],
+    )
 
     volumes = list(
         (
@@ -2510,7 +2521,7 @@ async def _live_attested_server_ids(db: AsyncSession) -> Set[str]:
     if not all_ids:
         return set()
     verified = await _verified_storage_ids(db, all_ids)
-    live = await _live_storage_ids(all_ids)
+    live = await _live_storage_ids(db, all_ids)
     return verified & live
 
 

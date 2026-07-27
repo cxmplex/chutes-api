@@ -60,6 +60,31 @@ spec:
           securityContext:
             {{- include "chutes.containerSecurityContext" . | nindent 12 }}
           command: ["uv", "run", "python", "-m", "api.gpu_scheduler"]
+          livenessProbe:
+            exec:
+              command:
+                - uv
+                - run
+                - python
+                - -m
+                - api.gpu_scheduler
+                - --live
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - uv
+                - run
+                - python
+                - -m
+                - api.gpu_scheduler
+                - --schema-ready
+            initialDelaySeconds: {{ .Values.gpuPlatformScheduler.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.gpuPlatformScheduler.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.gpuPlatformScheduler.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.gpuPlatformScheduler.readinessProbe.failureThreshold }}
           env:
             {{- include "chutes.sensitiveEnv" . | nindent 12 }}
             {{- include "chutes.commonEnv" . | nindent 12 }}

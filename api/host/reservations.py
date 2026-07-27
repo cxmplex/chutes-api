@@ -448,11 +448,36 @@ async def claim_storage_launch_intent(
     return reservation, token
 
 
+async def observe_gpu_storage_liveness(
+    db: AsyncSession,
+    host_id: str,
+) -> set[str]:
+    """Observe untrusted Redis health before lifecycle authority is locked."""
+
+    server_ids = list(
+        (
+            await db.execute(
+                select(StorageLaunchIntent.server_id).where(
+                    StorageLaunchIntent.host_id == host_id,
+                    StorageLaunchIntent.host_compute_type == "gpu",
+                    StorageLaunchIntent.state == "active",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    from api.storage.service import _live_storage_ids
+
+    return await _live_storage_ids(db, sorted(set(server_ids)))
+
+
 async def gpu_host_storage_readiness(
     db: AsyncSession,
     host: Host,
     *,
     include_allocation: bool = True,
+    observed_live_storage_ids: Optional[set[str]] = None,
 ) -> GpuHostStorageReadinessV1:
     """Derive schedulability from current storage authority, quote, incarnation, and liveness."""
 
@@ -669,9 +694,12 @@ async def gpu_host_storage_readiness(
             reason="storage_incarnation_not_current",
         )
 
-    from api.storage.service import _live_storage_ids
-
-    live = intent.server_id in await _live_storage_ids([intent.server_id])
+    if observed_live_storage_ids is None:
+        observed_live_storage_ids = await observe_gpu_storage_liveness(
+            db,
+            host.host_id,
+        )
+    live = intent.server_id in observed_live_storage_ids
     if not live:
         return GpuHostStorageReadinessV1(
             **base,

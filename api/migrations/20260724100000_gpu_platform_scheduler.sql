@@ -341,6 +341,95 @@ ALTER TABLE servers
 
 -- migrate:down
 
+-- Refuse a lossy rollback before changing any catalog object. The locks close the
+-- check-to-DDL race and deliberately follow one fixed cross-table order.
+LOCK TABLE gpu_launch_reservations IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE instances IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE launch_configs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE registry_sessions IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE server_attestations IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE servers IN ACCESS EXCLUSIVE MODE;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM servers
+         WHERE gpu_runtime_session_attestation_id IS NOT NULL
+            OR gpu_runtime_session_expires_at IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1
+          FROM server_attestations
+         WHERE gpu_evidence IS NOT NULL
+            OR gpu_evidence_sha256 IS NOT NULL
+            OR gpu_evidence_certificate_sha256s IS NOT NULL
+            OR gpu_launch_reservation_id IS NOT NULL
+            OR gpu_allocation_group_id IS NOT NULL
+            OR gpu_allocation_group_generation IS NOT NULL
+            OR gpu_host_boot_generation IS NOT NULL
+            OR gpu_reservation_generation IS NOT NULL
+            OR gpu_management_mode IS NOT NULL
+            OR gpu_process_incarnation IS NOT NULL
+            OR gpu_topology_fingerprint IS NOT NULL
+            OR gpu_release_id IS NOT NULL
+            OR gpu_profile_id IS NOT NULL
+            OR gpu_chute_id IS NOT NULL
+            OR gpu_job_id IS NOT NULL
+            OR gpu_claims_sha256 IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1 FROM jobs
+         WHERE gpu_management_mode IS NOT NULL
+            OR gpu_launch_reservation_id IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1 FROM instances
+         WHERE gpu_management_mode IS NOT NULL
+            OR gpu_launch_reservation_id IS NOT NULL
+            OR gpu_allocation_group_id IS NOT NULL
+            OR gpu_allocation_group_generation IS NOT NULL
+            OR gpu_process_incarnation IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1 FROM launch_configs
+         WHERE gpu_management_mode IS NOT NULL
+            OR gpu_launch_reservation_id IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1 FROM registry_sessions
+         WHERE manifest_tag_digests <> '{}'::jsonb
+    ) OR EXISTS (
+        SELECT 1 FROM gpu_launch_reservations
+         WHERE chute_version IS NOT NULL
+            OR descriptor_closure_sha256 IS NOT NULL
+            OR allowed_manifests <> '[]'::jsonb
+            OR allowed_blobs <> '[]'::jsonb
+            OR allowed_manifest_tags <> '[]'::jsonb
+            OR manifest_tag_digests <> '{}'::jsonb
+            OR launch_command_id IS NOT NULL
+            OR launch_dispatched_at IS NOT NULL
+            OR launch_ack_at IS NOT NULL
+            OR launch_ack_status IS NOT NULL
+            OR launch_ack_detail IS NOT NULL
+            OR workload_dispatched_at IS NOT NULL
+            OR workload_command_id IS NOT NULL
+            OR teardown_command_id IS NOT NULL
+            OR teardown_dispatched_at IS NOT NULL
+            OR teardown_requested_at IS NOT NULL
+            OR teardown_reason IS NOT NULL
+            OR teardown_ack_at IS NOT NULL
+            OR teardown_ack_status IS NOT NULL
+            OR teardown_ack_detail IS NOT NULL
+            OR last_reconciled_at IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1 FROM launch_configs
+         WHERE job_id IS NOT NULL
+         GROUP BY job_id
+        HAVING COUNT(*) > 1
+    ) THEN
+        RAISE EXCEPTION
+            'cannot roll back GPU platform scheduler migration while migration-owned state exists';
+    END IF;
+END
+$$;
+
 ALTER TABLE servers DROP CONSTRAINT IF EXISTS ck_servers_gpu_runtime_session;
 ALTER TABLE servers DROP COLUMN IF EXISTS gpu_runtime_session_expires_at;
 ALTER TABLE servers DROP COLUMN IF EXISTS gpu_runtime_session_attestation_id;
@@ -376,20 +465,6 @@ ALTER TABLE instances DROP COLUMN IF EXISTS gpu_launch_reservation_id;
 ALTER TABLE instances DROP COLUMN IF EXISTS gpu_management_mode;
 
 DROP INDEX IF EXISTS uq_launch_configs_gpu_reservation;
-DO $$
-BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM launch_configs
-        WHERE job_id IS NOT NULL
-        GROUP BY job_id
-        HAVING COUNT(*) > 1
-    ) THEN
-        RAISE EXCEPTION
-            'cannot restore global launch-config job uniqueness while retry history exists';
-    END IF;
-END
-$$;
 DROP INDEX IF EXISTS uq_job_launch_config_active;
 ALTER TABLE launch_configs
     ADD CONSTRAINT uq_job_launch_config UNIQUE (job_id);

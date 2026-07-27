@@ -20,6 +20,7 @@ from api.constants import (
 )
 from api.database import generate_uuid, get_db_session
 from api.host.schemas import (
+    GpuAllocationGroup,
     GpuLaunchReservation,
     RegistrySession,
     RegistrySessionClaimsV1,
@@ -29,7 +30,7 @@ from api.host.schemas import (
     canonical_sha256,
 )
 from api.server.schemas import Server, ServerAttestation
-from api.host.locks import acquire_gpu_lifecycle_lock
+from api.host.locks import acquire_gpu_lifecycle_lock, assert_gpu_external_work_allowed
 from api.instance.schemas import Instance, LaunchConfig
 from api.job.schemas import Job
 from api.server.gpu_sessions import (
@@ -54,6 +55,8 @@ async def _miner_launch_scope_current(
     db: AsyncSession,
     server: Server,
     launch_config: LaunchConfig | None,
+    *,
+    for_update: bool = False,
 ) -> bool:
     if (
         launch_config is None
@@ -68,11 +71,10 @@ async def _miner_launch_scope_current(
         or launch_config.registry_scope_revoked_at is not None
     ):
         return False
-    instance = (
-        (await db.execute(select(Instance).where(Instance.config_id == launch_config.config_id)))
-        .unique()
-        .scalar_one_or_none()
-    )
+    instance_query = select(Instance).where(Instance.config_id == launch_config.config_id)
+    if for_update:
+        instance_query = instance_query.with_for_update()
+    instance = (await db.execute(instance_query)).unique().scalar_one_or_none()
     if instance is not None:
         return bool(
             instance.server_id == server.server_id
@@ -83,7 +85,10 @@ async def _miner_launch_scope_current(
             and (instance.active or not instance.verified)
         )
     if launch_config.job_id is not None:
-        job = await db.get(Job, launch_config.job_id)
+        job_query = select(Job).where(Job.job_id == launch_config.job_id)
+        if for_update:
+            job_query = job_query.with_for_update()
+        job = (await db.execute(job_query)).scalar_one_or_none()
         return bool(
             job is not None
             and job.gpu_management_mode == "miner"
@@ -141,35 +146,218 @@ async def _current_attested_registry_server(db: AsyncSession, cert_hash: str) ->
             status_code=status.HTTP_403_FORBIDDEN,
             detail="TD identity is not registry-capable.",
         )
-    latest = (
-        await db.execute(
-            select(ServerAttestation)
-            .where(ServerAttestation.server_id == server.server_id)
-            .order_by(
-                ServerAttestation.created_at.desc(),
-                ServerAttestation.attestation_id.desc(),
-            )
-            .limit(1)
-        )
-    ).scalar_one_or_none()
+    latest = await _latest_attestation_attempt(db, server.server_id)
+    _cpu_registry_attestation_current(server, latest)
+    return server
+
+
+
+def _cpu_registry_attestation_current(
+    server: Server,
+    latest: ServerAttestation | None,
+) -> ServerAttestation:
     cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=settings.release_attestation_max_age_seconds
     )
     if (
         latest is None
+        or latest.server_id != server.server_id
         or latest.verification_error is not None
         or latest.verified_at is None
         or latest.verified_at < cutoff
         or latest.measurement_name != server.measurement_name
-        or latest.measurement_config_fingerprint != server.measurement_config_fingerprint
+        or latest.measurement_config_fingerprint
+        != server.measurement_config_fingerprint
         or latest.trust_set_fingerprint != server.trust_set_fingerprint
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="TD does not have a fresh exact attestation.",
         )
-    return server
+    return latest
 
+
+def _gpu_registry_snapshot(
+    server: Server,
+    runtime_payload: dict,
+    cert_hash: str,
+) -> dict:
+    return {
+        "kind": "gpu",
+        "server_id": server.server_id,
+        "cert_hash": cert_hash.lower(),
+        "runtime_payload": dict(runtime_payload),
+    }
+
+
+async def _cpu_registry_snapshot(
+    db: AsyncSession,
+    server: Server,
+    cert_hash: str,
+) -> dict:
+    latest = await _latest_attestation_attempt(db, server.server_id)
+    _cpu_registry_attestation_current(server, latest)
+    return {
+        "kind": "cpu",
+        "server_id": server.server_id,
+        "cert_hash": cert_hash.lower(),
+        "launch_reservation_id": server.launch_reservation_id,
+        "attestation_id": latest.attestation_id,
+    }
+
+
+async def _locked_registry_authority(
+    db: AsyncSession,
+    snapshot: dict,
+) -> tuple[Server, GpuLaunchReservation | TdLaunchReservation]:
+    """Refetch the exact attestation and reservation after descriptor resolution."""
+
+    server = (
+        await db.execute(
+            select(Server)
+            .where(Server.server_id == snapshot["server_id"])
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        server is None
+        or server.attested_cert_pubkey_hash != snapshot["cert_hash"]
+        or not server.self_registered
+        or not server.is_tee
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registry attestation identity changed during descriptor resolution.",
+        )
+
+    if snapshot["kind"] == "gpu":
+        payload = snapshot["runtime_payload"]
+        reservation = (
+            await db.execute(
+                select(GpuLaunchReservation)
+                .where(GpuLaunchReservation.reservation_id == payload["reservation_id"])
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        group = (
+            (
+                await db.execute(
+                    select(GpuAllocationGroup)
+                    .where(
+                        GpuAllocationGroup.allocation_group_id
+                        == server.gpu_allocation_group_id
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if server.gpu_allocation_group_id is not None
+            else None
+        )
+        latest = await _latest_attestation_attempt(
+            db,
+            server.server_id,
+            for_update=True,
+        )
+        try:
+            _current_attestation(
+                server,
+                latest,
+                expected_id=payload["attestation_id"],
+            )
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="GPU registry attestation changed during descriptor resolution.",
+            ) from exc
+        now = datetime.now(timezone.utc)
+        if (
+            datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc) <= now
+            or server.compute_type != "gpu"
+            or server.tee_type != "tdx"
+            or server.gpu_retired_at is not None
+            or server.server_id != payload["server_id"]
+            or server.miner_hotkey != payload["owner_hotkey"]
+            or server.gpu_management_mode != payload["management_mode"]
+            or server.gpu_launch_reservation_id != payload["reservation_id"]
+            or server.attested_cert_pubkey_hash != payload["attested_spki_sha256"]
+            or server.gpu_runtime_session_attestation_id != payload["attestation_id"]
+            or server.gpu_runtime_session_expires_at is None
+            or server.gpu_runtime_session_expires_at <= now
+            or reservation is None
+            or group is None
+            or reservation.state != "running"
+            or group.state != "running"
+            or reservation.registration_attestation_id is None
+            or reservation.server_id != server.server_id
+            or reservation.management_mode != server.gpu_management_mode
+            or reservation.allocation_group_id != server.gpu_allocation_group_id
+            or reservation.allocation_group_generation
+            != server.gpu_allocation_group_generation
+            or reservation.process_incarnation != server.gpu_process_incarnation
+            or reservation.topology_fingerprint != server.gpu_topology_fingerprint
+            or group.management_mode != reservation.management_mode
+            or group.reservation_id != reservation.reservation_id
+            or group.generation != reservation.allocation_group_generation
+            or group.reservation_generation != reservation.reservation_generation
+            or group.process_incarnation != reservation.process_incarnation
+            or latest is None
+            or latest.gpu_claims_sha256 != reservation.claims_sha256
+            or latest.gpu_release_id != reservation.gpu_release_id
+            or latest.gpu_profile_id != reservation.profile_id
+            or latest.gpu_host_boot_generation != reservation.host_boot_generation
+            or latest.gpu_reservation_generation != reservation.reservation_generation
+            or latest.gpu_evidence_certificate_sha256s
+            != reservation.gpu_attestation_certificate_sha256s
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="GPU runtime lineage changed during descriptor resolution.",
+            )
+        return server, reservation
+
+    latest_query = (
+        select(ServerAttestation)
+        .where(ServerAttestation.server_id == server.server_id)
+        .order_by(
+            ServerAttestation.created_at.desc(),
+            ServerAttestation.attestation_id.desc(),
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    latest = (await db.execute(latest_query)).scalar_one_or_none()
+    reservation = (
+        await db.execute(
+            select(TdLaunchReservation)
+            .where(
+                TdLaunchReservation.reservation_id
+                == snapshot["launch_reservation_id"]
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    _cpu_registry_attestation_current(server, latest)
+    if (
+        server.compute_type != "cpu"
+        or server.launch_reservation_id != snapshot["launch_reservation_id"]
+        or latest is None
+        or latest.attestation_id != snapshot["attestation_id"]
+        or reservation is None
+        or reservation.consumed_at is None
+        or reservation.invalidated_at is not None
+        or reservation.server_id != server.server_id
+        or reservation.role != "chute"
+        or reservation.consumed_cert_pubkey_hash != snapshot["cert_hash"]
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CPU runtime lineage changed during descriptor resolution.",
+        )
+    return server, reservation
 
 def _encode_registry_session(row: RegistrySession) -> str:
     claims = RegistrySessionClaimsV1(
@@ -252,8 +440,17 @@ async def create_registry_session(
     platform_runtime = bool(
         runtime_payload is not None and server.gpu_management_mode == "platform"
     )
+    authority_snapshot = (
+        _gpu_registry_snapshot(server, runtime_payload, cert_hash)
+        if runtime_payload is not None
+        else await _cpu_registry_snapshot(db, server, cert_hash)
+    )
+    # Release the authentication read transaction before bounded registry I/O.  The exact
+    # attestation/reservation/certificate lineage is compared under the lifecycle lock below.
+    await db.commit()
     resolved_closure = None
     if not platform_runtime:
+        assert_gpu_external_work_allowed(db, "registry descriptor closure resolution")
         try:
             resolved_closure = await resolve_oci_descriptor_closure(
                 body.repository,
@@ -265,11 +462,10 @@ async def create_registry_session(
                 detail="The reserved OCI descriptor closure could not be verified.",
             ) from exc
     await acquire_gpu_lifecycle_lock(db)
-    server = (
-        await db.execute(
-            select(Server).where(Server.server_id == server.server_id).with_for_update()
-        )
-    ).scalar_one()
+    server, authority_reservation = await _locked_registry_authority(
+        db,
+        authority_snapshot,
+    )
     scope_id = ""
     launch_config = None
     platform_closure = None
@@ -288,16 +484,15 @@ async def create_registry_session(
                     .scalar_one_or_none()
                 )
             valid_scope = bool(
-                await _miner_launch_scope_current(db, server, launch_config)
+                await _miner_launch_scope_current(
+                    db, server, launch_config, for_update=True
+                )
                 and launch_config.container_repository == body.repository
                 and launch_config.container_manifest_digest == body.manifest_digest
             )
             scope_id = f"launch-config:{body.launch_config_id}"
         else:
-            reservation = await db.get(
-                GpuLaunchReservation,
-                server.gpu_launch_reservation_id,
-            )
+            reservation = authority_reservation
             valid_scope = bool(
                 body.launch_config_id is None
                 and reservation is not None
@@ -339,7 +534,7 @@ async def create_registry_session(
                         sha256=reservation.descriptor_closure_sha256,
                     )
     else:
-        reservation = await db.get(TdLaunchReservation, server.launch_reservation_id)
+        reservation = authority_reservation
         valid_scope = bool(
             body.launch_config_id is None
             and reservation is not None

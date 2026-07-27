@@ -5,6 +5,7 @@ from __future__ import annotations
 import api.logging_bootstrap  # noqa: F401
 
 import asyncio
+import sys
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -22,7 +23,7 @@ from api.agent_channel import (
 )
 from api.chute.schemas import Chute, NodeSelector
 from api.config import settings
-from api.database import get_session
+from api.database import engine, get_session
 from api.host.gpu_allocations import (
     GpuAllocationError,
     _expire_locked_reservations,
@@ -31,9 +32,16 @@ from api.host.gpu_allocations import (
     quarantine_gpu_reservation_control_plane,
     record_gpu_command_dispatch,
     reserve_gpu_group,
+    _trusted_platform_workload,
 )
-from api.host.locks import acquire_gpu_lifecycle_lock
-from api.host.reservations import gpu_host_storage_readiness
+from api.host.locks import (
+    acquire_gpu_lifecycle_lock,
+    assert_gpu_external_work_allowed,
+)
+from api.host.reservations import (
+    gpu_host_storage_readiness,
+    observe_gpu_storage_liveness,
+)
 from api.host.schemas import (
     GpuAllocationGroup,
     GpuInventoryReport,
@@ -47,11 +55,17 @@ from api.job.schemas import Job
 from api.log import install_asyncio_exception_handler
 from api.metagraph import MetagraphNode
 from api.releases.schemas import GuestRelease, RELEASE_STATUS_ACTIVE
-from api.server.gpu_sessions import _current_attestation, _latest_attestation_attempt
+from api.server.gpu_sessions import (
+    _current_attestation,
+    _latest_attestation_attempt,
+    require_completed_gpu_registration,
+)
 from api.server.schemas import Host, Server
 from api.storage.service import ensure_default_volume_binding
 from api.util import semcomp
 
+REQUIRED_GPU_SCHEMA_VERSION = "20260726121000"
+SCHEMA_WAIT_SECONDS = 2
 SCHEDULER_INTERVAL_SECONDS = 15
 SCHEDULER_LOCK_KEY = "gpu_platform_scheduler:lock"
 SCHEDULER_LOCK_TTL_SECONDS = 120
@@ -87,19 +101,25 @@ def _chute_image_ref(chute: Chute) -> str:
     return image
 
 
-async def _container_intent(chute: Chute) -> tuple[str, str] | None:
+async def _container_intent(session, chute: Chute) -> tuple[str, str] | None:
+    assert_gpu_external_work_allowed(session, "registry image digest resolution")
     repository = _chute_image_ref(chute).rsplit(":", 1)[0]
     try:
         from api.image.forge import get_image_digest
 
-        digest = await get_image_digest(f"{settings.registry_host}/{_chute_image_ref(chute)}")
+        digest = await get_image_digest(
+            f"{settings.registry_host}/{_chute_image_ref(chute)}"
+        )
     except Exception as exc:  # noqa: BLE001 - placement fails closed
-        logger.warning(f"Could not resolve exact GPU container intent for {chute.chute_id}: {exc}")
+        logger.warning(
+            f"Could not resolve exact GPU container intent for {chute.chute_id}: {exc}"
+        )
         return None
     return repository, digest
 
 
-async def _target_count(chute_id: str) -> int:
+async def _target_count(session, chute_id: str) -> int:
+    assert_gpu_external_work_allowed(session, "GPU target scale Redis lookup")
     value = await settings.redis_client.get(f"scale:{chute_id}")
     return max(int(value) if value else 0, 1)
 
@@ -134,7 +154,11 @@ async def acquire_gpu_workload_lock(
 
 def _platform_gpu_selector(chute: Chute, job: Optional[Job] = None) -> NodeSelector:
     selector = NodeSelector(
-        **(job.node_selector if job is not None and job.node_selector else chute.node_selector)
+        **(
+            job.node_selector
+            if job is not None and job.node_selector
+            else chute.node_selector
+        )
     )
     if (
         not chute.tee
@@ -170,7 +194,10 @@ def group_matches_selector(
         and not any(identifier.startswith("b300") for identifier in identifiers)
         and not str(group.model or "").upper().startswith("B300")
         and (requested_profile is None or group.profile_id == requested_profile)
-        and (requested_topology is None or group.topology_fingerprint == requested_topology)
+        and (
+            requested_topology is None
+            or group.topology_fingerprint == requested_topology
+        )
     )
 
 
@@ -183,7 +210,8 @@ def inventory_budget_matches(
     return bool(
         resources.gpu_scratch_disk_mib >= required_disk_mib
         and resources.disk_allocation_shortfall_mib <= resources.data_disk_free_mib
-        and resources.storage_vcpus + resources.l0_reserved_vcpus < resources.logical_cpus
+        and resources.storage_vcpus + resources.l0_reserved_vcpus
+        < resources.logical_cpus
         and resources.storage_memory_mib
         + resources.storage_overhead_mib
         + resources.gpu_overhead_mib
@@ -198,10 +226,14 @@ async def _demand_count(
     job: Optional[Job],
 ) -> int:
     job_condition = (
-        LaunchConfig.job_id == job.job_id if job is not None else LaunchConfig.job_id.is_(None)
+        LaunchConfig.job_id == job.job_id
+        if job is not None
+        else LaunchConfig.job_id.is_(None)
     )
     instance_job_condition = (
-        LaunchConfig.job_id == job.job_id if job is not None else LaunchConfig.job_id.is_(None)
+        LaunchConfig.job_id == job.job_id
+        if job is not None
+        else LaunchConfig.job_id.is_(None)
     )
     instance_count = int(
         (
@@ -236,7 +268,9 @@ async def _demand_count(
                         select(GpuLaunchReservation.reservation_id).where(
                             GpuLaunchReservation.reservation_id
                             == LaunchConfig.gpu_launch_reservation_id,
-                            GpuLaunchReservation.state.in_({"quarantined", "resetting"}),
+                            GpuLaunchReservation.state.in_(
+                                {"quarantined", "resetting"}
+                            ),
                         )
                     ),
                     ~exists(
@@ -295,7 +329,8 @@ async def _candidate_groups(
                 GpuAllocationGroup.management_mode.is_(None),
                 GpuAllocationGroup.reservation_id.is_(None),
                 GpuAllocationGroup.gpu_count == selector.gpu_count,
-                GpuAllocationGroup.vram_mib >= int(selector.min_vram_gb_per_gpu or 0) * 1024,
+                GpuAllocationGroup.vram_mib
+                >= int(selector.min_vram_gb_per_gpu or 0) * 1024,
                 Host.compute_type == "gpu",
                 Host.tee_type == "tdx",
                 Host.provisioning_state == "ready",
@@ -341,6 +376,62 @@ async def _place_workload(
     *,
     job: Optional[Job] = None,
 ) -> bool:
+    # Scale, registry closure, agent liveness, and storage liveness are all
+    # preflight observations. The lifecycle transaction below revalidates the
+    # authoritative database rows before reserving anything.
+    async with get_session(readonly=True) as scale_session:
+        target = (
+            1 if job is not None else await _target_count(scale_session, chute.chute_id)
+        )
+    try:
+        preflight_selector = _platform_gpu_selector(chute, job)
+    except (GpuAllocationError, ValueError):
+        return False
+    preflight_disk_mib = (
+        int((job.job_args or {}).get("_disk_gb") or DEFAULT_GPU_DISK_GB) * 1024
+        if job is not None
+        else DEFAULT_GPU_DISK_GB * 1024
+    )
+    async with get_session(readonly=True) as preflight_session:
+        preflight_candidates = await _candidate_groups(
+            preflight_session,
+            preflight_selector,
+            required_disk_mib=preflight_disk_mib,
+        )
+        identifiers = sorted(
+            {
+                identifier
+                for group, _host in preflight_candidates
+                for identifier in set(group.gpu_identifiers or [])
+            }
+        )
+        if not identifiers:
+            return False
+        preflight_request = GpuPlatformReservationRequestV1(
+            server_id="gpu-preflight",
+            process_incarnation="gpu-preflight",
+            gpu_identifier=identifiers[0],
+            gpu_count=int(preflight_selector.gpu_count or 0),
+            minimum_vram_mib=int(preflight_selector.min_vram_gb_per_gpu or 0) * 1024,
+            chute_id=chute.chute_id,
+            job_id=job.job_id if job is not None else None,
+        )
+        trusted_workload = await _trusted_platform_workload(
+            preflight_session, preflight_request
+        )
+        observed_storage_by_host = {
+            host.host_id: await observe_gpu_storage_liveness(
+                preflight_session, host.host_id
+            )
+            for _group, host in preflight_candidates
+        }
+    online_host_ids = {
+        host.host_id
+        for _group, host in preflight_candidates
+        if await is_agent_online(host.host_id)
+    }
+    if not online_host_ids:
+        return False
     async with get_session() as session:
         await acquire_gpu_workload_lock(
             session,
@@ -364,7 +455,9 @@ async def _place_workload(
         locked_job = None
         if job is not None:
             locked_job = (
-                await session.execute(select(Job).where(Job.job_id == job.job_id).with_for_update())
+                await session.execute(
+                    select(Job).where(Job.job_id == job.job_id).with_for_update()
+                )
             ).scalar_one_or_none()
             if (
                 locked_job is None
@@ -376,13 +469,15 @@ async def _place_workload(
         try:
             selector = _platform_gpu_selector(locked_chute, locked_job)
         except (GpuAllocationError, ValueError) as exc:
-            logger.warning(f"GPU platform placement rejected {locked_chute.chute_id}: {exc}")
+            logger.warning(
+                f"GPU platform placement rejected {locked_chute.chute_id}: {exc}"
+            )
             return False
-        target = 1 if locked_job is not None else await _target_count(locked_chute.chute_id)
         if await _demand_count(session, locked_chute, locked_job) >= target:
             return False
         required_disk_mib = (
-            int((locked_job.job_args or {}).get("_disk_gb") or DEFAULT_GPU_DISK_GB) * 1024
+            int((locked_job.job_args or {}).get("_disk_gb") or DEFAULT_GPU_DISK_GB)
+            * 1024
             if locked_job is not None
             else DEFAULT_GPU_DISK_GB * 1024
         )
@@ -391,14 +486,19 @@ async def _place_workload(
             selector,
             required_disk_mib=required_disk_mib,
         ):
-            if not await is_agent_online(host.host_id):
+            if host.host_id not in online_host_ids:
                 continue
             readiness = await gpu_host_storage_readiness(
                 session,
                 host,
                 include_allocation=False,
+                observed_live_storage_ids=observed_storage_by_host.get(
+                    host.host_id, set()
+                ),
             )
-            if not (readiness.trusted_storage_ready and readiness.control_channel_eligible):
+            if not (
+                readiness.trusted_storage_ready and readiness.control_channel_eligible
+            ):
                 continue
             identifiers = sorted(set(group.gpu_identifiers))
             if len(identifiers) != 1:
@@ -421,6 +521,10 @@ async def _place_workload(
                     expected_allocation_group_id=group.allocation_group_id,
                     expected_profile_id=group.profile_id,
                     expected_topology_fingerprint=group.topology_fingerprint,
+                    observed_live_storage_ids=observed_storage_by_host.get(
+                        host.host_id, set()
+                    ),
+                    trusted_platform_workload=trusted_workload,
                 )
             except GpuAllocationError as exc:
                 logger.info(
@@ -472,7 +576,14 @@ async def _dispatch_launch(reservation_id: str) -> bool:
         )
         claims_sha256 = reservation.claims_sha256
         command_id = reservation.launch_command_id or str(uuid.uuid4())
+        await record_gpu_command_dispatch(
+            session,
+            reservation_id,
+            command="launch_gpu",
+            command_id=command_id,
+        )
         await session.commit()
+        assert_gpu_external_work_allowed(session, "GPU launch liveness preflight")
     if not await is_agent_online(host_id):
         return False
     command_id = await send_agent_command(
@@ -485,28 +596,22 @@ async def _dispatch_launch(reservation_id: str) -> bool:
         },
         command_id=command_id,
     )
-    async with get_session() as session:
-        try:
-            await record_gpu_command_dispatch(
-                session,
-                reservation_id,
-                command="launch_gpu",
-                command_id=command_id,
-            )
-            await session.commit()
-        except GpuAllocationError:
-            await session.rollback()
-            return False
     return True
 
 
 async def _latest_current_gpu_attestation(session, server: Server) -> bool:
     try:
         latest = await _latest_attestation_attempt(session, server.server_id)
-        _current_attestation(
+        current = _current_attestation(
             server,
             latest,
         )
+        reservation = await session.get(
+            GpuLaunchReservation, server.gpu_launch_reservation_id
+        )
+        if reservation is None:
+            return False
+        await require_completed_gpu_registration(session, reservation, current, server)
         return bool(
             latest is not None
             and server.gpu_runtime_session_attestation_id == latest.attestation_id
@@ -523,22 +628,27 @@ async def _create_platform_launch_config(
     server: Server,
     chute: Chute,
     job: Optional[Job],
+    default_volume,
 ) -> tuple[LaunchConfig, str]:
-    await acquire_gpu_lifecycle_lock(session)
     if (
         server.gpu_management_mode != "platform"
         or server.gpu_launch_reservation_id != reservation.reservation_id
         or server.gpu_allocation_group_id != reservation.allocation_group_id
-        or server.gpu_allocation_group_generation != reservation.allocation_group_generation
+        or server.gpu_allocation_group_generation
+        != reservation.allocation_group_generation
         or server.gpu_process_incarnation != reservation.process_incarnation
         or server.gpu_retired_at is not None
     ):
-        raise GpuAllocationError("Platform scheduler rejected a miner-managed or stale GPU server.")
+        raise GpuAllocationError(
+            "Platform scheduler rejected a miner-managed or stale GPU server."
+        )
     existing = (
         (
             await session.execute(
                 select(LaunchConfig)
-                .where(LaunchConfig.gpu_launch_reservation_id == reservation.reservation_id)
+                .where(
+                    LaunchConfig.gpu_launch_reservation_id == reservation.reservation_id
+                )
                 .with_for_update()
             )
         )
@@ -546,7 +656,9 @@ async def _create_platform_launch_config(
         .scalar_one_or_none()
     )
     if existing is not None:
-        raise GpuAllocationError("Platform GPU reservation already has a launch config.")
+        raise GpuAllocationError(
+            "Platform GPU reservation already has a launch config."
+        )
     miner = (
         await session.execute(
             select(MetagraphNode).where(
@@ -556,13 +668,18 @@ async def _create_platform_launch_config(
         )
     ).scalar_one_or_none()
     if miner is None:
-        raise GpuAllocationError("GPU server owner is absent from the current metagraph.")
+        raise GpuAllocationError(
+            "GPU server owner is absent from the current metagraph."
+        )
     launch_owner_id = job.user_id if job is not None else chute.user_id
-    _, default_volume, _ = await ensure_default_volume_binding(
-        session,
-        launch_owner_id,
-        chute.chute_id,
-    )
+    if (
+        default_volume.user_id != launch_owner_id
+        or default_volume.deleted
+        or default_volume.purged_at is not None
+    ):
+        raise GpuAllocationError(
+            "Platform GPU default volume changed before launch-config CAS."
+        )
     config = LaunchConfig(
         config_id=str(uuid.uuid4()),
         env_key=uuid.uuid4().hex,
@@ -612,6 +729,41 @@ def _platform_launch_token(
 
 async def _dispatch_workload(reservation_id: str) -> bool:
     async with get_session() as session:
+        # Non-authoritative lookup discovers only the ChuteFS owner/chute pair.
+        # Bind User -> default binding/volume before any GPU lifecycle/workload lock.
+        launch_hint = (
+            await session.execute(
+                select(
+                    GpuLaunchReservation.chute_id,
+                    GpuLaunchReservation.job_id,
+                ).where(GpuLaunchReservation.reservation_id == reservation_id)
+            )
+        ).one_or_none()
+        if launch_hint is None or launch_hint.chute_id is None:
+            return False
+        chute_owner_hint = (
+            await session.execute(
+                select(Chute.user_id).where(Chute.chute_id == launch_hint.chute_id)
+            )
+        ).scalar_one_or_none()
+        job_owner_hint = (
+            (
+                await session.execute(
+                    select(Job.user_id).where(Job.job_id == launch_hint.job_id)
+                )
+            ).scalar_one_or_none()
+            if launch_hint.job_id is not None
+            else None
+        )
+        launch_owner_hint = job_owner_hint or chute_owner_hint
+        if launch_owner_hint is None:
+            return False
+        _, default_volume, _ = await ensure_default_volume_binding(
+            session,
+            launch_owner_hint,
+            launch_hint.chute_id,
+        )
+
         await acquire_gpu_lifecycle_lock(session)
         reservation = (
             await session.execute(
@@ -634,7 +786,9 @@ async def _dispatch_workload(reservation_id: str) -> bool:
         )
         server = (
             await session.execute(
-                select(Server).where(Server.server_id == reservation.server_id).with_for_update()
+                select(Server)
+                .where(Server.server_id == reservation.server_id)
+                .with_for_update()
             )
         ).scalar_one_or_none()
         chute = (
@@ -652,7 +806,9 @@ async def _dispatch_workload(reservation_id: str) -> bool:
         job = (
             (
                 await session.execute(
-                    select(Job).where(Job.job_id == reservation.job_id).with_for_update()
+                    select(Job)
+                    .where(Job.job_id == reservation.job_id)
+                    .with_for_update()
                 )
             ).scalar_one_or_none()
             if reservation.job_id
@@ -664,8 +820,11 @@ async def _dispatch_workload(reservation_id: str) -> bool:
             or chute.disabled
             or not chute.tee
             or chute.image.compute_type != "gpu"
+            or reservation.chute_id != launch_hint.chute_id
+            or reservation.job_id != launch_hint.job_id
             or (reservation.job_id is not None and job is None)
             or (job is not None and job.finished_at is not None)
+            or (job.user_id if job is not None else chute.user_id) != launch_owner_hint
             or not await _latest_current_gpu_attestation(session, server)
         ):
             raise GpuAllocationError(
@@ -675,7 +834,10 @@ async def _dispatch_workload(reservation_id: str) -> bool:
             (
                 await session.execute(
                     select(LaunchConfig)
-                    .where(LaunchConfig.gpu_launch_reservation_id == reservation.reservation_id)
+                    .where(
+                        LaunchConfig.gpu_launch_reservation_id
+                        == reservation.reservation_id
+                    )
                     .with_for_update()
                 )
             )
@@ -689,6 +851,7 @@ async def _dispatch_workload(reservation_id: str) -> bool:
                 server,
                 chute,
                 job,
+                default_volume,
             )
         else:
             if (
@@ -697,7 +860,8 @@ async def _dispatch_workload(reservation_id: str) -> bool:
                 or config.chute_id != reservation.chute_id
                 or config.job_id != reservation.job_id
                 or config.container_repository != reservation.container_repository
-                or config.container_manifest_digest != reservation.container_manifest_digest
+                or config.container_manifest_digest
+                != reservation.container_manifest_digest
                 or config.failed_at is not None
                 or config.verification_error is not None
             ):
@@ -767,6 +931,9 @@ async def _dispatch_workload_or_teardown(reservation_id: str) -> None:
 async def _reservation_still_desired(
     session,
     reservation: GpuLaunchReservation,
+    *,
+    resolved_image_ref: Optional[str],
+    resolved_container_intent: tuple[str, str] | None,
 ) -> tuple[bool, str]:
     chute = (
         (
@@ -812,9 +979,14 @@ async def _reservation_still_desired(
             )
         )
     ).scalar_one_or_none()
-    if active_release is None or active_release.release_id != reservation.gpu_release_id:
+    if (
+        active_release is None
+        or active_release.release_id != reservation.gpu_release_id
+    ):
         return False, "GPU release rolled"
-    intent = await _container_intent(chute)
+    if resolved_image_ref != _chute_image_ref(chute):
+        return True, "container identity changed during external resolution"
+    intent = resolved_container_intent
     if intent is None:
         # Existing guests remain bound to the already-reserved descriptor closure.
         # A transient registry outage blocks new placement, not safe running work.
@@ -828,6 +1000,38 @@ async def _reservation_still_desired(
 
 
 async def _reconcile_reservation(reservation_id: str) -> None:
+    resolved_image_ref: Optional[str] = None
+    resolved_container_intent: tuple[str, str] | None = None
+    async with get_session(readonly=True) as preflight_session:
+        preflight_reservation = await preflight_session.get(
+            GpuLaunchReservation,
+            reservation_id,
+        )
+        if (
+            preflight_reservation is None
+            or preflight_reservation.management_mode not in {"platform", "miner"}
+        ):
+            return
+        preflight_host_id = preflight_reservation.host_id
+        if preflight_reservation.management_mode == "platform":
+            preflight_chute = (
+                (
+                    await preflight_session.execute(
+                        select(Chute)
+                        .options(joinedload(Chute.image))
+                        .where(Chute.chute_id == preflight_reservation.chute_id)
+                    )
+                )
+                .unique()
+                .scalar_one_or_none()
+            )
+            if preflight_chute is not None:
+                resolved_image_ref = _chute_image_ref(preflight_chute)
+                resolved_container_intent = await _container_intent(
+                    preflight_session,
+                    preflight_chute,
+                )
+    online = await is_agent_online(preflight_host_id)
     async with get_session() as session:
         await acquire_gpu_lifecycle_lock(session)
         identity = (
@@ -855,12 +1059,7 @@ async def _reconcile_reservation(reservation_id: str) -> None:
                 reservation.failure_reason
                 or "GPU reservation remains quarantined pending explicit recovery."
             )
-            host_online = await is_agent_online(reservation.host_id)
-            reset_wedged = bool(
-                reservation.teardown_requested_at is not None
-                and reservation.teardown_requested_at
-                <= _utcnow() - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS)
-            )
+            host_online = online
             reset_retry_due = bool(
                 reservation.teardown_dispatched_at is None
                 or reservation.teardown_dispatched_at
@@ -876,23 +1075,29 @@ async def _reconcile_reservation(reservation_id: str) -> None:
                     metadata=reservation.failure_metadata,
                 )
                 await fence_session.commit()
-            if host_online and reset_retry_due and not reset_wedged:
+            if host_online and reset_retry_due:
                 await send_gpu_reservation_teardown(
                     reservation_id,
                     reason=f"quarantine reset: {failure_reason}",
                 )
             return
         if management_mode == "platform":
-            desired, reason = await _reservation_still_desired(session, reservation)
+            desired, reason = await _reservation_still_desired(
+                session,
+                reservation,
+                resolved_image_ref=resolved_image_ref,
+                resolved_container_intent=resolved_container_intent,
+            )
         else:
             desired, reason = True, "current miner whole-fabric reservation"
-        online = await is_agent_online(reservation.host_id)
         now = _utcnow()
         if online:
             reservation.last_reconciled_at = now
         elif reservation.last_reconciled_at is None:
             reservation.last_reconciled_at = now
-        elif now - reservation.last_reconciled_at > timedelta(seconds=HOST_LOSS_GRACE_SECONDS):
+        elif now - reservation.last_reconciled_at > timedelta(
+            seconds=HOST_LOSS_GRACE_SECONDS
+        ):
             await session.rollback()
             async with get_session() as fence_session:
                 await quarantine_gpu_reservation_control_plane(
@@ -912,33 +1117,20 @@ async def _reconcile_reservation(reservation_id: str) -> None:
         teardown_retry_due = (
             reservation.teardown_command_id is None
             or reservation.teardown_dispatched_at is None
-            or reservation.teardown_dispatched_at <= now - timedelta(seconds=TEARDOWN_RETRY_SECONDS)
-        )
-        teardown_wedged = bool(
-            teardown_requested
-            and reservation.teardown_requested_at
-            <= now - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS)
-            and state not in {"released", "expired"}
+            or reservation.teardown_dispatched_at
+            <= now - timedelta(seconds=TEARDOWN_RETRY_SECONDS)
         )
         await session.commit()
     if teardown_requested:
-        if teardown_wedged:
-            async with get_session() as session:
-                await quarantine_gpu_reservation_control_plane(
-                    session,
-                    reservation_id,
-                    code="gpu_teardown_reset_wedged",
-                    reason=(
-                        "GPU teardown did not produce exact process-absence and "
-                        "group-reset proof within the bounded lifecycle window."
-                    ),
-                )
-                await session.commit()
-            return
         if online and teardown_retry_due and state not in {"released", "expired"}:
             await send_gpu_reservation_teardown(
                 reservation_id,
                 reason=teardown_reason,
+                operation_type=(
+                    "release_rollover"
+                    if teardown_reason == "GPU release rolled"
+                    else None
+                ),
             )
         return
     if state == "reserved":
@@ -948,7 +1140,9 @@ async def _reconcile_reservation(reservation_id: str) -> None:
         async with get_session() as session:
             row = await session.get(GpuLaunchReservation, reservation_id)
             started = row.claimed_at or row.launching_at or row.issued_at
-        if started and started < _utcnow() - timedelta(seconds=CLAIMED_LAUNCH_TIMEOUT_SECONDS):
+        if started and started < _utcnow() - timedelta(
+            seconds=CLAIMED_LAUNCH_TIMEOUT_SECONDS
+        ):
             await send_gpu_reservation_teardown(
                 reservation_id,
                 reason="GPU guest failed to register before its launch deadline",
@@ -972,7 +1166,9 @@ async def _reconcile_reservation(reservation_id: str) -> None:
             instance = (
                 (
                     await session.execute(
-                        select(Instance).where(Instance.gpu_launch_reservation_id == reservation_id)
+                        select(Instance).where(
+                            Instance.gpu_launch_reservation_id == reservation_id
+                        )
                     )
                 )
                 .unique()
@@ -1005,16 +1201,23 @@ async def _reconcile_reservation(reservation_id: str) -> None:
             and config.retrieved_at is None
             and row is not None
             and row.workload_dispatched_at is not None
-            and row.workload_dispatched_at <= _utcnow() - timedelta(seconds=LAUNCH_RETRY_SECONDS)
+            and row.workload_dispatched_at
+            <= _utcnow() - timedelta(seconds=LAUNCH_RETRY_SECONDS)
             and config.created_at
-            >= (_utcnow().replace(tzinfo=None) - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS))
+            >= (
+                _utcnow().replace(tzinfo=None)
+                - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS)
+            )
         ):
             await _dispatch_workload_or_teardown(reservation_id)
         elif (
             instance is None
             and config.created_at
             and config.created_at
-            < (_utcnow().replace(tzinfo=None) - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS))
+            < (
+                _utcnow().replace(tzinfo=None)
+                - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS)
+            )
         ):
             await send_gpu_reservation_teardown(
                 reservation_id,
@@ -1024,7 +1227,8 @@ async def _reconcile_reservation(reservation_id: str) -> None:
             instance is not None
             and not instance.active
             and instance.created_at
-            and instance.created_at < (_utcnow() - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS))
+            and instance.created_at
+            < (_utcnow() - timedelta(seconds=ACTIVATION_TIMEOUT_SECONDS))
         ):
             await send_gpu_reservation_teardown(
                 reservation_id,
@@ -1050,7 +1254,9 @@ async def reconcile_platform_reservations() -> None:
         try:
             await _reconcile_reservation(reservation_id)
         except Exception as exc:  # noqa: BLE001
-            logger.error(f"GPU platform reservation reconcile failed for {reservation_id}: {exc}")
+            logger.error(
+                f"GPU platform reservation reconcile failed for {reservation_id}: {exc}"
+            )
 
 
 async def reconcile_miner_reservations() -> None:
@@ -1071,7 +1277,9 @@ async def reconcile_miner_reservations() -> None:
         try:
             await _reconcile_reservation(reservation_id)
         except Exception as exc:  # noqa: BLE001
-            logger.error(f"GPU miner reservation reconcile failed for {reservation_id}: {exc}")
+            logger.error(
+                f"GPU miner reservation reconcile failed for {reservation_id}: {exc}"
+            )
 
 
 async def place_platform_demand() -> None:
@@ -1123,6 +1331,15 @@ async def place_platform_demand() -> None:
 
 
 async def schedule_once() -> None:
+    from api.gpu_hotplug_service import retry_due_gpu_hotplug_commands
+    from api.gpu_registration_service import (
+        cleanup_expired_gpu_registration_nonces,
+    )
+
+    async with get_session() as session:
+        await cleanup_expired_gpu_registration_nonces(session)
+        await session.commit()
+    await retry_due_gpu_hotplug_commands()
     await reconcile_miner_reservations()
     await reconcile_platform_reservations()
     await place_platform_demand()
@@ -1149,8 +1366,46 @@ async def _tick_with_lock() -> None:
         )
 
 
+async def required_gpu_schema_present() -> bool:
+    """Check the exact migration row without running ORM scheduling queries."""
+
+    try:
+        async with engine.connect() as connection:
+            result = await connection.execute(
+                text(
+                    "SELECT 1 FROM schema_migrations WHERE version = :required_version"
+                ),
+                {"required_version": REQUIRED_GPU_SCHEMA_VERSION},
+            )
+            return result.scalar_one_or_none() == 1
+    except Exception as exc:  # table absence and blocked migration both mean not ready
+        logger.warning(
+            "Platform GPU scheduler schema barrier is not ready for "
+            f"{REQUIRED_GPU_SCHEMA_VERSION}: {exc}"
+        )
+        return False
+
+
+async def wait_for_required_gpu_schema() -> None:
+    """Wait before Redis election or any ORM scheduling query can execute."""
+
+    while not await required_gpu_schema_present():
+        await asyncio.sleep(SCHEMA_WAIT_SECONDS)
+
+
+def scheduler_liveness_healthy() -> bool:
+    """The waiting process is live even while the exact schema barrier is closed."""
+
+    return True
+
+
 async def main() -> None:
     install_asyncio_exception_handler()
+    logger.info(
+        "Platform GPU scheduler waiting for exact schema version "
+        f"{REQUIRED_GPU_SCHEMA_VERSION}"
+    )
+    await wait_for_required_gpu_schema()
     logger.info("Platform GPU scheduler starting")
     while True:
         try:
@@ -1161,4 +1416,11 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--schema-ready"]:
+        ready = asyncio.run(required_gpu_schema_present())
+        raise SystemExit(0 if ready else 1)
+    if sys.argv[1:] == ["--live"]:
+        raise SystemExit(0 if scheduler_liveness_healthy() else 1)
+    if sys.argv[1:]:
+        raise SystemExit("usage: python -m api.gpu_scheduler [--schema-ready|--live]")
     asyncio.run(main())

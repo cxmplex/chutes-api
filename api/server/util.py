@@ -101,19 +101,19 @@ def extract_client_cert_hash(require_proxy_verified: bool = False):
     return _extract_request_client_cert
 
 
-def extract_client_cert_pem():
+def extract_client_cert_pem(require_proxy_verified: bool = False):
     """FastAPI dependency: return the client certificate as a canonical PEM string.
 
-    Used by CPU TEE self-registration so the validator can persist the exact attestation-bound
-    serving cert (whose pubkey hash is verified against the quote report_data) and later pin it as
-    the instance cacert for the validator<->chute transport.
+    CPU TEE registration retains the quote-bound header behavior. GPU Registration V2 sets
+    require_proxy_verified=True so nonce issuance, processing, and replay additionally require
+    a live client-certificate handshake before any runtime token can be minted.
     """
 
     async def _extract_request_client_cert_pem(request: Request):
         try:
-            # Attestation/registration: cert is quote-bound; accept the header cert (the in-guest
-            # agent posts it via header, not mTLS). The quote check is the trust anchor.
-            cert = _get_client_certificate(request, require_proxy_verified=False)
+            cert = _get_client_certificate(
+                request, require_proxy_verified=require_proxy_verified
+            )
             return cert.public_bytes(serialization.Encoding.PEM).decode()
         except HTTPException:
             raise

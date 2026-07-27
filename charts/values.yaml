@@ -853,6 +853,11 @@ gpuPlatformScheduler:
                     - gpu-platform-scheduler
             topologyKey: kubernetes.io/hostname
   tolerations: []
+  readinessProbe:
+    initialDelaySeconds: 2
+    periodSeconds: 2
+    timeoutSeconds: 5
+    failureThreshold: 1
   resources:
     requests:
       cpu: "500m"

@@ -59,7 +59,10 @@ from api.host.schemas import (
     PcsMailboxEnvelopeV2,
     canonical_sha256,
 )
-from api.host.locks import acquire_gpu_lifecycle_lock
+from api.host.locks import (
+    acquire_gpu_lifecycle_lock,
+    assert_gpu_external_work_allowed,
+)
 from api.server.schemas import Host
 
 HOST_ID_HEADER = "X-Chutes-Host-Id"
@@ -77,6 +80,46 @@ _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 class HostAuthError(ValueError):
     pass
+
+
+async def _assert_gpu_credential_change_safe(
+    db: AsyncSession,
+    host: Host,
+) -> None:
+    """Preserve the only credential that can finish durable PCI custody."""
+
+    if host.compute_type != "gpu":
+        return
+    from api.gpu_models import GpuLifecycleOperation
+    from api.host.schemas import GpuAllocationGroup
+
+    operation = (
+        await db.execute(
+            select(GpuLifecycleOperation.operation_id)
+            .where(
+                GpuLifecycleOperation.host_id == host.host_id,
+                GpuLifecycleOperation.phase.notin_(("finalized", "quarantined")),
+            )
+            .order_by(GpuLifecycleOperation.operation_id)
+            .with_for_update()
+        )
+    ).scalars().first()
+    reclaim_pending = (
+        await db.execute(
+            select(GpuAllocationGroup.allocation_group_id)
+            .where(
+                GpuAllocationGroup.host_id == host.host_id,
+                GpuAllocationGroup.state == "recovery_required",
+            )
+            .order_by(GpuAllocationGroup.allocation_group_id)
+            .with_for_update()
+        )
+    ).scalars().first()
+    if operation is not None or reclaim_pending is not None:
+        raise HostAuthError(
+            "GPU host credential change is blocked until lifecycle custody "
+            "is terminal and forced-recovery reclaim is complete."
+        )
 
 
 def _utcnow() -> datetime:
@@ -411,6 +454,7 @@ async def redeem_enrollment_voucher(
         await db.flush()
 
     if request_compute == "gpu" and host.active_key_generation is not None:
+        await _assert_gpu_credential_change_safe(db, host)
         from api.host.gpu_allocations import fence_gpu_host_authority
 
         await fence_gpu_host_authority(
@@ -605,6 +649,10 @@ async def create_host_auth_challenge(
         or key.revoked_at is not None
     ):
         raise HostAuthError("Host key generation is not active.")
+    # The Redis challenge is only transport/replay state. Commit the locked
+    # identity validation before touching Redis; authentication revalidates the
+    # key lineage after consuming the challenge.
+    await db.commit()
     now = _utcnow()
     challenge = HostAuthChallengeV1(
         challenge_id=generate_uuid(),
@@ -614,6 +662,7 @@ async def create_host_auth_challenge(
         expires_at=now + timedelta(seconds=AUTH_CHALLENGE_TTL_SECONDS),
     )
     redis_key = f"host:http-challenge:{challenge.challenge_id}"
+    assert_gpu_external_work_allowed(db, "host HTTP challenge Redis SETEX")
     try:
         await settings.redis_client.setex(
             redis_key,
@@ -643,6 +692,8 @@ async def create_host_socket_challenge(
         or key.revoked_at is not None
     ):
         raise HostAuthError("Host key generation is not control-channel eligible.")
+    # Do not retain GPU lifecycle authority across Redis transport work.
+    await db.commit()
     now = _utcnow()
     challenge = HostSocketChallengeV1(
         challenge_id=generate_uuid(),
@@ -652,6 +703,7 @@ async def create_host_socket_challenge(
         challenge=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("ascii").rstrip("="),
         expires_at=now + timedelta(seconds=AUTH_CHALLENGE_TTL_SECONDS),
     )
+    assert_gpu_external_work_allowed(db, "host socket challenge Redis SETEX")
     try:
         await settings.redis_client.setex(
             f"host:socket-challenge:{challenge.challenge_id}",
@@ -668,7 +720,6 @@ async def verify_host_socket_authentication(
     session_id: str,
     authentication: HostSocketAuthenticationV1 | HostSocketAuthenticationV2,
 ) -> Host:
-    await acquire_gpu_lifecycle_lock(db)
     if authentication.session_id != session_id:
         raise HostAuthError("Host socket authentication names another session.")
     now = _utcnow()
@@ -677,6 +728,7 @@ async def verify_host_socket_authentication(
         issued_at = issued_at.replace(tzinfo=timezone.utc)
     if abs((now - issued_at).total_seconds()) > HOST_SIGNATURE_MAX_SKEW_SECONDS:
         raise HostAuthError("Host socket authentication is stale.")
+    assert_gpu_external_work_allowed(db, "host socket challenge Redis GETDEL")
     try:
         raw = await settings.redis_client.getdel(
             f"host:socket-challenge:{authentication.challenge_id}"
@@ -694,6 +746,14 @@ async def verify_host_socket_authentication(
         or challenge.expires_at <= now
     ):
         raise HostAuthError("Host socket challenge does not match the authentication.")
+    observed_live_storage_ids = None
+    if isinstance(authentication, HostSocketAuthenticationV2):
+        from api.host.reservations import observe_gpu_storage_liveness
+
+        observed_live_storage_ids = await observe_gpu_storage_liveness(
+            db, authentication.host_id
+        )
+    await acquire_gpu_lifecycle_lock(db)
     host = (
         await db.execute(
             select(Host).where(Host.host_id == authentication.host_id).with_for_update()
@@ -731,7 +791,11 @@ async def verify_host_socket_authentication(
     if authentication_compute == "gpu":
         from api.host.reservations import gpu_host_storage_readiness
 
-        readiness = await gpu_host_storage_readiness(db, host)
+        readiness = await gpu_host_storage_readiness(
+            db,
+            host,
+            observed_live_storage_ids=observed_live_storage_ids,
+        )
         host.capacity = int(host.reported_capacity or 0) if readiness.trusted_schedulable else 0
         if not readiness.control_channel_eligible:
             await db.commit()
@@ -752,7 +816,6 @@ async def get_current_host(
 ) -> Host:
     """Authenticate one method/path/body-bound request from an active logical host key."""
 
-    await acquire_gpu_lifecycle_lock(db)
     if not all(
         [
             host_id_header,
@@ -782,6 +845,7 @@ async def get_current_host(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Logical-host signature is stale.",
         )
+    assert_gpu_external_work_allowed(db, "host HTTP challenge Redis GETDEL")
     try:
         raw = await settings.redis_client.getdel(f"host:http-challenge:{challenge_id}")
     except Exception as exc:
@@ -810,6 +874,7 @@ async def get_current_host(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Logical-host challenge does not match this request.",
         )
+    await acquire_gpu_lifecycle_lock(db)
     host = (
         await db.execute(select(Host).where(Host.host_id == host_id_header).with_for_update())
     ).scalar_one_or_none()
@@ -861,6 +926,8 @@ async def get_current_host(
             detail=str(exc),
         ) from exc
     key.last_used_at = now
+    # Authentication must not leak trust-bearing row locks into the endpoint.
+    await db.commit()
     return host
 
 
@@ -1081,6 +1148,7 @@ async def revoke_host_credentials(
         raise HostAuthError("Logical host is unknown or owned by another miner.")
     now = _utcnow()
     if host.compute_type == "gpu":
+        await _assert_gpu_credential_change_safe(db, host)
         from api.host.gpu_allocations import fence_gpu_host_authority
 
         await fence_gpu_host_authority(

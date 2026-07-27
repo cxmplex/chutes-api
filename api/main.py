@@ -59,6 +59,7 @@ from api.metrics.util import keep_gauges_fresh
 from api.instance.util import start_instance_invalidation_listener
 from api.log import install_asyncio_exception_handler
 from api.client_ip import resolve_client_ip
+from api.storage.startup import require_chutefs_token_key_retention
 
 
 async def loop_lag_monitor(interval: float = 0.1, warn_threshold: float = 0.2):
@@ -121,6 +122,7 @@ async def lifespan(_: FastAPI):
         )
 
     await run_database_migrations()
+    await require_chutefs_token_key_retention()
 
     loop = asyncio.get_event_loop()
     executor = ThreadPoolExecutor(max_workers=64)
