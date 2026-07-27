@@ -3213,15 +3213,14 @@ async def process_runtime_attestation(
         db.add(attestation)
         if gpu_runtime and nonce_context.gpu_launch_reservation_id:
             await db.flush()
-            from api.host.gpu_allocations import (
-                quarantine_gpu_reservation_control_plane,
-            )
+            from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
-            await quarantine_gpu_reservation_control_plane(
+            await request_gpu_lifecycle_fence(
                 db,
                 nonce_context.gpu_launch_reservation_id,
                 code="gpu_runtime_attestation_failed",
                 reason=str(e.detail),
+                operation_type="normal_delete",
                 metadata={"attestation_id": attestation.attestation_id},
             )
         await db.commit()

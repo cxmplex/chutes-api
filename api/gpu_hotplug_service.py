@@ -672,13 +672,14 @@ async def record_gpu_hotplug_ack(
     row.failure_reason = ack.failure_reason
     row.updated_at = now
     if ack.state == "failed" and custody_current:
-        from api.host.gpu_allocations import quarantine_gpu_reservation_control_plane
+        from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
-        await quarantine_gpu_reservation_control_plane(
+        await request_gpu_lifecycle_fence(
             db,
             reservation.reservation_id,
             code=ack.failure_code or "gpu_hotplug_failed",
             reason=ack.failure_reason or "Legacy GPU hotplug failed.",
+            operation_type="normal_delete",
             metadata={"hotplug_command_id": row.command_id},
         )
     await db.flush()

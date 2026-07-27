@@ -97,15 +97,21 @@ def _assert_authenticated_host(
     allow_reboot_resume: bool = False,
 ) -> None:
     boot_matches = host.boot_generation == row.host_boot_generation
-    if (
-        allow_reboot_resume
-        and isinstance(row, GpuLifecycleOperation)
-        and row.operation_type
-        not in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
-    ):
-        boot_matches = int(host.boot_generation or 0) >= int(
-            row.host_boot_generation or 0
+    if allow_reboot_resume and isinstance(row, GpuLifecycleOperation):
+        recovery_crossed_physical_boundary = bool(
+            row.operation_type
+            in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
+            and row.phase
+            in {"physical_result", "receipt_accepted", "local_release_acked"}
         )
+        if (
+            row.operation_type
+            not in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
+            or recovery_crossed_physical_boundary
+        ):
+            boot_matches = int(host.boot_generation or 0) >= int(
+                row.host_boot_generation or 0
+            )
     if (
         host.host_id != row.host_id
         or host.active_key_generation != row.host_key_generation
@@ -362,6 +368,8 @@ def _assert_recovery_inventory(
         or report.host_id != host.host_id
         or report.host_key_generation != host.active_key_generation
         or report.host_boot_generation != host.boot_generation
+        or report.report_generation != host.gpu_inventory_report_generation
+        or claims.report_generation != host.gpu_inventory_report_generation
         or claims.report_id != report.report_id
         or claims.host_id != host.host_id
         or claims.host_key_generation != host.active_key_generation
@@ -484,11 +492,14 @@ async def _recovery_event_exists(
     ).scalar_one_or_none() is not None
 
 
-async def _revoke_expired_unstarted_recovery(
+async def _revoke_unstarted_recovery(
     db: AsyncSession,
     authorization: GpuRecoveryAuthorization,
     group: GpuAllocationGroup,
     now: datetime,
+    *,
+    failure_code: str,
+    failure_reason: str,
 ) -> None:
     row = await _locked_operation(db, authorization.operation_id)
     if await _recovery_event_exists(db, row.operation_id, "started"):
@@ -500,13 +511,13 @@ async def _revoke_expired_unstarted_recovery(
     if row.phase == "intent":
         row.phase = "quarantined"
         row.reporting_state = "quarantined"
-        row.failure_code = "gpu_recovery_authorization_expired"
-        row.failure_reason = "GPU recovery authorization expired before presentation."
+        row.failure_code = failure_code
+        row.failure_reason = failure_reason
         row.finalized_at = now
         row.updated_at = now
     elif row.phase != "quarantined":
         raise GpuLifecycleError(
-            "Expired GPU recovery authorization has already changed physical state."
+            "GPU recovery authorization has already changed physical state."
         )
     if group.recovery_authorization_id == authorization.authorization_id:
         group.recovery_authorization_id = None
@@ -526,11 +537,26 @@ def _assert_successor_recovery_custody(
     operation: GpuLifecycleOperation,
     authorization: GpuRecoveryAuthorization,
     reservation: Optional[GpuLaunchReservation],
+    *,
+    invalidated_finalized: bool = False,
 ) -> None:
     """Require the failed recovery's immutable custody before superseding it."""
 
     if (
-        operation.phase != "quarantined"
+        (
+            operation.phase != "quarantined"
+            if not invalidated_finalized
+            else (
+                operation.phase != "finalized"
+                or operation.result_outcome != "accepted"
+                or operation.receipt_id is None
+                or operation.receipt_sha256 is None
+                or operation.local_release_ack_sha256 is None
+                or group.failure_code != "gpu_inventory_changed_during_release"
+                or not isinstance(group.failure_metadata, dict)
+                or not group.failure_metadata.get("inventory_report_id")
+            )
+        )
         or operation.host_id != authorization.host_id
         or operation.allocation_group_id != group.allocation_group_id
         or operation.allocation_group_generation != group.generation
@@ -667,8 +693,20 @@ async def authorize_gpu_recovery(
     if existing is not None:
         operation = await _locked_operation(db, existing.operation_id)
         started = await _recovery_event_exists(db, existing.operation_id, "started")
+        completed = await _recovery_event_exists(
+            db, existing.operation_id, "completed"
+        )
         revoked = await _recovery_event_exists(db, existing.operation_id, "revoked")
-        if operation.phase == "quarantined" and started:
+        invalidated_finalized = bool(
+            operation.phase == "finalized"
+            and operation.result_outcome == "accepted"
+            and started
+            and completed
+            and revoked
+            and group.state == "quarantined"
+            and group.failure_code == "gpu_inventory_changed_during_release"
+        )
+        if (operation.phase == "quarantined" and started) or invalidated_finalized:
             if existing.inventory_report_id == request.report_id:
                 raise GpuLifecycleError(
                     "Failed GPU recovery requires a fresh current inventory report."
@@ -679,20 +717,42 @@ async def authorize_gpu_recovery(
                 operation,
                 existing,
                 reservation,
+                invalidated_finalized=invalidated_finalized,
             )
             _clear_recovery_projection_for_successor(
                 group,
                 existing.authorization_id,
                 now,
             )
+        elif not started and existing.inventory_report_id != request.report_id:
+            await _revoke_unstarted_recovery(
+                db,
+                existing,
+                group,
+                now,
+                failure_code="gpu_recovery_inventory_superseded",
+                failure_reason=(
+                    "A newer exact host inventory report superseded the recovery "
+                    "authorization before presentation."
+                ),
+            )
         elif not revoked and (existing.expires_at > now or started):
-            if existing.inventory_report_id != request.report_id:
-                raise GpuLifecycleError(
-                    "GPU recovery generation already has an authorization for another report."
-                )
             return await _recovery_authorization_envelope(db, existing)
         elif not revoked:
-            await _revoke_expired_unstarted_recovery(db, existing, group, now)
+            await _revoke_unstarted_recovery(
+                db,
+                existing,
+                group,
+                now,
+                failure_code="gpu_recovery_authorization_expired",
+                failure_reason=(
+                    "GPU recovery authorization expired before presentation."
+                ),
+            )
+        else:
+            raise GpuLifecycleError(
+                "Revoked GPU recovery authorization requires a fresh inventory report."
+            )
 
     prior_host_key_generation = group.host_key_generation
     prior_host_boot_generation = group.host_boot_generation
@@ -914,6 +974,19 @@ async def _validate_recovery_authorization(
         raise GpuLifecycleError("GPU recovery authorization expired before start.")
     group = await _locked_group(db, row.allocation_group_id)
     report = await _locked_inventory_report(db, authorization.inventory_report_id)
+    if started is None:
+        try:
+            report_claims = GpuInventoryReportV1.model_validate(report.claims)
+        except ValueError as exc:
+            raise GpuLifecycleError(
+                "GPU recovery inventory report is malformed."
+            ) from exc
+        _assert_recovery_inventory(
+            authenticated_host,
+            group,
+            report,
+            report_claims,
+        )
     if (
         authenticated_host.host_id != authorization.host_id
         or authenticated_host.active_key_generation != authorization.host_key_generation
@@ -1082,6 +1155,7 @@ def _derived_reservation_operation_type(
         in {
             "launch_active_release_changed",
             "reservation_active_release_changed",
+            "claim_active_release_changed",
         }
         or reservation.teardown_reason == "GPU release rolled"
     ):
@@ -1362,8 +1436,11 @@ async def gpu_lifecycle_operation_response(
             "receipt_id": row.receipt_id,
             "receipt_sha256": row.receipt_sha256,
             "local_release_ack_sha256": row.local_release_ack_sha256,
-            "failure_code": row.failure_code,
-            "failure_reason": row.failure_reason,
+            # Post-receipt inventory fencing is an internal finalization
+            # directive until the exact local-release ACK makes quarantine
+            # terminal. V1 permits failure fields only on a quarantined phase.
+            "failure_code": row.failure_code if row.phase == "quarantined" else None,
+            "failure_reason": row.failure_reason if row.phase == "quarantined" else None,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
             "finalized_at": row.finalized_at,
@@ -1727,17 +1804,13 @@ async def _finalize_local_release(
     authenticated_host: Host,
     operation_id: str,
     ack_sha256: str,
-    *,
-    exact_persisted_replay: bool = False,
 ) -> GpuLifecycleOperationV1:
     await acquire_gpu_lifecycle_lock(db)
     row = await _locked_operation(db, operation_id)
-    if exact_persisted_replay:
-        await _locked_current_logical_host(db, authenticated_host, row)
-    else:
-        await _locked_authenticated_host(
-            db, authenticated_host, row, allow_reboot_resume=True
-        )
+    # The exact persisted ACK is the authority for finalization. The current
+    # logical host may finish it after a boot or key-generation change without
+    # rewriting the operation's immutable original lineage.
+    await _locked_current_logical_host(db, authenticated_host, row)
     if not secrets.compare_digest(row.local_release_ack_sha256 or "", ack_sha256):
         raise GpuLifecycleError("GPU local-release ACK replay changed canonical bytes.")
     if row.phase == "finalized":
@@ -1749,6 +1822,41 @@ async def _finalize_local_release(
     if group.state != "release_pending":
         raise GpuLifecycleError("GPU group left release-pending before final ACK.")
     now = _now()
+    if row.failure_code == "gpu_inventory_changed_during_release":
+        reason = row.failure_reason or (
+            "GPU inventory changed after reset began; the group cannot be reused."
+        )
+        if reservation is not None:
+            _quarantine_reservation(
+                reservation,
+                group,
+                code=row.failure_code,
+                reason=reason,
+                metadata={
+                    "lifecycle_operation_id": row.operation_id,
+                    "receipt_id": row.receipt_id,
+                },
+                now=now,
+            )
+            await _retire_gpu_runtime_lineage(db, reservation, now, reason=reason)
+        else:
+            _quarantine_group(
+                group,
+                code=row.failure_code,
+                reason=reason,
+                metadata={
+                    "lifecycle_operation_id": row.operation_id,
+                    "receipt_id": row.receipt_id,
+                },
+                now=now,
+            )
+        row.phase = "quarantined"
+        row.reporting_state = "quarantined"
+        row.finalized_at = now
+        row.updated_at = now
+        await _append_recovery_event(db, row, "quarantined", occurred_at=now)
+        await db.flush()
+        return await gpu_lifecycle_operation_response(db, row, group=group)
     if row.operation_type == "forced_dead_guest_recovery":
         if reservation is None:
             raise GpuLifecycleError("Forced recovery lost its reservation lineage.")
@@ -1823,9 +1931,13 @@ async def record_gpu_local_release_ack(
                 "GPU local-release ACK replay changed canonical bytes."
             )
         await _locked_current_logical_host(db, authenticated_host, row)
-        if row.phase == "finalized":
+        if row.phase in {"finalized", "quarantined"}:
             return await gpu_lifecycle_operation_response(db, row)
     else:
+        # Only the original L0 credential may make the first local-absence
+        # assertion. A successor key may replay an ACK only after its exact bytes
+        # are durable above; logical host identity alone does not prove custody of
+        # the old CHUTES_DATA journal or physical device state.
         await _locked_authenticated_host(
             db, authenticated_host, row, allow_reboot_resume=True
         )
@@ -1852,7 +1964,6 @@ async def record_gpu_local_release_ack(
         authenticated_host,
         operation_id,
         ack_sha256,
-        exact_persisted_replay=exact_persisted_replay,
     )
     await db.commit()
     return response

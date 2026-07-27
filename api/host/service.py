@@ -85,17 +85,17 @@ class HostAuthError(ValueError):
 async def _assert_gpu_credential_change_safe(
     db: AsyncSession,
     host: Host,
-) -> None:
-    """Preserve the only credential that can finish durable PCI custody."""
+) -> bool:
+    """Return whether exact post-physical journals cover every active custody."""
 
     if host.compute_type != "gpu":
-        return
+        return False
     from api.gpu_models import GpuLifecycleOperation
     from api.host.schemas import GpuAllocationGroup
 
-    operation = (
+    operations = (
         await db.execute(
-            select(GpuLifecycleOperation.operation_id)
+            select(GpuLifecycleOperation)
             .where(
                 GpuLifecycleOperation.host_id == host.host_id,
                 GpuLifecycleOperation.phase.notin_(("finalized", "quarantined")),
@@ -103,23 +103,60 @@ async def _assert_gpu_credential_change_safe(
             .order_by(GpuLifecycleOperation.operation_id)
             .with_for_update()
         )
-    ).scalars().first()
-    reclaim_pending = (
+    ).scalars().all()
+    safe_phases = {"local_release_acked"}
+    unsafe_operation = next(
+        (
+            item
+            for item in operations
+            if item.phase not in safe_phases
+            or item.operation_type
+            in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
+        ),
+        None,
+    )
+    active_groups = (
         await db.execute(
-            select(GpuAllocationGroup.allocation_group_id)
+            select(GpuAllocationGroup)
             .where(
                 GpuAllocationGroup.host_id == host.host_id,
-                GpuAllocationGroup.state == "recovery_required",
+                GpuAllocationGroup.state.in_(
+                    (
+                        "reserved",
+                        "launching",
+                        "running",
+                        "resetting",
+                        "release_pending",
+                        "recovery_required",
+                    )
+                ),
             )
             .order_by(GpuAllocationGroup.allocation_group_id)
             .with_for_update()
         )
-    ).scalars().first()
-    if operation is not None or reclaim_pending is not None:
+    ).scalars().all()
+    if unsafe_operation is not None or any(
+        item.state == "recovery_required" for item in active_groups
+    ):
         raise HostAuthError(
             "GPU host credential change is blocked until lifecycle custody "
-            "is terminal and forced-recovery reclaim is complete."
+            "has a persisted local-release ACK and forced-recovery reclaim is complete."
         )
+    if not operations:
+        return False
+
+    protected_groups = {
+        (item.allocation_group_id, item.allocation_group_generation)
+        for item in operations
+    }
+    if any(
+        (item.allocation_group_id, item.generation) not in protected_groups
+        for item in active_groups
+    ):
+        raise HostAuthError(
+            "GPU host credential change is blocked while unjournaled GPU custody remains."
+        )
+    return True
 
 
 def _utcnow() -> datetime:
@@ -454,15 +491,16 @@ async def redeem_enrollment_voucher(
         await db.flush()
 
     if request_compute == "gpu" and host.active_key_generation is not None:
-        await _assert_gpu_credential_change_safe(db, host)
-        from api.host.gpu_allocations import fence_gpu_host_authority
+        post_physical_replay = await _assert_gpu_credential_change_safe(db, host)
+        if not post_physical_replay:
+            from api.host.gpu_allocations import fence_gpu_host_authority
 
-        await fence_gpu_host_authority(
-            db,
-            host.host_id,
-            code="host_key_rotated",
-            reason="GPU host key generation rotated before exact reset.",
-        )
+            await fence_gpu_host_authority(
+                db,
+                host.host_id,
+                code="host_key_rotated",
+                reason="GPU host key generation rotated before exact reset.",
+            )
 
     previous_keys = (
         (
@@ -1149,15 +1187,16 @@ async def revoke_host_credentials(
         raise HostAuthError("Logical host is unknown or owned by another miner.")
     now = _utcnow()
     if host.compute_type == "gpu":
-        await _assert_gpu_credential_change_safe(db, host)
-        from api.host.gpu_allocations import fence_gpu_host_authority
+        post_physical_replay = await _assert_gpu_credential_change_safe(db, host)
+        if not post_physical_replay:
+            from api.host.gpu_allocations import fence_gpu_host_authority
 
-        await fence_gpu_host_authority(
-            db,
-            host_id,
-            code="host_key_revoked",
-            reason="GPU host credential revoked before exact reset.",
-        )
+            await fence_gpu_host_authority(
+                db,
+                host_id,
+                code="host_key_revoked",
+                reason="GPU host credential revoked before exact reset.",
+            )
     await db.execute(
         update(HostEnrollmentVoucher)
         .where(

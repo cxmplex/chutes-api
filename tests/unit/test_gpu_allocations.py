@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from api.host import gpu_allocations
+from api.host import gpu_allocations, router as host_router
 from api.host.gpu_allocations import (
     GpuAllocationError,
     _l0_gpu_profile_id,
@@ -19,13 +19,13 @@ from api.host.gpu_allocations import (
     reserve_gpu_group,
     sign_gpu_launch_claims,
 )
+from api.gpu_contracts import GpuPhysicalResultV1
 from api.host.schemas import (
     GpuInventoryGroupV1,
     GpuInventoryReportV1,
     GpuLaunchReservationClaimsV1,
     GpuMinerReservationRequestV1,
     GpuPlatformReservationRequestV1,
-    GpuResetResultV1,
     canonical_sha256,
 )
 from api.server.schemas import Host
@@ -40,13 +40,18 @@ from tests.unit.test_release_provenance import _gpu_document
 
 UUIDS = [f"GPU-00000000-0000-0000-0000-{index:012x}" for index in range(1, 9)]
 BDFS = [f"0000:{index:02x}:00.0" for index in range(1, 9)]
-GPU_CLAIM_FIXTURE_SHA256 = "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197"
+GPU_CLAIM_FIXTURE_SHA256 = (
+    "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197"
+)
 
 
 def test_gpu_claims_receive_measured_es256_envelope(monkeypatch):
     claims = GpuLaunchReservationClaimsV1.model_validate(
         json.loads(
-            (Path(__file__).resolve().parents[1] / "fixtures/gpu_launch_claims_v1.json").read_text()
+            (
+                Path(__file__).resolve().parents[1]
+                / "fixtures/gpu_launch_claims_v1.json"
+            ).read_text()
         )
     )
     private_key = ec.generate_private_key(ec.SECP256R1())
@@ -80,7 +85,10 @@ def test_gpu_claims_receive_measured_es256_envelope(monkeypatch):
 def test_gpu_claim_signing_fails_without_validator_asymmetric_key(monkeypatch):
     claims = GpuLaunchReservationClaimsV1.model_validate(
         json.loads(
-            (Path(__file__).resolve().parents[1] / "fixtures/gpu_launch_claims_v1.json").read_text()
+            (
+                Path(__file__).resolve().parents[1]
+                / "fixtures/gpu_launch_claims_v1.json"
+            ).read_text()
         )
     )
     monkeypatch.setattr(
@@ -96,7 +104,10 @@ def test_gpu_claim_signing_fails_without_validator_asymmetric_key(monkeypatch):
 def test_gpu_claim_signing_rejects_nonpositive_key_epoch(monkeypatch):
     claims = GpuLaunchReservationClaimsV1.model_validate(
         json.loads(
-            (Path(__file__).resolve().parents[1] / "fixtures/gpu_launch_claims_v1.json").read_text()
+            (
+                Path(__file__).resolve().parents[1]
+                / "fixtures/gpu_launch_claims_v1.json"
+            ).read_text()
         )
     )
     monkeypatch.setattr(
@@ -215,7 +226,11 @@ def test_exact_inventory_canonicalization_binds_every_topology_field():
     disconnected = _group()
     disconnected["nvlink_edges"].pop()
     disconnected["topology_fingerprint"] = canonical_sha256(
-        {key: value for key, value in disconnected.items() if key != "topology_fingerprint"}
+        {
+            key: value
+            for key, value in disconnected.items()
+            if key != "topology_fingerprint"
+        }
     )
     with pytest.raises(ValidationError, match="complete and connected"):
         GpuInventoryGroupV1.model_validate(disconnected)
@@ -230,9 +245,15 @@ def test_exact_inventory_canonicalization_binds_every_topology_field():
         GpuInventoryGroupV1.model_validate(unsafe)
 
     contradictory = _group()
-    contradictory["devices"][1]["iommu_group"] = contradictory["devices"][0]["iommu_group"]
+    contradictory["devices"][1]["iommu_group"] = contradictory["devices"][0][
+        "iommu_group"
+    ]
     contradictory["topology_fingerprint"] = canonical_sha256(
-        {key: value for key, value in contradictory.items() if key != "topology_fingerprint"}
+        {
+            key: value
+            for key, value in contradictory.items()
+            if key != "topology_fingerprint"
+        }
     )
     with pytest.raises(ValidationError, match="contradictory"):
         GpuInventoryGroupV1.model_validate(contradictory)
@@ -240,7 +261,11 @@ def test_exact_inventory_canonicalization_binds_every_topology_field():
     arbitrary_fabric = _group()
     arbitrary_fabric["fabrics"][0]["fabric_id"] = "f" * 64
     arbitrary_fabric["topology_fingerprint"] = canonical_sha256(
-        {key: value for key, value in arbitrary_fabric.items() if key != "topology_fingerprint"}
+        {
+            key: value
+            for key, value in arbitrary_fabric.items()
+            if key != "topology_fingerprint"
+        }
     )
     with pytest.raises(ValidationError, match="fabric_id"):
         GpuInventoryGroupV1.model_validate(arbitrary_fabric)
@@ -268,7 +293,8 @@ def test_inventory_profile_is_selected_only_from_signed_provenance():
 def test_inventory_profile_is_bound_to_signed_l0_qemu_tdvf_closure():
     provenance = json.loads(
         (
-            Path(__file__).resolve().parents[1] / "fixtures/gpu_provenance_v3_complete.json"
+            Path(__file__).resolve().parents[1]
+            / "fixtures/gpu_provenance_v3_complete.json"
         ).read_text()
     )
     environment = provenance["launch_environments"][0]
@@ -331,7 +357,9 @@ def _claims(mode="platform"):
         "gpu_bdfs": BDFS,
         "gpu_uuids": sorted(UUIDS),
         "gpu_identifiers": ["b200"] * 8,
-        "gpu_attestation_certificate_sha256s": [f"{index:064x}" for index in range(1, 9)],
+        "gpu_attestation_certificate_sha256s": [
+            f"{index:064x}" for index in range(1, 9)
+        ],
         "topology_fingerprint": "1" * 64,
         "gpu_release_id": "release",
         "gpu_profile_id": "b200-8gpu",
@@ -353,7 +381,9 @@ def _claims(mode="platform"):
         "miner_hourly_cost": 12.5 if mode == "miner" else None,
         "chute_id": "chute" if mode == "platform" else None,
         "container_repository": "org/image" if mode == "platform" else None,
-        "container_manifest_digest": f"sha256:{'9' * 64}" if mode == "platform" else None,
+        "container_manifest_digest": f"sha256:{'9' * 64}"
+        if mode == "platform"
+        else None,
         "launch_nonce": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4=",
         "issued_at": now,
         "expires_at": now + timedelta(minutes=15),
@@ -450,7 +480,7 @@ def test_same_sized_nvidia_evidence_from_another_group_fails():
             for index in range(8)
         ],
     )
-    with pytest.raises(InvalidGpuEvidenceError, match="reserved GPU group"):
+    with pytest.raises(InvalidGpuEvidenceError, match="selected reservation devices"):
         _assert_reserved_nvidia_devices(claims, result)
 
 
@@ -493,6 +523,10 @@ async def test_reservation_checks_full_storage_gate_before_group_locks():
             AsyncMock(return_value=(release, {}, provenance)),
         ),
         patch(
+            "api.host.reservations.observe_gpu_storage_liveness",
+            AsyncMock(return_value=set()),
+        ),
+        patch(
             "api.host.reservations.gpu_host_storage_readiness",
             AsyncMock(
                 return_value=SimpleNamespace(
@@ -509,16 +543,20 @@ async def test_reservation_checks_full_storage_gate_before_group_locks():
     assert "pg_advisory_xact_lock" in str(db.execute.await_args.args[0])
 
 
-def test_reset_result_requires_absence_reset_and_driver_restore_together():
+def test_physical_result_requires_absence_reset_and_driver_restore_together():
     common = {
+        "operation_id": "operation",
+        "allocation_group_id": "group",
+        "allocation_group_generation": 1,
         "reservation_id": "reservation",
+        "reservation_generation": 1,
         "claims_sha256": "1" * 64,
         "process_incarnation": "gpu-process",
         "gpu_bdfs": BDFS,
         "gpu_uuids": sorted(UUIDS),
         "topology_fingerprint": "2" * 64,
     }
-    success = GpuResetResultV1(
+    success = GpuPhysicalResultV1(
         **common,
         qemu_absent=True,
         reset_succeeded=True,
@@ -526,7 +564,7 @@ def test_reset_result_requires_absence_reset_and_driver_restore_together():
     )
     assert success.reset_succeeded
     with pytest.raises(ValidationError, match="failure metadata"):
-        GpuResetResultV1(
+        GpuPhysicalResultV1(
             **common,
             qemu_absent=True,
             reset_succeeded=False,
@@ -582,7 +620,9 @@ async def test_failed_target_cutover_rebinds_same_migration_after_exact_reset(st
         def scalar_one_or_none(self):
             return self.value
 
-    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(value) for value in values]))
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(value) for value in values])
+    )
     await _require_resumable_legacy_migration(
         db,
         migration,
@@ -643,10 +683,72 @@ async def test_failed_target_cutover_rejects_ambiguous_qemu_reset():
         def scalar_one_or_none(self):
             return self.value
 
-    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(value) for value in values]))
+    db = SimpleNamespace(
+        execute=AsyncMock(side_effect=[Result(value) for value in values])
+    )
     with pytest.raises(GpuAllocationError, match="not exact"):
         await _require_resumable_legacy_migration(
             db,
             migration,
             SimpleNamespace(host_id="host-1", miner_hotkey="owner"),
         )
+
+
+@pytest.mark.asyncio
+async def test_recovery_dispatch_commits_before_guard_and_reuses_operation_id(
+    monkeypatch,
+):
+    calls = []
+
+    class Db:
+        def __init__(self):
+            self.info = {}
+
+        async def commit(self):
+            calls.append("commit")
+            self.info.clear()
+
+        async def rollback(self):
+            calls.append("rollback")
+
+    db = Db()
+    operation = SimpleNamespace(
+        host_id="host-1",
+        operation_id="operation-1",
+        model_dump=lambda **_kwargs: {"operation_id": "operation-1"},
+    )
+    envelope = SimpleNamespace(
+        operation=operation,
+        model_dump=lambda **_kwargs: {"authorization_id": "authorization-1"},
+    )
+
+    async def authorize(current_db, *_args, **_kwargs):
+        assert current_db is db
+        current_db.info["gpu_lifecycle_lock_held"] = True
+        calls.append("authorize")
+        return envelope
+
+    async def send(host_id, command, payload, *, command_id=None):
+        assert not db.info.get("gpu_lifecycle_lock_held")
+        calls.append(("send", host_id, command, command_id, payload))
+        return command_id
+
+    monkeypatch.setattr(host_router, "authorize_gpu_recovery", authorize)
+    monkeypatch.setattr(host_router, "send_agent_command", send)
+    user = SimpleNamespace(user_id="admin-1", has_role=lambda _role: True)
+
+    result = await host_router.authorize_gpu_group_recovery_endpoint(
+        "group-1",
+        SimpleNamespace(report_id="report-1", reason="focused test"),
+        db=db,
+        current_user=user,
+    )
+
+    assert result is envelope
+    assert calls[:2] == ["authorize", "commit"]
+    assert calls[2][0:4] == (
+        "send",
+        "host-1",
+        "recover_gpu_group",
+        "operation-1",
+    )

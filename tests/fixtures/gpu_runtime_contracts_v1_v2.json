@@ -1,0 +1,937 @@
+{
+  "lifecycle_v1": {
+    "accepted_frontiers": [
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "physical_result",
+        "physical_result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:01:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "release_pending",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "receipt_accepted",
+        "physical_result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+        "process_incarnation": "fixture-process",
+        "receipt_id": "fixture-reset-receipt-1",
+        "receipt_sha256": "46457efa56659a2ebb0eb4a1aee7bfdd6473d1cd60e56367a00168c8981c9cc8",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "result_outcome": "accepted",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:01:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "release_pending",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "local_release_ack_sha256": "996835f99c7cc1598922d52d16851d6fef772947006ce5986ae57e7b1bf671f0",
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "local_release_acked",
+        "physical_result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+        "process_incarnation": "fixture-process",
+        "receipt_id": "fixture-reset-receipt-1",
+        "receipt_sha256": "46457efa56659a2ebb0eb4a1aee7bfdd6473d1cd60e56367a00168c8981c9cc8",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "result_outcome": "accepted",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:02:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "finalized_at": "2026-07-25T12:02:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "available",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "local_release_ack_sha256": "996835f99c7cc1598922d52d16851d6fef772947006ce5986ae57e7b1bf671f0",
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "finalized",
+        "physical_result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+        "process_incarnation": "fixture-process",
+        "receipt_id": "fixture-reset-receipt-1",
+        "receipt_sha256": "46457efa56659a2ebb0eb4a1aee7bfdd6473d1cd60e56367a00168c8981c9cc8",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "result_outcome": "accepted",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:02:00Z",
+        "version": 1
+      }
+    ],
+    "forced_physical_result": {
+      "allocation_group_generation": 4,
+      "allocation_group_id": "fixture-group",
+      "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+      "evidence": {
+        "forced": true
+      },
+      "gpu_bdfs": [
+        "0000:01:00.0"
+      ],
+      "gpu_uuids": [
+        "GPU-00000000-0000-0000-0000-000000000001"
+      ],
+      "guest_shutdown_clean": false,
+      "operation_id": "10000000-0000-4000-8000-000000000006",
+      "original_drivers_restored": true,
+      "process_incarnation": "fixture-process",
+      "qemu_absent": true,
+      "reservation_generation": 5,
+      "reservation_id": "fixture-reservation",
+      "reset_succeeded": true,
+      "schema": "chutes.gpu-physical-result.v1",
+      "source_reader_result": {
+        "migration_id": "fixture-migration-1",
+        "readers_absent": true,
+        "schema": "chutes.gpu-source-reader-result.v1",
+        "sources": [
+          {
+            "namespace": "storage",
+            "reader_pids": [],
+            "source_path_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+          },
+          {
+            "namespace": "tdx-cache",
+            "reader_pids": [],
+            "source_path_sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+          }
+        ],
+        "version": 1
+      },
+      "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+      "version": 1
+    },
+    "hotplug_acked": {
+      "ack_sha256": "8116ba52be61d6aadb18e2a6e799ee754d91759e58ebeb76953a46da63adae5d",
+      "command_id": "gpu-hotplug-2dd5548a4ef9f84a17bd97dfb6ad7658fb906e7644776c8298799239ba526e8e",
+      "objects": [
+        {
+          "block_node_name": "gpu-legacy-storage-node",
+          "block_node_present": true,
+          "device_bound": true,
+          "device_id": "gpu-legacy-storage-device",
+          "device_present": true,
+          "namespace": "storage",
+          "serial": "gpu-legacy-storage",
+          "source_path_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        {
+          "block_node_name": "gpu-legacy-cache-node",
+          "block_node_present": true,
+          "device_bound": true,
+          "device_id": "gpu-legacy-cache-device",
+          "device_present": true,
+          "namespace": "tdx-cache",
+          "serial": "gpu-legacy-cache",
+          "source_path_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      ],
+      "payload_sha256": "b8df4773bc42f45cd58c4856f50b944fa9b50345567ac1ddf44c8c8ef26f8ddc",
+      "schema": "chutes.gpu-hotplug-command-ack.v1",
+      "state": "acked",
+      "version": 1
+    },
+    "hotplug_command": {
+      "allocation_group_generation": 4,
+      "allocation_group_id": "fixture-group",
+      "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+      "command_id": "gpu-hotplug-2dd5548a4ef9f84a17bd97dfb6ad7658fb906e7644776c8298799239ba526e8e",
+      "host_boot_generation": 3,
+      "host_id": "fixture-host",
+      "host_key_generation": 2,
+      "migration_id": "fixture-migration-1",
+      "payload": {
+        "legacy_migration_id": "fixture-migration-1",
+        "process_incarnation": "fixture-process",
+        "reservation_claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "reservation_id": "fixture-reservation",
+        "server_id": "fixture-server"
+      },
+      "payload_sha256": "b8df4773bc42f45cd58c4856f50b944fa9b50345567ac1ddf44c8c8ef26f8ddc",
+      "process_incarnation": "fixture-process",
+      "reservation_generation": 5,
+      "reservation_id": "fixture-reservation",
+      "schema": "chutes.gpu-hotplug-command.v1",
+      "stable_server_id": "fixture-server",
+      "version": 1
+    },
+    "hotplug_failed": {
+      "ack_sha256": "c28e6f815ccc0d2b735a29776fc0ba5c1358020b39d992bce1a5159f0d83578f",
+      "command_id": "gpu-hotplug-2dd5548a4ef9f84a17bd97dfb6ad7658fb906e7644776c8298799239ba526e8e",
+      "failure_code": "frontend_missing",
+      "failure_reason": "block backend exists but frontend device is absent",
+      "objects": [
+        {
+          "block_node_name": "gpu-legacy-storage-node",
+          "block_node_present": true,
+          "device_bound": true,
+          "device_id": "gpu-legacy-storage-device",
+          "device_present": true,
+          "namespace": "storage",
+          "serial": "gpu-legacy-storage",
+          "source_path_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        {
+          "block_node_name": "gpu-legacy-cache-node",
+          "block_node_present": true,
+          "device_bound": false,
+          "device_id": "gpu-legacy-cache-device",
+          "device_present": false,
+          "namespace": "tdx-cache",
+          "serial": "gpu-legacy-cache",
+          "source_path_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        }
+      ],
+      "payload_sha256": "b8df4773bc42f45cd58c4856f50b944fa9b50345567ac1ddf44c8c8ef26f8ddc",
+      "schema": "chutes.gpu-hotplug-command-ack.v1",
+      "state": "failed",
+      "version": 1
+    },
+    "intents": [
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000001",
+        "operation_type": "pre_slot_claim_quarantine",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000002",
+        "operation_type": "launch_rollback",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000003",
+        "operation_type": "release_rollover",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "operation_id": "10000000-0000-4000-8000-000000000005",
+        "operation_type": "ownerless_group_recovery",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "recovery_authorization_id": "fixture-recovery-authorization-ownerless_group_recovery",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000006",
+        "operation_type": "forced_dead_guest_recovery",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "recovery_authorization_id": "fixture-recovery-authorization-forced_dead_guest_recovery",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      }
+    ],
+    "local_release_ack": {
+      "allocation_group_generation": 4,
+      "allocation_group_id": "fixture-group",
+      "local_claim_absent": true,
+      "local_owner_absent": true,
+      "local_slot_absent": true,
+      "local_state_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "observed_at": "2026-07-25T12:02:00Z",
+      "operation_id": "10000000-0000-4000-8000-000000000004",
+      "process_incarnation": "fixture-process",
+      "receipt_id": "fixture-reset-receipt-1",
+      "reservation_id": "fixture-reservation",
+      "result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+      "schema": "chutes.gpu-local-release-ack.v1",
+      "version": 1
+    },
+    "physical_result": {
+      "allocation_group_generation": 4,
+      "allocation_group_id": "fixture-group",
+      "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+      "evidence": {
+        "driver": "nvidia",
+        "reset_count": 1
+      },
+      "gpu_bdfs": [
+        "0000:01:00.0"
+      ],
+      "gpu_uuids": [
+        "GPU-00000000-0000-0000-0000-000000000001"
+      ],
+      "guest_shutdown_clean": true,
+      "operation_id": "10000000-0000-4000-8000-000000000004",
+      "original_drivers_restored": true,
+      "process_incarnation": "fixture-process",
+      "qemu_absent": true,
+      "reservation_generation": 5,
+      "reservation_id": "fixture-reservation",
+      "reset_succeeded": true,
+      "schema": "chutes.gpu-physical-result.v1",
+      "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+      "version": 1
+    },
+    "quarantined_frontiers": [
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "failure_code": "host_rebooted",
+        "failure_reason": "Host reboot invalidated recovery authorization",
+        "finalized_at": "2026-07-25T12:02:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "quarantined",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "quarantined",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:02:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "failure_code": "host_rebooted",
+        "failure_reason": "Host reboot invalidated recovery authorization",
+        "finalized_at": "2026-07-25T12:02:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "quarantined",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "quarantined",
+        "physical_result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:02:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "failure_code": "host_rebooted",
+        "failure_reason": "Host reboot invalidated recovery authorization",
+        "finalized_at": "2026-07-25T12:02:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "quarantined",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "quarantined",
+        "physical_result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+        "process_incarnation": "fixture-process",
+        "receipt_id": "fixture-reset-receipt-1",
+        "receipt_sha256": "46457efa56659a2ebb0eb4a1aee7bfdd6473d1cd60e56367a00168c8981c9cc8",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "result_outcome": "accepted",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:02:00Z",
+        "version": 1
+      },
+      {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "failure_code": "host_rebooted",
+        "failure_reason": "Host reboot invalidated recovery authorization",
+        "finalized_at": "2026-07-25T12:02:00Z",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "quarantined",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "local_release_ack_sha256": "996835f99c7cc1598922d52d16851d6fef772947006ce5986ae57e7b1bf671f0",
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000004",
+        "operation_type": "normal_delete",
+        "owner_hotkey": "fixture-owner",
+        "phase": "quarantined",
+        "physical_result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+        "process_incarnation": "fixture-process",
+        "receipt_id": "fixture-reset-receipt-1",
+        "receipt_sha256": "46457efa56659a2ebb0eb4a1aee7bfdd6473d1cd60e56367a00168c8981c9cc8",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "result_outcome": "accepted",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:02:00Z",
+        "version": 1
+      }
+    ],
+    "recovery_authorization": {
+      "authorization_id": "fixture-recovery-authorization-forced_dead_guest_recovery",
+      "expires_at": "2026-07-25T12:17:00Z",
+      "inventory_report_id": "fixture-inventory-report-1",
+      "inventory_report_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "operation": {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000006",
+        "operation_type": "forced_dead_guest_recovery",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "recovery_authorization_id": "fixture-recovery-authorization-forced_dead_guest_recovery",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "version": 1
+      },
+      "recovery_nonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "schema": "chutes.gpu-recovery-authorization.v1",
+      "version": 1
+    },
+    "recovery_events": [
+      {
+        "authorization_id": "fixture-recovery-authorization-forced_dead_guest_recovery",
+        "event_id": "fixture-recovery-event-authorized",
+        "operation_id": "10000000-0000-4000-8000-000000000006",
+        "schema": "chutes.gpu-recovery-event.v1",
+        "state": "authorized",
+        "version": 1
+      },
+      {
+        "authorization_id": "fixture-recovery-authorization-forced_dead_guest_recovery",
+        "completed_at": "2026-07-25T12:02:00Z",
+        "event_id": "fixture-recovery-event-revoked",
+        "operation_id": "10000000-0000-4000-8000-000000000006",
+        "schema": "chutes.gpu-recovery-event.v1",
+        "state": "revoked",
+        "version": 1
+      },
+      {
+        "authorization_id": "fixture-recovery-authorization-forced_dead_guest_recovery",
+        "completed_at": "2026-07-25T12:20:00Z",
+        "current_host_boot_generation": 4,
+        "current_host_key_generation": 2,
+        "current_inventory_report_id": "fixture-inventory-report-boot-4",
+        "current_inventory_report_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "event_id": "fixture-recovery-event-reclaimed",
+        "operation_id": "10000000-0000-4000-8000-000000000006",
+        "reclaim_reservation_generation": 6,
+        "reclaim_reservation_id": "fixture-reclaim-reservation",
+        "schema": "chutes.gpu-recovery-event.v1",
+        "state": "reclaimed",
+        "version": 1
+      }
+    ],
+    "reset_receipt": {
+      "accepted_at": "2026-07-25T12:01:00Z",
+      "local_release_required": true,
+      "operation_id": "10000000-0000-4000-8000-000000000004",
+      "outcome": "accepted",
+      "phase": "receipt_accepted",
+      "receipt_id": "fixture-reset-receipt-1",
+      "result_sha256": "c635c6f8f5bf4401ce5f28e0015dd159b91df5d5885dc4103f671932b96eccdf",
+      "schema": "chutes.gpu-reset-receipt.v1",
+      "version": 1
+    },
+    "source_reader_result": {
+      "migration_id": "fixture-migration-1",
+      "readers_absent": true,
+      "schema": "chutes.gpu-source-reader-result.v1",
+      "sources": [
+        {
+          "namespace": "storage",
+          "reader_pids": [],
+          "source_path_sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+        },
+        {
+          "namespace": "tdx-cache",
+          "reader_pids": [],
+          "source_path_sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+        }
+      ],
+      "version": 1
+    }
+  },
+  "registration_v2": {
+    "completed_response": {
+      "allocation_group_generation": 4,
+      "allocation_group_id": "fixture-group",
+      "attempt_id": "fixture-registration-attempt-1",
+      "attestation_id": "fixture-attestation-1",
+      "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+      "gpu_identifiers": [
+        "b200"
+      ],
+      "gpu_uuids": [
+        "GPU-00000000-0000-0000-0000-000000000001"
+      ],
+      "management_mode": "platform",
+      "measurement_config_fingerprint": "5555555555555555555555555555555555555555555555555555555555555555",
+      "measurement_name": "gpu-baremetal-tdx-1.11.0-b200-8gpu-platform",
+      "measurement_version": "1.11.0",
+      "owner_hotkey": "fixture-owner",
+      "process_incarnation": "fixture-process",
+      "registration_id": "fixture-registration-1",
+      "registration_replay_until": "2026-07-25T12:17:00Z",
+      "reservation_id": "fixture-reservation",
+      "runtime_session": "fixture-runtime-token",
+      "runtime_session_expires_at": "2026-07-25T12:17:00Z",
+      "schema": "chutes.gpu-registration-response.v2",
+      "server_id": "fixture-server",
+      "state": "completed",
+      "status": "registered",
+      "status_url": "/servers/gpu/registration/attempts/fixture-registration-attempt-1",
+      "trust_set_fingerprint": "6666666666666666666666666666666666666666666666666666666666666666",
+      "verified_at": "2026-07-25T12:02:00Z",
+      "version": 2
+    },
+    "failed_response": {
+      "attempt_id": "fixture-registration-attempt-2",
+      "failure_code": "quote_invalid",
+      "failure_detail": "fixture quote validation failed",
+      "schema": "chutes.gpu-registration-response.v2",
+      "state": "failed",
+      "status_url": "/servers/gpu/registration/attempts/fixture-registration-attempt-2",
+      "version": 2
+    },
+    "nonce_claimed": {
+      "claimed_attempt_id": "fixture-registration-attempt-1",
+      "client_request_id": "gpu-registration-v2-4b131f3fc1539e0de0aff625c79d3b04ec27c9e501add231da21cebd44da2b1b",
+      "expires_at": "2026-07-25T12:17:00Z",
+      "nonce": "1111111111111111111111111111111111111111111111111111111111111111",
+      "nonce_id": "fixture-registration-nonce-1",
+      "request_generation": 1,
+      "reservation_id": "fixture-reservation",
+      "schema": "chutes.gpu-registration-nonce.v2",
+      "status_url": "/servers/gpu/registration/attempts/fixture-registration-attempt-1",
+      "version": 2
+    },
+    "nonce_issued": {
+      "client_request_id": "gpu-registration-v2-4b131f3fc1539e0de0aff625c79d3b04ec27c9e501add231da21cebd44da2b1b",
+      "expires_at": "2026-07-25T12:17:00Z",
+      "nonce": "1111111111111111111111111111111111111111111111111111111111111111",
+      "nonce_id": "fixture-registration-nonce-1",
+      "request_generation": 1,
+      "reservation_id": "fixture-reservation",
+      "schema": "chutes.gpu-registration-nonce.v2",
+      "version": 2
+    },
+    "nonce_request": {
+      "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+      "client_request_id": "gpu-registration-v2-4b131f3fc1539e0de0aff625c79d3b04ec27c9e501add231da21cebd44da2b1b",
+      "launch_reservation": "fixture-reservation.rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "request_generation": 1,
+      "schema": "chutes.gpu-registration-nonce.v2",
+      "server_id": "fixture-server",
+      "version": 2
+    },
+    "processing_response": {
+      "attempt_id": "fixture-registration-attempt-1",
+      "retry_after_seconds": 3,
+      "schema": "chutes.gpu-registration-response.v2",
+      "state": "processing",
+      "status_url": "/servers/gpu/registration/attempts/fixture-registration-attempt-1",
+      "version": 2
+    },
+    "request": {
+      "endpoints": {
+        "http": {
+          "port": 8080
+        }
+      },
+      "external_host": "gpu.example.test",
+      "external_ports": {
+        "ssh": 2201
+      },
+      "gpu_evidence": [
+        {
+          "certificate_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000001"
+        }
+      ],
+      "gpu_uuids": [
+        "GPU-00000000-0000-0000-0000-000000000001"
+      ],
+      "launch_reservation": "fixture-reservation.rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+      "nonce": "1111111111111111111111111111111111111111111111111111111111111111",
+      "nonce_id": "fixture-registration-nonce-1",
+      "quote": "fixture-tdx-quote",
+      "quote_commitment": {
+        "attested_spki_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "claims": {
+          "allocation_group_generation": 4,
+          "allocation_group_id": "fixture-group",
+          "allowed_blobs": [
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          ],
+          "allowed_manifest_tags": [
+            "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sig"
+          ],
+          "allowed_manifests": [
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          ],
+          "chute_id": "fixture-chute",
+          "compute_type": "gpu",
+          "container_manifest_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "container_repository": "fixture/image",
+          "descriptor_closure_sha256": "72fbde50aab8b457e56e34328bd9396948fa96f12915d27c7d29b0c69bd67e8c",
+          "expires_at": "2026-07-23T00:15:00Z",
+          "gpu_attestation_certificate_sha256s": [
+            "1111111111111111111111111111111111111111111111111111111111111111"
+          ],
+          "gpu_bdfs": [
+            "0000:01:00.0"
+          ],
+          "gpu_identifiers": [
+            "b200"
+          ],
+          "gpu_profile_id": "b200-8gpu",
+          "gpu_release_id": "fixture-release",
+          "gpu_uuids": [
+            "GPU-00000000-0000-0000-0000-000000000001"
+          ],
+          "host_boot_generation": 3,
+          "host_id": "fixture-host",
+          "host_key_generation": 2,
+          "image_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+          "image_version": "1.11.0",
+          "initrd_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+          "issued_at": "2026-07-23T00:00:00Z",
+          "job_id": "fixture-job",
+          "kernel_measurement_mode": "efi-image-as-is",
+          "kernel_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+          "launch_nonce": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4=",
+          "machine_type": "pc-q35-10.2",
+          "management_mode": "platform",
+          "manifest_tag_digests": {
+            "sha256-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sig": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "measurement_name": "gpu-baremetal-tdx-1.11.0-b200-8gpu-platform",
+          "mode_cmdline_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+          "owner_hotkey": "fixture-owner",
+          "process_incarnation": "fixture-process",
+          "profile_contract_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "qemu_binary_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "qemu_package_version": "1:10.2.1+ds-1ubuntu4",
+          "release_target_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "reservation_generation": 5,
+          "reservation_id": "fixture-reservation",
+          "schema": "chutes.gpu-launch-reservation",
+          "server_id": "fixture-server",
+          "tdvf_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "tee_type": "tdx",
+          "token_id": "fixture-token",
+          "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+          "version": 1,
+          "workload_owner": "fixture-owner"
+        },
+        "launch_nonce": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4=",
+        "release_target_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "reservation_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "schema": "chutes.gpu-quote-commitment",
+        "version": 1
+      },
+      "schema": "chutes.gpu-registration-request.v2",
+      "server_id": "fixture-server",
+      "td_signature": "fixture-td-signature",
+      "version": 2
+    }
+  },
+  "schema": "chutes.gpu-runtime-contract-fixtures.v1",
+  "version": 1
+}

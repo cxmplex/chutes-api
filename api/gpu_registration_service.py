@@ -1263,13 +1263,14 @@ async def _complete_attempt(
         ).scalars()
     )
     if competitor_ids:
-        from api.host.gpu_allocations import quarantine_gpu_reservation_control_plane
+        from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
-        await quarantine_gpu_reservation_control_plane(
+        await request_gpu_lifecycle_fence(
             db,
             attempt.reservation_id,
             code="gpu_registration_verified_competitor",
             reason="Independently verified requests competed for the completed nonce.",
+            operation_type="normal_delete",
             metadata={
                 "attempt_id": attempt.attempt_id,
                 "conflict_ids": competitor_ids,
@@ -2034,9 +2035,9 @@ async def _verify_recorded_conflict(
     row.verification_detail = detail
     row.verified_at = _now()
     if final_state == "verified_competitor" and attempt.state == "completed":
-        from api.host.gpu_allocations import quarantine_gpu_reservation_control_plane
+        from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
-        await quarantine_gpu_reservation_control_plane(
+        await request_gpu_lifecycle_fence(
             db,
             reservation.reservation_id,
             code="gpu_registration_verified_competitor",
@@ -2044,6 +2045,7 @@ async def _verify_recorded_conflict(
                 "A second independently verified request used the completed "
                 "registration nonce."
             ),
+            operation_type="normal_delete",
             metadata={
                 "attempt_id": attempt.attempt_id,
                 "conflict_id": row.conflict_id,

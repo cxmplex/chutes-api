@@ -65,6 +65,8 @@ _NON_IDLE_GROUP_STATES = {
     "launching",
     "running",
     "resetting",
+    "release_pending",
+    "recovery_required",
     "quarantined",
 }
 
@@ -455,7 +457,9 @@ async def _assert_platform_workload_current(
 
     chute = (
         await db.execute(
-            select(Chute).where(Chute.chute_id == request.chute_id).with_for_update()
+            select(Chute)
+            .where(Chute.chute_id == request.chute_id)
+            .with_for_update(of=Chute)
         )
     ).scalar_one_or_none()
     if chute is None or not chute.tee or chute.disabled:
@@ -464,7 +468,9 @@ async def _assert_platform_workload_current(
         )
     image = (
         await db.execute(
-            select(Image).where(Image.image_id == chute.image_id).with_for_update()
+            select(Image)
+            .where(Image.image_id == chute.image_id)
+            .with_for_update(of=Image)
         )
     ).scalar_one_or_none()
     if (
@@ -480,7 +486,9 @@ async def _assert_platform_workload_current(
     if request.job_id is not None:
         job = (
             await db.execute(
-                select(Job).where(Job.job_id == request.job_id).with_for_update()
+                select(Job)
+                .where(Job.job_id == request.job_id)
+                .with_for_update(of=Job)
             )
         ).scalar_one_or_none()
         if (
@@ -830,8 +838,8 @@ async def _terminalize_lifecycle_before_quarantine(
     code: str,
     reason: str,
     now: datetime,
-) -> tuple[Optional[object], Optional[GpuLaunchReservation]]:
-    """Close the exact operation before custody is fenced or quarantined."""
+) -> tuple[Optional[object], Optional[GpuLaunchReservation], bool]:
+    """Close pre-receipt custody, preserving an authoritative phase-two frontier."""
 
     from api.gpu_models import (
         GpuLifecycleOperation,
@@ -851,7 +859,7 @@ async def _terminalize_lifecycle_before_quarantine(
         )
     ).scalar_one_or_none()
     if operation is None:
-        return None, None
+        return None, None, False
     reservation = (
         (
             await db.execute(
@@ -863,6 +871,11 @@ async def _terminalize_lifecycle_before_quarantine(
         if operation.reservation_id is not None
         else None
     )
+    if operation.phase in {"receipt_accepted", "local_release_acked"}:
+        # Once the API accepted a physical result, a later control-plane fence
+        # cannot revoke that receipt or reclassify ownership. L0 must replay the
+        # exact local-release ACK/finalization from its durable journal.
+        return operation, reservation, True
     if operation.phase == "physical_result":
         from api.gpu_contracts import GpuResetReceiptV1
 
@@ -927,7 +940,7 @@ async def _terminalize_lifecycle_before_quarantine(
         group.recovery_authorized_at = None
         group.recovery_started_at = None
         group.recovery_completed_at = None
-    return operation, reservation
+    return operation, reservation, False
 
 
 async def _quarantine_group_reservations(
@@ -941,9 +954,15 @@ async def _quarantine_group_reservations(
 ) -> None:
     await acquire_gpu_lifecycle_lock(db)
     now = now or _utcnow()
-    operation, operation_reservation = await _terminalize_lifecycle_before_quarantine(
+    (
+        operation,
+        operation_reservation,
+        phase_two_preserved,
+    ) = await _terminalize_lifecycle_before_quarantine(
         db, group, code=code, reason=reason, now=now
     )
+    if phase_two_preserved:
+        return
     reservations = (
         (
             await db.execute(
@@ -1020,9 +1039,12 @@ async def fence_gpu_host_authority(
         (
             operation,
             operation_reservation,
+            phase_two_preserved,
         ) = await _terminalize_lifecycle_before_quarantine(
             db, group, code=code, reason=reason, now=now
         )
+        if phase_two_preserved:
+            continue
         reservations = (
             (
                 await db.execute(
@@ -1224,6 +1246,15 @@ async def advance_gpu_host_boot(
         )
         if operation is None:
             return False
+        if operation.phase in {
+            "physical_result",
+            "receipt_accepted",
+            "local_release_acked",
+        }:
+            # The old-boot CHUTES_DATA journal already crossed a durable physical
+            # boundary. Preserve its exact bytes and authorization so the current
+            # logical host can replay the receipt/ACK/finalization protocol.
+            return True
         authorization = (
             await db.execute(
                 select(GpuRecoveryAuthorization)
@@ -1687,10 +1718,221 @@ async def reconcile_gpu_inventory(
         .all()
     )
     non_idle = [item for item in groups if item.state in _NON_IDLE_GROUP_STATES]
+    from api.gpu_models import (
+        GpuLifecycleOperation,
+        GpuRecoveryAuthorization,
+        GpuRecoveryEvent,
+    )
+
+    operations = (
+        (
+            await db.execute(
+                select(GpuLifecycleOperation)
+                .where(
+                    GpuLifecycleOperation.host_id == host.host_id,
+                    GpuLifecycleOperation.phase.notin_(("finalized", "quarantined")),
+                )
+                .order_by(GpuLifecycleOperation.operation_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    operations_by_group: dict[tuple[str, int], list[GpuLifecycleOperation]] = {}
+    for operation in operations:
+        operations_by_group.setdefault(
+            (
+                operation.allocation_group_id,
+                operation.allocation_group_generation,
+            ),
+            [],
+        ).append(operation)
+
+    def _exact_reset_journal(group: GpuAllocationGroup) -> bool:
+        matches = operations_by_group.get(
+            (group.allocation_group_id, group.generation), []
+        )
+        if len(matches) != 1:
+            return False
+        operation = matches[0]
+        if (
+            operation.topology_fingerprint != group.topology_fingerprint
+            or list(operation.gpu_bdfs) != list(group.gpu_bdfs)
+            or list(operation.gpu_uuids) != list(group.gpu_uuids)
+        ):
+            return False
+        if operation.reservation_id is None:
+            return bool(
+                group.reservation_id is None
+                and group.reservation_owner is None
+                and group.management_mode is None
+                and group.process_incarnation is None
+            )
+        return bool(
+            group.reservation_id == operation.reservation_id
+            and group.reservation_generation == operation.reservation_generation
+            and group.process_incarnation == operation.process_incarnation
+            and group.management_mode == operation.management_mode
+        )
+
+    protected = [
+        item
+        for item in groups
+        if item.state in {"release_pending", "recovery_required"}
+        or (item.state == "resetting" and _exact_reset_journal(item))
+    ]
     allocation_group: Optional[GpuAllocationGroup] = None
     now = _utcnow()
 
-    if status == "accepted" and profile is not None:
+    if protected:
+        allocation_group = protected[0]
+        protected_values = (
+            _group_values(report, profile)
+            if status == "accepted" and profile is not None
+            else None
+        )
+        closure_matches = bool(
+            len(protected) == 1
+            and protected_values is not None
+            and allocation_group.profile_id == protected_values["profile_id"]
+            and allocation_group.topology_fingerprint == topology_fingerprint
+            and allocation_group.gpu_release_id == report.gpu_release_id
+            and all(
+                getattr(allocation_group, key) == value
+                for key, value in protected_values.items()
+            )
+        )
+        if not closure_matches:
+            status = "quarantined"
+            reason = (
+                f"GPU {allocation_group.state} custody differs from the current "
+                "signed inventory/profile/release closure and remains unavailable."
+            )
+            matching_operations = operations_by_group.get(
+                (allocation_group.allocation_group_id, allocation_group.generation),
+                [],
+            )
+            operation = matching_operations[0] if len(matching_operations) == 1 else None
+            if allocation_group.state == "recovery_required":
+                # The finalized operation and its response bytes are immutable.
+                # Revoke only the completed recovery authorization and fence the
+                # mutable group projection until a fresh exact report authorizes
+                # a successor recovery.
+                authorization = (
+                    (
+                        await db.execute(
+                            select(GpuRecoveryAuthorization)
+                            .where(
+                                GpuRecoveryAuthorization.authorization_id
+                                == allocation_group.recovery_authorization_id
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if allocation_group.recovery_authorization_id is not None
+                    else None
+                )
+                completed_operation = (
+                    (
+                        await db.execute(
+                            select(GpuLifecycleOperation)
+                            .where(
+                                GpuLifecycleOperation.operation_id
+                                == authorization.operation_id
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if authorization is not None
+                    else None
+                )
+                if completed_operation is not None:
+                    revoked = (
+                        await db.execute(
+                            select(GpuRecoveryEvent.event_id).where(
+                                GpuRecoveryEvent.operation_id
+                                == completed_operation.operation_id,
+                                GpuRecoveryEvent.state == "revoked",
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if revoked is None:
+                        db.add(
+                            GpuRecoveryEvent(
+                                event_id=generate_uuid(),
+                                authorization_id=authorization.authorization_id,
+                                operation_id=completed_operation.operation_id,
+                                state="revoked",
+                                reset_result=completed_operation.physical_result,
+                                reset_result_sha256=(
+                                    completed_operation.physical_result_sha256
+                                ),
+                                receipt_id=completed_operation.receipt_id,
+                                receipt_sha256=completed_operation.receipt_sha256,
+                                local_release_ack=(
+                                    completed_operation.local_release_ack
+                                ),
+                                local_release_ack_sha256=(
+                                    completed_operation.local_release_ack_sha256
+                                ),
+                                created_at=now,
+                                updated_at=now,
+                            )
+                        )
+                _quarantine_group(
+                    allocation_group,
+                    code="gpu_inventory_changed_during_release",
+                    reason=reason,
+                    metadata={"inventory_report_id": report.report_id},
+                    now=now,
+                )
+            elif operation is not None and operation.phase in {"intent", "physical_result"}:
+                # Before an accepted receipt the stable quarantine transition can
+                # close the operation immediately (and, for a stored result, mint
+                # the exact quarantined receipt that L0 may replay).
+                await _quarantine_group_reservations(
+                    db,
+                    allocation_group,
+                    code="gpu_inventory_changed_during_release",
+                    reason=reason,
+                    metadata={"inventory_report_id": report.report_id},
+                    now=now,
+                )
+            elif operation is not None and operation.phase in {
+                "receipt_accepted",
+                "local_release_acked",
+            }:
+                # The accepted receipt/ACK bytes remain authoritative, but their
+                # finalization must not make a now-conflicting group available.
+                operation.failure_code = "gpu_inventory_changed_during_release"
+                operation.failure_reason = reason
+                operation.updated_at = now
+                allocation_group.last_seen_at = now
+                allocation_group.updated_at = now
+            else:
+                _quarantine_group(
+                    allocation_group,
+                    code="gpu_inventory_changed_during_release",
+                    reason=reason,
+                    metadata={"inventory_report_id": report.report_id},
+                    now=now,
+                )
+        elif allocation_group.state == "recovery_required":
+            # Exact physical identity may advance only the mutable current-host
+            # report projection. Old reservation/recovery custody stays immutable.
+            allocation_group.host_key_generation = report.host_key_generation
+            allocation_group.host_boot_generation = report.host_boot_generation
+            allocation_group.last_report_id = report.report_id
+            allocation_group.last_seen_at = now
+            allocation_group.updated_at = now
+        else:
+            # A reset journal or API receipt is not a release. Keep the exact old
+            # host/report custody projection until its canonical physical result,
+            # receipt, and local-release ACK reach finalization.
+            allocation_group.last_seen_at = now
+            allocation_group.updated_at = now
+    elif status == "accepted" and profile is not None:
         values = _group_values(report, profile)
         exact = next(
             (
@@ -1704,19 +1946,33 @@ async def reconcile_gpu_inventory(
         if exact is not None:
             allocation_group = exact
             if allocation_group.state == "quarantined":
+                quarantine_closure_matches = bool(
+                    allocation_group.gpu_release_id == report.gpu_release_id
+                    and all(
+                        getattr(allocation_group, key) == value
+                        for key, value in values.items()
+                    )
+                )
                 status = "quarantined"
-                reason = (
-                    "GPU allocation group remains quarantined pending explicit "
-                    "reset/recovery evidence."
-                )
-                await _quarantine_group_reservations(
-                    db,
-                    allocation_group,
-                    code=allocation_group.failure_code or "group_quarantined",
-                    reason=allocation_group.failure_reason or reason,
-                    metadata=allocation_group.failure_metadata,
-                    now=now,
-                )
+                if quarantine_closure_matches:
+                    reason = (
+                        "GPU allocation group remains quarantined; exact fresh "
+                        "inventory is retained only for explicit recovery."
+                    )
+                    # A signed report can advance current-host evidence without
+                    # changing quarantine custody, generation, topology, or owner.
+                    allocation_group.host_key_generation = report.host_key_generation
+                    allocation_group.host_boot_generation = report.host_boot_generation
+                    allocation_group.last_report_id = report.report_id
+                    allocation_group.last_seen_at = now
+                    allocation_group.updated_at = now
+                else:
+                    reason = (
+                        "Quarantined GPU physical/profile/release closure changed; "
+                        "the prior recovery projection remains authoritative."
+                    )
+                    allocation_group.last_seen_at = now
+                    allocation_group.updated_at = now
             elif allocation_group.state in _NON_IDLE_GROUP_STATES:
                 immutable_mismatch = {
                     key: (getattr(allocation_group, key), value)
@@ -1926,6 +2182,53 @@ def _recovery_reclaim_request_sha256(
     )
 
 
+def _latest_gpu_inventory_matches_group(
+    host: Host,
+    group: GpuAllocationGroup,
+    report: Optional[GpuInventoryReport],
+    *,
+    require_group_report_link: bool = True,
+) -> bool:
+    """Validate mutable host-latest evidence against immutable group identity."""
+
+    if report is None:
+        return False
+    try:
+        claims = GpuInventoryReportV1.model_validate(report.claims)
+    except ValueError:
+        return False
+    matching_groups = [
+        item
+        for item in claims.groups
+        if item.topology_fingerprint == group.topology_fingerprint
+        and [device.bdf for device in item.devices] == list(group.gpu_bdfs)
+        and [device.uuid for device in item.devices] == list(group.gpu_uuids)
+        and [device.attestation_certificate_sha256 for device in item.devices]
+        == list(group.gpu_attestation_certificate_sha256s)
+    ]
+    return bool(
+        len(matching_groups) == 1
+        and report.reconciliation_status == "accepted"
+        and hmac.compare_digest(report.claims_sha256, canonical_sha256(claims))
+        and report.host_id == host.host_id
+        and report.host_key_generation == host.active_key_generation
+        and report.host_boot_generation == host.boot_generation
+        and report.report_generation == host.gpu_inventory_report_generation
+        and claims.report_id == report.report_id
+        and claims.report_generation == host.gpu_inventory_report_generation
+        and claims.host_id == host.host_id
+        and claims.host_key_generation == host.active_key_generation
+        and claims.host_boot_generation == host.boot_generation
+        and claims.host_boot_id == host.boot_id
+        and claims.gpu_release_id == group.gpu_release_id
+        and claims.profile_contract_sha256 == group.profile_contract_sha256
+        and report.topology_fingerprint == group.topology_fingerprint
+        and (
+            not require_group_report_link or group.last_report_id == report.report_id
+        )
+    )
+
+
 def _reclaimed_group_active_state_is_exact(
     reservation: GpuLaunchReservation,
     group: GpuAllocationGroup,
@@ -2020,10 +2323,24 @@ async def _replay_reclaimed_gpu_group(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    report = (
+    event_report = (
         await db.execute(
             select(GpuInventoryReport)
             .where(GpuInventoryReport.report_id == event.current_inventory_report_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    current_report = (
+        await db.execute(
+            select(GpuInventoryReport)
+            .where(
+                GpuInventoryReport.host_id == host.host_id,
+                GpuInventoryReport.host_key_generation
+                == host.active_key_generation,
+                GpuInventoryReport.host_boot_generation == host.boot_generation,
+                GpuInventoryReport.report_generation
+                == host.gpu_inventory_report_generation,
+            )
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -2051,24 +2368,25 @@ async def _replay_reclaimed_gpu_group(
         or authorization.migration_id != legacy_migration_id
         or group is None
         or reservation is None
-        or report is None
+        or event_report is None
+        or current_report is None
         or event.reclaim_reservation_generation != reservation.reservation_generation
         or event.current_host_key_generation != host.active_key_generation
         or event.current_host_boot_generation != host.boot_generation
-        or event.current_inventory_report_id != report.report_id
+        or event.current_inventory_report_id != event_report.report_id
         or not hmac.compare_digest(
-            event.current_inventory_report_sha256 or "", report.claims_sha256
+            event.current_inventory_report_sha256 or "", event_report.claims_sha256
         )
-        or report.host_id != host.host_id
-        or report.host_key_generation != host.active_key_generation
-        or report.host_boot_generation != host.boot_generation
-        or report.reconciliation_status != "accepted"
+        or event_report.host_id != host.host_id
+        or event_report.host_key_generation != event.current_host_key_generation
+        or event_report.host_boot_generation != event.current_host_boot_generation
+        or event_report.reconciliation_status != "accepted"
         or group.allocation_group_id != authorization.allocation_group_id
         or group.generation != authorization.allocation_group_generation
         or group.host_id != host.host_id
         or group.host_key_generation != host.active_key_generation
         or group.host_boot_generation != host.boot_generation
-        or group.last_report_id != report.report_id
+        or not _latest_gpu_inventory_matches_group(host, group, current_report)
         or not _reclaimed_group_active_state_is_exact(reservation, group)
         or group.management_mode != "miner"
         or group.reservation_id != reservation.reservation_id
@@ -2954,22 +3272,15 @@ async def resolve_gpu_registration_reservation(
         and reservation.server_id is not None
     )
     if reservation.expires_at <= now and not consumed_retry:
-        _quarantine_reservation(
-            reservation,
-            group,
-            code="gpu_registration_missed_launch_deadline",
-            reason="GPU guest registration arrived after the claimed launch deadline.",
-            now=now,
-        )
-        await _retire_gpu_runtime_lineage(
+        await request_gpu_lifecycle_fence(
             db,
-            reservation,
-            now,
+            reservation.reservation_id,
+            code="gpu_registration_missed_launch_deadline",
             reason="GPU guest registration missed its launch deadline.",
+            operation_type="launch_rollback",
         )
-        await db.flush()
         raise GpuAllocationQuarantinedError(
-            "GPU guest registration missed its launch deadline."
+            "GPU guest registration missed its launch deadline; reset is pending."
         )
     if (
         (
@@ -3007,22 +3318,15 @@ async def claim_gpu_reservation(
     _assert_host_association(host, reservation, group)
     now = _utcnow()
     if release.release_id != reservation.gpu_release_id:
-        _quarantine_reservation(
-            reservation,
-            group,
-            code="claim_active_release_changed",
-            reason="GPU reservation no longer matches the active exact release.",
-            now=now,
-        )
-        await _retire_gpu_runtime_lineage(
+        await request_gpu_lifecycle_fence(
             db,
-            reservation,
-            now,
+            reservation.reservation_id,
+            code="claim_active_release_changed",
             reason="GPU reservation release changed before claim.",
+            operation_type="release_rollover",
         )
-        await db.flush()
         raise GpuAllocationQuarantinedError(
-            "GPU reservation release changed before claim."
+            "GPU reservation release changed before claim; reset is pending."
         )
     if (
         reservation.state == "claimed"
@@ -3066,15 +3370,15 @@ async def mark_gpu_launching(
     _validate_row_claims(reservation)
     _assert_host_association(host, reservation, group)
     if release.release_id != reservation.gpu_release_id:
-        _quarantine_reservation(
-            reservation,
-            group,
+        await request_gpu_lifecycle_fence(
+            db,
+            reservation.reservation_id,
             code="launch_active_release_changed",
-            reason="GPU reservation no longer matches the active exact release.",
+            reason="GPU reservation release changed before launch.",
+            operation_type="release_rollover",
         )
-        await db.flush()
         raise GpuAllocationQuarantinedError(
-            "GPU reservation release changed before launch."
+            "GPU reservation release changed before launch; reset is pending."
         )
     if reservation.state == "quarantined":
         raise GpuAllocationQuarantinedError(
@@ -3245,6 +3549,59 @@ async def _retire_gpu_runtime_lineage(
     server.gpu_runtime_session_expires_at = None
     server.last_health_at = None
     await db.flush()
+
+
+async def request_gpu_lifecycle_fence(
+    db: AsyncSession,
+    reservation_id: str,
+    *,
+    code: str,
+    reason: str,
+    operation_type: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+):
+    """Fence exact current custody through one durable physical-release intent.
+
+    Same-host failures must not overwrite custody with a terminal quarantine before
+    L0 has a restart-safe operation to execute. The intent and runtime-authority
+    retirement commit atomically; physical ownership remains ``resetting`` until the
+    two-phase result/receipt/local-ACK protocol completes.
+    """
+
+    await acquire_gpu_lifecycle_lock(db)
+    reservation, _group = await _locked_reservation_group(db, reservation_id)
+    if reservation.state in {"released", "expired"}:
+        return None
+    now = _utcnow()
+    reservation.teardown_requested_at = reservation.teardown_requested_at or now
+    reservation.teardown_reason = reservation.teardown_reason or reason[:2000]
+    # The producer code is needed only while deriving the immutable operation type;
+    # create_gpu_lifecycle_operation clears mutable failure projections afterwards.
+    reservation.failure_code = code[:128]
+    reservation.failure_reason = reason[:2000]
+    reservation.failure_metadata = metadata or {}
+    await db.flush()
+    from api.gpu_lifecycle_service import (
+        GpuLifecycleError,
+        ensure_reservation_lifecycle_operation,
+    )
+
+    try:
+        operation = await ensure_reservation_lifecycle_operation(
+            db,
+            reservation.reservation_id,
+            operation_type=operation_type,
+        )
+    except GpuLifecycleError as exc:
+        raise GpuAllocationError(str(exc)) from exc
+    await _retire_gpu_runtime_lineage(
+        db,
+        reservation,
+        now,
+        reason=reason,
+    )
+    await db.flush()
+    return operation
 
 
 async def record_gpu_command_dispatch(
@@ -3445,9 +3802,14 @@ async def quarantine_gpu_reservation_control_plane(
     if reservation.state in {"released", "expired"}:
         return
     now = _utcnow()
-    await _terminalize_lifecycle_before_quarantine(
-        db, group, code=code, reason=reason, now=now
+    _operation, _operation_reservation, phase_two_preserved = (
+        await _terminalize_lifecycle_before_quarantine(
+            db, group, code=code, reason=reason, now=now
+        )
     )
+    if phase_two_preserved:
+        await db.flush()
+        return
     _quarantine_reservation(
         reservation,
         group,
@@ -3484,9 +3846,14 @@ async def quarantine_gpu_reservation(
     ):
         raise GpuAllocationError("GPU quarantine request does not match reservation.")
     now = _utcnow()
-    await _terminalize_lifecycle_before_quarantine(
-        db, group, code=code, reason=reason, now=now
+    _operation, _operation_reservation, phase_two_preserved = (
+        await _terminalize_lifecycle_before_quarantine(
+            db, group, code=code, reason=reason, now=now
+        )
     )
+    if phase_two_preserved:
+        await db.flush()
+        return
     _quarantine_reservation(
         reservation,
         group,
