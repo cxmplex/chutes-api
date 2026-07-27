@@ -655,6 +655,22 @@ async def authorize_gpu_recovery(
 
     await acquire_gpu_lifecycle_lock(db)
     group = await _locked_group(db, allocation_group_id)
+    permanently_lost = (
+        await db.execute(
+            select(GpuHostLossEvent.event_id)
+            .where(
+                GpuHostLossEvent.allocation_group_id
+                == group.allocation_group_id,
+                GpuHostLossEvent.allocation_group_generation
+                == group.generation,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if permanently_lost is not None or group.failure_code == "gpu_host_permanently_lost":
+        raise GpuLifecycleError(
+            "Permanently lost GPU custody cannot be recovered or reclaimed."
+        )
     host = (
         await db.execute(
             select(Host).where(Host.host_id == group.host_id).with_for_update()
@@ -885,7 +901,6 @@ async def authorize_gpu_recovery(
         migration_id=migration_id,
         recovery_nonce=recovery_nonce,
         recovery_nonce_hash=hashlib.sha256(recovery_nonce.encode("ascii")).hexdigest(),
-        state="issued",
         authorized_by=authorized_by,
         issued_at=now,
         expires_at=expires_at,

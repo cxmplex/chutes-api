@@ -43,12 +43,14 @@ from api.gpu_lifecycle_service import (
     GpuLifecycleError,
     authorize_gpu_recovery,
     ensure_reservation_lifecycle_operation,
+    finalize_gpu_host_loss,
     get_gpu_lifecycle_operation,
     record_gpu_local_release_ack,
     record_gpu_physical_result,
     start_gpu_recovery,
 )
 from api.gpu_models import (
+    GpuHostLossEvent,
     GpuHotplugCommand,
     GpuLifecycleOperation,
     GpuRecoveryAuthorization,
@@ -101,6 +103,7 @@ from api.host.schemas import (
     canonical_json_bytes,
     canonical_sha256,
     GpuQuoteCommitmentV1,
+    GpuHostLossFinalizeRequestV1,
     GpuRecoveryAuthorizeRequestV1,
 )
 from api.releases.provenance import (
@@ -1509,6 +1512,7 @@ async def _seed_ordinary_lifecycle_phase(sessions, phase: str):
             row.physical_result_sha256 = result_sha256
             row.phase = "physical_result"
             row.reporting_state = "physical_result"
+            await session.flush()
         receipt = None
         if phase in {"receipt_accepted", "local_release_acked"}:
             receipt = GpuResetReceiptV1(
@@ -1528,6 +1532,7 @@ async def _seed_ordinary_lifecycle_phase(sessions, phase: str):
             row.reporting_state = "receipt_accepted"
             group.state = "release_pending"
             group.resetting_at = None
+            await session.flush()
         ack = None
         if phase == "local_release_acked":
             ack = GpuLocalReleaseAckV1(
@@ -2859,42 +2864,28 @@ async def test_old_key_forced_recovery_bridges_to_current_signed_inventory(
             )
         )
         host.active_key_generation = 2
-        host.gpu_inventory_report_generation = 2
         await session.flush()
-        report_claims = _report().model_copy(
-            update={
-                "report_id": "recovery-report-key-2",
-                "report_generation": 2,
-                "host_key_generation": 2,
-            }
+        report_claims = _current_host_report(
+            host,
+            "recovery-report-key-2",
         )
-        reported_group = report_claims.groups[0]
-        report = GpuInventoryReport(
-            report_id=report_claims.report_id,
-            host_id=host.host_id,
-            host_key_generation=2,
-            host_boot_generation=host.boot_generation,
-            report_generation=2,
-            gpu_release_id="gpu-release",
-            profile_contract_sha256=report_claims.profile_contract_sha256,
-            topology_fingerprint=reported_group.topology_fingerprint,
-            claims=report_claims.model_dump(mode="json"),
-            claims_sha256=canonical_sha256(report_claims),
-            reconciliation_status="quarantined",
-            failure_reason="same fabric under rotated host key",
+        reconciled = await gpu_allocations.reconcile_gpu_inventory(
+            session,
+            host,
+            report_claims,
         )
-        session.add(report)
-        await session.flush()
         group = await session.get(
             GpuAllocationGroup,
             response.claims.allocation_group_id,
         )
-        group.last_report_id = report.report_id
+        assert reconciled.status == "quarantined"
+        assert group.host_key_generation == 1
+        assert group.last_report_id != report_claims.report_id
         envelope = await authorize_gpu_recovery(
             session,
             response.claims.allocation_group_id,
             GpuRecoveryAuthorizeRequestV1(
-                report_id=report.report_id,
+                report_id=report_claims.report_id,
                 reason="operator confirmed exact rotated-key inventory",
             ),
             authorized_by="admin",
@@ -2917,6 +2908,96 @@ async def test_old_key_forced_recovery_bridges_to_current_signed_inventory(
         assert group.host_key_generation == 2
         assert group.state == "quarantined"
         await session.commit()
+
+
+@pytest.mark.parametrize("phase", ["receipt_accepted", "local_release_acked"])
+async def test_permanent_host_loss_cannot_reenter_forced_recovery(
+    postgres_schema,
+    phase,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    operation, _result, _receipt, _ack = await _seed_ordinary_lifecycle_phase(
+        sessions,
+        phase,
+    )
+
+    async with sessions() as session:
+        row = await session.get(GpuLifecycleOperation, operation.operation_id)
+        retired = await finalize_gpu_host_loss(
+            session,
+            operation.operation_id,
+            GpuHostLossFinalizeRequestV1(
+                operation_id=operation.operation_id,
+                allocation_group_id=operation.allocation_group_id,
+                allocation_group_generation=operation.allocation_group_generation,
+                receipt_sha256=row.receipt_sha256,
+                reason="the original L0 and its durable journal are permanently lost",
+            ),
+            authorized_by="admin-user",
+        )
+        assert retired.phase == "quarantined"
+        assert retired.group_state == "quarantined"
+        group = await session.get(
+            GpuAllocationGroup,
+            operation.allocation_group_id,
+        )
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            operation.reservation_id,
+        )
+        event = (
+            await session.execute(
+                select(GpuHostLossEvent).where(
+                    GpuHostLossEvent.operation_id == operation.operation_id
+                )
+            )
+        ).scalar_one()
+        assert event.receipt_sha256 == row.receipt_sha256
+        assert group.state == reservation.state == "quarantined"
+        assert group.failure_code == "gpu_host_permanently_lost"
+        assert reservation.failure_code == "gpu_host_permanently_lost"
+        await session.commit()
+
+    async with sessions() as session:
+        host = await session.get(Host, "gpu-host")
+        current_report = _current_host_report(
+            host,
+            f"permanent-host-loss-{phase}",
+        )
+        reconciled = await gpu_allocations.reconcile_gpu_inventory(
+            session,
+            host,
+            current_report,
+        )
+        assert reconciled.status == "quarantined"
+        with pytest.raises(
+            GpuLifecycleError,
+            match="Permanently lost GPU custody cannot be recovered or reclaimed",
+        ):
+            await authorize_gpu_recovery(
+                session,
+                operation.allocation_group_id,
+                GpuRecoveryAuthorizeRequestV1(
+                    report_id=current_report.report_id,
+                    reason="must not reclaim permanently lost custody",
+                ),
+                authorized_by="admin-user",
+            )
+        await session.rollback()
+
+    async with sessions() as session:
+        group = await session.get(
+            GpuAllocationGroup,
+            operation.allocation_group_id,
+        )
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            operation.reservation_id,
+        )
+        assert group.state == reservation.state == "quarantined"
+        assert group.available_at is None
+        assert reservation.released_at is None
 
 
 async def test_old_boot_ownerless_recovery_bridges_to_current_signed_inventory(
@@ -3372,6 +3453,7 @@ async def _seed_recovery_lifecycle_phase(sessions, recovery_mode: str, phase: st
         row.physical_result_sha256 = result_sha256
         row.phase = "physical_result"
         row.reporting_state = "physical_result"
+        await session.flush()
         receipt = None
         ack = None
         if phase in {"receipt_accepted", "local_release_acked"}:
@@ -3393,6 +3475,7 @@ async def _seed_recovery_lifecycle_phase(sessions, recovery_mode: str, phase: st
             row.reporting_state = "receipt_accepted"
             group.state = "release_pending"
             group.resetting_at = None
+            await session.flush()
         if phase == "local_release_acked":
             ack = GpuLocalReleaseAckV1(
                 operation_id=operation.operation_id,
@@ -3900,6 +3983,11 @@ async def test_failed_recovery_allows_one_fresh_report_successor_and_full_retry(
             "authorization_report": old_authorization.inventory_report_id,
             "authorization_nonce_hash": old_authorization.recovery_nonce_hash,
         }
+        prior_group_custody = (
+            group.last_report_id,
+            group.host_key_generation,
+            group.host_boot_generation,
+        )
         await session.commit()
 
     fresh_claims = _report().model_copy(
@@ -3918,9 +4006,16 @@ async def test_failed_recovery_allows_one_fresh_report_successor_and_full_retry(
         assert reconciled.status == "quarantined"
         group = await session.get(GpuAllocationGroup, "allocation-group")
         assert group.state == "quarantined"
-        assert group.last_report_id == fresh_claims.report_id
-        assert group.host_key_generation == fresh_claims.host_key_generation
-        assert group.host_boot_generation == fresh_claims.host_boot_generation
+        assert (
+            group.last_report_id,
+            group.host_key_generation,
+            group.host_boot_generation,
+        ) == prior_group_custody
+        fresh_report = await session.get(
+            GpuInventoryReport,
+            fresh_claims.report_id,
+        )
+        assert fresh_report.reconciliation_status == "quarantined"
         await session.commit()
 
     async def authorize_successor():

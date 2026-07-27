@@ -26,6 +26,10 @@ pytestmark = pytest.mark.skipif(
     reason="TEST_DATABASE_URL is required for GPU migration guard tests",
 )
 MIGRATIONS = Path(__file__).resolve().parents[2] / "api/migrations"
+LIFECYCLE_PREFLIGHT = (
+    Path(__file__).resolve().parents[2]
+    / "scripts/preflight_gpu_lifecycle_migration.sql"
+)
 
 PLATFORM = "20260724100000_gpu_platform_scheduler.sql"
 REGISTRY = "20260724100500_registry_launch_scope.sql"
@@ -291,7 +295,14 @@ CREATE TABLE registry_sessions (
 
 LIFECYCLE_PREDECESSOR = """
 CREATE TABLE hosts (host_id VARCHAR PRIMARY KEY);
-CREATE TABLE gpu_launch_reservations (reservation_id VARCHAR PRIMARY KEY);
+CREATE TABLE gpu_launch_reservations (
+    reservation_id VARCHAR PRIMARY KEY,
+    allocation_group_id VARCHAR,
+    allocation_group_generation INTEGER,
+    server_id VARCHAR,
+    process_incarnation VARCHAR,
+    gpu_uuids JSONB NOT NULL DEFAULT '[]'::jsonb
+);
 CREATE TABLE gpu_inventory_reports (report_id VARCHAR PRIMARY KEY);
 CREATE TABLE gpu_allocation_groups (
     allocation_group_id VARCHAR PRIMARY KEY,
@@ -318,6 +329,7 @@ CREATE TABLE nodes (
     server_id VARCHAR REFERENCES servers(server_id),
     gpu_allocation_group_id VARCHAR,
     gpu_allocation_group_generation INTEGER,
+    gpu_retired_at TIMESTAMPTZ,
     CONSTRAINT ck_nodes_gpu_allocation_identity CHECK (
         (gpu_allocation_group_id IS NULL AND gpu_allocation_group_generation IS NULL)
         OR (gpu_allocation_group_id IS NOT NULL AND gpu_allocation_group_generation > 0)
@@ -690,6 +702,75 @@ def test_exact_predecessor_data_survives_allowed_down(
         after = _psql(assertion, schema)
         assert after.returncode == 0, after.stderr.decode()
         assert after.stdout == before.stdout
+    finally:
+        _drop_schema(schema)
+
+
+def test_lifecycle_preflight_rejects_current_reservation_from_other_custody():
+    schema = _create_schema(
+        "lifecycle_preflight_wrong_custody",
+        """
+        CREATE TABLE gpu_inventory_reports (report_id VARCHAR PRIMARY KEY);
+        CREATE TABLE gpu_allocation_groups (
+            allocation_group_id VARCHAR PRIMARY KEY,
+            generation INTEGER NOT NULL,
+            last_report_id VARCHAR NOT NULL
+        );
+        CREATE TABLE gpu_launch_reservations (
+            reservation_id VARCHAR PRIMARY KEY,
+            allocation_group_id VARCHAR NOT NULL,
+            allocation_group_generation INTEGER NOT NULL,
+            server_id VARCHAR NOT NULL,
+            process_incarnation VARCHAR NOT NULL,
+            gpu_uuids JSONB NOT NULL
+        );
+        CREATE TABLE servers (
+            server_id VARCHAR PRIMARY KEY,
+            gpu_launch_reservation_id VARCHAR,
+            gpu_process_incarnation VARCHAR,
+            gpu_allocation_group_id VARCHAR,
+            gpu_allocation_group_generation INTEGER
+        );
+        CREATE TABLE nodes (
+            uuid VARCHAR PRIMARY KEY,
+            server_id VARCHAR,
+            gpu_allocation_group_id VARCHAR,
+            gpu_allocation_group_generation INTEGER,
+            gpu_retired_at TIMESTAMPTZ
+        );
+
+        INSERT INTO gpu_inventory_reports(report_id) VALUES ('report-current');
+        INSERT INTO gpu_allocation_groups(
+            allocation_group_id, generation, last_report_id
+        ) VALUES
+            ('group-current', 1, 'report-current'),
+            ('group-other', 1, 'report-current');
+        INSERT INTO gpu_launch_reservations(
+            reservation_id, allocation_group_id,
+            allocation_group_generation, server_id,
+            process_incarnation, gpu_uuids
+        ) VALUES (
+            'reservation-other', 'group-other', 1, 'server-other',
+            'same-process', '["gpu-node"]'::jsonb
+        );
+        INSERT INTO servers(
+            server_id, gpu_launch_reservation_id, gpu_process_incarnation,
+            gpu_allocation_group_id, gpu_allocation_group_generation
+        ) VALUES (
+            'server-current', 'reservation-other', 'same-process',
+            'group-current', 1
+        );
+        INSERT INTO nodes(
+            uuid, server_id, gpu_allocation_group_id,
+            gpu_allocation_group_generation, gpu_retired_at
+        ) VALUES ('gpu-node', 'server-current', 'group-current', 1, NULL);
+        """,
+    )
+    try:
+        result = _psql(LIFECYCLE_PREFLIGHT.read_text(encoding="utf-8"), schema)
+        assert result.returncode == 0, result.stderr.decode()
+        assert b"gpu-node|server-current|group-current|1||{}|blocking_live" in result.stdout
+        assert b"repairable_live" not in result.stdout
     finally:
         _drop_schema(schema)
 

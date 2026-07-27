@@ -34,6 +34,9 @@ WITH reservation_candidates AS (
                     AND server.gpu_process_incarnation IS NOT NULL
                     AND allocation_group.generation = node.gpu_allocation_group_generation
                     AND current_reservation.reservation_id = server.gpu_launch_reservation_id
+                    AND current_reservation.allocation_group_id = allocation_group.allocation_group_id
+                    AND current_reservation.allocation_group_generation = allocation_group.generation
+                    AND current_reservation.server_id = server.server_id
                     AND current_reservation.process_incarnation = server.gpu_process_incarnation
                     AND current_reservation.gpu_uuids ? node.uuid
                    THEN 'repairable_live'

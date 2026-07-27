@@ -18,6 +18,15 @@ def test_node_backfill_repairs_only_exact_lineage_and_lists_blocking_live_ids():
     assert "string_agg(uuid::text, ', ' ORDER BY uuid::text)" in migration
     assert "blocking_live" in preflight
     assert "reservation_ids" in preflight
+    assert (
+        "current_reservation.allocation_group_id = "
+        "allocation_group.allocation_group_id"
+    ) in preflight
+    assert (
+        "current_reservation.allocation_group_generation = "
+        "allocation_group.generation"
+    ) in preflight
+    assert "current_reservation.server_id = server.server_id" in preflight
     assert not any(
         token in preflight.upper()
         for token in ("UPDATE ", "DELETE ", "INSERT ", "ALTER ", "LOCK TABLE")
