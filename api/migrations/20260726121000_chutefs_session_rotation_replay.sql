@@ -350,10 +350,15 @@ BEGIN
             OR token_seed IS NOT NULL
             OR token_key_id IS NOT NULL
             OR response_replay_until IS NOT NULL
-    ) OR EXISTS (
-        SELECT 1 FROM chutefs_token_key_epochs
-    ) OR EXISTS (
-        SELECT 1 FROM chutefs_token_key_replica_acks
+    ) OR (SELECT count(*) FROM chutefs_token_key_epochs) > 1
+      OR EXISTS (
+        SELECT 1
+          FROM chutefs_token_key_epochs epoch
+         WHERE epoch.predecessor_key_id IS NOT NULL
+            OR epoch.state <> 'active'
+            OR epoch.activated_at IS NULL
+            OR epoch.retiring_at IS NOT NULL
+            OR epoch.retired_at IS NOT NULL
     ) OR EXISTS (
         SELECT 1 FROM chutefs_token_key_epoch_operations
     ) THEN

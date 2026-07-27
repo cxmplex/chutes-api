@@ -551,7 +551,9 @@ FOR EACH ROW EXECUTE FUNCTION prevent_user_delete_before_chutefs_erasure();
 
 -- migrate:down
 
--- Match the shared destructive-down order before either the guard or trigger/DDL changes.
+-- Runtime ends its non-authoritative lookup transaction before taking this
+-- lock in shared mode, so no earlier ACCESS SHARE table lock can invert this
+-- destructive-down order.
 SELECT pg_advisory_xact_lock(
     hashtextextended('chutes.chutefs-schema-fence.v1', 0)
 );

@@ -54,6 +54,15 @@ _TOKEN_DOMAIN = b"chutes.chutefs-session-token.v1\0"
 _SCHEMA_FENCE_ADVISORY_LOCK = "chutes.chutefs-schema-fence.v1"
 
 
+def _require_clean_preflight_session(db: AsyncSession) -> None:
+    """Refuse to turn a caller's pending ORM mutation into a preflight commit."""
+
+    if db.new or db.dirty or db.deleted:
+        raise RuntimeError(
+            "ChuteFS lifecycle locking requires a session with no pending ORM writes."
+        )
+
+
 async def lock_launch_storage_configurations(
     db: AsyncSession,
     config_ids: list[str],
@@ -70,6 +79,7 @@ async def lock_launch_storage_configurations(
     additional_user_ids = sorted(set(additional_user_ids or []))
     if not ordered_ids and not additional_user_ids:
         return
+    _require_clean_preflight_session(db)
     hints = list(
         (
             await db.execute(
@@ -97,6 +107,13 @@ async def lock_launch_storage_configurations(
     )
     for instance_id in instance_ids:
         await _require_not_disabled(db, instance_id)
+    # The lookups above are non-authoritative and Redis is external work. End
+    # their transaction before taking either shared schema fence: even ordinary
+    # SELECTs retain ACCESS SHARE table locks until transaction end, which
+    # would invert the down-migration order (exclusive advisory, then table
+    # locks). Refuse to commit any caller-owned ORM mutation accidentally.
+    _require_clean_preflight_session(db)
+    await db.commit()
     # Every runtime path takes these shared transaction fences before its first
     # trust-bearing row lock. Destructive schema rollback and token-key epoch
     # transitions take the matching exclusive advisory lock first, so neither
