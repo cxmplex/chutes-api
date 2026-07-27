@@ -425,11 +425,13 @@ async def _place_workload(
             )
             for _group, host in preflight_candidates
         }
-    online_host_ids = {
-        host.host_id
-        for _group, host in preflight_candidates
-        if await is_agent_online(host.host_id)
-    }
+    online_host_ids = set()
+    for host_id in sorted({host.host_id for _group, host in preflight_candidates}):
+        assert_gpu_external_work_allowed(
+            preflight_session, "GPU placement agent liveness preflight"
+        )
+        if await is_agent_online(host_id):
+            online_host_ids.add(host_id)
     if not online_host_ids:
         return False
     async with get_session() as session:
@@ -584,8 +586,10 @@ async def _dispatch_launch(reservation_id: str) -> bool:
         )
         await session.commit()
         assert_gpu_external_work_allowed(session, "GPU launch liveness preflight")
+    assert_gpu_external_work_allowed(session, "GPU launch agent liveness preflight")
     if not await is_agent_online(host_id):
         return False
+    assert_gpu_external_work_allowed(session, "GPU launch command dispatch")
     command_id = await send_agent_command(
         host_id,
         "launch_gpu",
@@ -876,6 +880,7 @@ async def _dispatch_workload(reservation_id: str) -> bool:
         config_id = config.config_id
         server_id = server.server_id
         external_ports = server.external_ports
+    assert_gpu_external_work_allowed(session, "GPU workload agent liveness preflight")
     if not await is_agent_online(server_id):
         return False
     ports = {"primary": 8000, "logging": 8001}
@@ -886,6 +891,7 @@ async def _dispatch_workload(reservation_id: str) -> bool:
         if job is not None
         else DEFAULT_GPU_DISK_GB
     )
+    assert_gpu_external_work_allowed(session, "GPU workload command dispatch")
     await send_agent_command(
         server_id,
         "deploy_chute",
@@ -1031,6 +1037,9 @@ async def _reconcile_reservation(reservation_id: str) -> None:
                     preflight_session,
                     preflight_chute,
                 )
+    assert_gpu_external_work_allowed(
+        preflight_session, "GPU reconciliation agent liveness preflight"
+    )
     online = await is_agent_online(preflight_host_id)
     async with get_session() as session:
         await acquire_gpu_lifecycle_lock(session)

@@ -10,6 +10,7 @@ Endpoint groups + auth:
 """
 
 from datetime import datetime, timezone
+import secrets
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -735,6 +736,38 @@ async def discover_default_volume(
     )
 
 
+async def _authorize_default_volume_with_storage_observation(
+    db: AsyncSession,
+    authorization: str,
+    request: Request,
+    operation: str,
+):
+    """Stage Redis liveness between two exact launch-authority checks."""
+
+    initial = await launch_sessions.authorize_default_volume(
+        db, authorization, request, operation
+    )
+    expected_authority = launch_sessions.default_volume_authorization_sha256(
+        initial, operation
+    )
+    await db.commit()
+    observed_live_storage_ids = await service.observe_storage_liveness(db)
+    await db.commit()
+    current = await launch_sessions.authorize_default_volume(
+        db, authorization, request, operation
+    )
+    if not secrets.compare_digest(
+        expected_authority,
+        launch_sessions.default_volume_authorization_sha256(current, operation),
+    ):
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="ChuteFS launch authority changed during storage liveness observation.",
+        )
+    return current, observed_live_storage_ids
+
+
 @router.post("/default-volume/objects/placement", response_model=PlacementResponse)
 async def plan_default_placement(
     body: PlacementRequest,
@@ -742,13 +775,18 @@ async def plan_default_placement(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, "put")
+    authorized, observed_live_storage_ids = (
+        await _authorize_default_volume_with_storage_observation(
+            db, authorization, request, "put"
+        )
+    )
     obj, peers = await service.plan_object_placement(
         db,
         authorized.volume,
         body.request_id,
         body.key,
         body.size_bytes,
+        observed_live_storage_ids=observed_live_storage_ids,
     )
     return PlacementResponse(
         object_id=obj.object_id,
@@ -798,11 +836,16 @@ async def locate_default_object(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, "get")
+    authorized, observed_live_storage_ids = (
+        await _authorize_default_volume_with_storage_observation(
+            db, authorization, request, "get"
+        )
+    )
     obj, peers, replicas_confirmed = await service.locate_object(
         db,
         authorized.volume,
         body.key,
+        observed_live_storage_ids=observed_live_storage_ids,
     )
     return LocateObjectResponse(
         object_id=obj.object_id,
@@ -885,7 +928,12 @@ async def issue_default_volume_grant(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, body.op)
+    authorized = await launch_sessions.authorize_default_volume(
+        db, authorization, request, body.op
+    )
+    expected_authority = launch_sessions.default_volume_authorization_sha256(
+        authorized, body.op
+    )
     from api.storage.service import GRANT_TTL_SECONDS
 
     remaining_access_seconds = max(
@@ -893,16 +941,34 @@ async def issue_default_volume_grant(
         int((authorized.session.access_expires_at - datetime.now(timezone.utc)).total_seconds()),
     )
     effective_ttl = min(GRANT_TTL_SECONDS, remaining_access_seconds)
+    user_id = authorized.config.user_id
+    volume_id = authorized.volume.volume_id
+    session_id = authorized.session.session_id
+    generation = authorized.session.generation
+    await db.commit()
     grant = await service.issue_grant(
         db,
-        authorized.config.user_id,
-        authorized.volume.volume_id,
+        user_id,
+        volume_id,
         [body.op],
-        launch_session_id=authorized.session.session_id,
-        launch_session_generation=authorized.session.generation,
+        launch_session_id=session_id,
+        launch_session_generation=generation,
         ttl_seconds=effective_ttl,
     )
-
+    await db.commit()
+    current = await launch_sessions.authorize_default_volume(
+        db, authorization, request, body.op
+    )
+    if not secrets.compare_digest(
+        expected_authority,
+        launch_sessions.default_volume_authorization_sha256(current, body.op),
+    ):
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="ChuteFS launch authority changed while issuing the grant.",
+        )
+    await db.commit()
     return GrantResponse(grant=grant, expires_in=effective_ttl)
 
 

@@ -3904,9 +3904,9 @@ async def validate_tee_launch_config_instance(
         expected_hash=filesystem_hash,
     )
 
+    await _verify_job_ports(db, instance, port_results=port_results)
     # Everything checks out.
     launch_config.verified_at = func.now()
-    await _verify_job_ports(db, instance, port_results=port_results)
     await _mark_instance_verified(db, instance, launch_config)
     return_value = await _build_launch_config_verified_response(
         db, instance, launch_config, request
@@ -4984,6 +4984,11 @@ async def _verify_job_ports(
                     ),
                     {"instance_id": instance.instance_id, "reason": reason},
                 )
+                # Persist the deletion reason and release any lifecycle/row
+                # locks before publishing the failure notification. The
+                # notifier is Redis-backed and must not race a rollback of
+                # the state it announces.
+                await db.commit()
                 asyncio.create_task(notify_deleted(instance))
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -5310,9 +5315,9 @@ async def verify_graval_launch_config_instance(
         expected_hash=filesystem_hash,
     )
 
+    await _verify_job_ports(db, instance, port_results=port_results)
     # Everything checks out; apply external results only to the exact CAS rows.
     launch_config.verified_at = func.now()
-    await _verify_job_ports(db, instance, port_results=port_results)
     await _mark_instance_verified(db, instance, launch_config)
     return_value = await _build_launch_config_verified_response(
         db, instance, launch_config, request
@@ -5409,8 +5414,8 @@ async def verify_tee_launch_config_instance(
             detail="TEE launch verification authority changed during socket checks.",
         )
 
-    launch_config.verified_at = func.now()
     await _verify_job_ports(db, instance, port_results=port_results)
+    launch_config.verified_at = func.now()
     await _mark_instance_verified(db, instance, launch_config)
     return_value = await _build_launch_config_verified_response(
         db, instance, launch_config, request

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -17,7 +18,10 @@ from sqlalchemy.orm import joinedload, lazyload
 
 from api.chute.schemas import Chute
 from api.config import settings
-from api.host.locks import acquire_gpu_lifecycle_lock
+from api.host.locks import (
+    acquire_gpu_lifecycle_lock,
+    assert_gpu_external_work_allowed,
+)
 from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import (
@@ -89,7 +93,7 @@ async def lock_launch_storage_configurations(
         ).scalars()
     )
     for instance_id in instance_ids:
-        await _require_not_disabled(instance_id)
+        await _require_not_disabled(db, instance_id)
     user_ids = sorted(
         {user_id for _config_id, user_id in hints} | set(additional_user_ids)
     )
@@ -178,6 +182,43 @@ class AuthorizedDefaultVolume:
     context: LaunchStorageContext
 
 
+def default_volume_authorization_sha256(
+    authorized: AuthorizedDefaultVolume,
+    operation: str,
+) -> str:
+    """Hash every immutable authority used across one staged external observation."""
+
+    row = authorized.session
+    document = {
+        "operation": operation,
+        "session_id": row.session_id,
+        "config_id": row.config_id,
+        "instance_id": row.instance_id,
+        "binding_id": row.binding_id,
+        "user_id": row.user_id,
+        "chute_id": row.chute_id,
+        "job_id": row.job_id,
+        "compute_type": row.compute_type,
+        "management_mode": row.management_mode,
+        "server_id": row.server_id,
+        "volume_id": row.volume_id,
+        "reservation_id": row.reservation_id,
+        "allocation_group_id": row.allocation_group_id,
+        "allocation_group_generation": row.allocation_group_generation,
+        "process_incarnation": row.process_incarnation,
+        "attestation_id": row.attestation_id,
+        "attested_cert_pubkey_hash": row.attested_cert_pubkey_hash,
+        "allowed_operations": sorted(row.allowed_operations),
+        "generation": row.generation,
+        "access_token_hash": row.access_token_hash,
+        "access_expires_at": row.access_expires_at.isoformat(),
+        "config_verified_at": authorized.config.verified_at.isoformat(),
+    }
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -262,7 +303,8 @@ def _bearer(authorization: str) -> str:
     return token.strip()
 
 
-async def _require_not_disabled(instance_id: str) -> None:
+async def _require_not_disabled(db: AsyncSession, instance_id: str) -> None:
+    assert_gpu_external_work_allowed(db, "ChuteFS instance revocation Redis GET")
     try:
         disabled = await settings.redis_client.get(f"instance_disabled:{instance_id}")
     except Exception as exc:
@@ -864,6 +906,11 @@ async def authorize_default_volume(
         ),
         "process_incarnation": (
             reservation.process_incarnation if reservation is not None else None
+        ),
+        "attestation_id": (
+            server.gpu_runtime_session_attestation_id
+            if config.compute_type == "gpu"
+            else None
         ),
         "attested_cert_pubkey_hash": (
             server.attested_cert_pubkey_hash.lower() if server.attested_cert_pubkey_hash else None

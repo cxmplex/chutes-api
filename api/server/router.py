@@ -16,6 +16,7 @@ from api.config import (
     settings,
 )
 from api.node.util import check_node_inventory
+from api.host.locks import assert_gpu_external_work_allowed
 from api.host.schemas import canonical_sha256
 from api.user.schemas import User
 from api.user.service import get_current_user
@@ -1444,6 +1445,11 @@ async def get_runtime_nonce(
             raise Exception()
 
         context = await runtime_attestation_context_for_server_db(db, server)
+        # The context is an immutable snapshot. Release GPU lifecycle and row
+        # locks before the Redis-backed nonce transport; consumption revalidates
+        # the same canonical context against current database lineage.
+        await db.commit()
+        assert_gpu_external_work_allowed(db, "runtime attestation nonce creation")
         nonce_info = await create_nonce(
             server.ip,
             purpose=NoncePurpose.RUNTIME,

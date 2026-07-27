@@ -537,6 +537,7 @@ async def redeem_enrollment_voucher(
         from api.agent_channel import send_agent_command
 
         try:
+            assert_gpu_external_work_allowed(db, "host rotation disconnect dispatch")
             await send_agent_command(
                 host.host_id,
                 "disconnect",
@@ -1199,6 +1200,7 @@ async def revoke_host_credentials(
     from api.agent_channel import send_agent_command
 
     try:
+        assert_gpu_external_work_allowed(db, "host revocation disconnect dispatch")
         await send_agent_command(host_id, "disconnect", {"reason": "host credential revoked"})
     except Exception as exc:
         logger.warning(

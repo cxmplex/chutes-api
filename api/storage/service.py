@@ -130,6 +130,25 @@ async def _live_storage_ids(
     return live
 
 
+async def observe_storage_liveness(db: AsyncSession) -> Set[str]:
+    """Observe all eligible storage Redis liveness before trust-bearing locks."""
+
+    server_ids = list(
+        (
+            await db.execute(
+                select(Server.server_id)
+                .where(
+                    Server.storage_role.is_(True),
+                    Server.storage_incarnation.is_not(None),
+                    Server.attested_cert_pubkey_hash.is_not(None),
+                )
+                .order_by(Server.server_id)
+            )
+        ).scalars()
+    )
+    return await _live_storage_ids(db, server_ids)
+
+
 async def _verified_storage_ids(db: AsyncSession, server_ids: Sequence[str]) -> Set[str]:
     """Return storage IDs with a fresh successful attestation against a currently loaded storage pin."""
     if not server_ids:
@@ -262,12 +281,20 @@ async def find_server_by_attested_cert_hash(db: AsyncSession, cert_hash: str) ->
 
 
 async def _attested_live_peers(
-    db: AsyncSession, servers: Sequence[Server], include_cert: bool = False
+    db: AsyncSession,
+    servers: Sequence[Server],
+    include_cert: bool = False,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> List[StoragePeer]:
     """Filter servers to attested + live + reachable storage peers, as StoragePeer objects."""
     ids = [s.server_id for s in servers]
     verified = await _verified_storage_ids(db, ids)
-    live = await _live_storage_ids(db, ids)
+    live = (
+        await _live_storage_ids(db, ids)
+        if observed_live_storage_ids is None
+        else observed_live_storage_ids
+    )
     peers: List[StoragePeer] = []
     for s in servers:
         if s.server_id not in verified or s.server_id not in live:
@@ -1931,9 +1958,15 @@ async def _capacity_ranked_peers(
     projected_size_bytes: int,
     *,
     include_cert: bool = False,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> List[StoragePeer]:
     """Fresh peers with enough unreserved disk, roomiest first."""
-    peers = await _attested_live_peers(db, servers, include_cert=include_cert)
+    peers = await _attested_live_peers(
+        db,
+        servers,
+        include_cert=include_cert,
+        observed_live_storage_ids=observed_live_storage_ids,
+    )
     server_by_id = {server.server_id: server for server in servers}
     reserved = await _pending_reserved_bytes(db)
     ranked: List[tuple[int, StoragePeer]] = []
@@ -1954,13 +1987,23 @@ async def _capacity_ranked_peers(
 
 
 async def _pick_replicas(
-    db: AsyncSession, replication_factor: int, projected_size_bytes: int
+    db: AsyncSession,
+    replication_factor: int,
+    projected_size_bytes: int,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> List[StoragePeer]:
     """Pick capacity-safe, fresh replicas on distinct physical failure domains only."""
     servers = list(
         (await db.execute(select(Server).where(Server.storage_role.is_(True)))).scalars().all()
     )
-    peers = await _capacity_ranked_peers(db, servers, projected_size_bytes, include_cert=True)
+    peers = await _capacity_ranked_peers(
+        db,
+        servers,
+        projected_size_bytes,
+        include_cert=True,
+        observed_live_storage_ids=observed_live_storage_ids,
+    )
     # Map server_id -> host_id for distinct-host placement.
     host_by_id = {s.server_id: (s.host_id or s.server_id) for s in servers}
     chosen: List[StoragePeer] = []
@@ -2044,6 +2087,8 @@ async def plan_object_placement(
     request_id: str,
     key: str,
     size_bytes: int,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> tuple[StorageObject, List[StoragePeer]]:
     """Create one immutable pending generation and assign its initial replica targets."""
     if size_bytes < 0 or size_bytes > settings.storage_max_object_bytes:
@@ -2111,7 +2156,12 @@ async def plan_object_placement(
         servers = await _storage_servers_by_id(
             db, [placement.server_id for placement in placements]
         )
-        peers = await _attested_live_peers(db, servers, include_cert=True)
+        peers = await _attested_live_peers(
+            db,
+            servers,
+            include_cert=True,
+            observed_live_storage_ids=observed_live_storage_ids,
+        )
         await db.commit()
         return existing_request, peers
 
@@ -2186,7 +2236,12 @@ async def plan_object_placement(
     db.add(obj)
     await db.flush()
 
-    peers = await _pick_replicas(db, locked_volume.replication_factor, size_bytes)
+    peers = await _pick_replicas(
+        db,
+        locked_volume.replication_factor,
+        size_bytes,
+        observed_live_storage_ids=observed_live_storage_ids,
+    )
 
     if not peers:
         raise HTTPException(
@@ -2504,7 +2559,11 @@ async def commit_object(
     return obj, replicas_confirmed
 
 
-async def _live_attested_server_ids(db: AsyncSession) -> Set[str]:
+async def _live_attested_server_ids(
+    db: AsyncSession,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
+) -> Set[str]:
     """Storage IDs with current disk identity, fresh attestation, and live mTLS activity."""
     all_ids = [
         row[0]
@@ -2521,7 +2580,11 @@ async def _live_attested_server_ids(db: AsyncSession) -> Set[str]:
     if not all_ids:
         return set()
     verified = await _verified_storage_ids(db, all_ids)
-    live = await _live_storage_ids(db, all_ids)
+    live = (
+        await _live_storage_ids(db, all_ids)
+        if observed_live_storage_ids is None
+        else observed_live_storage_ids
+    )
     return verified & live
 
 
@@ -5160,7 +5223,11 @@ async def replica_authorization(
 
 
 async def locate_object(
-    db: AsyncSession, volume: StorageVolume, key: str
+    db: AsyncSession,
+    volume: StorageVolume,
+    key: str,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> tuple[StorageObject, List[StoragePeer], int]:
     obj = (
         await db.execute(
@@ -5186,7 +5253,10 @@ async def locate_object(
         .all()
     )
     servers = await _storage_servers_by_id(db, [placement.server_id for placement in placements])
-    live_ids = await _live_attested_server_ids(db)
+    live_ids = await _live_attested_server_ids(
+        db,
+        observed_live_storage_ids=observed_live_storage_ids,
+    )
     durable = await _current_durable_placements(
         db,
         obj,
@@ -6173,6 +6243,9 @@ async def issue_grant(
         datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
     ).isoformat()
     payload = json.dumps(grant_context)
+    from api.host.locks import assert_gpu_external_work_allowed
+
+    assert_gpu_external_work_allowed(db, "ChuteFS grant Redis SETEX")
     await settings.redis_client.setex(f"storage:grant:{token}", ttl_seconds, payload)
     return token
 

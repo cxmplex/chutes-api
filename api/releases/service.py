@@ -2457,7 +2457,30 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
 
     trusted_tee_counts[release.tee_type] = len(trusted_server_ids)
     host_by_id = {host.host_id: host for host in hosts}
-    online_by_host = {host.host_id: await is_agent_online(host.host_id) for host in hosts}
+    online_by_host = {}
+    for host in hosts:
+        assert_gpu_external_work_allowed(db, "release-status host liveness lookup")
+        online_by_host[host.host_id] = await is_agent_online(host.host_id)
+    observed_storage_by_host: dict[str, set[str]] = {}
+    online_by_server: dict[str, bool] = {}
+    if release.compute_type == "gpu":
+        from api.host.reservations import observe_gpu_storage_liveness
+
+        for host in hosts:
+            observed_storage_by_host[host.host_id] = (
+                await observe_gpu_storage_liveness(db, host.host_id)
+            )
+        for server_id in sorted(
+            {
+                reservation.server_id
+                for reservation in gpu_reservations
+                if reservation.server_id is not None
+            }
+        ):
+            assert_gpu_external_work_allowed(
+                db, "release-status guest liveness lookup"
+            )
+            online_by_server[server_id] = await is_agent_online(server_id)
     host_rows = []
     gpu_storage_siblings = []
     for host in hosts:
@@ -2474,7 +2497,13 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 host_storage_sha = sibling.image.sha256
                 from api.host.reservations import gpu_host_storage_readiness
 
-                readiness = await gpu_host_storage_readiness(db, host)
+                readiness = await gpu_host_storage_readiness(
+                    db,
+                    host,
+                    observed_live_storage_ids=observed_storage_by_host.get(
+                        host.host_id, set()
+                    ),
+                )
                 gpu_storage_siblings.append(readiness.model_dump(mode="json"))
             except ReleaseError:
                 storage_contract_ok = False
@@ -2613,6 +2642,9 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                     db,
                     current_host,
                     include_allocation=False,
+                    observed_live_storage_ids=observed_storage_by_host.get(
+                        current_host.host_id, set()
+                    ),
                 )
                 storage_ready = bool(
                     readiness.trusted_storage_ready and readiness.control_channel_eligible
@@ -2629,7 +2661,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 and (
                     (
                         server.gpu_management_mode == "platform"
-                        and await is_agent_online(server.server_id)
+                        and online_by_server.get(server.server_id, False)
                     )
                     or (server.gpu_management_mode == "miner" and runtime_session_ready)
                 )

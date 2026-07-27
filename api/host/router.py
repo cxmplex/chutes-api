@@ -651,11 +651,17 @@ async def create_miner_gpu_reservation_endpoint(
                 }
                 acknowledgement = None
                 for _attempt in range(2):
+                    assert_gpu_external_work_allowed(
+                        db, "legacy source-confirm command dispatch"
+                    )
                     await send_agent_command(
                         host_id,
                         command,
                         command_data,
                         command_id=command_id,
+                    )
+                    assert_gpu_external_work_allowed(
+                        db, "legacy source-confirm ACK wait"
                     )
                     acknowledgement = await wait_for_agent_command_ack(
                         host_id,
@@ -1303,10 +1309,21 @@ async def list_hosts(
         )
     ).all()
     used_by_host = {host_id: count for host_id, count in used_rows}
+    observed_storage_by_host = {
+        host.host_id: await observe_gpu_storage_liveness(db, host.host_id)
+        for host in sorted(hosts, key=lambda item: item.host_id)
+        if host.compute_type == "gpu"
+    }
     out = []
     for h in hosts:
         readiness = (
-            await gpu_host_storage_readiness(db, h) if h.compute_type == "gpu" else None
+            await gpu_host_storage_readiness(
+                db,
+                h,
+                observed_live_storage_ids=observed_storage_by_host.get(h.host_id, set()),
+            )
+            if h.compute_type == "gpu"
+            else None
         )
         out.append(
             {
