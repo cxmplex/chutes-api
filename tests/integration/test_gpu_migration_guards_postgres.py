@@ -253,7 +253,8 @@ CREATE TABLE gpu_launch_reservations (
 CREATE TABLE servers (
     server_id VARCHAR PRIMARY KEY,
     gpu_retired_at TIMESTAMPTZ,
-    gpu_runtime_session_attestation_id VARCHAR
+    gpu_runtime_session_attestation_id VARCHAR,
+    attested_cert_pubkey_hash VARCHAR
 );
 CREATE TABLE launch_configs (
     config_id VARCHAR PRIMARY KEY,
@@ -405,13 +406,53 @@ CREATE TABLE chutefs_launch_sessions (
             INSERT INTO chutes(chute_id, user_id, node_selector)
             VALUES ('chute', 'user', '{"compute_type":"cpu"}');
             INSERT INTO launch_configs(
-                config_id, chute_id, user_id, compute_type, completed_at
-            ) VALUES ('config', 'chute', 'user', 'cpu', NOW());
+                config_id, chute_id, user_id, compute_type,
+                storage_session_exchange_allowed
+            ) VALUES ('config', 'chute', 'user', 'cpu', TRUE);
             """,
             (
                 "default_chutefs_volume_bindings",
                 "chutefs_launch_sessions",
                 "launch_configs",
+                "storage_volumes",
+                "users",
+            ),
+            b"cannot roll back default ChuteFS volumes",
+        ),
+        (
+            CHUTEFS,
+            "chutefs_unbound_volume_down",
+            CHUTEFS_PREDECESSOR,
+            """
+            INSERT INTO users(user_id) VALUES ('user');
+            INSERT INTO storage_volumes(volume_id, user_id, deleted)
+            VALUES ('unbound-incomplete', 'user', FALSE);
+            """,
+            (
+                "default_chutefs_volume_bindings",
+                "chutefs_launch_sessions",
+                "storage_volume_keys",
+                "storage_volumes",
+                "users",
+            ),
+            b"cannot roll back default ChuteFS volumes",
+        ),
+        (
+            CHUTEFS,
+            "chutefs_key_down",
+            CHUTEFS_PREDECESSOR,
+            """
+            INSERT INTO users(user_id) VALUES ('user');
+            INSERT INTO storage_volumes(
+                volume_id, user_id, deleted, purged_at, key_shredded_at
+            ) VALUES ('volume-with-key', 'user', TRUE, NOW(), NOW());
+            INSERT INTO storage_volume_keys(key_id, volume_id)
+            VALUES ('key', 'volume-with-key');
+            """,
+            (
+                "default_chutefs_volume_bindings",
+                "chutefs_launch_sessions",
+                "storage_volume_keys",
                 "storage_volumes",
                 "users",
             ),
@@ -460,13 +501,14 @@ CREATE TABLE chutefs_launch_sessions (
                 session_id, config_id, instance_id, binding_id, user_id,
                 chute_id, compute_type, management_mode, server_id, volume_id,
                 allowed_operations, access_token_hash, refresh_token_hash,
-                access_expires_at, refresh_expires_at
+                access_expires_at, refresh_expires_at, attested_cert_pubkey_hash
             ) VALUES (
                 'session', 'config', 'instance', 'binding', 'user', 'chute',
                 'cpu', 'platform', 'server', 'volume',
                 '["put", "get", "list", "delete"]',
                 '{"a" * 64}', '{"b" * 64}',
-                NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '10 minutes'
+                NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '10 minutes',
+                '{"c" * 64}'
             );
             """,
             (
@@ -601,8 +643,8 @@ def test_migration_specific_down_guard_preserves_catalog_and_data(
             INSERT INTO users(user_id) VALUES ('user');
             INSERT INTO chutes(chute_id, user_id, node_selector)
             VALUES ('chute', 'user', '{"compute_type":"cpu"}');
-            INSERT INTO launch_configs(config_id, chute_id)
-            VALUES ('config', 'chute');
+            INSERT INTO launch_configs(config_id, chute_id, verified_at)
+            VALUES ('config', 'chute', NOW());
             """,
             "SELECT config_id || '|' || chute_id FROM launch_configs;",
         ),
@@ -773,8 +815,8 @@ async def _assert_writer_cannot_cross_down(
             INSERT INTO users(user_id) VALUES ('user');
             INSERT INTO chutes(chute_id, user_id, node_selector)
             VALUES ('chute', 'user', '{"compute_type":"cpu"}');
-            INSERT INTO launch_configs(config_id, chute_id)
-            VALUES ('config', 'chute');
+            INSERT INTO launch_configs(config_id, chute_id, verified_at)
+            VALUES ('config', 'chute', NOW());
             """,
             "launch_configs",
             "UPDATE launch_configs SET completed_at = NOW() WHERE config_id = 'config'",

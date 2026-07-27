@@ -2488,11 +2488,10 @@ class ChuteFSLaunchSession(Base):
         ForeignKey("instances.instance_id", ondelete="CASCADE"),
         nullable=False,
     )
-    rotated_from_session_id = Column(
-        String,
-        ForeignKey("chutefs_launch_sessions.session_id", ondelete="RESTRICT"),
-        nullable=True,
-    )
+    # Audit identity only: the predecessor row may be pruned after its replay
+    # window while this digest remains immutable on the successor.
+    rotated_from_session_id = Column(String, nullable=True)
+    rotated_from_session_sha256 = Column(String(64), nullable=True)
     binding_id = Column(
         String,
         ForeignKey("default_chutefs_volume_bindings.binding_id", ondelete="RESTRICT"),
@@ -2565,13 +2564,13 @@ class ChuteFSLaunchSession(Base):
             'AND allowed_operations = \'["put", "get", "list", "delete"]\'::jsonb '
             "AND generation > 0 "
             "AND access_expires_at <= refresh_expires_at "
+            "AND attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$' "
             "AND ((compute_type = 'cpu' AND management_mode = 'platform' "
             "AND reservation_id IS NULL AND allocation_group_id IS NULL "
             "AND allocation_group_generation IS NULL AND process_incarnation IS NULL) "
             "OR (compute_type = 'gpu' AND reservation_id IS NOT NULL "
             "AND allocation_group_id IS NOT NULL AND allocation_group_generation > 0 "
-            "AND process_incarnation IS NOT NULL AND attestation_id IS NOT NULL "
-            "AND attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$'))",
+            "AND process_incarnation IS NOT NULL AND attestation_id IS NOT NULL))",
             name="ck_chutefs_launch_session_scope",
         ),
         CheckConstraint(
@@ -2585,13 +2584,129 @@ class ChuteFSLaunchSession(Base):
         CheckConstraint(
             "((token_seed IS NULL AND token_key_id IS NULL "
             "AND rotation_request_sha256 IS NULL AND response_replay_until IS NULL "
-            "AND rotated_from_session_id IS NULL) OR "
+            "AND rotated_from_session_id IS NULL "
+            "AND rotated_from_session_sha256 IS NULL) OR "
             "(token_seed ~ '^[0-9a-f]{64}$' AND token_key_id IS NOT NULL "
             "AND token_key_id <> '' "
             "AND rotation_request_sha256 ~ '^[0-9a-f]{64}$' "
             "AND response_replay_until IS NOT NULL "
-            "AND response_replay_until <= refresh_expires_at))",
+            "AND response_replay_until <= refresh_expires_at "
+            "AND ((rotated_from_session_id IS NULL "
+            "AND rotated_from_session_sha256 IS NULL) OR "
+            "(rotated_from_session_id IS NOT NULL "
+            "AND rotated_from_session_sha256 ~ '^[0-9a-f]{64}$'))))",
             name="ck_chutefs_launch_session_rotation_replay",
+        ),
+    )
+
+
+class ChuteFSTokenKeyEpoch(Base):
+    """Non-secret database authority for coordinated ChuteFS token-key rotation."""
+
+    __tablename__ = "chutefs_token_key_epochs"
+
+    key_id = Column(String, primary_key=True)
+    predecessor_key_id = Column(
+        String,
+        ForeignKey("chutefs_token_key_epochs.key_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    state = Column(String, nullable=False)
+    required_replica_ids = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    activated_at = Column(DateTime(timezone=True), nullable=True)
+    retiring_at = Column(DateTime(timezone=True), nullable=True)
+    retired_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_chutefs_token_key_epoch_active",
+            "state",
+            unique=True,
+            postgresql_where=state == "active",
+        ),
+        CheckConstraint(
+            "state IN ('staged', 'active', 'retiring', 'retired')",
+            name="ck_chutefs_token_key_epoch_state",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(required_replica_ids) = 'array' "
+            "AND jsonb_array_length(required_replica_ids) > 0",
+            name="ck_chutefs_token_key_epoch_replicas",
+        ),
+        CheckConstraint(
+            "(state = 'staged' AND activated_at IS NULL "
+            "AND retiring_at IS NULL AND retired_at IS NULL) OR "
+            "(state = 'active' AND activated_at IS NOT NULL "
+            "AND retiring_at IS NULL AND retired_at IS NULL) OR "
+            "(state = 'retiring' AND activated_at IS NOT NULL "
+            "AND retiring_at IS NOT NULL AND retired_at IS NULL) OR "
+            "(state = 'retired' AND activated_at IS NOT NULL "
+            "AND retiring_at IS NOT NULL AND retired_at IS NOT NULL)",
+            name="ck_chutefs_token_key_epoch_timestamps",
+        ),
+    )
+
+
+class ChuteFSTokenKeyReplicaAck(Base):
+    """One serving replica's acknowledgement of a staged non-secret key epoch."""
+
+    __tablename__ = "chutefs_token_key_replica_acks"
+
+    replica_id = Column(String, primary_key=True)
+    key_id = Column(
+        String,
+        ForeignKey("chutefs_token_key_epochs.key_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    key_ids = Column(JSONB, nullable=False)
+    key_fingerprints = Column(JSONB, nullable=False)
+    keyring_sha256 = Column(String(64), nullable=False)
+    acknowledged_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "jsonb_typeof(key_ids) = 'array' "
+            "AND key_ids ? key_id "
+            "AND jsonb_typeof(key_fingerprints) = 'object' "
+            "AND key_fingerprints ? key_id "
+            "AND keyring_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_chutefs_token_key_replica_ack",
+        ),
+    )
+
+
+class ChuteFSTokenKeyEpochOperation(Base):
+    """Immutable idempotency and administrator audit record for one epoch CAS."""
+
+    __tablename__ = "chutefs_token_key_epoch_operations"
+
+    request_id = Column(String, primary_key=True)
+    request_sha256 = Column(String(64), nullable=False)
+    operation_type = Column(String, nullable=False)
+    key_id = Column(
+        String,
+        ForeignKey("chutefs_token_key_epochs.key_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    predecessor_key_id = Column(String, nullable=True)
+    requested_by_user_id = Column(String, nullable=False)
+    # Preserve Python ``None`` as SQL NULL so the operation-shape check can
+    # distinguish transition records from a JSON ``null`` payload.
+    required_replica_ids = Column(JSONB(none_as_null=True), nullable=True)
+    response_json = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "request_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND operation_type IN ('stage', 'activate', 'retire') "
+            "AND ((operation_type = 'stage' "
+            "AND jsonb_typeof(required_replica_ids) = 'array' "
+            "AND jsonb_array_length(required_replica_ids) > 0) "
+            "OR (operation_type IN ('activate', 'retire') "
+            "AND required_replica_ids IS NULL))",
+            name="ck_chutefs_token_key_epoch_operation",
         ),
     )
 

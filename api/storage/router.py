@@ -27,6 +27,7 @@ from api.user.schemas import User
 from api.user.service import get_current_user
 from api.storage import service
 from api.storage import launch_sessions
+from api.storage import key_epochs
 from api.storage.schemas import (
     AnnounceModelHoldingsRequest,
     AnnounceModelHoldingsResponse,
@@ -35,6 +36,9 @@ from api.storage.schemas import (
     AdministrativeEraseRetirementResponse,
     CommitObjectRequest,
     CommitObjectResponse,
+    ChuteFSTokenKeyEpochResponse,
+    ChuteFSTokenKeyStageRequest,
+    ChuteFSTokenKeyTransitionRequest,
     CreateVolumeRequest,
     DeleteVolumeResponse,
     DeleteObjectRequest,
@@ -151,7 +155,7 @@ async def require_storage_administrator(
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Storage erase retirement requires a support or billing administrator.",
+            detail="Storage administration requires a support or billing administrator.",
         )
     return current_user
 
@@ -301,6 +305,73 @@ async def administratively_retire_erase_tasks(
         body.reason,
     )
     return AdministrativeEraseRetirementResponse(retired=retired)
+
+
+@router.post(
+    "/admin/chutefs/token-keys/stage",
+    response_model=ChuteFSTokenKeyEpochResponse,
+)
+async def stage_chutefs_token_key(
+    body: ChuteFSTokenKeyStageRequest,
+    db: AsyncSession = Depends(get_db_session),
+    administrator: User = Depends(require_storage_administrator),
+):
+    """Stage one successor epoch for an exact serving-replica cohort."""
+    return ChuteFSTokenKeyEpochResponse(
+        **(
+            await key_epochs.stage_token_key_epoch(
+                db,
+                administrator_id=administrator.user_id,
+                request_id=body.request_id,
+                key_id=body.key_id,
+                required_replica_ids=body.required_replica_ids,
+            )
+        )
+    )
+
+
+@router.post(
+    "/admin/chutefs/token-keys/activate",
+    response_model=ChuteFSTokenKeyEpochResponse,
+)
+async def activate_chutefs_token_key(
+    body: ChuteFSTokenKeyTransitionRequest,
+    db: AsyncSession = Depends(get_db_session),
+    administrator: User = Depends(require_storage_administrator),
+):
+    """Activate a successor only after every named replica acknowledges it."""
+    return ChuteFSTokenKeyEpochResponse(
+        **(
+            await key_epochs.activate_token_key_epoch(
+                db,
+                administrator_id=administrator.user_id,
+                request_id=body.request_id,
+                key_id=body.key_id,
+            )
+        )
+    )
+
+
+@router.post(
+    "/admin/chutefs/token-keys/retire",
+    response_model=ChuteFSTokenKeyEpochResponse,
+)
+async def retire_chutefs_token_key(
+    body: ChuteFSTokenKeyTransitionRequest,
+    db: AsyncSession = Depends(get_db_session),
+    administrator: User = Depends(require_storage_administrator),
+):
+    """Retire the old key after all authority and replay windows expire."""
+    return ChuteFSTokenKeyEpochResponse(
+        **(
+            await key_epochs.retire_token_key_epoch(
+                db,
+                administrator_id=administrator.user_id,
+                request_id=body.request_id,
+                key_id=body.key_id,
+            )
+        )
+    )
 
 
 # --- peer discovery + cert authority (attested caller) -----------------------------------------

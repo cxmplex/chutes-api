@@ -9,10 +9,15 @@ from types import SimpleNamespace
 import pytest
 
 from api.config import settings
-from api.server.schemas import ChuteFSLaunchSession
+from api.server.schemas import (
+    ChuteFSLaunchSession,
+    ChuteFSTokenKeyEpoch,
+    ChuteFSTokenKeyReplicaAck,
+)
 from api.storage import launch_sessions
 from api.storage import service as storage_service
-from api.storage.startup import missing_retained_token_keys
+from api.storage import startup as storage_startup
+from api.storage.startup import missing_retained_token_keys, token_keyset_sha256
 
 
 def _row(**updates):
@@ -20,7 +25,7 @@ def _row(**updates):
         "session_id": "session-1",
         "generation": 7,
         "token_seed": "ab" * 32,
-        "token_key_id": "launch-config-key-v1",
+        "token_key_id": "chutefs-dev-key-v1",
     }
     values.update(updates)
     return SimpleNamespace(**values)
@@ -127,10 +132,33 @@ def test_keyring_rejects_missing_active_and_duplicate_ids(monkeypatch):
         _ = settings.chutefs_token_keys
 
 
+def test_keyring_requires_explicit_dev_opt_in_and_never_reuses_launch_jwt(monkeypatch):
+    monkeypatch.setattr(settings, "chutefs_token_keys_json", None)
+    monkeypatch.setattr(settings, "chutefs_allow_insecure_dev_key", False)
+    with pytest.raises(ValueError, match="CHUTEFS_ALLOW_INSECURE_DEV_KEY"):
+        _ = settings.chutefs_token_keys
+
+    monkeypatch.setattr(settings, "chutefs_token_key_id", "dedicated")
+    monkeypatch.setattr(
+        settings,
+        "chutefs_token_keys_json",
+        json.dumps({"dedicated": settings.launch_config_key}),
+    )
+    with pytest.raises(ValueError, match="launch-JWT"):
+        _ = settings.chutefs_token_keys
+
+
+def test_keyset_fingerprint_binds_actual_secret_bytes():
+    first = token_keyset_sha256({"old": "o" * 32, "new": "n" * 32})
+    different_secret = token_keyset_sha256({"old": "o" * 32, "new": "x" * 32})
+    assert first != different_secret
+
+
 def test_session_model_has_one_active_successor_and_replay_metadata():
     columns = ChuteFSLaunchSession.__table__.columns
     assert {
         "rotated_from_session_id",
+        "rotated_from_session_sha256",
         "rotation_request_sha256",
         "token_seed",
         "token_key_id",
@@ -140,6 +168,60 @@ def test_session_model_has_one_active_successor_and_replay_metadata():
     assert indexes["uq_chutefs_launch_session_active_config"].unique
     assert indexes["uq_chutefs_launch_session_active_instance"].unique
     assert indexes["uq_chutefs_launch_session_successor"].unique
+    assert not columns["rotated_from_session_id"].foreign_keys
+
+    assert {
+        "key_id",
+        "predecessor_key_id",
+        "state",
+        "required_replica_ids",
+    }.issubset(ChuteFSTokenKeyEpoch.__table__.columns.keys())
+    assert {
+        "replica_id",
+        "key_id",
+        "key_ids",
+        "key_fingerprints",
+        "keyring_sha256",
+    }.issubset(ChuteFSTokenKeyReplicaAck.__table__.columns.keys())
+
+
+def test_current_lineage_binds_certificate_and_operational_attestation():
+    config = SimpleNamespace(
+        config_id="config",
+        user_id="user",
+        chute_id="chute",
+        job_id="job",
+        compute_type="gpu",
+        gpu_management_mode="miner",
+    )
+    instance = SimpleNamespace(instance_id="instance")
+    binding = SimpleNamespace(binding_id="binding")
+    volume = SimpleNamespace(volume_id="volume")
+    server = SimpleNamespace(
+        server_id="server",
+        gpu_runtime_session_attestation_id="attestation-a",
+        attested_cert_pubkey_hash="A" * 64,
+    )
+    reservation = SimpleNamespace(
+        reservation_id="reservation",
+        allocation_group_id="group",
+        allocation_group_generation=3,
+        process_incarnation="process",
+    )
+    current = launch_sessions._current_session_identity(
+        config, instance, binding, volume, server, reservation
+    )
+    assert current["attestation_id"] == "attestation-a"
+    assert current["attested_cert_pubkey_hash"] == "a" * 64
+    assert launch_sessions._session_matches_current(SimpleNamespace(**current), current)
+
+    server.gpu_runtime_session_attestation_id = "attestation-b"
+    advanced = launch_sessions._current_session_identity(
+        config, instance, binding, volume, server, reservation
+    )
+    assert not launch_sessions._session_matches_current(
+        SimpleNamespace(**current), advanced
+    )
 
 
 def test_revocation_preflight_and_binding_locks_follow_shared_order():
@@ -192,6 +274,14 @@ def test_purge_and_account_erasure_do_not_prelock_the_user():
     assert "additional_user_ids=[user_id]" in inspect.getsource(
         storage_service.prepare_user_storage_erasure
     )
+    delete_source = inspect.getsource(storage_service.delete_volume)
+    erasure_source = inspect.getsource(storage_service.prepare_user_storage_erasure)
+    assert delete_source.index("select(DefaultChuteFSVolumeBinding)") < delete_source.index(
+        "select(StorageVolume)"
+    )
+    assert erasure_source.index("select(DefaultChuteFSVolumeBinding)") < erasure_source.index(
+        "select(StorageVolume)"
+    )
 
 
 def test_rotation_migration_locks_and_guards_only_its_state():
@@ -202,8 +292,11 @@ def test_rotation_migration_locks_and_guards_only_its_state():
     down = migration.split("-- migrate:down", maxsplit=1)[1]
 
     assert down.lstrip().startswith("LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;")
+    assert "LOCK TABLE chutefs_token_key_epochs IN ACCESS EXCLUSIVE MODE;" in down
+    assert "LOCK TABLE chutefs_token_key_replica_acks IN ACCESS EXCLUSIVE MODE;" in down
     for column in (
         "rotated_from_session_id",
+        "rotated_from_session_sha256",
         "rotation_request_sha256",
         "token_seed",
         "token_key_id",
@@ -214,6 +307,49 @@ def test_rotation_migration_locks_and_guards_only_its_state():
     assert "GROUP BY instance_id" in down
     assert "repository" not in down
     assert "descriptor_closure" not in down
+
+    up = migration.split("-- migrate:down", maxsplit=1)[0]
+    assert "REFERENCES chutefs_launch_sessions(session_id)" not in up
+    for field in (
+        "generation",
+        "access_token_hash",
+        "refresh_token_hash",
+        "access_expires_at",
+        "refresh_expires_at",
+        "rotated_from_session_id",
+        "rotated_from_session_sha256",
+        "rotation_request_sha256",
+        "token_seed",
+        "token_key_id",
+        "response_replay_until",
+        "attestation_id",
+        "rotated_at",
+    ):
+        assert f"NEW.{field} IS DISTINCT FROM OLD.{field}" in up
+    assert "acknowledged_keyring_sha256 IS DISTINCT FROM expected_keyring_sha256" in up
+    assert "acknowledged_key_fingerprints IS DISTINCT FROM expected_key_fingerprints" in up
+
+
+def test_key_epoch_bootstrap_orders_stage_ack_then_activation():
+    source = inspect.getsource(storage_startup.require_chutefs_token_key_retention)
+    staged = source.index("INSERT INTO chutefs_token_key_epochs")
+    acknowledged = source.index("INSERT INTO chutefs_token_key_replica_acks")
+    activated = source.index("UPDATE chutefs_token_key_epochs")
+    assert staged < acknowledged < activated
+    assert "active key fingerprint" in source
+
+
+def test_key_epoch_ack_is_readiness_only_and_liveness_stays_independent():
+    source = (Path(__file__).parents[2] / "api/main.py").read_text()
+    ping = source.split("async def ping():", maxsplit=1)[1].split(
+        "async def ready(", maxsplit=1
+    )[0]
+    ready = source.split("async def ready(", maxsplit=1)[1].split(
+        "def _tee_trust_metrics", maxsplit=1
+    )[0]
+
+    assert "require_chutefs_token_key_retention" not in ping
+    assert "require_chutefs_token_key_retention" in ready
 
 
 def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
@@ -236,15 +372,44 @@ def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
         "jobs",
         "launch_configs",
         "servers",
+        "storage_volume_keys",
         "storage_volumes",
         "users",
         "chutefs_launch_sessions",
         "default_chutefs_volume_bindings",
     ]
-    assert "JOIN storage_volumes volume ON volume.volume_id = binding.volume_id" in down[:guard_end]
-    assert "volume.purged_at IS NULL" in down[:guard_end]
-    assert "volume.key_shredded_at IS NULL" in down[:guard_end]
-    assert "FROM storage_volumes\n            WHERE" not in down[:guard_end]
+    guard = down[:guard_end]
+    assert "FROM storage_volumes volume" in guard
+    assert "volume.purged_at IS NULL" in guard
+    assert "volume.key_shredded_at IS NULL" in guard
+    assert "NOT EXISTS" in guard
+    assert "FROM storage_volume_keys" in guard
+    assert "default_volume_id IS NOT NULL" in guard
+    assert "storage_session_exchange_allowed" in guard
+    assert "completed_at IS NOT NULL" not in guard
+    assert "failed_at IS NULL AND completed_at IS NULL" in guard
+
+
+def test_server_revocation_trigger_uses_distinct_identity_changes():
+    migration = (
+        Path(__file__).parents[2] / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
+    ).read_text()
+    function = migration.split(
+        "CREATE OR REPLACE FUNCTION revoke_chutefs_session_on_server_change()",
+        maxsplit=1,
+    )[1].split("$$;", maxsplit=1)[0]
+    assert "gpu_runtime_session_attestation_id\n            IS DISTINCT FROM" in function
+    assert "attested_cert_pubkey_hash\n            IS DISTINCT FROM" in function
+    assert "gpu_runtime_session_attestation_id IS NULL" not in function
+
+
+def test_pruning_requires_all_authority_windows_to_expire_and_is_bounded():
+    source = inspect.getsource(launch_sessions._prune_expired_session_lineage)
+    assert "access_expires_at <= now" in source
+    assert "refresh_expires_at <= now" in source
+    assert "response_replay_until <= now" in source
+    assert ".limit(limit)" in source
+    assert "limit: int = 128" in source
 
 
 def test_token_key_retention_accepts_present_live_key():
@@ -272,3 +437,9 @@ def test_token_key_retention_ignores_expired_session_key():
         {"active"},
         now=now,
     ) == []
+
+
+def test_startup_retains_keys_through_strict_refresh_expiry():
+    source = inspect.getsource(storage_startup.require_chutefs_token_key_retention)
+    assert '"SELECT token_key_id, MAX(refresh_expires_at) "' in source
+    assert "CASE WHEN revoked_at IS NULL" not in source

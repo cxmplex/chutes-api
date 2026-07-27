@@ -235,15 +235,17 @@ nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
 - name: CHUTEFS_TOKEN_KEY_ID
   valueFrom:
     secretKeyRef:
-      name: launch-config
-      key: chutefs-token-key-id
-      optional: true
+      name: chutefs-token-keys
+      key: bootstrap-key-id
 - name: CHUTEFS_TOKEN_KEYS_JSON
   valueFrom:
     secretKeyRef:
-      name: launch-config
-      key: chutefs-token-keys-json
-      optional: true
+      name: chutefs-token-keys
+      key: keyring-json
+- name: CHUTEFS_TOKEN_REPLICA_ID
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.uid
 - name: ENVDUMP_UNLOCK
   valueFrom:
     secretKeyRef:

@@ -285,6 +285,7 @@ CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (
         AND allowed_operations = '["put", "get", "list", "delete"]'::jsonb
         AND generation > 0
         AND access_expires_at <= refresh_expires_at
+        AND attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$'
         AND (
             (
                 compute_type = 'cpu'
@@ -302,7 +303,6 @@ CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (
                 AND allocation_group_generation > 0
                 AND process_incarnation IS NOT NULL
                 AND attestation_id IS NOT NULL
-                AND attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$'
             )
         )
     ),
@@ -340,9 +340,16 @@ BEGIN
         OR NEW.allocation_group_id IS DISTINCT FROM OLD.allocation_group_id
         OR NEW.allocation_group_generation IS DISTINCT FROM OLD.allocation_group_generation
         OR NEW.process_incarnation IS DISTINCT FROM OLD.process_incarnation
+        OR NEW.attestation_id IS DISTINCT FROM OLD.attestation_id
         OR NEW.attested_cert_pubkey_hash IS DISTINCT FROM OLD.attested_cert_pubkey_hash
         OR NEW.allowed_operations IS DISTINCT FROM OLD.allowed_operations
+        OR NEW.generation IS DISTINCT FROM OLD.generation
+        OR NEW.access_token_hash IS DISTINCT FROM OLD.access_token_hash
+        OR NEW.refresh_token_hash IS DISTINCT FROM OLD.refresh_token_hash
+        OR NEW.access_expires_at IS DISTINCT FROM OLD.access_expires_at
+        OR NEW.refresh_expires_at IS DISTINCT FROM OLD.refresh_expires_at
         OR NEW.created_at IS DISTINCT FROM OLD.created_at
+        OR NEW.rotated_at IS DISTINCT FROM OLD.rotated_at
     ) THEN
         RAISE EXCEPTION 'launch-bound ChuteFS session identity is immutable';
     END IF;
@@ -405,7 +412,10 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     IF NEW.gpu_retired_at IS DISTINCT FROM OLD.gpu_retired_at
-       OR NEW.gpu_runtime_session_attestation_id IS NULL
+       OR NEW.gpu_runtime_session_attestation_id
+            IS DISTINCT FROM OLD.gpu_runtime_session_attestation_id
+       OR NEW.attested_cert_pubkey_hash
+            IS DISTINCT FROM OLD.attested_cert_pubkey_hash
     THEN
         UPDATE chutefs_launch_sessions
            SET revoked_at = COALESCE(revoked_at, NOW())
@@ -418,7 +428,8 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_revoke_chutefs_session_on_server_change ON servers;
 CREATE TRIGGER trg_revoke_chutefs_session_on_server_change
-AFTER UPDATE OF gpu_retired_at, gpu_runtime_session_attestation_id ON servers
+AFTER UPDATE OF gpu_retired_at, gpu_runtime_session_attestation_id,
+    attested_cert_pubkey_hash ON servers
 FOR EACH ROW EXECUTE FUNCTION revoke_chutefs_session_on_server_change();
 
 CREATE OR REPLACE FUNCTION revoke_chutefs_session_on_reservation_change()
@@ -546,6 +557,7 @@ LOCK TABLE instances IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE jobs IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE launch_configs IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE servers IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE storage_volume_keys IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE storage_volumes IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;
@@ -553,21 +565,25 @@ LOCK TABLE default_chutefs_volume_bindings IN ACCESS EXCLUSIVE MODE;
 
 DO $$
 BEGIN
-    IF EXISTS (
-           SELECT 1
-             FROM default_chutefs_volume_bindings binding
-             JOIN storage_volumes volume ON volume.volume_id = binding.volume_id
-            WHERE volume.purged_at IS NULL
-               OR volume.key_shredded_at IS NULL
-       )
-       OR EXISTS (SELECT 1 FROM default_chutefs_volume_bindings)
+    IF EXISTS (SELECT 1 FROM default_chutefs_volume_bindings)
        OR EXISTS (SELECT 1 FROM chutefs_launch_sessions)
        OR EXISTS (
            SELECT 1
-             FROM launch_configs
+             FROM storage_volumes volume
+            WHERE (volume.purged_at IS NULL OR volume.key_shredded_at IS NULL)
+              AND NOT EXISTS (
+                  SELECT 1
+                    FROM default_chutefs_volume_bindings binding
+                   WHERE binding.volume_id = volume.volume_id
+              )
+       )
+       OR EXISTS (SELECT 1 FROM storage_volume_keys)
+       OR EXISTS (
+           SELECT 1
+            FROM launch_configs
             WHERE default_volume_id IS NOT NULL
                OR storage_session_exchange_allowed
-               OR completed_at IS NOT NULL
+               OR (failed_at IS NULL AND completed_at IS NULL)
        )
     THEN
         RAISE EXCEPTION

@@ -1650,6 +1650,17 @@ async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
         config_ids,
         additional_user_ids=[user_id],
     )
+    binding = (
+        await db.execute(
+            select(DefaultChuteFSVolumeBinding)
+            .where(
+                DefaultChuteFSVolumeBinding.volume_id == volume_id,
+                DefaultChuteFSVolumeBinding.user_id == user_id,
+                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
     volume = (
         await db.execute(
             select(StorageVolume)
@@ -1667,16 +1678,6 @@ async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
         volume.delete_requested_at = datetime.now(timezone.utc)
         volume.used_bytes = 0
         await db.flush()
-    binding = (
-        await db.execute(
-            select(DefaultChuteFSVolumeBinding)
-            .where(
-                DefaultChuteFSVolumeBinding.volume_id == volume_id,
-                DefaultChuteFSVolumeBinding.lifecycle_state == "active",
-            )
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
     if binding is not None:
         binding.lifecycle_state = "retired"
         binding.retired_at = datetime.now(timezone.utc)
@@ -1753,19 +1754,6 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
         additional_user_ids=[user_id],
     )
 
-    volumes = list(
-        (
-            await db.execute(
-                select(StorageVolume)
-                .where(StorageVolume.user_id == user_id)
-                .order_by(StorageVolume.volume_id)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .all()
-    )
-
     locked_configs = list(
         (
             await db.execute(
@@ -1799,6 +1787,35 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
             else []
         )
     }
+    bindings = list(
+        (
+            await db.execute(
+                select(DefaultChuteFSVolumeBinding)
+                .where(DefaultChuteFSVolumeBinding.user_id == user_id)
+                .order_by(DefaultChuteFSVolumeBinding.binding_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    active_binding_by_volume = {
+        binding.volume_id: binding
+        for binding in bindings
+        if binding.lifecycle_state == "active"
+    }
+    volumes = list(
+        (
+            await db.execute(
+                select(StorageVolume)
+                .where(StorageVolume.user_id == user_id)
+                .order_by(StorageVolume.volume_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
     now = datetime.now(timezone.utc)
     await db.execute(
         update(ChuteFSLaunchSession)
@@ -1863,20 +1880,15 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
             volume.deleted = True
             volume.delete_requested_at = now
             volume.used_bytes = 0
-        binding = (
-            await db.execute(
-                select(DefaultChuteFSVolumeBinding)
-                .where(
-                    DefaultChuteFSVolumeBinding.volume_id == volume.volume_id,
-                    DefaultChuteFSVolumeBinding.lifecycle_state == "active",
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
+            # The binding trigger validates retirement against the persisted
+            # volume deletion flag. Flush this row first; lock acquisition still
+            # follows the shared binding-before-volume order above.
+            await db.flush([volume])
+        binding = active_binding_by_volume.get(volume.volume_id)
         if binding is not None:
             binding.lifecycle_state = "retired"
             binding.retired_at = now
-        await db.flush()
+            await db.flush([binding])
         await _retire_deleted_volume_batch(
             db,
             volume,

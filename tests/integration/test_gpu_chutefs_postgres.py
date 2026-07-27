@@ -32,6 +32,8 @@ from api.instance.util import create_launch_jwt_v2
 from api.job.schemas import Job
 from api.server.schemas import (
     ChuteFSLaunchSession,
+    ChuteFSTokenKeyEpoch,
+    ChuteFSTokenKeyReplicaAck,
     DefaultChuteFSVolumeBinding,
     Server,
     StorageVolume,
@@ -40,6 +42,7 @@ from api.server.schemas import (
 from api.server.util import get_public_key_hash
 from api.server.service import delete_server
 from api.storage import launch_sessions, service
+from api.storage.startup import token_key_fingerprints, token_keyset_sha256
 from api.storage.router import issue_default_volume_grant
 from api.storage.schemas import DefaultGrantRequest
 from api.user.schemas import User
@@ -234,6 +237,36 @@ async def _install_launch_erasure_migration(db: AsyncSession) -> None:
     await db.rollback()
 
 
+async def _ensure_test_token_key_epoch(db: AsyncSession) -> str:
+    key_id = settings.chutefs_token_key_id
+    existing = await db.get(ChuteFSTokenKeyEpoch, key_id)
+    if existing is not None:
+        return key_id
+    keys = settings.chutefs_token_keys
+    replica_id = "chutefs-test-replica"
+    epoch = ChuteFSTokenKeyEpoch(
+        key_id=key_id,
+        state="staged",
+        required_replica_ids=[replica_id],
+    )
+    db.add(epoch)
+    await db.flush()
+    db.add(
+        ChuteFSTokenKeyReplicaAck(
+            replica_id=replica_id,
+            key_id=key_id,
+            key_ids=sorted(keys),
+            key_fingerprints=token_key_fingerprints(keys),
+            keyring_sha256=token_keyset_sha256(keys),
+        )
+    )
+    await db.flush()
+    epoch.state = "active"
+    epoch.activated_at = datetime.now(timezone.utc)
+    await db.commit()
+    return key_id
+
+
 async def test_timestamped_migration_applies_with_durable_constraints(pg_session):
     db, _ = pg_session
     migration = "20260724234500_gpu_chutefs_default_volume.sql"
@@ -426,6 +459,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     monkeypatch,
 ):
     db, redis = pg_session
+    await _ensure_test_token_key_epoch(db)
     chute = await _chute(db, storage_pg.USER_ID, f"session-{uuid.uuid4().hex}")
     _, cert = _identity("launch-session")
     config, instance = await _cpu_launch(
@@ -521,14 +555,20 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     )
     assert [row.generation for row in rows] == [issued.generation, rotated.generation]
     assert sum(row.revoked_at is None for row in rows) == 1
-    rows[-1].response_replay_until = datetime.now(timezone.utc) - timedelta(seconds=1)
-    await db.commit()
-    with pytest.raises(HTTPException, match="invalid, expired, replayed, or revoked"):
-        await launch_sessions.refresh_launch_storage_session(
-            db,
-            f"Bearer {issued.refresh_token}",
-            request,
+    replay_deadline = rows[-1].response_replay_until
+    assert replay_deadline is not None
+    with monkeypatch.context() as replay_time:
+        replay_time.setattr(
+            launch_sessions,
+            "_now",
+            lambda: replay_deadline + timedelta(seconds=1),
         )
+        with pytest.raises(HTTPException, match="invalid, expired, replayed, or revoked"):
+            await launch_sessions.refresh_launch_storage_session(
+                db,
+                f"Bearer {issued.refresh_token}",
+                request,
+            )
     await db.rollback()
     replay_rows = list(
         (
@@ -605,6 +645,7 @@ async def test_delayed_launch_exchange_cannot_replace_refreshed_session(
     monkeypatch,
 ):
     db, _ = pg_session
+    await _ensure_test_token_key_epoch(db)
     chute = await _chute(db, storage_pg.USER_ID, f"stale-issue-{uuid.uuid4().hex}")
     _, cert = _identity("stale-issue")
     config, instance = await _cpu_launch(
@@ -644,15 +685,21 @@ async def test_delayed_launch_exchange_cannot_replace_refreshed_session(
         launch_sessions._ACCESS_PREFIX,
     )
     issued_row = await db.get(ChuteFSLaunchSession, issued_session_id)
-    issued_row.response_replay_until = datetime.now(timezone.utc) - timedelta(seconds=1)
-    await db.commit()
-    with pytest.raises(HTTPException, match="advanced beyond this issue request"):
-        await launch_sessions.exchange_launch_token(
-            db,
-            config_id,
-            launch_token,
-            request,
+    issue_replay_deadline = issued_row.response_replay_until
+    assert issue_replay_deadline is not None
+    with monkeypatch.context() as issue_time:
+        issue_time.setattr(
+            launch_sessions,
+            "_now",
+            lambda: issue_replay_deadline + timedelta(seconds=1),
         )
+        with pytest.raises(HTTPException, match="advanced beyond this issue request"):
+            await launch_sessions.exchange_launch_token(
+                db,
+                config_id,
+                launch_token,
+                request,
+            )
     await db.rollback()
     pre_rotation_rows = list(
         (
@@ -918,6 +965,7 @@ async def test_retired_server_delete_cleans_launch_identity_and_session(
     monkeypatch,
 ):
     db, _ = pg_session
+    await _ensure_test_token_key_epoch(db)
     chute = await _chute(db, storage_pg.USER_ID, f"server-delete-{uuid.uuid4().hex}")
     _, cert = _identity("server-delete")
     server_id = f"server-delete-{uuid.uuid4().hex}"
@@ -959,6 +1007,7 @@ async def test_refresh_and_instance_disable_share_lifecycle_lock_without_deadloc
     monkeypatch,
 ):
     db, _ = pg_session
+    await _ensure_test_token_key_epoch(db)
     chute = await _chute(db, storage_pg.USER_ID, f"lock-order-{uuid.uuid4().hex}")
     _, cert = _identity("lock-order")
     config, instance = await _cpu_launch(
@@ -1041,6 +1090,7 @@ async def test_refresh_and_account_erasure_share_lock_order_without_deadlock(
     monkeypatch,
 ):
     db, _ = pg_session
+    await _ensure_test_token_key_epoch(db)
     chute = await _chute(db, storage_pg.USER_ID, f"erasure-lock-{uuid.uuid4().hex}")
     _, cert = _identity("erasure-lock")
     config, _ = await _cpu_launch(
@@ -1104,3 +1154,123 @@ async def test_refresh_and_account_erasure_share_lock_order_without_deadlock(
     assert rotated.generation == issued.generation + 1
     assert erasure["ready"] is False
     assert config_id in erasure["active_launches"]
+
+
+async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
+    db, _ = pg_session
+    key_id = await _ensure_test_token_key_epoch(db)
+    chute = await _chute(db, storage_pg.USER_ID, f"prune-{uuid.uuid4().hex}")
+    _, cert = _identity("prune-lineage")
+    config, instance = await _cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"prune-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    binding = await db.scalar(
+        select(DefaultChuteFSVolumeBinding).where(
+            DefaultChuteFSVolumeBinding.user_id == storage_pg.USER_ID,
+            DefaultChuteFSVolumeBinding.chute_id == chute.chute_id,
+            DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+        )
+    )
+    server = await db.get(Server, config.server_id)
+    now = datetime.now(timezone.utc)
+
+    def digest(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    common = {
+        "config_id": config.config_id,
+        "instance_id": instance.instance_id,
+        "binding_id": binding.binding_id,
+        "user_id": storage_pg.USER_ID,
+        "chute_id": chute.chute_id,
+        "job_id": None,
+        "compute_type": "cpu",
+        "management_mode": "platform",
+        "server_id": server.server_id,
+        "volume_id": binding.volume_id,
+        "reservation_id": None,
+        "allocation_group_id": None,
+        "allocation_group_generation": None,
+        "process_incarnation": None,
+        "attestation_id": None,
+        "attested_cert_pubkey_hash": server.attested_cert_pubkey_hash,
+        "allowed_operations": list(launch_sessions.ALLOWED_OPERATIONS),
+        "token_key_id": key_id,
+    }
+    history_ids = [f"history-{index:03d}-{uuid.uuid4().hex}" for index in range(129)]
+    for index, session_id in enumerate(history_ids, start=1):
+        db.add(
+            ChuteFSLaunchSession(
+                session_id=session_id,
+                rotated_from_session_id=None,
+                rotated_from_session_sha256=None,
+                generation=index,
+                access_token_hash=digest(f"access-{session_id}"),
+                refresh_token_hash=digest(f"refresh-{session_id}"),
+                access_expires_at=now - timedelta(hours=2),
+                refresh_expires_at=now - timedelta(hours=1),
+                rotation_request_sha256=digest(f"rotate-{session_id}"),
+                token_seed=digest(f"seed-{session_id}"),
+                response_replay_until=now - timedelta(minutes=90),
+                revoked_at=now - timedelta(hours=2),
+                **common,
+            )
+        )
+
+    active_id = f"active-{uuid.uuid4().hex}"
+    db.add(
+        ChuteFSLaunchSession(
+            session_id=active_id,
+            rotated_from_session_id=history_ids[0],
+            rotated_from_session_sha256=digest(history_ids[0]),
+            generation=130,
+            access_token_hash=digest(f"access-{active_id}"),
+            refresh_token_hash=digest(f"refresh-{active_id}"),
+            access_expires_at=now + timedelta(minutes=15),
+            refresh_expires_at=now + timedelta(hours=24),
+            rotation_request_sha256=digest(f"rotate-{active_id}"),
+            token_seed=digest(f"seed-{active_id}"),
+            response_replay_until=now + timedelta(minutes=15),
+            revoked_at=None,
+            **common,
+        )
+    )
+    await db.commit()
+
+    assert await launch_sessions._prune_expired_session_lineage(
+        db,
+        config.config_id,
+        now=now,
+    ) == 128
+    await db.commit()
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(ChuteFSLaunchSession)
+            .where(ChuteFSLaunchSession.config_id == config.config_id)
+        )
+        == 2
+    )
+    assert await db.get(ChuteFSLaunchSession, history_ids[0]) is None
+    active = await db.get(ChuteFSLaunchSession, active_id)
+    assert active.rotated_from_session_id == history_ids[0]
+    assert active.rotated_from_session_sha256 == digest(history_ids[0])
+
+    assert await launch_sessions._prune_expired_session_lineage(
+        db,
+        config.config_id,
+        now=now,
+    ) == 1
+    await db.commit()
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(ChuteFSLaunchSession)
+            .where(ChuteFSLaunchSession.config_id == config.config_id)
+        )
+        == 1
+    )

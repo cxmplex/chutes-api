@@ -4,6 +4,7 @@ Application-wide settings.
 
 import os
 import hashlib
+import hmac
 import ipaddress
 import re
 from pathlib import Path
@@ -1101,16 +1102,34 @@ class Settings(BaseSettings):
     ).hexdigest()
     chutefs_token_key_id: str = os.getenv(
         "CHUTEFS_TOKEN_KEY_ID",
-        "launch-config-key-v1",
+        "chutefs-dev-key-v1",
     )
     chutefs_token_keys_json: Optional[str] = os.getenv("CHUTEFS_TOKEN_KEYS_JSON")
+    chutefs_allow_insecure_dev_key: bool = (
+        os.getenv("CHUTEFS_ALLOW_INSECURE_DEV_KEY", "false").lower() == "true"
+    )
+    chutefs_token_replica_id: str = os.getenv(
+        "CHUTEFS_TOKEN_REPLICA_ID",
+        os.getenv("HOSTNAME", "local-dev"),
+    )
     gpu_launch_key_epoch: int = int(os.getenv("GPU_LAUNCH_KEY_EPOCH", "1"))
 
     @property
     def chutefs_token_keys(self) -> Dict[str, str]:
         """Versioned response-recovery keys retained through referenced session expiry."""
         if self.chutefs_token_keys_json is None:
-            keys = {"launch-config-key-v1": self.launch_config_key}
+            if not self.chutefs_allow_insecure_dev_key:
+                raise ValueError(
+                    "CHUTEFS_TOKEN_KEYS_JSON is required unless the dedicated "
+                    "CHUTEFS_ALLOW_INSECURE_DEV_KEY development opt-in is true"
+                )
+            # Tests and local validators receive a purpose-separated dev key. Production
+            # never derives a ChuteFS key from a default or from the launch-JWT key.
+            dev_key = hashlib.sha256(
+                b"chutes.dev.chutefs-token-key.v1\0"
+                + self.launch_config_key.encode("ascii")
+            ).hexdigest()
+            keys = {"chutefs-dev-key-v1": dev_key}
         else:
 
             def unique_keyring(pairs):
@@ -1145,6 +1164,14 @@ class Settings(BaseSettings):
                 "ChuteFS token keys must be a non-empty ASCII keyring containing "
                 "CHUTEFS_TOKEN_KEY_ID"
             )
+        if any(hmac.compare_digest(secret, self.launch_config_key) for secret in keys.values()):
+            raise ValueError("ChuteFS token keys must not reuse the launch-JWT signing key")
+        if (
+            not isinstance(self.chutefs_token_replica_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", self.chutefs_token_replica_id)
+            is None
+        ):
+            raise ValueError("CHUTEFS_TOKEN_REPLICA_ID is malformed")
         return dict(keys)
 
     # New, asymmetric launch config keys.

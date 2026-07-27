@@ -208,6 +208,10 @@ async def ready(request: Request):
             detail={"tee_measurements": trust_health},
         )
     try:
+        # Kubernetes calls readiness periodically on every serving pod. This is
+        # also the bounded per-replica acknowledgement path for epochs staged
+        # after a rolling key distribution, so activation never needs a restart.
+        await require_chutefs_token_key_retention()
         async with get_session() as session:
             await session.execute(text("SELECT 1"))
         async with get_session(readonly=True) as session:

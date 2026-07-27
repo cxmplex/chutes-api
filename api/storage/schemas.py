@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _IMMUTABLE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+_TOKEN_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_REPLICA_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MAX_INT64 = 9_223_372_036_854_775_807
 
 
@@ -308,6 +310,73 @@ class LaunchStorageExchangeResponse(BaseModel):
 
     launch_context: LaunchStorageContext
     storage_session: LaunchStorageSessionResponse
+
+
+class ChuteFSTokenKeyStageRequest(BaseModel):
+    """Stage one successor epoch for an exact set of currently serving replicas."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    key_id: str
+    required_replica_ids: List[str] = Field(..., min_length=1, max_length=256)
+
+    @field_validator("request_id")
+    @classmethod
+    def validate_request_id(cls, value: str) -> str:
+        try:
+            return str(UUID(value))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("request_id must be a canonical UUID") from exc
+
+    @field_validator("key_id")
+    @classmethod
+    def validate_key_id(cls, value: str) -> str:
+        if _TOKEN_KEY_ID_RE.fullmatch(value) is None:
+            raise ValueError("key_id is malformed")
+        return value
+
+    @field_validator("required_replica_ids")
+    @classmethod
+    def validate_replica_ids(cls, values: List[str]) -> List[str]:
+        if any(_REPLICA_ID_RE.fullmatch(value) is None for value in values):
+            raise ValueError("required_replica_ids contains a malformed replica identity")
+        if len(set(values)) != len(values):
+            raise ValueError("required_replica_ids must be unique")
+        return sorted(values)
+
+
+class ChuteFSTokenKeyTransitionRequest(BaseModel):
+    """Activate or retire one exact staged/retiring key epoch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    key_id: str
+
+    @field_validator("request_id")
+    @classmethod
+    def validate_request_id(cls, value: str) -> str:
+        return ChuteFSTokenKeyStageRequest.validate_request_id(value)
+
+    @field_validator("key_id")
+    @classmethod
+    def validate_key_id(cls, value: str) -> str:
+        return ChuteFSTokenKeyStageRequest.validate_key_id(value)
+
+
+class ChuteFSTokenKeyEpochResponse(BaseModel):
+    """Stable response persisted for exact administrator retry."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    operation: Literal["stage", "activate", "retire"]
+    key_id: str
+    predecessor_key_id: Optional[str] = None
+    state: Literal["staged", "active", "retired"]
+    active_key_id: Optional[str] = None
+    required_replica_ids: List[str] = Field(default_factory=list)
 
 
 class DefaultGrantRequest(BaseModel):
