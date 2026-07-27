@@ -35,6 +35,7 @@ from api.host.schemas import (
     canonical_sha256,
 )
 from api.host.locks import (
+    GPU_LIFECYCLE_LOCK_INFO_KEY,
     acquire_gpu_lifecycle_lock,
     assert_gpu_external_work_allowed,
 )
@@ -314,7 +315,7 @@ async def _active_gpu_release(
     from api.releases.service import ReleaseError, _validate_active_release
 
     try:
-        _validate_active_release(release)
+        _validate_active_release(release, db)
     except ReleaseError as exc:
         raise GpuAllocationError(
             f"Active GPU release failed current trust revalidation: {exc}"
@@ -336,6 +337,22 @@ async def _active_gpu_release(
     ):
         raise GpuAllocationError("Active GPU release provenance is not GPU TDX v3.")
     return release, image, provenance
+
+
+async def _preverify_active_gpu_release(db: AsyncSession, host_id: str) -> None:
+    """Verify exact detached provenance before acquiring lifecycle custody."""
+
+    from api.releases.service import (
+        ReleaseError,
+        preverify_active_gpu_release_for_host,
+    )
+
+    try:
+        await preverify_active_gpu_release_for_host(db, host_id)
+    except ReleaseError as exc:
+        raise GpuAllocationError(
+            f"Active GPU release failed current trust preverification: {exc}"
+        ) from exc
 
 
 async def _trusted_platform_workload(
@@ -1632,6 +1649,7 @@ async def reconcile_gpu_inventory(
 ) -> GpuInventoryReconcileResponseV1:
     """Reconcile signed logical-host telemetry only against signed release provenance."""
 
+    await _preverify_active_gpu_release(db, authenticated_host.host_id)
     host = await _host_lock(db, authenticated_host.host_id)
     observed_at = report.observed_at
     if observed_at.tzinfo is None:
@@ -2449,6 +2467,8 @@ async def reserve_gpu_group(
     expected_allocation_group_id: Optional[str] = None,
     expected_profile_id: Optional[str] = None,
     expected_topology_fingerprint: Optional[str] = None,
+    expected_inventory_report_id: Optional[str] = None,
+    expected_inventory_report_sha256: Optional[str] = None,
     recovery_authorization_id: Optional[str] = None,
     observed_live_storage_ids: Optional[set[str]] = None,
     trusted_platform_workload: Optional[
@@ -2462,6 +2482,12 @@ async def reserve_gpu_group(
     )
     if recovery_authorization_id is not None and management_mode != "miner":
         raise GpuAllocationError("GPU forced-recovery reclaim is miner-managed only.")
+    if (expected_inventory_report_id is None) != (
+        expected_inventory_report_sha256 is None
+    ):
+        raise GpuAllocationError(
+            "GPU reservation inventory CAS requires both report ID and digest."
+        )
     reclaim_request_sha256 = (
         _recovery_reclaim_request_sha256(recovery_authorization_id, host_id, request)
         if recovery_authorization_id is not None
@@ -2500,6 +2526,8 @@ async def reserve_gpu_group(
             "allowed_manifest_tags": [],
             "manifest_tag_digests": {},
         }
+    if not db.info.get(GPU_LIFECYCLE_LOCK_INFO_KEY):
+        await _preverify_active_gpu_release(db, host_id)
     await acquire_gpu_lifecycle_lock(db)
     if isinstance(request, GpuPlatformReservationRequestV1):
         await _assert_platform_workload_current(
@@ -2764,6 +2792,43 @@ async def reserve_gpu_group(
     )
     if group is None:
         raise GpuAllocationError("No exact matching available GPU allocation group.")
+    if reclaim_context is None:
+        current_report = (
+            await db.execute(
+                select(GpuInventoryReport)
+                .where(
+                    GpuInventoryReport.host_id == host.host_id,
+                    GpuInventoryReport.host_key_generation
+                    == host.active_key_generation,
+                    GpuInventoryReport.host_boot_generation == host.boot_generation,
+                    GpuInventoryReport.report_generation
+                    == host.gpu_inventory_report_generation,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            not _latest_gpu_inventory_matches_group(
+                host,
+                group,
+                current_report,
+                require_group_report_link=False,
+            )
+            or (
+                expected_inventory_report_id is not None
+                and (
+                    current_report is None
+                    or current_report.report_id != expected_inventory_report_id
+                    or not hmac.compare_digest(
+                        current_report.claims_sha256,
+                        expected_inventory_report_sha256 or "",
+                    )
+                )
+            )
+        ):
+            raise GpuAllocationError(
+                "GPU allocation group no longer matches the exact host-latest inventory report."
+            )
     if reclaim_context is not None:
         authorization = reclaim_context["authorization"]
         operation = reclaim_context["operation"]
@@ -3310,6 +3375,7 @@ async def claim_gpu_reservation(
     request: GpuReservationClaimRequestV1,
 ) -> GpuLaunchReservationClaimsV1:
     reservation_id, token_hash = _parse_reservation_token(request.token)
+    await _preverify_active_gpu_release(db, authenticated_host.host_id)
     host = await _host_lock(db, authenticated_host.host_id)
     release, _image, _provenance = await _active_gpu_release(db, host)
     await _expire_locked_reservations(db, host.host_id)
@@ -3363,6 +3429,7 @@ async def mark_gpu_launching(
     authenticated_host: Host,
     request: GpuReservationStateRequestV1,
 ) -> None:
+    await _preverify_active_gpu_release(db, authenticated_host.host_id)
     host = await _host_lock(db, authenticated_host.host_id)
     release, _image, _provenance = await _active_gpu_release(db, host)
     await _expire_locked_reservations(db, host.host_id)
@@ -3874,6 +3941,8 @@ async def quarantine_gpu_reservation(
 async def gpu_group_available(db: AsyncSession, host: Host) -> bool:
     if host.compute_type != "gpu" or int(host.boot_generation or 0) < 1:
         return False
+    if not db.info.get(GPU_LIFECYCLE_LOCK_INFO_KEY):
+        await _preverify_active_gpu_release(db, host.host_id)
     host = await _host_lock(db, host.host_id)
     await _active_gpu_release(db, host)
     await _expire_locked_reservations(db, host.host_id)

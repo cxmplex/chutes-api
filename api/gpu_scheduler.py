@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 from loguru import logger
-from sqlalchemy import exists, func, or_, select, text
+from sqlalchemy import and_, exists, func, or_, select, text
 from sqlalchemy.orm import joinedload
 
 import api.database.orms  # noqa: F401
@@ -26,6 +26,8 @@ from api.config import settings
 from api.database import engine, get_session
 from api.host.gpu_allocations import (
     GpuAllocationError,
+    _latest_gpu_inventory_matches_group,
+    _preverify_active_gpu_release,
     _expire_locked_reservations,
     _locked_reservation_group,
     gpu_reservation_token,
@@ -322,8 +324,20 @@ async def _candidate_groups(
     cutoff = _utcnow() - timedelta(seconds=GPU_INVENTORY_MAX_AGE_SECONDS)
     rows = (
         await session.execute(
-            select(GpuAllocationGroup, Host)
+            select(GpuAllocationGroup, Host, GpuInventoryReport)
             .join(Host, Host.host_id == GpuAllocationGroup.host_id)
+            .join(
+                GpuInventoryReport,
+                and_(
+                    GpuInventoryReport.host_id == Host.host_id,
+                    GpuInventoryReport.host_key_generation
+                    == Host.active_key_generation,
+                    GpuInventoryReport.host_boot_generation
+                    == Host.boot_generation,
+                    GpuInventoryReport.report_generation
+                    == Host.gpu_inventory_report_generation,
+                ),
+            )
             .where(
                 GpuAllocationGroup.state == "available",
                 GpuAllocationGroup.management_mode.is_(None),
@@ -350,16 +364,18 @@ async def _candidate_groups(
         )
     ).all()
     candidates = []
-    for group, host in rows:
+    for group, host, report in rows:
         if not group_matches_selector(group, selector):
             continue
-        report = await session.get(GpuInventoryReport, group.last_report_id)
+        if not _latest_gpu_inventory_matches_group(
+            host,
+            group,
+            report,
+            require_group_report_link=False,
+        ):
+            continue
         try:
-            report_claims = (
-                GpuInventoryReportV1.model_validate(report.claims)
-                if report is not None and report.reconciliation_status == "accepted"
-                else None
-            )
+            report_claims = GpuInventoryReportV1.model_validate(report.claims)
         except ValueError:
             report_claims = None
         if report_claims is None or not inventory_budget_matches(
@@ -367,7 +383,7 @@ async def _candidate_groups(
             required_disk_mib=required_disk_mib,
         ):
             continue
-        candidates.append((group, host))
+        candidates.append((group, host, report))
     return candidates
 
 
@@ -401,7 +417,7 @@ async def _place_workload(
         identifiers = sorted(
             {
                 identifier
-                for group, _host in preflight_candidates
+                for group, _host, _report in preflight_candidates
                 for identifier in set(group.gpu_identifiers or [])
             }
         )
@@ -423,10 +439,12 @@ async def _place_workload(
             host.host_id: await observe_gpu_storage_liveness(
                 preflight_session, host.host_id
             )
-            for _group, host in preflight_candidates
+            for _group, host, _report in preflight_candidates
         }
     online_host_ids = set()
-    for host_id in sorted({host.host_id for _group, host in preflight_candidates}):
+    for host_id in sorted(
+        {host.host_id for _group, host, _report in preflight_candidates}
+    ):
         assert_gpu_external_work_allowed(
             preflight_session, "GPU placement agent liveness preflight"
         )
@@ -435,6 +453,18 @@ async def _place_workload(
     if not online_host_ids:
         return False
     async with get_session() as session:
+        preverified_host_ids = set()
+        for host_id in sorted(online_host_ids):
+            try:
+                await _preverify_active_gpu_release(session, host_id)
+            except GpuAllocationError as exc:
+                logger.info(
+                    f"GPU host {host_id} failed release provenance preflight: {exc}"
+                )
+                continue
+            preverified_host_ids.add(host_id)
+        if not preverified_host_ids:
+            return False
         await acquire_gpu_workload_lock(
             session,
             chute.chute_id,
@@ -483,12 +513,12 @@ async def _place_workload(
             if locked_job is not None
             else DEFAULT_GPU_DISK_GB * 1024
         )
-        for group, host in await _candidate_groups(
+        for group, host, report in await _candidate_groups(
             session,
             selector,
             required_disk_mib=required_disk_mib,
         ):
-            if host.host_id not in online_host_ids:
+            if host.host_id not in preverified_host_ids:
                 continue
             readiness = await gpu_host_storage_readiness(
                 session,
@@ -523,6 +553,8 @@ async def _place_workload(
                     expected_allocation_group_id=group.allocation_group_id,
                     expected_profile_id=group.profile_id,
                     expected_topology_fingerprint=group.topology_fingerprint,
+                    expected_inventory_report_id=report.report_id,
+                    expected_inventory_report_sha256=report.claims_sha256,
                     observed_live_storage_ids=observed_storage_by_host.get(
                         host.host_id, set()
                     ),

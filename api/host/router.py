@@ -51,6 +51,7 @@ from api.host.reservations import (
 from api.host.gpu_allocations import (
     GpuAllocationError,
     GpuAllocationQuarantinedError,
+    _preverify_active_gpu_release,
     _trusted_platform_workload,
     claim_gpu_reservation,
     mark_gpu_launching,
@@ -542,6 +543,7 @@ async def create_platform_gpu_reservation_endpoint(
         target = (
             1 if body.job_id is not None else await _target_count(db, body.chute_id)
         )
+        await _preverify_active_gpu_release(db, host_id)
         await acquire_gpu_workload_lock(db, body.chute_id, body.job_id)
         chute = await db.get(Chute, body.chute_id)
         job = await db.get(Job, body.job_id) if body.job_id else None

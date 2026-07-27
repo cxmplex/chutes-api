@@ -8,12 +8,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from api.chute.schemas import NodeSelector
+from api.host import gpu_allocations, router as host_router, service as host_service
 from api.host.locks import GPU_LIFECYCLE_LOCK_INFO_KEY
-from api.host import router as host_router
 from api.releases import service as release_service
 from api.releases.provenance import ProvenanceError
-from api.server import router as server_router
+from api.server import router as server_router, service as server_service
 from api.storage import launch_sessions, router as storage_router, service as storage_service
+from tests.unit.test_gpu_allocations import _report
+
+import api.gpu_scheduler as gpu_scheduler
 
 with patch("ctypes.CDLL", return_value=MagicMock()):
     from api.instance import router as instance_router
@@ -280,3 +284,157 @@ def test_release_provenance_preflight_precedes_activation_locks():
     verifier_call = validator_source.rindex("verify_provenance_signature")
     assert locked_branch < verifier_call
     assert "key not in snapshot_keys or cached is None" in validator_source
+
+
+def test_gpu_release_preverification_precedes_every_lifecycle_call_site():
+    for function in (
+        gpu_allocations.reconcile_gpu_inventory,
+        gpu_allocations.claim_gpu_reservation,
+        gpu_allocations.mark_gpu_launching,
+    ):
+        source = inspect.getsource(function)
+        assert source.index("await _preverify_active_gpu_release") < source.index(
+            "await _host_lock"
+        )
+
+    reserve_source = inspect.getsource(gpu_allocations.reserve_gpu_group)
+    assert reserve_source.index("await _preverify_active_gpu_release") < (
+        reserve_source.index("await acquire_gpu_lifecycle_lock")
+    )
+    assert "GPU_LIFECYCLE_LOCK_INFO_KEY" in reserve_source
+
+    active_source = inspect.getsource(gpu_allocations._active_gpu_release)
+    assert "_validate_active_release(release, db)" in active_source
+
+    registration_source = inspect.getsource(server_service.register_gpu_server)
+    assert registration_source.index(
+        "await preverify_active_gpu_release_for_host"
+    ) < registration_source.index("await before_publish()")
+
+    platform_route_source = inspect.getsource(
+        host_router.create_platform_gpu_reservation_endpoint
+    )
+    assert platform_route_source.index(
+        "await _preverify_active_gpu_release"
+    ) < platform_route_source.index("await acquire_gpu_workload_lock")
+
+    socket_source = inspect.getsource(host_service.verify_host_socket_authentication)
+    assert socket_source.index("await _preverify_active_gpu_release") < (
+        socket_source.index("await acquire_gpu_lifecycle_lock")
+    )
+
+    scheduler_source = inspect.getsource(gpu_scheduler._place_workload)
+    assert scheduler_source.index("await _preverify_active_gpu_release") < (
+        scheduler_source.index("await acquire_gpu_workload_lock")
+    )
+
+
+class _CandidateSession:
+    def __init__(self, group, host, report):
+        self.row = (group, host, report)
+
+    async def execute(self, _statement):
+        return SimpleNamespace(all=lambda: [self.row])
+
+    async def get(self, *_args, **_kwargs):
+        raise AssertionError("scheduler must not load stale group.last_report_id")
+
+
+def _scheduler_inventory_state(report):
+    inventory_group = report.groups[0]
+    group = SimpleNamespace(
+        allocation_group_id="group-1",
+        state="available",
+        management_mode=None,
+        reservation_id=None,
+        gpu_count=len(inventory_group.devices),
+        vram_mib=min(device.vram_mib for device in inventory_group.devices),
+        gpu_identifiers=[device.gpu_identifier for device in inventory_group.devices],
+        model=inventory_group.model,
+        profile_id=inventory_group.reported_profile_id,
+        topology_fingerprint=inventory_group.topology_fingerprint,
+        gpu_bdfs=[device.bdf for device in inventory_group.devices],
+        gpu_uuids=[device.uuid for device in inventory_group.devices],
+        gpu_attestation_certificate_sha256s=[
+            device.attestation_certificate_sha256 for device in inventory_group.devices
+        ],
+        gpu_release_id=report.gpu_release_id,
+        profile_contract_sha256=report.profile_contract_sha256,
+        last_report_id="report-r1",
+    )
+    host = SimpleNamespace(
+        host_id=report.host_id,
+        active_key_generation=report.host_key_generation,
+        boot_generation=report.host_boot_generation,
+        boot_id=report.host_boot_id,
+        gpu_inventory_report_generation=report.report_generation,
+    )
+    report_row = SimpleNamespace(
+        report_id=report.report_id,
+        claims=report.model_dump(mode="json"),
+        claims_sha256=gpu_allocations.canonical_sha256(report),
+        reconciliation_status="accepted",
+        host_id=report.host_id,
+        host_key_generation=report.host_key_generation,
+        host_boot_generation=report.host_boot_generation,
+        report_generation=report.report_generation,
+        topology_fingerprint=inventory_group.topology_fingerprint,
+    )
+    return group, host, report_row
+
+
+@pytest.mark.asyncio
+async def test_scheduler_uses_host_latest_r2_capacity_after_reset():
+    base = _report()
+    current = base.model_copy(
+        update={"report_id": "report-r2", "report_generation": 2}
+    )
+    group, host, report_row = _scheduler_inventory_state(current)
+    selector = NodeSelector(
+        compute_type="gpu",
+        gpu_count=len(current.groups[0].devices),
+        min_vram_gb_per_gpu=16,
+        include=["b200"],
+    )
+
+    assert not gpu_allocations._latest_gpu_inventory_matches_group(
+        host, group, report_row
+    )
+    assert gpu_allocations._latest_gpu_inventory_matches_group(
+        host,
+        group,
+        report_row,
+        require_group_report_link=False,
+    )
+    candidates = await gpu_scheduler._candidate_groups(
+        _CandidateSession(group, host, report_row),
+        selector,
+        required_disk_mib=10 * 1024,
+    )
+    assert candidates == [(group, host, report_row)]
+
+    reduced = current.model_copy(
+        update={
+            "resources": current.resources.model_copy(
+                update={"gpu_scratch_disk_mib": 10 * 1024 - 1}
+            )
+        }
+    )
+    reduced_group, reduced_host, reduced_row = _scheduler_inventory_state(reduced)
+    assert await gpu_scheduler._candidate_groups(
+        _CandidateSession(reduced_group, reduced_host, reduced_row),
+        selector,
+        required_disk_mib=10 * 1024,
+    ) == []
+
+
+def test_scheduler_carries_latest_report_into_locked_reservation_cas():
+    scheduler_source = inspect.getsource(gpu_scheduler._place_workload)
+    assert "expected_inventory_report_id=report.report_id" in scheduler_source
+    assert "expected_inventory_report_sha256=report.claims_sha256" in scheduler_source
+
+    reserve_source = inspect.getsource(gpu_allocations.reserve_gpu_group)
+    assert "GpuInventoryReport.report_generation" in reserve_source
+    assert "require_group_report_link=False" in reserve_source
+    assert "current_report.report_id != expected_inventory_report_id" in reserve_source
+    assert "current_report.claims_sha256" in reserve_source

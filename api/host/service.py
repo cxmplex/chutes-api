@@ -787,11 +787,13 @@ async def verify_host_socket_authentication(
         raise HostAuthError("Host socket challenge does not match the authentication.")
     observed_live_storage_ids = None
     if isinstance(authentication, HostSocketAuthenticationV2):
+        from api.host.gpu_allocations import _preverify_active_gpu_release
         from api.host.reservations import observe_gpu_storage_liveness
 
         observed_live_storage_ids = await observe_gpu_storage_liveness(
             db, authentication.host_id
         )
+        await _preverify_active_gpu_release(db, authentication.host_id)
     await acquire_gpu_lifecycle_lock(db)
     host = (
         await db.execute(

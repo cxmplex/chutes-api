@@ -1975,6 +1975,21 @@ async def register_gpu_server(
         getattr(verification_result, "revocation_status", {}) or {}
     )
 
+    from api.releases.service import (
+        ReleaseError,
+        preverify_active_gpu_release_for_host,
+    )
+
+    try:
+        await preverify_active_gpu_release_for_host(
+            db,
+            args.quote_commitment.claims.host_id,
+        )
+    except ReleaseError as exc:
+        raise ServerRegistrationError(
+            f"GPU release provenance preverification failed: {exc}"
+        ) from exc
+
     # Registration V2 supplies a lease-owner CAS callback. It reacquires the
     # lifecycle transaction and validates the persisted immutable request after
     # external quote/NVIDIA work but before any server/reservation publication.
