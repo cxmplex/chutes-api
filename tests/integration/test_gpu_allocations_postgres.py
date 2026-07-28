@@ -143,6 +143,8 @@ from api.server.service import (
     process_runtime_attestation,
 )
 from api.server.schemas import (
+    ChuteFSTokenKeyEpoch,
+    ChuteFSTokenKeyReplicaAck,
     DefaultChuteFSVolumeBinding,
     GpuInfraCustody,
     GpuLegacyCloseRequestV1,
@@ -168,6 +170,7 @@ from api.server.gpu_infra import (
     lease_gpu_infra,
 )
 from api.storage import launch_sessions
+from api.storage.startup import token_key_fingerprints, token_keyset_sha256
 from api.server.schemas import (
     GpuInfraAcknowledgeRequestV1,
     GpuInfraConfirmRequestV1,
@@ -328,6 +331,28 @@ async def postgres_schema():
         await connection.run_sync(Base.metadata.create_all)
     sessions = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with sessions() as session:
+        key_id = settings.chutefs_token_key_id
+        keys = settings.chutefs_token_keys
+        replica_id = "gpu-allocation-test-replica"
+        epoch = ChuteFSTokenKeyEpoch(
+            key_id=key_id,
+            state="staged",
+            required_replica_ids=[replica_id],
+        )
+        session.add(epoch)
+        await session.flush()
+        session.add(
+            ChuteFSTokenKeyReplicaAck(
+                replica_id=replica_id,
+                key_id=key_id,
+                key_ids=sorted(keys),
+                key_fingerprints=token_key_fingerprints(keys),
+                keyring_sha256=token_keyset_sha256(keys),
+            )
+        )
+        await session.flush()
+        epoch.state = "active"
+        epoch.activated_at = datetime.now(timezone.utc)
         await ensure_gpu_registration_recovery_key_authority(session)
         await session.commit()
     try:
