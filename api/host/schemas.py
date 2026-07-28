@@ -2675,7 +2675,11 @@ class RegistrySession(Base):
     scope_id = Column(String, nullable=False)
     launch_config_id = Column(
         String,
-        ForeignKey("launch_configs.config_id", ondelete="CASCADE"),
+        ForeignKey(
+            "launch_configs.config_id",
+            name="fk_registry_session_launch_config",
+            ondelete="CASCADE",
+        ),
         nullable=True,
     )
     attested_cert_pubkey_hash = Column(String(64), nullable=False)
