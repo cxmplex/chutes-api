@@ -3,6 +3,7 @@ Unit tests for api/server/util module.
 Tests TDX quote parsing, validation, and utility functions.
 """
 
+import asyncio
 import base64
 import json
 import pytest
@@ -31,6 +32,7 @@ from api.server.quote import (
     TdxVerificationResult,
 )
 from api.server.exceptions import (
+    AttestationVerifierUnavailableError,
     InvalidQuoteError,
     InvalidSignatureError,
     MeasurementMismatchError,
@@ -766,6 +768,26 @@ async def test_verify_quote_signature_success(sample_boot_quote):
         assert args[0] == sample_boot_quote.raw_bytes
         assert args[1] is mock_collateral
         assert args[2] == INTEL_SGX_ROOT_CA_DER
+
+
+@pytest.mark.asyncio
+async def test_verify_quote_signature_classifies_collateral_timeout_as_unavailable(
+    sample_boot_quote,
+):
+    verifier = Mock()
+    with (
+        patch(
+            "api.server.util.get_collateral",
+            new_callable=AsyncMock,
+            side_effect=asyncio.TimeoutError,
+        ),
+        patch("api.server.util.verify_with_root_ca", verifier),
+    ):
+        with pytest.raises(AttestationVerifierUnavailableError) as unavailable:
+            await verify_quote_signature(sample_boot_quote)
+
+    assert unavailable.value.status_code == 503
+    verifier.assert_not_called()
 
 
 @pytest.mark.asyncio

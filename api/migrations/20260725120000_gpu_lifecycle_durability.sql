@@ -607,7 +607,16 @@ CREATE TABLE IF NOT EXISTS gpu_registration_conflicts (
     state VARCHAR NOT NULL DEFAULT 'recorded',
     processing_lease_owner VARCHAR,
     processing_lease_expires_at TIMESTAMPTZ,
+    verification_attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ DEFAULT NOW(),
+    last_attempt_at TIMESTAMPTZ,
+    last_transient_error_code VARCHAR,
+    last_transient_error_detail TEXT,
+    last_transient_error_at TIMESTAMPTZ,
     verification_detail TEXT,
+    fence_state VARCHAR,
+    fence_operation_id VARCHAR,
+    fence_recorded_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     verified_at TIMESTAMPTZ,
     CONSTRAINT uq_gpu_registration_conflict UNIQUE (
@@ -630,22 +639,55 @@ CREATE TABLE IF NOT EXISTS gpu_registration_conflicts (
         (processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL)
         OR (processing_lease_owner IS NOT NULL AND processing_lease_expires_at IS NOT NULL)
     ),
+    CONSTRAINT ck_gpu_registration_conflict_retry_audit CHECK (
+        verification_attempt_count >= 0
+        AND ((last_transient_error_code IS NULL
+              AND last_transient_error_detail IS NULL
+              AND last_transient_error_at IS NULL)
+             OR (last_transient_error_code IS NOT NULL
+                 AND last_transient_error_detail IS NOT NULL
+                 AND last_transient_error_at IS NOT NULL))
+    ),
     CONSTRAINT ck_gpu_registration_conflict_shape CHECK (
         (state = 'recorded' AND request_payload_ciphertext IS NOT NULL
          AND request_payload_key_id IS NOT NULL
          AND processing_lease_owner IS NULL
          AND processing_lease_expires_at IS NULL AND verified_at IS NULL
-         AND verification_detail IS NULL)
+         AND verification_detail IS NULL AND next_attempt_at IS NOT NULL
+         AND fence_state IS NULL AND fence_operation_id IS NULL
+         AND fence_recorded_at IS NULL)
         OR (state = 'verifying' AND request_payload_ciphertext IS NOT NULL
             AND request_payload_key_id IS NOT NULL
             AND processing_lease_owner IS NOT NULL
-            AND processing_lease_expires_at IS NOT NULL AND verified_at IS NULL)
-        OR (state IN ('invalid', 'verified_competitor', 'dismissed')
+            AND processing_lease_expires_at IS NOT NULL AND verified_at IS NULL
+            AND verification_attempt_count > 0 AND last_attempt_at IS NOT NULL
+            AND next_attempt_at IS NULL AND verification_detail IS NULL
+            AND fence_state IS NULL AND fence_operation_id IS NULL
+            AND fence_recorded_at IS NULL)
+        OR (state IN ('invalid', 'dismissed')
             AND processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL
             AND request_payload_ciphertext IS NULL AND request_payload_key_id IS NULL
-            AND verified_at IS NOT NULL AND verification_detail IS NOT NULL)
+            AND verified_at IS NOT NULL AND verification_detail IS NOT NULL
+            AND next_attempt_at IS NULL
+            AND fence_state IS NULL AND fence_operation_id IS NULL
+            AND fence_recorded_at IS NULL)
+        OR (state = 'verified_competitor'
+            AND processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL
+            AND request_payload_ciphertext IS NULL AND request_payload_key_id IS NULL
+            AND verified_at IS NOT NULL AND verification_detail IS NOT NULL
+            AND next_attempt_at IS NULL
+            AND ((fence_state = 'pending' AND fence_operation_id IS NULL
+                  AND fence_recorded_at IS NULL)
+                 OR (fence_state = 'requested' AND fence_operation_id IS NOT NULL
+                     AND fence_recorded_at IS NOT NULL)
+                 OR (fence_state = 'custody_ended' AND fence_operation_id IS NULL
+                     AND fence_recorded_at IS NOT NULL)))
     )
 );
+CREATE INDEX IF NOT EXISTS idx_gpu_registration_conflict_due
+    ON gpu_registration_conflicts(state, next_attempt_at, processing_lease_expires_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_gpu_registration_conflict_fence
+    ON gpu_registration_conflicts(state, fence_state, verified_at);
 
 -- A create_all-first schema from an older binary can already contain these
 -- tables without epoch foreign keys. Never invent a fingerprint for existing

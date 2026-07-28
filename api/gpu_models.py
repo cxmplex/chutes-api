@@ -252,7 +252,20 @@ class GpuRegistrationConflict(Base):
     )
     processing_lease_owner = Column(String, nullable=True)
     processing_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
+    verification_attempt_count = Column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    next_attempt_at = Column(
+        DateTime(timezone=True), nullable=True, server_default=func.now()
+    )
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_transient_error_code = Column(String, nullable=True)
+    last_transient_error_detail = Column(Text, nullable=True)
+    last_transient_error_at = Column(DateTime(timezone=True), nullable=True)
     verification_detail = Column(Text, nullable=True)
+    fence_state = Column(String, nullable=True)
+    fence_operation_id = Column(String, nullable=True)
+    fence_recorded_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -287,22 +300,63 @@ class GpuRegistrationConflict(Base):
             name="ck_gpu_registration_conflict_lease",
         ),
         CheckConstraint(
+            "verification_attempt_count >= 0 AND ((last_transient_error_code IS NULL "
+            "AND last_transient_error_detail IS NULL AND last_transient_error_at IS NULL) "
+            "OR (last_transient_error_code IS NOT NULL "
+            "AND last_transient_error_detail IS NOT NULL "
+            "AND last_transient_error_at IS NOT NULL))",
+            name="ck_gpu_registration_conflict_retry_audit",
+        ),
+        CheckConstraint(
             "(state = 'recorded' AND request_payload_ciphertext IS NOT NULL "
             "AND request_payload_key_id IS NOT NULL "
             "AND processing_lease_owner IS NULL "
             "AND processing_lease_expires_at IS NULL AND verified_at IS NULL "
-            "AND verification_detail IS NULL) OR "
+            "AND verification_detail IS NULL AND next_attempt_at IS NOT NULL "
+            "AND fence_state IS NULL AND fence_operation_id IS NULL "
+            "AND fence_recorded_at IS NULL) OR "
             "(state = 'verifying' AND request_payload_ciphertext IS NOT NULL "
             "AND request_payload_key_id IS NOT NULL "
             "AND processing_lease_owner IS NOT NULL "
-            "AND processing_lease_expires_at IS NOT NULL AND verified_at IS NULL) OR "
-            "(state IN ('invalid', 'verified_competitor', 'dismissed') "
+            "AND processing_lease_expires_at IS NOT NULL AND verified_at IS NULL "
+            "AND verification_attempt_count > 0 AND last_attempt_at IS NOT NULL "
+            "AND next_attempt_at IS NULL AND verification_detail IS NULL "
+            "AND fence_state IS NULL AND fence_operation_id IS NULL "
+            "AND fence_recorded_at IS NULL) OR "
+            "(state IN ('invalid', 'dismissed') "
             "AND processing_lease_owner IS NULL "
             "AND processing_lease_expires_at IS NULL AND verified_at IS NOT NULL "
             "AND request_payload_ciphertext IS NULL "
             "AND request_payload_key_id IS NULL "
-            "AND verification_detail IS NOT NULL)",
+            "AND next_attempt_at IS NULL AND verification_detail IS NOT NULL "
+            "AND fence_state IS NULL AND fence_operation_id IS NULL "
+            "AND fence_recorded_at IS NULL) OR "
+            "(state = 'verified_competitor' "
+            "AND processing_lease_owner IS NULL "
+            "AND processing_lease_expires_at IS NULL AND verified_at IS NOT NULL "
+            "AND request_payload_ciphertext IS NULL "
+            "AND request_payload_key_id IS NULL "
+            "AND next_attempt_at IS NULL AND verification_detail IS NOT NULL "
+            "AND ((fence_state = 'pending' AND fence_operation_id IS NULL "
+            "AND fence_recorded_at IS NULL) OR "
+            "(fence_state = 'requested' AND fence_operation_id IS NOT NULL "
+            "AND fence_recorded_at IS NOT NULL) OR "
+            "(fence_state = 'custody_ended' AND fence_operation_id IS NULL "
+            "AND fence_recorded_at IS NOT NULL)))",
             name="ck_gpu_registration_conflict_shape",
+        ),
+        Index(
+            "idx_gpu_registration_conflict_due",
+            "state",
+            "next_attempt_at",
+            "processing_lease_expires_at",
+            "created_at",
+        ),
+        Index(
+            "idx_gpu_registration_conflict_fence",
+            "state",
+            "fence_state",
+            "verified_at",
         ),
     )
 

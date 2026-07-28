@@ -75,6 +75,7 @@ from api.gpu_registration_service import (
     _verify_recorded_conflict,
     cleanup_expired_gpu_registration_nonces,
     process_gpu_registration,
+    reconcile_gpu_registration_conflicts,
     registration_attempt_response,
 )
 from api.gpu_registration_keys import (
@@ -126,7 +127,11 @@ from api.host.service import (
     revoke_host_credentials,
 )
 from api.node.schemas import Node
-from api.server.exceptions import InvalidGpuEvidenceError, InvalidQuoteError
+from api.server.exceptions import (
+    AttestationVerifierUnavailableError,
+    InvalidGpuEvidenceError,
+    InvalidQuoteError,
+)
 from api.server.gpu_sessions import (
     latest_gpu_runtime_session,
     require_completed_gpu_registration,
@@ -696,6 +701,23 @@ async def test_gpu_allocation_migration_round_trip(postgres_schema):
             column.name for column in ServerAttestation.__table__.columns
         }
         assert "gpu_retired_at" in columns
+        conflict_columns = set(
+            (
+                await session.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = :schema "
+                        "AND table_name = 'gpu_registration_conflicts'"
+                    ),
+                    {"schema": schema},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert conflict_columns == {
+            column.name for column in GpuRegistrationConflict.__table__.columns
+        }
 
 
 async def test_concurrent_double_reservation_has_one_winner(postgres_schema):
@@ -5633,6 +5655,50 @@ def _registration_competitor(
     )
 
 
+async def _prepare_registration_conflict(session, *, suffix: str):
+    response, primary, primary_cert, primary_spki = (
+        await _prepare_registration_request(session, "miner")
+    )
+    attempt, lease_owner, conflict = await _claim_attempt(
+        session,
+        "192.0.2.30",
+        primary,
+        primary_spki,
+        primary_cert,
+    )
+    assert lease_owner is not None
+    assert conflict is None
+    competitor_spki = "d" * 64
+    competitor_cert = f"fixture-miner-{suffix}-competitor-certificate"
+    competitor = _registration_competitor(
+        primary,
+        spki_sha256=competitor_spki,
+        suffix=suffix,
+    )
+    replay_attempt, replay_lease, conflict = await _claim_attempt(
+        session,
+        "192.0.2.30",
+        competitor,
+        competitor_spki,
+        competitor_cert,
+    )
+    assert replay_attempt.attempt_id == attempt.attempt_id
+    assert replay_lease is None
+    assert conflict is not None
+    return (
+        response,
+        primary,
+        primary_cert,
+        primary_spki,
+        attempt,
+        lease_owner,
+        competitor,
+        competitor_cert,
+        competitor_spki,
+        conflict,
+    )
+
+
 async def _publish_completed_registration_fixture(
     session,
     response,
@@ -5764,6 +5830,40 @@ async def _publish_completed_registration_fixture(
         "verified_at": now.isoformat(),
         "status": "registered",
     }
+
+
+async def _persist_completed_attempt_without_conflict_scan(
+    session,
+    attempt: GpuRegistrationAttempt,
+    result: dict,
+) -> None:
+    """Persist the crash/upgrade frontier recovered by the conflict reconciler."""
+
+    now = datetime.now(timezone.utc)
+    registration_id = f"recovered-{attempt.attempt_id}"
+    stable = {
+        key: value
+        for key, value in result.items()
+        if key not in {"runtime_session", "runtime_session_expires_at"}
+    }
+    stable["registration_id"] = registration_id
+    attempt.state = "completed"
+    attempt.registration_id = registration_id
+    attempt.attestation_id = result["attestation_id"]
+    attempt.stable_response = stable
+    attempt.stable_response_sha256 = canonical_sha256(stable)
+    attempt.response_ready_at = now
+    attempt.registration_replay_until = now + timedelta(minutes=15)
+    attempt.processing_lease_owner = None
+    attempt.processing_lease_expires_at = None
+    attempt.request_payload_ciphertext = None
+    attempt.request_payload_key_id = None
+    attempt.completed_at = now
+    attempt.updated_at = now
+    nonce = await session.get(GpuRegistrationNonce, attempt.nonce_id)
+    nonce.state = "expired"
+    nonce.nonce_value = None
+    await session.flush()
 
 
 @pytest.mark.parametrize("mode", ["platform", "miner"])
@@ -6981,6 +7081,280 @@ async def test_valid_cross_certificate_competitor_after_completion_fences(
         )
 
 
+async def test_registration_conflict_transient_verifier_failure_retries_same_row(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        (
+            _response,
+            _primary,
+            _primary_cert,
+            _primary_spki,
+            _attempt,
+            _lease_owner,
+            competitor,
+            competitor_cert,
+            competitor_spki,
+            conflict,
+        ) = await _prepare_registration_conflict(session, suffix="transient")
+        conflict_id = conflict.conflict_id
+        ciphertext = conflict.request_payload_ciphertext
+        key_id = conflict.request_payload_key_id
+        with patch(
+            "api.gpu_registration_service.verify_gpu_registration_evidence",
+            AsyncMock(
+                side_effect=AttestationVerifierUnavailableError(
+                    "collateral temporarily unavailable"
+                )
+            ),
+        ):
+            state = await _verify_recorded_conflict(
+                session,
+                conflict,
+                competitor,
+                competitor_spki,
+                competitor_cert,
+            )
+        assert state == "recorded"
+        await session.refresh(conflict)
+        assert conflict.conflict_id == conflict_id
+        assert conflict.verification_attempt_count == 1
+        assert conflict.last_attempt_at is not None
+        assert conflict.next_attempt_at > conflict.last_attempt_at
+        assert (
+            conflict.last_transient_error_code
+            == "AttestationVerifierUnavailableError"
+        )
+        assert conflict.request_payload_ciphertext == ciphertext
+        assert conflict.request_payload_key_id == key_id
+        conflict.next_attempt_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await session.commit()
+
+    @asynccontextmanager
+    async def scoped_session():
+        async with sessions() as session:
+            yield session
+
+    with (
+        patch("api.gpu_registration_service.get_session", scoped_session),
+        patch(
+            "api.gpu_registration_service.verify_gpu_registration_evidence",
+            AsyncMock(return_value=(object(), object(), _verified_gpu_subset(1, 2))),
+        ),
+    ):
+        assert await reconcile_gpu_registration_conflicts() == 1
+
+    async with sessions() as session:
+        conflict = await session.get(GpuRegistrationConflict, conflict_id)
+        assert conflict.state == "verified_competitor"
+        assert conflict.verification_attempt_count == 2
+        assert conflict.fence_state == "pending"
+        assert conflict.request_payload_ciphertext is None
+        assert conflict.request_payload_key_id is None
+
+
+async def test_verified_conflict_fences_after_primary_completion_without_client_retry(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        (
+            response,
+            primary,
+            primary_cert,
+            primary_spki,
+            attempt,
+            _lease_owner,
+            competitor,
+            competitor_cert,
+            competitor_spki,
+            conflict,
+        ) = await _prepare_registration_conflict(session, suffix="no-client-retry")
+        with patch(
+            "api.gpu_registration_service.verify_gpu_registration_evidence",
+            AsyncMock(return_value=(object(), object(), _verified_gpu_subset(1, 2))),
+        ):
+            assert (
+                await _verify_recorded_conflict(
+                    session,
+                    conflict,
+                    competitor,
+                    competitor_spki,
+                    competitor_cert,
+                )
+                == "verified_competitor"
+            )
+        assert conflict.fence_state == "pending"
+        result = await _publish_completed_registration_fixture(
+            session,
+            response,
+            primary,
+            primary_cert,
+            primary_spki,
+        )
+        await _persist_completed_attempt_without_conflict_scan(
+            session,
+            attempt,
+            result,
+        )
+        conflict_id = conflict.conflict_id
+        reservation_id = response.claims.reservation_id
+        await session.commit()
+
+    @asynccontextmanager
+    async def scoped_session():
+        async with sessions() as session:
+            yield session
+
+    with patch("api.gpu_registration_service.get_session", scoped_session):
+        assert await reconcile_gpu_registration_conflicts() == 1
+
+    async with sessions() as session:
+        conflict = await session.get(GpuRegistrationConflict, conflict_id)
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            reservation_id,
+        )
+        group = await session.get(
+            GpuAllocationGroup,
+            response.claims.allocation_group_id,
+        )
+        assert conflict.state == "verified_competitor"
+        assert conflict.fence_state == "requested"
+        assert conflict.fence_operation_id is not None
+        assert conflict.fence_recorded_at is not None
+        assert reservation.state == group.state == "resetting"
+
+
+async def test_recorded_conflict_verification_outlives_response_replay_window(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        (
+            response,
+            primary,
+            primary_cert,
+            primary_spki,
+            attempt,
+            lease_owner,
+            competitor,
+            competitor_cert,
+            competitor_spki,
+            conflict,
+        ) = await _prepare_registration_conflict(session, suffix="expired-replay")
+        result = await _publish_completed_registration_fixture(
+            session,
+            response,
+            primary,
+            primary_cert,
+            primary_spki,
+        )
+        completed = await _complete_attempt(
+            session,
+            attempt.attempt_id,
+            lease_owner,
+            result,
+        )
+        now = datetime.now(timezone.utc)
+        completed.completed_at = now - timedelta(minutes=30)
+        completed.response_ready_at = now - timedelta(minutes=29)
+        completed.registration_replay_until = now - timedelta(minutes=5)
+        await session.commit()
+
+        with patch(
+            "api.gpu_registration_service.verify_gpu_registration_evidence",
+            AsyncMock(return_value=(object(), object(), _verified_gpu_subset(1, 2))),
+        ):
+            state = await _verify_recorded_conflict(
+                session,
+                conflict,
+                competitor,
+                competitor_spki,
+                competitor_cert,
+            )
+        assert state == "verified_competitor"
+        await session.refresh(conflict)
+        assert conflict.fence_state == "requested"
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            response.claims.reservation_id,
+        )
+        assert reservation.state == "resetting"
+
+
+async def test_primary_verifier_outage_preserves_processing_attempt_for_lease_resume(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        _response, request, cert_pem, spki_sha256 = (
+            await _prepare_registration_request(session, "miner")
+        )
+        attempt, lease_owner, conflict = await _claim_attempt(
+            session,
+            "192.0.2.30",
+            request,
+            spki_sha256,
+            cert_pem,
+        )
+        assert lease_owner is not None
+        assert conflict is None
+        attempt_id = attempt.attempt_id
+        ciphertext = attempt.request_payload_ciphertext
+        key_id = attempt.request_payload_key_id
+        lease_expiry = attempt.processing_lease_expires_at
+        await session.commit()
+        with patch(
+            "api.gpu_registration_service.register_gpu_server",
+            AsyncMock(
+                side_effect=AttestationVerifierUnavailableError(
+                    "collateral temporarily unavailable"
+                )
+            ),
+        ):
+            with pytest.raises(AttestationVerifierUnavailableError) as unavailable:
+                await _run_registration_attempt(
+                    session,
+                    attempt_id,
+                    lease_owner,
+                    spki_sha256,
+                )
+        assert unavailable.value.status_code == 503
+
+    async with sessions() as session:
+        attempt = await session.get(GpuRegistrationAttempt, attempt_id)
+        assert attempt.state == "processing"
+        assert attempt.processing_lease_owner == lease_owner
+        assert attempt.processing_lease_expires_at == lease_expiry
+        assert attempt.request_payload_ciphertext == ciphertext
+        assert attempt.request_payload_key_id == key_id
+        assert attempt.failure_code is None
+        attempt.processing_lease_expires_at = datetime.now(timezone.utc) - timedelta(
+            seconds=1
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        resumed, resumed_lease, resumed_conflict = await _claim_attempt(
+            session,
+            "192.0.2.30",
+            request,
+            spki_sha256,
+            cert_pem,
+        )
+        assert resumed.attempt_id == attempt_id
+        assert resumed_lease is not None
+        assert resumed_lease != lease_owner
+        assert resumed_conflict is None
+        assert resumed.request_payload_ciphertext == ciphertext
+
+
 async def test_hotplug_dispatch_refuses_quarantined_custody_without_send(
     postgres_schema,
 ):
@@ -7424,7 +7798,7 @@ async def test_verified_registration_conflict_cannot_fence_changed_lineage(
                 spki_sha256,
                 cert_pem,
             )
-        assert result == "invalid"
+        assert result == "dismissed"
 
     async with sessions() as session:
         conflict = await session.get(
@@ -7434,7 +7808,10 @@ async def test_verified_registration_conflict_cannot_fence_changed_lineage(
             gpu_allocations.GpuLaunchReservation, claims.reservation_id
         )
         group = await session.get(GpuAllocationGroup, claims.allocation_group_id)
-        assert conflict.state == "invalid"
+        assert conflict.state == "dismissed"
+        assert conflict.verification_detail == (
+            "registration custody ended before conflict verification completed"
+        )
         assert reservation.state == "launching"
         assert reservation.quarantined_at is None
         assert group.state == "launching"

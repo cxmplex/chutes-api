@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import secrets
@@ -15,7 +16,7 @@ from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.database import generate_uuid
+from api.database import generate_uuid, get_session
 from api.gpu_contracts import (
     GpuRegistrationNonceRequestV2,
     GpuRegistrationNonceV2,
@@ -51,7 +52,16 @@ from api.host.schemas import (
 )
 from api.server.exceptions import (
     AttestationError,
+    AttestationVerifierUnavailableError,
+    GetEvidenceError,
+    GpuEvidenceError,
+    InvalidClientCertError,
     InvalidGpuEvidenceError,
+    InvalidQuoteError,
+    InvalidSignatureError,
+    InvalidTdxConfiguration,
+    MeasurementMismatchError,
+    NonceError,
     ServerRegistrationError,
 )
 from api.server.schemas import Host, Server, ServerAttestation
@@ -66,6 +76,10 @@ from api.server.util import get_nonce_expiry_seconds
 _PROCESSING_LEASE_SECONDS = 90
 _REPLAY_SECONDS = 15 * 60
 _RETRY_AFTER_SECONDS = 2
+_CONFLICT_RETRY_BASE_SECONDS = 2
+_CONFLICT_RETRY_CAP_SECONDS = 5 * 60
+_CONFLICT_VERIFY_TIMEOUT_SECONDS = 60
+_CONFLICT_RECONCILE_LIMIT = 1
 
 
 class GpuRegistrationLeaseLost(RuntimeError):
@@ -259,6 +273,129 @@ def _conflict_audit_matches(
     )
 
 
+def _conflict_retry_delay_seconds(conflict_id: str, attempt_count: int) -> int:
+    """Return deterministic bounded exponential backoff with per-row jitter."""
+
+    exponent = min(max(attempt_count - 1, 0), 8)
+    base = min(
+        _CONFLICT_RETRY_CAP_SECONDS,
+        _CONFLICT_RETRY_BASE_SECONDS * (2**exponent),
+    )
+    jitter_window = min(max(base // 4, 1), 30)
+    jitter = int.from_bytes(
+        hashlib.sha256(f"{conflict_id}:{attempt_count}".encode("ascii")).digest()[:4],
+        "big",
+    ) % (jitter_window + 1)
+    return min(_CONFLICT_RETRY_CAP_SECONDS, base + jitter)
+
+
+def _conflict_retry_after_seconds(
+    conflict: GpuRegistrationConflict,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    if conflict.state == "verifying":
+        deadline = conflict.processing_lease_expires_at
+    elif conflict.state == "recorded":
+        deadline = conflict.next_attempt_at
+    else:
+        return None
+    if deadline is None:
+        return _RETRY_AFTER_SECONDS
+    seconds = int((deadline - (now or _now())).total_seconds())
+    return max(1, min(seconds + 1, _CONFLICT_RETRY_CAP_SECONDS))
+
+
+def _schedule_conflict_retry(
+    conflict: GpuRegistrationConflict,
+    *,
+    now: datetime,
+    code: str,
+    detail: str,
+    increment_attempt: bool,
+) -> None:
+    if increment_attempt:
+        conflict.verification_attempt_count += 1
+        conflict.last_attempt_at = now
+    conflict.state = "recorded"
+    conflict.processing_lease_owner = None
+    conflict.processing_lease_expires_at = None
+    conflict.next_attempt_at = now + timedelta(
+        seconds=_conflict_retry_delay_seconds(
+            conflict.conflict_id,
+            conflict.verification_attempt_count,
+        )
+    )
+    conflict.last_transient_error_code = code[:128]
+    conflict.last_transient_error_detail = detail[:2000]
+    conflict.last_transient_error_at = now
+    conflict.verification_detail = None
+    conflict.verified_at = None
+    conflict.fence_state = None
+    conflict.fence_operation_id = None
+    conflict.fence_recorded_at = None
+
+
+def _terminalize_conflict(
+    conflict: GpuRegistrationConflict,
+    *,
+    state: str,
+    detail: str,
+    now: datetime,
+) -> None:
+    conflict.state = state
+    conflict.processing_lease_owner = None
+    conflict.processing_lease_expires_at = None
+    conflict.next_attempt_at = None
+    conflict.verification_detail = detail[:2000]
+    conflict.verified_at = now
+    if state == "verified_competitor":
+        conflict.fence_state = "pending"
+        conflict.fence_operation_id = None
+        conflict.fence_recorded_at = None
+    else:
+        conflict.fence_state = None
+        conflict.fence_operation_id = None
+        conflict.fence_recorded_at = None
+    _scrub_conflict_request(conflict)
+
+
+_DETERMINISTIC_CONFLICT_ERRORS = (
+    InvalidClientCertError,
+    InvalidGpuEvidenceError,
+    InvalidQuoteError,
+    InvalidSignatureError,
+    MeasurementMismatchError,
+    NonceError,
+    ServerRegistrationError,
+)
+
+_TRANSIENT_CONFLICT_ERRORS = (
+    AttestationVerifierUnavailableError,
+    GetEvidenceError,
+    GpuEvidenceError,
+    GpuRegistrationRecoveryKeyUnavailable,
+    InvalidTdxConfiguration,
+    asyncio.TimeoutError,
+    TimeoutError,
+    ConnectionError,
+    OSError,
+)
+
+
+def _classify_conflict_verification_error(exc: Exception) -> tuple[bool, str, str]:
+    detail = str(getattr(exc, "detail", exc))[:2000] or exc.__class__.__name__
+    code = exc.__class__.__name__
+    if isinstance(exc, _DETERMINISTIC_CONFLICT_ERRORS):
+        return False, code, detail
+    if isinstance(exc, _TRANSIENT_CONFLICT_ERRORS):
+        return True, code, detail
+    if isinstance(exc, HTTPException) and exc.status_code < 500:
+        return False, code, detail
+    # Unknown verifier failures cannot establish that evidence is invalid.
+    return True, code, detail
+
+
 async def _scrub_terminal_registration_material(
     db: AsyncSession,
     nonce: GpuRegistrationNonce,
@@ -285,16 +422,23 @@ async def _scrub_terminal_registration_material(
         .scalars()
         .all()
     )
+    # Response recovery expiry is not a conflict-security deadline. Preserve
+    # nonterminal ciphertext and verified-competitor audit until exact custody
+    # ends, the primary fails, or verification reaches a deterministic verdict.
     for conflict in conflicts:
-        if conflict.state in {"recorded", "verifying"}:
-            conflict.state = "dismissed"
-            conflict.processing_lease_owner = None
-            conflict.processing_lease_expires_at = None
-            conflict.verification_detail = (
-                "registration replay window expired before conflict completion"
+        if attempt.state == "failed" and conflict.state in {
+            "recorded",
+            "verifying",
+            "verified_competitor",
+        }:
+            _terminalize_conflict(
+                conflict,
+                state="dismissed",
+                detail="primary registration attempt failed",
+                now=now,
             )
-            conflict.verified_at = now
-        _scrub_conflict_request(conflict)
+        elif conflict.state in {"invalid", "dismissed"}:
+            _scrub_conflict_request(conflict)
     _scrub_attempt_request(attempt)
     nonce.state = "revoked" if nonce.state == "revoked" else "expired"
     nonce.nonce_value = None
@@ -354,12 +498,12 @@ async def _fail_stale_processing_attempt(
         .all()
     )
     for conflict in conflicts:
-        conflict.state = "dismissed"
-        conflict.processing_lease_owner = None
-        conflict.processing_lease_expires_at = None
-        conflict.verification_detail = "primary registration lineage ended"
-        conflict.verified_at = now
-        _scrub_conflict_request(conflict)
+        _terminalize_conflict(
+            conflict,
+            state="dismissed",
+            detail="primary registration lineage ended",
+            now=now,
+        )
     nonce = (
         await db.execute(
             select(GpuRegistrationNonce)
@@ -540,12 +684,12 @@ async def cleanup_expired_gpu_registration_nonces(
                 .all()
             )
             for conflict in conflicts:
-                conflict.state = "dismissed"
-                conflict.processing_lease_owner = None
-                conflict.processing_lease_expires_at = None
-                conflict.verification_detail = "primary registration nonce was revoked"
-                conflict.verified_at = now
-                _scrub_conflict_request(conflict)
+                _terminalize_conflict(
+                    conflict,
+                    state="dismissed",
+                    detail="primary registration nonce was revoked",
+                    now=now,
+                )
         if attempt is not None and await _scrub_terminal_registration_material(
             db, row, attempt, now
         ):
@@ -1103,6 +1247,8 @@ async def _claim_attempt(
                         request.td_signature.encode("utf-8")
                     ).hexdigest(),
                     state="recorded",
+                    verification_attempt_count=0,
+                    next_attempt_at=now,
                 )
                 db.add(conflict)
                 await db.flush()
@@ -1408,12 +1554,12 @@ async def _mark_attempt_failed(
         .all()
     )
     for conflict in conflicts:
-        conflict.state = "dismissed"
-        conflict.processing_lease_owner = None
-        conflict.processing_lease_expires_at = None
-        conflict.verification_detail = "primary registration attempt failed"
-        conflict.verified_at = now
-        _scrub_conflict_request(conflict)
+        _terminalize_conflict(
+            conflict,
+            state="dismissed",
+            detail="primary registration attempt failed",
+            now=now,
+        )
     nonce = (
         await db.execute(
             select(GpuRegistrationNonce)
@@ -1481,23 +1627,26 @@ async def _complete_attempt(
         nonce.state = "revoked" if nonce.state == "revoked" else "expired"
         nonce.nonce_value = None
     await db.flush()
-    competitor_ids = list(
+    competitors = list(
         (
             await db.execute(
-                select(GpuRegistrationConflict.conflict_id)
+                select(GpuRegistrationConflict)
                 .where(
                     GpuRegistrationConflict.attempt_id == attempt_id,
                     GpuRegistrationConflict.state == "verified_competitor",
+                    GpuRegistrationConflict.fence_state == "pending",
                 )
                 .order_by(GpuRegistrationConflict.conflict_id)
                 .with_for_update()
             )
-        ).scalars()
+        )
+        .scalars()
+        .all()
     )
-    if competitor_ids:
+    if competitors:
         from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
-        await request_gpu_lifecycle_fence(
+        operation = await request_gpu_lifecycle_fence(
             db,
             attempt.reservation_id,
             code="gpu_registration_verified_competitor",
@@ -1505,9 +1654,17 @@ async def _complete_attempt(
             operation_type="normal_delete",
             metadata={
                 "attempt_id": attempt.attempt_id,
-                "conflict_ids": competitor_ids,
+                "conflict_ids": [item.conflict_id for item in competitors],
             },
         )
+        for competitor in competitors:
+            competitor.fence_state = (
+                "requested" if operation is not None else "custody_ended"
+            )
+            competitor.fence_operation_id = (
+                operation.operation_id if operation is not None else None
+            )
+            competitor.fence_recorded_at = now
     return attempt
 
 
@@ -1882,14 +2039,23 @@ async def get_gpu_registration_attempt(
 async def _verify_recorded_conflict(
     db: AsyncSession,
     conflict: GpuRegistrationConflict,
-    request: GpuRegistrationRequestV2,
-    expected_cert_hash: str,
-    cert_pem: str,
+    request: GpuRegistrationRequestV2 | None = None,
+    expected_cert_hash: str | None = None,
+    cert_pem: str | None = None,
 ) -> str:
     """Verify a competitor outside locks, then publish only under exact lineage CAS."""
 
     lease_owner = generate_uuid()
-    audit = _registration_request_audit(request, expected_cert_hash, cert_pem)
+    supplied_audit = (
+        _registration_request_audit(request, expected_cert_hash, cert_pem)
+        if request is not None
+        and expected_cert_hash is not None
+        and cert_pem is not None
+        else None
+    )
+    supplied_shape_valid = all(
+        item is None for item in (request, expected_cert_hash, cert_pem)
+    ) or all(item is not None for item in (request, expected_cert_hash, cert_pem))
     await acquire_gpu_lifecycle_lock(db)
     row = (
         await db.execute(
@@ -1908,12 +2074,12 @@ async def _verify_recorded_conflict(
     now = _now()
     if attempt.state == "failed":
         if row.state not in {"invalid", "dismissed"}:
-            row.state = "dismissed"
-            row.processing_lease_owner = None
-            row.processing_lease_expires_at = None
-            row.verification_detail = "primary registration attempt failed"
-            row.verified_at = now
-            _scrub_conflict_request(row)
+            _terminalize_conflict(
+                row,
+                state="dismissed",
+                detail="primary registration attempt failed",
+                now=now,
+            )
         await db.commit()
         return row.state
     if row.state in {"invalid", "verified_competitor", "dismissed"}:
@@ -1926,6 +2092,13 @@ async def _verify_recorded_conflict(
     ):
         await db.commit()
         return "verifying"
+    if (
+        row.state == "recorded"
+        and row.next_attempt_at is not None
+        and row.next_attempt_at > now
+    ):
+        await db.commit()
+        return "recorded"
     try:
         persisted_request = await _decrypt_registration_request(
             db,
@@ -1933,20 +2106,49 @@ async def _verify_recorded_conflict(
             row.request_payload_key_id,
             row.request_sha256,
         )
-    except ServerRegistrationError:
-        persisted_request = None
+    except GpuRegistrationRecoveryKeyUnavailable as exc:
+        _schedule_conflict_retry(
+            row,
+            now=now,
+            code=exc.__class__.__name__,
+            detail=str(exc.detail),
+            increment_attempt=True,
+        )
+        await db.commit()
+        return row.state
+    except ServerRegistrationError as exc:
+        _terminalize_conflict(
+            row,
+            state="invalid",
+            detail=str(exc.detail),
+            now=now,
+        )
+        await db.commit()
+        return row.state
+    persisted_audit = _registration_request_audit(
+        persisted_request,
+        row.peer_spki_sha256,
+        row.peer_certificate_pem,
+    )
     immutable_conflict = bool(
-        persisted_request is not None
+        supplied_shape_valid
         and row.attempt_id == attempt.attempt_id
-        and _conflict_audit_matches(row, persisted_request, audit)
+        and _conflict_audit_matches(row, persisted_request, persisted_audit)
+        and (
+            supplied_audit is None
+            or (
+                request is not None
+                and _conflict_audit_matches(row, request, supplied_audit)
+            )
+        )
     )
     if not immutable_conflict:
-        row.state = "invalid"
-        row.processing_lease_owner = None
-        row.processing_lease_expires_at = None
-        row.verification_detail = "conflict audit bytes changed before verification"
-        row.verified_at = now
-        _scrub_conflict_request(row)
+        _terminalize_conflict(
+            row,
+            state="invalid",
+            detail="conflict audit bytes changed before verification",
+            now=now,
+        )
         await db.commit()
         return row.state
     ciphertext_snapshot = row.request_payload_ciphertext
@@ -1956,22 +2158,32 @@ async def _verify_recorded_conflict(
     row.state = "verifying"
     row.processing_lease_owner = lease_owner
     row.processing_lease_expires_at = now + timedelta(seconds=_PROCESSING_LEASE_SECONDS)
+    row.verification_attempt_count += 1
+    row.last_attempt_at = now
+    row.next_attempt_at = None
     await db.commit()
 
     verified_gpu_evidence = None
+    verification_error: Exception | None = None
     try:
-        _, _, verified_gpu_evidence = await verify_gpu_registration_evidence(
-            db,
-            persisted_request,
-            persisted_request.nonce,
-            spki_snapshot,
-            certificate_snapshot,
+        _, _, verified_gpu_evidence = await asyncio.wait_for(
+            verify_gpu_registration_evidence(
+                db,
+                persisted_request,
+                persisted_request.nonce,
+                spki_snapshot,
+                certificate_snapshot,
+            ),
+            timeout=_CONFLICT_VERIFY_TIMEOUT_SECONDS,
         )
-        evidence_valid = True
         detail = "conflicting request independently verified"
-    except Exception as exc:  # evidence failures are audit data, not fencing authority
-        evidence_valid = False
-        detail = str(getattr(exc, "detail", exc))[:2000]
+    except Exception as exc:  # noqa: BLE001 - unknown verifier failures are retryable
+        verification_error = exc
+        _retryable, _code, detail = _classify_conflict_verification_error(exc)
+    finally:
+        # External verification may have opened a read transaction. End it before
+        # reacquiring the lifecycle advisory lock and trust-bearing row locks.
+        await db.rollback()
 
     await acquire_gpu_lifecycle_lock(db)
     row = (
@@ -2064,12 +2276,71 @@ async def _verify_recorded_conflict(
 
     now = _now()
     try:
+        _, persisted_token_hash = _parse_reservation_token(
+            persisted_request.launch_reservation
+        )
+    except HTTPException:
+        persisted_token_hash = ""
+    custody_current = bool(
+        persisted_token_hash
+        and _registration_processing_lineage_current(reservation, group)
+        and host is not None
+        and report is not None
+        and _registration_lineage_current(
+            host,
+            group,
+            report,
+            reservation,
+            persisted_request,
+            persisted_token_hash,
+            allowed_states={"launching", "running"},
+        )
+    )
+    if attempt.state == "failed" or not custody_current:
+        _terminalize_conflict(
+            row,
+            state="dismissed",
+            detail=(
+                "primary registration attempt failed"
+                if attempt.state == "failed"
+                else "registration custody ended before conflict verification completed"
+            ),
+            now=now,
+        )
+        await db.commit()
+        return row.state
+    if verification_error is not None:
+        retryable, code, detail = _classify_conflict_verification_error(
+            verification_error
+        )
+        if retryable:
+            _schedule_conflict_retry(
+                row,
+                now=now,
+                code=code,
+                detail=detail,
+                increment_attempt=False,
+            )
+            await db.commit()
+            return row.state
+
+    try:
         current_request = await _decrypt_registration_request(
             db,
             row.request_payload_ciphertext,
             row.request_payload_key_id,
             row.request_sha256,
         )
+    except GpuRegistrationRecoveryKeyUnavailable as exc:
+        _schedule_conflict_retry(
+            row,
+            now=now,
+            code=exc.__class__.__name__,
+            detail=str(exc.detail),
+            increment_attempt=False,
+        )
+        await db.commit()
+        return row.state
     except ServerRegistrationError:
         current_request = None
     audit_unchanged = bool(
@@ -2078,7 +2349,7 @@ async def _verify_recorded_conflict(
         and row.request_payload_key_id == key_id_snapshot
         and current_request.model_dump(mode="json", exclude_none=True)
         == persisted_request.model_dump(mode="json", exclude_none=True)
-        and _conflict_audit_matches(row, current_request, audit)
+        and _conflict_audit_matches(row, current_request, persisted_audit)
     )
     request = current_request or persisted_request
     try:
@@ -2091,6 +2362,7 @@ async def _verify_recorded_conflict(
         nonce_hash = ""
     claims = request.quote_commitment.claims
     claims_document = claims.model_dump(mode="json", exclude_none=True)
+    evidence_valid = verification_error is None
     common_exact = bool(
         evidence_valid
         and audit_unchanged
@@ -2144,6 +2416,16 @@ async def _verify_recorded_conflict(
                 attempt.request_payload_key_id,
                 attempt.request_sha256,
             )
+        except GpuRegistrationRecoveryKeyUnavailable as exc:
+            _schedule_conflict_retry(
+                row,
+                now=now,
+                code=exc.__class__.__name__,
+                detail=str(exc.detail),
+                increment_attempt=False,
+            )
+            await db.commit()
+            return row.state
         except ServerRegistrationError:
             primary_request = None
         try:
@@ -2220,8 +2502,6 @@ async def _verify_recorded_conflict(
         stable = dict(attempt.stable_response or {})
         exact = bool(
             common_exact
-            and attempt.registration_replay_until is not None
-            and attempt.registration_replay_until > now
             and server is not None
             and attempt.request_payload_ciphertext is None
             and attempt.request_payload_key_id is None
@@ -2282,16 +2562,16 @@ async def _verify_recorded_conflict(
                 "conflicting request evidence verified but post-verification "
                 "lineage, node selection, or immutable audit bytes changed"
             )
-    row.state = final_state
-    row.processing_lease_owner = None
-    row.processing_lease_expires_at = None
-    row.verification_detail = detail
-    row.verified_at = _now()
-    _scrub_conflict_request(row)
+    _terminalize_conflict(
+        row,
+        state=final_state,
+        detail=detail,
+        now=_now(),
+    )
     if final_state == "verified_competitor" and attempt.state == "completed":
         from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
-        await request_gpu_lifecycle_fence(
+        operation = await request_gpu_lifecycle_fence(
             db,
             reservation.reservation_id,
             code="gpu_registration_verified_competitor",
@@ -2305,8 +2585,167 @@ async def _verify_recorded_conflict(
                 "conflict_id": row.conflict_id,
             },
         )
+        row.fence_state = "requested" if operation is not None else "custody_ended"
+        row.fence_operation_id = (
+            operation.operation_id if operation is not None else None
+        )
+        row.fence_recorded_at = _now()
     await db.commit()
     return final_state
+
+
+async def _fence_verified_registration_conflict(
+    db: AsyncSession,
+    conflict_id: str,
+) -> bool:
+    """Fence a durable verified competitor after primary completion."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    row = (
+        await db.execute(
+            select(GpuRegistrationConflict)
+            .where(GpuRegistrationConflict.conflict_id == conflict_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        row is None
+        or row.state != "verified_competitor"
+        or row.fence_state != "pending"
+    ):
+        await db.commit()
+        return False
+    attempt = (
+        await db.execute(
+            select(GpuRegistrationAttempt)
+            .where(GpuRegistrationAttempt.attempt_id == row.attempt_id)
+            .with_for_update()
+        )
+    ).scalar_one()
+    now = _now()
+    if attempt.state == "processing":
+        await db.commit()
+        return False
+    if attempt.state == "failed":
+        _terminalize_conflict(
+            row,
+            state="dismissed",
+            detail="primary registration attempt failed before conflict fencing",
+            now=now,
+        )
+        await db.commit()
+        return True
+    reservation = (
+        await db.execute(
+            select(GpuLaunchReservation)
+            .where(GpuLaunchReservation.reservation_id == attempt.reservation_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    group = (
+        (
+            await db.execute(
+                select(GpuAllocationGroup)
+                .where(
+                    GpuAllocationGroup.allocation_group_id
+                    == reservation.allocation_group_id
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if reservation is not None
+        else None
+    )
+    if not _registration_processing_lineage_current(reservation, group):
+        row.fence_state = "custody_ended"
+        row.fence_recorded_at = now
+        await db.commit()
+        return True
+
+    from api.host.gpu_allocations import request_gpu_lifecycle_fence
+
+    operation = await request_gpu_lifecycle_fence(
+        db,
+        reservation.reservation_id,
+        code="gpu_registration_verified_competitor",
+        reason=(
+            "A second independently verified request used the completed "
+            "registration nonce."
+        ),
+        operation_type="normal_delete",
+        metadata={
+            "attempt_id": attempt.attempt_id,
+            "conflict_id": row.conflict_id,
+        },
+    )
+    row.fence_state = "requested" if operation is not None else "custody_ended"
+    row.fence_operation_id = operation.operation_id if operation is not None else None
+    row.fence_recorded_at = now
+    await db.commit()
+    return True
+
+
+async def reconcile_gpu_registration_conflicts(
+    *,
+    limit: int = _CONFLICT_RECONCILE_LIMIT,
+) -> int:
+    """Resume due verification leases and pending fences without client retries."""
+
+    now = _now()
+    async with get_session() as db:
+        conflict_ids = list(
+            (
+                await db.execute(
+                    select(GpuRegistrationConflict.conflict_id)
+                    .where(
+                        or_(
+                            (
+                                (GpuRegistrationConflict.state == "recorded")
+                                & (GpuRegistrationConflict.next_attempt_at <= now)
+                            ),
+                            (
+                                (GpuRegistrationConflict.state == "verifying")
+                                & (
+                                    GpuRegistrationConflict.processing_lease_expires_at
+                                    <= now
+                                )
+                            ),
+                            (
+                                (
+                                    GpuRegistrationConflict.state
+                                    == "verified_competitor"
+                                )
+                                & (GpuRegistrationConflict.fence_state == "pending")
+                            ),
+                        )
+                    )
+                    .order_by(GpuRegistrationConflict.created_at)
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        await db.rollback()
+
+    processed = 0
+    for conflict_id in conflict_ids:
+        try:
+            async with get_session() as db:
+                row = await db.get(GpuRegistrationConflict, conflict_id)
+                if row is None:
+                    continue
+                if row.state == "verified_competitor":
+                    await _fence_verified_registration_conflict(db, conflict_id)
+                else:
+                    await _verify_recorded_conflict(db, row)
+                processed += 1
+        except Exception as exc:  # noqa: BLE001 - each durable row retries independently
+            logger.error(
+                "GPU registration conflict reconciliation remains retryable for "
+                f"{conflict_id}: {exc}"
+            )
+    return processed
 
 
 async def _run_registration_attempt(
@@ -2402,6 +2841,20 @@ async def _run_registration_attempt(
         # restored key resumes this same attempt after the bounded lease.
         await db.rollback()
         raise
+    except (
+        AttestationVerifierUnavailableError,
+        GetEvidenceError,
+        GpuEvidenceError,
+        InvalidTdxConfiguration,
+    ) as exc:
+        # Availability failures have no attacker-evidence verdict. Preserve the
+        # processing attempt and its ciphertext so the same lease can resume.
+        await db.rollback()
+        if isinstance(exc, AttestationVerifierUnavailableError):
+            raise
+        raise AttestationVerifierUnavailableError(
+            str(getattr(exc, "detail", exc))[:2000]
+        ) from exc
     except GpuHotplugError as exc:
         await db.rollback()
         attempt = await _mark_attempt_failed(
@@ -2478,9 +2931,7 @@ async def process_gpu_registration(
                 "code": "gpu_registration_conflict",
                 "conflict_id": conflict.conflict_id,
                 "state": conflict_state,
-                "retry_after_seconds": (
-                    _RETRY_AFTER_SECONDS if conflict_state == "verifying" else None
-                ),
+                "retry_after_seconds": _conflict_retry_after_seconds(conflict),
             },
         )
     if lease_owner is None:

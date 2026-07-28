@@ -1375,11 +1375,13 @@ async def schedule_once() -> None:
     from api.gpu_hotplug_service import retry_due_gpu_hotplug_commands
     from api.gpu_registration_service import (
         cleanup_expired_gpu_registration_nonces,
+        reconcile_gpu_registration_conflicts,
     )
 
     async with get_session() as session:
         await cleanup_expired_gpu_registration_nonces(session)
         await session.commit()
+    await reconcile_gpu_registration_conflicts()
     await retry_due_gpu_hotplug_commands()
     await reconcile_miner_reservations()
     await reconcile_platform_reservations()

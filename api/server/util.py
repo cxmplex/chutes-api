@@ -15,7 +15,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.sql import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import unquote
-from aiohttp import ClientResponse
+from aiohttp import ClientError, ClientResponse
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, Request, status
 from loguru import logger
@@ -34,6 +34,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from api.server.exceptions import (
     AttestationError,
+    AttestationVerifierUnavailableError,
     GpuEvidenceError,
     InvalidClientCertError,
     InvalidGpuEvidenceError,
@@ -324,8 +325,25 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
     logger.info("Verifying TDX quote signature using dcap-qvl (pinned Intel root)")
 
     try:
-        # Perform quote verification against the pinned Intel root.
+        # Collateral transport cannot establish that attacker-supplied evidence is
+        # invalid. Preserve it as a retryable availability failure.
         collateral = await get_collateral(PHALA_PCCS_URL, quote.raw_bytes)
+    except (asyncio.TimeoutError, ClientError, OSError) as exc:
+        logger.error(f"TDX collateral service is unavailable: {exc}")
+        raise AttestationVerifierUnavailableError(
+            "TDX collateral service is temporarily unavailable."
+        ) from exc
+    except ValueError as exc:
+        logger.error(f"TDX quote/collateral request is invalid: {exc}")
+        raise InvalidQuoteError("Unable to parse provided quote for verification.") from exc
+    except Exception as exc:
+        logger.error(f"Unexpected TDX collateral verifier failure: {exc}")
+        raise AttestationVerifierUnavailableError(
+            "TDX collateral verifier failed before returning a verdict."
+        ) from exc
+
+    try:
+        # Perform quote verification against the pinned Intel root.
         try:
             verified_report = verify_with_root_ca(
                 quote.raw_bytes, collateral, INTEL_SGX_ROOT_CA_DER, int(time.time())
@@ -352,9 +370,14 @@ async def verify_quote_signature(quote: TdxQuote) -> TdxVerificationResult:
         # Preserve structured fail-closed attestation verdicts such as an authenticated
         # quote whose TCB/advisory/debug status is unacceptable.
         raise
-    except Exception as e:
-        logger.error(f"Unexpected error during quote verification: {e}")
-        raise InvalidQuoteError("Unable to parse provided quote for verification.")
+    except (ValueError, TypeError) as exc:
+        logger.error(f"Invalid quote during cryptographic verification: {exc}")
+        raise InvalidQuoteError("Unable to parse provided quote for verification.") from exc
+    except Exception as exc:
+        logger.error(f"Unexpected error during quote verification: {exc}")
+        raise AttestationVerifierUnavailableError(
+            "TDX verifier failed before returning a verdict."
+        ) from exc
 
 
 _AUDITED_DCAP_QVL_FALLBACK_VERSION = "0.5.3"

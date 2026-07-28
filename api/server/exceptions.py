@@ -70,6 +70,19 @@ class GpuEvidenceError(AttestationError):
         super().__init__(detail=detail)
 
 
+class AttestationVerifierUnavailableError(AttestationError):
+    """Raised when attestation infrastructure cannot return a verdict."""
+
+    def __init__(
+        self,
+        detail: str = "Attestation verifier is temporarily unavailable.",
+    ):
+        super().__init__(
+            detail=detail,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+
 class InvalidGpuEvidenceError(AttestationError):
     """Raised for invalid GPU evidence."""
 
