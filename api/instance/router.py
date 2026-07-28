@@ -71,6 +71,7 @@ from api.host.schemas import (
     GpuLaunchReservation,
     canonical_sha256,
 )
+from api.gpu_models import GpuLifecycleOperation
 from api.host.locks import (
     acquire_gpu_lifecycle_lock,
     assert_gpu_external_work_allowed,
@@ -3067,6 +3068,23 @@ def _miner_launch_jwt_policy(chute: Chute, job: Job | None) -> dict:
     }
 
 
+def _miner_launch_demand_posture(
+    chute: Chute,
+    *,
+    chutes_owner_id: str | None,
+) -> dict:
+    legacy_private_billing = has_legacy_private_billing(chute)
+    platform_owned = chute.user_id == chutes_owner_id
+    return {
+        "public": bool(chute.public),
+        "legacy_private_billing": legacy_private_billing,
+        "platform_owned": platform_owned,
+        "private_launch": bool(
+            not chute.public and not legacy_private_billing and not platform_owned
+        ),
+    }
+
+
 def _miner_launch_secret_sha256(label: str, value: str | None) -> str | None:
     if value is None:
         return None
@@ -3093,6 +3111,7 @@ def _miner_launch_request_document(
     binding: DefaultChuteFSVolumeBinding,
     volume: StorageVolume,
     policy: dict,
+    demand_posture: dict,
 ) -> dict:
     """Canonical authority accepted for one miner launch response.
 
@@ -3217,6 +3236,7 @@ def _miner_launch_request_document(
             ),
         },
         "jwt_policy": policy,
+        "demand_posture": demand_posture,
     }
 
 
@@ -3246,6 +3266,27 @@ async def _lock_current_miner_launch_custody(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
+    active_operation = (
+        (
+            await db.execute(
+                select(GpuLifecycleOperation)
+                .where(
+                    GpuLifecycleOperation.allocation_group_id
+                    == group.allocation_group_id,
+                    GpuLifecycleOperation.allocation_group_generation
+                    == group.generation,
+                    GpuLifecycleOperation.phase.not_in(
+                        ("finalized", "quarantined")
+                    ),
+                )
+                .with_for_update(of=GpuLifecycleOperation)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+        if group is not None
+        else None
+    )
     runtime_expiry = server.gpu_runtime_session_expires_at
     if runtime_expiry is not None and runtime_expiry.tzinfo is None:
         runtime_expiry = runtime_expiry.replace(tzinfo=timezone.utc)
@@ -3261,6 +3302,9 @@ async def _lock_current_miner_launch_custody(
         or runtime_expiry is None
         or runtime_expiry <= datetime.now(timezone.utc)
         or reservation.state != "running"
+        or reservation.teardown_requested_at is not None
+        or reservation.teardown_command_id is not None
+        or active_operation is not None
         or reservation.management_mode != "miner"
         or reservation.owner_hotkey != hotkey
         or reservation.workload_owner != hotkey
@@ -3286,6 +3330,34 @@ async def _lock_current_miner_launch_custody(
             "GPU server, reservation, or allocation-group custody is no longer current"
         )
     return reservation, group
+
+
+async def _preflight_current_miner_launch_custody(
+    db: AsyncSession,
+    *,
+    server_id: str,
+    hotkey: str,
+) -> None:
+    """Reject already-fenced custody before demand or registry external work."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    server = (
+        await db.execute(
+            select(Server)
+            .where(Server.server_id == server_id)
+            .options(lazyload("*"))
+            .with_for_update(of=Server)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if server is None:
+        _miner_launch_replay_conflict("GPU server custody is no longer current")
+    await _lock_current_miner_launch_custody(
+        db,
+        server=server,
+        hotkey=hotkey,
+    )
+    await db.commit()
 
 
 async def _existing_miner_launch_identity(
@@ -3328,6 +3400,7 @@ async def _lock_existing_miner_launch_storage(
     ).scalar_one_or_none()
     if user is None:
         _miner_launch_replay_conflict("launch owner no longer exists")
+    await acquire_gpu_lifecycle_lock(db)
     config = (
         (
             await db.execute(
@@ -3410,6 +3483,7 @@ async def _lock_new_miner_launch_storage_before_gpu_workload(
     ).scalar_one_or_none()
     if user is None:
         _miner_launch_replay_conflict("launch owner no longer exists")
+    await acquire_gpu_lifecycle_lock(db)
     existing = (
         (
             await db.execute(
@@ -3506,6 +3580,7 @@ async def _validate_locked_miner_launch_replay(
     requested_server_id: str,
     binding: DefaultChuteFSVolumeBinding,
     volume: StorageVolume,
+    chutes_owner_id: str | None,
 ) -> dict:
     config = (
         (
@@ -3622,6 +3697,10 @@ async def _validate_locked_miner_launch_replay(
     if config.gpu_launch_reservation_id != reservation.reservation_id:
         _miner_launch_replay_conflict("launch config reservation is no longer current")
     policy = _miner_launch_jwt_policy(chute, job)
+    demand_posture = _miner_launch_demand_posture(
+        chute,
+        chutes_owner_id=chutes_owner_id,
+    )
     expected_sha256 = canonical_sha256(
         _miner_launch_request_document(
             request_id=request_id,
@@ -3635,6 +3714,7 @@ async def _validate_locked_miner_launch_replay(
             binding=binding,
             volume=volume,
             policy=policy,
+            demand_posture=demand_posture,
         )
     )
     if not isinstance(
@@ -3662,6 +3742,7 @@ async def _try_replay_miner_launch_config(
     chute_id: str,
     job_id: str | None,
     server_id: str,
+    chutes_owner_id: str | None,
 ) -> dict | None:
     identity = await _existing_miner_launch_identity(
         db,
@@ -3698,6 +3779,7 @@ async def _try_replay_miner_launch_config(
         requested_server_id=server_id,
         binding=binding,
         volume=volume,
+        chutes_owner_id=chutes_owner_id,
     )
 
 
@@ -3721,6 +3803,9 @@ async def get_launch_config(
     ),
 ):
     miner = await _check_blacklisted(db, hotkey)
+    chutes_owner_id = await db.scalar(
+        select(User.user_id).where(User.username == "chutes")
+    )
     runtime_server_id = getattr(request.state, "gpu_runtime_server_id", None)
     durable_request_id = None
     if runtime_server_id is not None:
@@ -3738,9 +3823,15 @@ async def get_launch_config(
             chute_id=chute_id,
             job_id=job_id,
             server_id=runtime_server_id,
+            chutes_owner_id=chutes_owner_id,
         )
         if replay is not None:
             return replay
+        await _preflight_current_miner_launch_custody(
+            db,
+            server_id=runtime_server_id,
+            hotkey=hotkey,
+        )
 
     # Resolve external demand telemetry and registry intent before acquiring the
     # global/workload lifecycle locks, then bind the results to an exact chute snapshot.
@@ -3773,7 +3864,7 @@ async def get_launch_config(
     is_private = bool(
         not chute.public
         and not has_legacy_private_billing(chute)
-        and chute.user_id != await chutes_user_id()
+        and chute.user_id != chutes_owner_id
     )
     demand_input = _launch_demand_input_document(
         chute,
@@ -3840,6 +3931,7 @@ async def get_launch_config(
             requested_server_id=runtime_server_id,
             binding=default_binding,
             volume=default_volume,
+            chutes_owner_id=chutes_owner_id,
         )
     chute = (
         (
@@ -4068,6 +4160,10 @@ async def get_launch_config(
                     binding=default_binding,
                     volume=default_volume,
                     policy=jwt_policy,
+                    demand_posture=_miner_launch_demand_posture(
+                        chute,
+                        chutes_owner_id=chutes_owner_id,
+                    ),
                 )
             )
         db.add(launch_config)
@@ -4095,6 +4191,7 @@ async def get_launch_config(
                 chute_id=chute_id,
                 job_id=job_id,
                 server_id=runtime_server_id,
+                chutes_owner_id=chutes_owner_id,
             )
             if replay is not None:
                 return replay

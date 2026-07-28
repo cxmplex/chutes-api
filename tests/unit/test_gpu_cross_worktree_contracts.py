@@ -4,6 +4,7 @@ import base64
 import hashlib
 import importlib
 import importlib.util
+import inspect
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -12,9 +13,14 @@ from types import SimpleNamespace
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi import HTTPException
 import pytest
 
 from api.host.schemas import GpuLaunchReservationClaimsV1, canonical_sha256
+from api.instance.router import (
+    _canonical_miner_launch_request_id,
+    get_launch_config,
+)
 from api.registry.router import _registry_session_response
 from api.releases.provenance import load_canonical_provenance
 from api.releases.schemas import (
@@ -174,6 +180,28 @@ def test_api_gpu_claim_fixture_is_byte_identical_and_parses_in_sek8s():
     assert canonical_sha256(api_claims) == (
         "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197"
     )
+
+
+def test_miner_persists_and_sends_the_api_required_launch_request_uuid():
+    miner_source = (
+        _repository("miner") / "src/chutes-miner/chutes_miner/gepetto.py"
+    ).read_text(encoding="utf-8")
+    assert "intent_id = str(uuid.uuid4())" in miner_source
+    assert '"miner_launch_request_id": intent_id' in miner_source
+    assert 'params["miner_launch_request_id"] = intent_id' in miner_source
+
+    handler_source = inspect.getsource(get_launch_config)
+    attested_branch = handler_source.split("if runtime_server_id is not None:", 1)[
+        1
+    ].split("# Resolve external demand telemetry", 1)[0]
+    assert (
+        "_canonical_miner_launch_request_id(miner_launch_request_id)" in attested_branch
+    )
+    request_id = "88888888-8888-4888-8888-888888888888"
+    assert _canonical_miner_launch_request_id(request_id) == request_id
+    with pytest.raises(HTTPException) as exc:
+        _canonical_miner_launch_request_id(None)
+    assert getattr(exc.value, "status_code", None) == 422
 
 
 def test_api_registry_response_is_accepted_and_bound_by_sek8s_consumer():

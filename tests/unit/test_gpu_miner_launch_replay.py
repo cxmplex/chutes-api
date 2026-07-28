@@ -79,7 +79,16 @@ async def test_new_miner_launch_uses_shared_storage_then_gpu_lock_order(monkeypa
         assert (_db, chute_id, job_id) == (db, "chute-1", "job-1")
         order.append("gpu_workload")
 
+    async def _lifecycle_lock(_db):
+        assert _db is db
+        order.append("gpu_lifecycle")
+
     monkeypatch.setattr(instance_router, "ensure_default_volume_binding", _ensure)
+    monkeypatch.setattr(
+        instance_router,
+        "acquire_gpu_lifecycle_lock",
+        _lifecycle_lock,
+    )
     monkeypatch.setattr(gpu_scheduler, "acquire_gpu_workload_lock", _gpu_lock)
 
     (
@@ -98,6 +107,7 @@ async def test_new_miner_launch_uses_shared_storage_then_gpu_lock_order(monkeypa
     assert existing is None
     assert order == [
         "user",
+        "gpu_lifecycle",
         "launch_config",
         "binding_volume",
         "gpu_workload",

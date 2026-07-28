@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import HTTPException
@@ -12,8 +12,9 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import DBAPIError
 
 from api.chute.schemas import Chute, NodeSelector
-from api.host.gpu_allocations import reserve_gpu_group
+from api.host.gpu_allocations import request_gpu_teardown, reserve_gpu_group
 from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
+from api.gpu_models import GpuLifecycleOperation
 from api.image.schemas import Image
 from api.instance import router as instance_router
 from api.instance.schemas import LaunchConfig
@@ -473,3 +474,173 @@ async def test_integrity_error_fallback_replays_winning_config(
     assert try_calls == 2
     async with sessions() as session:
         assert await session.scalar(select(func.count()).select_from(LaunchConfig)) == 1
+
+
+async def test_node_selector_or_demand_posture_change_rejects_replay(
+    postgres_schema,  # noqa: F811
+    monkeypatch,
+):
+    sessions, _schema = postgres_schema
+    lineage = await _seed_launch_authority(sessions, with_job=False)
+    request_id = "55555555-5555-4555-8555-555555555555"
+    redis = SimpleNamespace(set=AsyncMock(), publish=AsyncMock())
+    demand = AsyncMock(
+        return_value={
+            "scale_value": None,
+            "inventory_history": None,
+            "bounty_exists": None,
+            "registry_repository": "owner/miner-launch-image",
+            "registry_manifest_digest": f"sha256:{'7' * 64}",
+        }
+    )
+    token = Mock(return_value="token")
+    monkeypatch.setattr(instance_router.settings, "_redis_client", redis)
+    monkeypatch.setattr(
+        instance_router,
+        "_collect_launch_demand_external_work",
+        demand,
+    )
+    monkeypatch.setattr(instance_router, "_check_scalable", AsyncMock())
+    monkeypatch.setattr(instance_router, "_verify_tee_version_support", AsyncMock())
+    monkeypatch.setattr(instance_router, "create_launch_jwt_v2", token)
+
+    async with sessions() as session:
+        first = await _issue(session, lineage, request_id)
+    async with sessions() as session:
+        chute = await session.get(Chute, lineage["chute_id"])
+        original_selector = dict(chute.node_selector)
+        chute.node_selector = NodeSelector(
+            **{**original_selector, "gpu_count": 4}
+        )
+        await session.commit()
+    async with sessions() as session:
+        with pytest.raises(HTTPException) as exc:
+            await _issue(session, lineage, request_id)
+        assert exc.value.status_code == 409
+
+    async with sessions() as session:
+        chute = await session.get(Chute, lineage["chute_id"])
+        original_version = chute.version
+        chute.node_selector = NodeSelector(**original_selector)
+        chute.public = False
+        await session.commit()
+        assert chute.version == original_version
+
+    async with sessions() as session:
+        with pytest.raises(HTTPException) as exc:
+            await _issue(session, lineage, request_id)
+        assert exc.value.status_code == 409
+
+    assert demand.await_count == 1
+    assert token.call_count == 1
+    assert redis.set.await_count == 1
+    assert redis.publish.await_count == 1
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(LaunchConfig)) == 1
+        config = await session.get(LaunchConfig, first["config_id"])
+        assert config.retrieved_at is None
+
+
+async def test_stop_intent_and_active_operation_independently_fence_launches(
+    postgres_schema,  # noqa: F811
+    monkeypatch,
+):
+    sessions, _schema = postgres_schema
+    lineage = await _seed_launch_authority(sessions, with_job=True)
+    request_id = "66666666-6666-4666-8666-666666666666"
+    redis = SimpleNamespace(set=AsyncMock(), publish=AsyncMock())
+    demand = AsyncMock(
+        return_value={
+            "scale_value": None,
+            "inventory_history": None,
+            "bounty_exists": None,
+            "registry_repository": "owner/miner-launch-image",
+            "registry_manifest_digest": f"sha256:{'7' * 64}",
+        }
+    )
+    token = Mock(return_value="token")
+    monkeypatch.setattr(instance_router.settings, "_redis_client", redis)
+    monkeypatch.setattr(
+        instance_router,
+        "_collect_launch_demand_external_work",
+        demand,
+    )
+    monkeypatch.setattr(
+        instance_router,
+        "_verify_tee_version_support",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(instance_router, "create_launch_jwt_v2", token)
+
+    async with sessions() as session:
+        first = await _issue(session, lineage, request_id)
+    async with sessions() as session:
+        server = await session.get(Server, lineage["server_id"])
+        reservation = await session.get(
+            GpuLaunchReservation,
+            server.gpu_launch_reservation_id,
+        )
+        reservation.teardown_requested_at = datetime.now(timezone.utc)
+        reservation.teardown_reason = "focused stop-intent replay fence test"
+        await session.commit()
+    async with sessions() as session:
+        with pytest.raises(HTTPException) as exc:
+            await _issue(session, lineage, request_id)
+        assert exc.value.status_code == 409
+
+    async with sessions() as session:
+        server = await session.get(Server, lineage["server_id"])
+        reservation = await session.get(
+            GpuLaunchReservation,
+            server.gpu_launch_reservation_id,
+        )
+        reservation.teardown_requested_at = None
+        reservation.teardown_reason = None
+        await session.commit()
+    async with sessions() as session:
+        server = await session.get(Server, lineage["server_id"])
+        await request_gpu_teardown(
+            session,
+            server.gpu_launch_reservation_id,
+            reason="focused replay fence test",
+        )
+        reservation = await session.get(
+            GpuLaunchReservation,
+            server.gpu_launch_reservation_id,
+        )
+        group = await session.get(
+            GpuAllocationGroup,
+            server.gpu_allocation_group_id,
+        )
+        # Prove the durable operation is authoritative even if mutable projections
+        # are stale or incorrectly restored to their pre-teardown values.
+        reservation.state = "running"
+        reservation.teardown_requested_at = None
+        reservation.teardown_reason = None
+        group.state = "running"
+        await session.commit()
+
+    async with sessions() as session:
+        with pytest.raises(HTTPException) as exc:
+            await _issue(
+                session,
+                lineage,
+                "77777777-7777-4777-8777-777777777777",
+            )
+        assert exc.value.status_code == 409
+
+    assert demand.await_count == 1
+    assert token.call_count == 1
+    assert redis.set.await_count == 1
+    assert redis.publish.await_count == 1
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(LaunchConfig)) == 1
+        assert (
+            await session.scalar(
+                select(func.count()).select_from(GpuLifecycleOperation)
+            )
+            == 1
+        )
+        job = await session.get(Job, lineage["job_id"])
+        assert job.miner_history == ["owner"]
+        assert first["config_id"] is not None
