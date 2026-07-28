@@ -17,7 +17,8 @@ from api.instance.schemas import Instance
 from api.user.schemas import User
 from tests.integration import test_gpu_allocations_postgres as gpu_pg
 
-pytest_plugins = ["tests.integration.test_gpu_allocations_postgres"]
+postgres_schema = gpu_pg.postgres_schema
+unsigned_debug_provenance = gpu_pg.unsigned_debug_provenance
 
 pytestmark = [
     pytest.mark.asyncio,

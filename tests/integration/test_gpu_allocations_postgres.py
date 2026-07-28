@@ -432,10 +432,12 @@ def unsigned_debug_provenance():
                 provenance_schema_version=3,
             )
         )
-    configured = SimpleNamespace(
-        allow_debug_measurements=True,
-        skip_metagraph_check=True,
-        tee_measurements=pins,
+    configured = release_service.settings.model_copy(
+        update={
+            "allow_debug_measurements": True,
+            "skip_metagraph_check": True,
+            "tee_measurements": pins,
+        }
     )
     ready_storage = SimpleNamespace(
         trusted_storage_ready=True,

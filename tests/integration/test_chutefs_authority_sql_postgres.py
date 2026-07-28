@@ -18,7 +18,8 @@ from api.server.schemas import (
 from tests.integration import test_gpu_chutefs_postgres as chutefs_pg
 from tests.integration import test_storage_reconciliation_postgres as storage_pg
 
-pytest_plugins = ["tests.integration.test_gpu_chutefs_postgres"]
+pg_session = storage_pg.pg_session
+storage_crypto = chutefs_pg.storage_crypto
 
 pytestmark = [
     pytest.mark.asyncio,
