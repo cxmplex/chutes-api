@@ -393,7 +393,7 @@ async def test_mismatched_key_preserves_attempt_and_conflict_ciphertext_then_res
             )
         assert attempt_error.value.headers == {"Retry-After": "5"}
         conflict = await session.get(GpuRegistrationConflict, conflict_id)
-        with pytest.raises(GpuRegistrationRecoveryKeyUnavailable):
+        assert (
             await _verify_recorded_conflict(
                 session,
                 conflict,
@@ -401,6 +401,8 @@ async def test_mismatched_key_preserves_attempt_and_conflict_ciphertext_then_res
                 competitor_spki,
                 competitor_cert,
             )
+            == "recorded"
+        )
         await session.rollback()
 
         persisted_attempt = await session.get(
@@ -413,6 +415,16 @@ async def test_mismatched_key_preserves_attempt_and_conflict_ciphertext_then_res
         assert persisted_attempt.request_payload_ciphertext == attempt_ciphertext
         assert persisted_conflict.state == "recorded"
         assert persisted_conflict.request_payload_ciphertext == conflict_ciphertext
+        assert persisted_conflict.request_payload_key_id == persisted_key_id
+        assert persisted_conflict.processing_lease_owner is None
+        assert persisted_conflict.processing_lease_expires_at is None
+        assert persisted_conflict.verification_attempt_count == 1
+        assert persisted_conflict.last_attempt_at is not None
+        assert persisted_conflict.next_attempt_at is not None
+        assert (
+            persisted_conflict.last_transient_error_code
+            == "GpuRegistrationRecoveryKeyUnavailable"
+        )
 
         _configure_keyring(
             monkeypatch,
@@ -534,6 +546,7 @@ async def test_retirement_blocks_attempt_then_conflict_and_exact_replay_is_stabl
         conflict.state = "invalid"
         conflict.request_payload_ciphertext = None
         conflict.request_payload_key_id = None
+        conflict.next_attempt_at = None
         conflict.verification_detail = "terminal fixture"
         conflict.verified_at = now
         await session.commit()
