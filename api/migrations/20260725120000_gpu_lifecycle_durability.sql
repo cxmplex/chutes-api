@@ -129,6 +129,354 @@ BEGIN
 END
 $$;
 
+CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_epochs (
+    key_id VARCHAR(64) PRIMARY KEY,
+    key_sha256 VARCHAR(64) NOT NULL,
+    predecessor_key_id VARCHAR(64) REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT,
+    state VARCHAR NOT NULL,
+    required_replica_ids JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    activated_at TIMESTAMPTZ,
+    retiring_at TIMESTAMPTZ,
+    retired_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ,
+    CONSTRAINT ck_gpu_registration_recovery_key_epoch_identity CHECK (
+        key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'
+        AND key_sha256 ~ '^[0-9a-f]{64}$'
+    ),
+    CONSTRAINT ck_gpu_registration_recovery_key_epoch_state CHECK (
+        state IN ('staged', 'active', 'retiring', 'retired', 'cancelled')
+    ),
+    CONSTRAINT ck_gpu_registration_recovery_key_epoch_replicas CHECK (
+        jsonb_typeof(required_replica_ids) = 'array'
+        AND jsonb_array_length(required_replica_ids) > 0
+    ),
+    CONSTRAINT ck_gpu_registration_recovery_key_epoch_timestamps CHECK (
+        (state = 'staged' AND activated_at IS NULL
+         AND retiring_at IS NULL AND retired_at IS NULL
+         AND cancelled_at IS NULL)
+        OR (state = 'active' AND activated_at IS NOT NULL
+            AND retiring_at IS NULL AND retired_at IS NULL
+            AND cancelled_at IS NULL)
+        OR (state = 'retiring' AND activated_at IS NOT NULL
+            AND retiring_at IS NOT NULL AND retired_at IS NULL
+            AND cancelled_at IS NULL)
+        OR (state = 'retired' AND activated_at IS NOT NULL
+            AND retiring_at IS NOT NULL AND retired_at IS NOT NULL
+            AND cancelled_at IS NULL)
+        OR (state = 'cancelled' AND activated_at IS NULL
+            AND retiring_at IS NULL AND retired_at IS NULL
+            AND cancelled_at IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_registration_recovery_key_active
+    ON gpu_registration_recovery_key_epochs(state) WHERE state = 'active';
+
+CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_replica_acks (
+    replica_id VARCHAR(128) NOT NULL,
+    key_id VARCHAR(64) NOT NULL REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE CASCADE,
+    key_ids JSONB NOT NULL,
+    key_fingerprints JSONB NOT NULL,
+    keyring_sha256 VARCHAR(64) NOT NULL,
+    acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (replica_id, key_id),
+    CONSTRAINT ck_gpu_registration_recovery_key_replica_ack CHECK (
+        replica_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        AND jsonb_typeof(key_ids) = 'array' AND key_ids ? key_id
+        AND jsonb_typeof(key_fingerprints) = 'object'
+        AND key_fingerprints ? key_id
+        AND keyring_sha256 ~ '^[0-9a-f]{64}$'
+    )
+);
+
+CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_epoch_operations (
+    request_id VARCHAR PRIMARY KEY,
+    request_sha256 VARCHAR(64) NOT NULL,
+    operation_type VARCHAR NOT NULL,
+    key_id VARCHAR(64) NOT NULL REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT,
+    predecessor_key_id VARCHAR(64),
+    requested_by_user_id VARCHAR NOT NULL,
+    required_replica_ids JSONB,
+    reason VARCHAR,
+    response_json JSONB NOT NULL,
+    response_sha256 VARCHAR(64) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_gpu_registration_recovery_key_epoch_operation CHECK (
+        request_sha256 ~ '^[0-9a-f]{64}$'
+        AND response_sha256 ~ '^[0-9a-f]{64}$'
+        AND operation_type IN ('stage', 'activate', 'retire', 'cancel')
+        AND (
+            (operation_type = 'stage'
+             AND jsonb_typeof(required_replica_ids) = 'array'
+             AND jsonb_array_length(required_replica_ids) > 0
+             AND reason IS NULL)
+            OR (operation_type IN ('activate', 'retire')
+                AND required_replica_ids IS NULL AND reason IS NULL)
+            OR (operation_type = 'cancel'
+                AND required_replica_ids IS NULL
+                AND length(reason) BETWEEN 1 AND 2000)
+        )
+    )
+);
+CREATE OR REPLACE FUNCTION prevent_gpu_registration_recovery_key_operation_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'GPU registration recovery-key epoch operation audit is immutable';
+END;
+$$;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgname = 'trg_gpu_registration_recovery_key_operation_immutable'
+           AND tgrelid = 'gpu_registration_recovery_key_epoch_operations'::regclass
+           AND NOT tgisinternal
+    ) THEN
+        CREATE TRIGGER trg_gpu_registration_recovery_key_operation_immutable
+            BEFORE UPDATE OR DELETE ON gpu_registration_recovery_key_epoch_operations
+            FOR EACH ROW EXECUTE FUNCTION prevent_gpu_registration_recovery_key_operation_mutation();
+    END IF;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION enforce_gpu_registration_recovery_key_transition()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'GPU registration recovery-key epochs cannot be deleted';
+    END IF;
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.state <> 'staged'
+           OR NEW.activated_at IS NOT NULL
+           OR NEW.retiring_at IS NOT NULL
+           OR NEW.retired_at IS NOT NULL
+           OR NEW.cancelled_at IS NOT NULL
+        THEN
+            RAISE EXCEPTION 'GPU registration recovery-key epochs must begin staged';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF NEW.key_id IS DISTINCT FROM OLD.key_id
+       OR NEW.key_sha256 IS DISTINCT FROM OLD.key_sha256
+       OR NEW.predecessor_key_id IS DISTINCT FROM OLD.predecessor_key_id
+       OR NEW.required_replica_ids IS DISTINCT FROM OLD.required_replica_ids
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'GPU registration recovery-key epoch identity is immutable';
+    END IF;
+    IF NEW.state IS NOT DISTINCT FROM OLD.state THEN
+        IF NEW.activated_at IS DISTINCT FROM OLD.activated_at
+           OR NEW.retiring_at IS DISTINCT FROM OLD.retiring_at
+           OR NEW.retired_at IS DISTINCT FROM OLD.retired_at
+           OR NEW.cancelled_at IS DISTINCT FROM OLD.cancelled_at
+        THEN
+            RAISE EXCEPTION 'GPU registration recovery-key timestamps are immutable';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.state = 'staged' AND NEW.state = 'active'
+       AND OLD.activated_at IS NULL AND NEW.activated_at IS NOT NULL
+       AND NEW.retiring_at IS NULL AND NEW.retired_at IS NULL
+       AND NEW.cancelled_at IS NULL
+    THEN
+        IF (
+            NEW.predecessor_key_id IS NULL
+            AND EXISTS (
+                SELECT 1 FROM gpu_registration_recovery_key_epochs epoch
+                 WHERE epoch.key_id <> NEW.key_id
+            )
+        ) OR (
+            NEW.predecessor_key_id IS NOT NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM gpu_registration_recovery_key_epochs predecessor
+                 WHERE predecessor.key_id = NEW.predecessor_key_id
+                   AND predecessor.state = 'retiring'
+                   AND predecessor.key_sha256 IS NOT NULL
+                   AND predecessor.activated_at IS NOT NULL
+                   AND predecessor.retiring_at IS NOT NULL
+                   AND predecessor.retired_at IS NULL
+            )
+        ) THEN
+            RAISE EXCEPTION 'GPU registration recovery-key activation has no exact retiring predecessor';
+        END IF;
+        IF EXISTS (
+            SELECT 1
+              FROM jsonb_array_elements_text(NEW.required_replica_ids) required(replica_id)
+             WHERE NOT EXISTS (
+                 SELECT 1
+                   FROM gpu_registration_recovery_key_replica_acks ack
+                  WHERE ack.key_id = NEW.key_id
+                    AND ack.replica_id = required.replica_id
+                    AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
+                    AND ack.key_ids ? NEW.key_id
+                    AND ack.key_fingerprints ->> NEW.key_id = NEW.key_sha256
+                    AND (
+                        NEW.predecessor_key_id IS NULL
+                        OR (
+                            ack.key_ids ? NEW.predecessor_key_id
+                            AND ack.key_fingerprints ->> NEW.predecessor_key_id = (
+                                SELECT predecessor.key_sha256
+                                  FROM gpu_registration_recovery_key_epochs predecessor
+                                 WHERE predecessor.key_id = NEW.predecessor_key_id
+                            )
+                        )
+                    )
+             )
+        ) OR (
+            SELECT COUNT(DISTINCT (
+                ack.key_ids::text || E'\n' || ack.key_fingerprints::text
+                || E'\n' || ack.keyring_sha256
+            ))
+              FROM gpu_registration_recovery_key_replica_acks ack
+             WHERE ack.key_id = NEW.key_id
+               AND ack.replica_id IN (
+                   SELECT jsonb_array_elements_text(NEW.required_replica_ids)
+               )
+        ) <> 1 THEN
+            RAISE EXCEPTION 'GPU registration recovery-key activation lacks exact fresh replica ACKs';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.state = 'active' AND NEW.state = 'retiring'
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND OLD.retiring_at IS NULL AND NEW.retiring_at IS NOT NULL
+       AND NEW.retired_at IS NULL AND NEW.cancelled_at IS NULL
+    THEN
+        IF (
+            SELECT COUNT(*)
+              FROM gpu_registration_recovery_key_epochs successor
+             WHERE successor.state = 'staged'
+               AND successor.predecessor_key_id = OLD.key_id
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM jsonb_array_elements_text(successor.required_replica_ids) required(replica_id)
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                          FROM gpu_registration_recovery_key_replica_acks ack
+                         WHERE ack.key_id = successor.key_id
+                           AND ack.replica_id = required.replica_id
+                           AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
+                           AND ack.key_ids ? successor.key_id
+                           AND ack.key_ids ? OLD.key_id
+                           AND ack.key_fingerprints ->> successor.key_id = successor.key_sha256
+                           AND ack.key_fingerprints ->> OLD.key_id = OLD.key_sha256
+                    )
+               )
+               AND (
+                   SELECT COUNT(DISTINCT (
+                       ack.key_ids::text || E'\n' || ack.key_fingerprints::text
+                       || E'\n' || ack.keyring_sha256
+                   ))
+                     FROM gpu_registration_recovery_key_replica_acks ack
+                    WHERE ack.key_id = successor.key_id
+                      AND ack.replica_id IN (
+                          SELECT jsonb_array_elements_text(successor.required_replica_ids)
+                      )
+               ) = 1
+        ) <> 1 THEN
+            RAISE EXCEPTION 'GPU registration recovery-key retirement lacks one exact ACKed successor';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.state = 'retiring' AND NEW.state = 'retired'
+       AND NEW.activated_at IS NOT DISTINCT FROM OLD.activated_at
+       AND NEW.retiring_at IS NOT DISTINCT FROM OLD.retiring_at
+       AND OLD.retired_at IS NULL AND NEW.retired_at IS NOT NULL
+       AND NEW.cancelled_at IS NULL
+    THEN
+        IF EXISTS (
+            SELECT 1 FROM gpu_registration_attempts
+             WHERE state = 'processing' AND request_payload_key_id = OLD.key_id
+        ) OR EXISTS (
+            SELECT 1 FROM gpu_registration_conflicts
+             WHERE state IN ('recorded', 'verifying')
+               AND request_payload_key_id = OLD.key_id
+        ) THEN
+            RAISE EXCEPTION 'GPU registration recovery key still has nonterminal references';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.state = 'staged' AND NEW.state = 'cancelled'
+       AND NEW.activated_at IS NULL
+       AND NEW.retiring_at IS NULL
+       AND NEW.retired_at IS NULL
+       AND OLD.cancelled_at IS NULL
+       AND NEW.cancelled_at IS NOT NULL
+    THEN
+        IF EXISTS (
+            SELECT 1
+              FROM gpu_registration_recovery_key_replica_acks ack
+             WHERE ack.key_id = OLD.key_id
+        ) THEN
+            RAISE EXCEPTION 'cancelled GPU registration recovery key still has replica ACKs';
+        END IF;
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'invalid GPU registration recovery-key transition % -> %',
+        OLD.state, NEW.state;
+END;
+$$;
+CREATE OR REPLACE FUNCTION enforce_gpu_registration_recovery_key_replica_ack()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM gpu_registration_recovery_key_epochs epoch
+         WHERE epoch.key_id = NEW.key_id
+           AND epoch.state IN ('staged', 'active', 'retiring')
+    ) THEN
+        RAISE EXCEPTION 'GPU registration recovery-key epoch is not ACK-eligible';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION enforce_gpu_registration_recovery_key_authority_closure()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (SELECT COUNT(*) FROM gpu_registration_recovery_key_epochs
+         WHERE state = 'active') <> 1
+    THEN
+        RAISE EXCEPTION 'GPU registration recovery-key authority requires exactly one active epoch';
+    END IF;
+    RETURN NULL;
+END;
+$$;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgname = 'trg_gpu_registration_recovery_key_replica_ack'
+           AND tgrelid = 'gpu_registration_recovery_key_replica_acks'::regclass
+           AND NOT tgisinternal
+    ) THEN
+        CREATE TRIGGER trg_gpu_registration_recovery_key_replica_ack
+            BEFORE INSERT OR UPDATE ON gpu_registration_recovery_key_replica_acks
+            FOR EACH ROW EXECUTE FUNCTION enforce_gpu_registration_recovery_key_replica_ack();
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgname = 'trg_gpu_registration_recovery_key_transition'
+           AND tgrelid = 'gpu_registration_recovery_key_epochs'::regclass
+           AND NOT tgisinternal
+    ) THEN
+        CREATE TRIGGER trg_gpu_registration_recovery_key_transition
+            BEFORE INSERT OR UPDATE OR DELETE ON gpu_registration_recovery_key_epochs
+            FOR EACH ROW EXECUTE FUNCTION enforce_gpu_registration_recovery_key_transition();
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger
+         WHERE tgname = 'trg_gpu_registration_recovery_key_closure'
+           AND tgrelid = 'gpu_registration_recovery_key_epochs'::regclass
+           AND NOT tgisinternal
+    ) THEN
+        CREATE CONSTRAINT TRIGGER trg_gpu_registration_recovery_key_closure
+            AFTER INSERT OR UPDATE OR DELETE ON gpu_registration_recovery_key_epochs
+            DEFERRABLE INITIALLY DEFERRED
+            FOR EACH ROW EXECUTE FUNCTION enforce_gpu_registration_recovery_key_authority_closure();
+    END IF;
+END
+$$;
+
 CREATE TABLE IF NOT EXISTS gpu_registration_nonces (
     nonce_id VARCHAR PRIMARY KEY,
     client_request_id VARCHAR NOT NULL,
@@ -174,7 +522,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
     registration_id VARCHAR UNIQUE,
     request_sha256 VARCHAR(64) NOT NULL,
     request_payload_ciphertext TEXT,
-    request_payload_key_id VARCHAR(64),
+    request_payload_key_id VARCHAR(64) CONSTRAINT fk_gpu_registration_attempt_recovery_key
+        REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT,
     peer_certificate_pem TEXT NOT NULL,
     peer_certificate_sha256 VARCHAR(64) NOT NULL,
     peer_spki_sha256 VARCHAR(64) NOT NULL,
@@ -247,7 +596,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_conflicts (
     nonce_id VARCHAR NOT NULL REFERENCES gpu_registration_nonces(nonce_id) ON DELETE RESTRICT,
     request_sha256 VARCHAR(64) NOT NULL,
     request_payload_ciphertext TEXT,
-    request_payload_key_id VARCHAR(64),
+    request_payload_key_id VARCHAR(64) CONSTRAINT fk_gpu_registration_conflict_recovery_key
+        REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT,
     peer_certificate_pem TEXT NOT NULL,
     peer_certificate_sha256 VARCHAR(64) NOT NULL,
     peer_spki_sha256 VARCHAR(64) NOT NULL,
@@ -296,6 +646,64 @@ CREATE TABLE IF NOT EXISTS gpu_registration_conflicts (
             AND verified_at IS NOT NULL AND verification_detail IS NOT NULL)
     )
 );
+
+-- A create_all-first schema from an older binary can already contain these
+-- tables without epoch foreign keys. Never invent a fingerprint for existing
+-- ciphertext: fail the transaction with exact durable row/key identities.
+DO $$
+DECLARE
+    unresolved TEXT;
+BEGIN
+    SELECT string_agg(identity, ', ' ORDER BY identity)
+      INTO unresolved
+      FROM (
+          SELECT 'attempt:' || attempt_id || ':' || request_payload_key_id AS identity
+            FROM gpu_registration_attempts attempt
+           WHERE request_payload_key_id IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM gpu_registration_recovery_key_epochs epoch
+                  WHERE epoch.key_id = attempt.request_payload_key_id
+             )
+          UNION ALL
+          SELECT 'conflict:' || conflict_id || ':' || request_payload_key_id AS identity
+            FROM gpu_registration_conflicts conflict
+           WHERE request_payload_key_id IS NOT NULL
+             AND NOT EXISTS (
+                 SELECT 1 FROM gpu_registration_recovery_key_epochs epoch
+                  WHERE epoch.key_id = conflict.request_payload_key_id
+             )
+      ) unresolved_rows;
+    IF unresolved IS NOT NULL THEN
+        RAISE EXCEPTION
+            'cannot bind GPU registration recovery ciphertext to a verified key epoch: %',
+            unresolved;
+    END IF;
+END
+$$;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'fk_gpu_registration_attempt_recovery_key'
+           AND conrelid = 'gpu_registration_attempts'::regclass
+    ) THEN
+        ALTER TABLE gpu_registration_attempts
+            ADD CONSTRAINT fk_gpu_registration_attempt_recovery_key
+            FOREIGN KEY (request_payload_key_id)
+            REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'fk_gpu_registration_conflict_recovery_key'
+           AND conrelid = 'gpu_registration_conflicts'::regclass
+    ) THEN
+        ALTER TABLE gpu_registration_conflicts
+            ADD CONSTRAINT fk_gpu_registration_conflict_recovery_key
+            FOREIGN KEY (request_payload_key_id)
+            REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT;
+    END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
     operation_id VARCHAR PRIMARY KEY,
@@ -782,6 +1190,15 @@ ALTER TABLE gpu_allocation_groups ADD CONSTRAINT ck_gpu_allocation_group_owner C
 
 -- migrate:down
 
+-- Match runtime recovery-key -> lifecycle -> row ordering so a guarded down
+-- cannot deadlock an in-flight mint, rotation, or retirement transaction.
+SELECT pg_advisory_xact_lock(
+    hashtextextended('chutes.gpu-registration-recovery-key-epochs.v1', 0)
+);
+SELECT pg_advisory_xact_lock(hashtextextended('chutes:gpu-lifecycle:v1', 0));
+LOCK TABLE gpu_registration_recovery_key_epochs IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE gpu_registration_recovery_key_replica_acks IN ACCESS EXCLUSIVE MODE;
+LOCK TABLE gpu_registration_recovery_key_epoch_operations IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE gpu_allocation_groups IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE nodes IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE gpu_hotplug_commands IN ACCESS EXCLUSIVE MODE;
@@ -803,6 +1220,12 @@ BEGIN
        OR EXISTS (SELECT 1 FROM gpu_recovery_events)
        OR EXISTS (SELECT 1 FROM gpu_host_loss_events)
        OR EXISTS (SELECT 1 FROM gpu_hotplug_commands)
+       OR EXISTS (SELECT 1 FROM gpu_registration_recovery_key_epoch_operations)
+       OR (SELECT COUNT(*) FROM gpu_registration_recovery_key_epochs) > 1
+       OR EXISTS (
+           SELECT 1 FROM gpu_registration_recovery_key_epochs
+            WHERE state <> 'active' OR predecessor_key_id IS NOT NULL
+       )
        OR EXISTS (
            SELECT 1 FROM nodes
             WHERE gpu_launch_reservation_id IS NOT NULL
@@ -862,3 +1285,20 @@ ALTER TABLE gpu_registration_nonces DROP CONSTRAINT fk_gpu_registration_nonce_at
 DROP TABLE gpu_registration_conflicts;
 DROP TABLE gpu_registration_attempts;
 DROP TABLE gpu_registration_nonces;
+DROP TRIGGER trg_gpu_registration_recovery_key_operation_immutable
+    ON gpu_registration_recovery_key_epoch_operations;
+DROP FUNCTION prevent_gpu_registration_recovery_key_operation_mutation();
+DROP TABLE gpu_registration_recovery_key_epoch_operations;
+DROP TRIGGER trg_gpu_registration_recovery_key_replica_ack
+    ON gpu_registration_recovery_key_replica_acks;
+DELETE FROM gpu_registration_recovery_key_replica_acks;
+DROP TRIGGER trg_gpu_registration_recovery_key_transition
+    ON gpu_registration_recovery_key_epochs;
+DROP TRIGGER trg_gpu_registration_recovery_key_closure
+    ON gpu_registration_recovery_key_epochs;
+DELETE FROM gpu_registration_recovery_key_epochs;
+DROP TABLE gpu_registration_recovery_key_replica_acks;
+DROP TABLE gpu_registration_recovery_key_epochs;
+DROP FUNCTION enforce_gpu_registration_recovery_key_authority_closure();
+DROP FUNCTION enforce_gpu_registration_recovery_key_replica_ack();
+DROP FUNCTION enforce_gpu_registration_recovery_key_transition();

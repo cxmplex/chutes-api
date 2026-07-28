@@ -256,6 +256,10 @@ nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
     secretKeyRef:
       name: gpu-registration-recovery-keys
       key: keyring-json
+- name: GPU_REGISTRATION_RECOVERY_REPLICA_ID
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.uid
 - name: ENVDUMP_UNLOCK
   valueFrom:
     secretKeyRef:

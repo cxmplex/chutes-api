@@ -10,12 +10,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException, status
-from cryptography.fernet import InvalidToken
+from cryptography.fernet import Fernet, InvalidToken
 from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.config import settings
 from api.database import generate_uuid
 from api.gpu_contracts import (
     GpuRegistrationNonceRequestV2,
@@ -28,6 +27,11 @@ from api.gpu_hotplug_service import (
     GpuHotplugError,
     dispatch_gpu_hotplug_command,
     ensure_gpu_hotplug_command,
+)
+from api.gpu_registration_keys import (
+    GpuRegistrationRecoveryKeyUnavailable,
+    load_registration_recovery_cipher,
+    lock_active_registration_recovery_key,
 )
 from api.gpu_models import (
     GpuHotplugCommand,
@@ -173,20 +177,19 @@ def _registration_request_audit(
     }
 
 
-def _encrypt_registration_request(
+async def _encrypt_registration_request(
+    db: AsyncSession,
     request: GpuRegistrationRequestV2,
+    *,
+    locked_key: tuple[str, Fernet] | None = None,
 ) -> tuple[str, str]:
-    key_id = settings.gpu_registration_recovery_key_id
-    cipher = settings.gpu_registration_recovery_keys.get(key_id)
-    if cipher is None:
-        raise ServerRegistrationError(
-            "The active GPU registration recovery key is unavailable."
-        )
+    key_id, cipher = locked_key or await lock_active_registration_recovery_key(db)
     ciphertext = cipher.encrypt(canonical_json_bytes(request)).decode("ascii")
     return ciphertext, key_id
 
 
-def _decrypt_registration_request(
+async def _decrypt_registration_request(
+    db: AsyncSession,
     ciphertext: str | None,
     key_id: str | None,
     request_sha256: str,
@@ -195,11 +198,7 @@ def _decrypt_registration_request(
         raise ServerRegistrationError(
             "Persisted GPU registration recovery material is unavailable."
         )
-    cipher = settings.gpu_registration_recovery_keys.get(key_id)
-    if cipher is None:
-        raise ServerRegistrationError(
-            "Persisted GPU registration recovery key is unavailable."
-        )
+    cipher = await load_registration_recovery_cipher(db, key_id)
     try:
         plaintext = cipher.decrypt(ciphertext.encode("ascii"))
         document = json.loads(plaintext)
@@ -905,6 +904,9 @@ async def _claim_attempt(
 ]:
     """Atomically claim the nonce and insert the attempt, or classify an exact replay."""
 
+    # Recovery-key fencing precedes the global lifecycle lock. Rotation uses
+    # the same order before inspecting nonterminal attempts/conflicts.
+    recovery_key = await lock_active_registration_recovery_key(db)
     await acquire_gpu_lifecycle_lock(db)
     nonce = (
         await db.execute(
@@ -1078,7 +1080,9 @@ async def _claim_attempt(
                 )
             ).scalar_one_or_none()
             if conflict is None:
-                ciphertext, key_id = _encrypt_registration_request(request)
+                ciphertext, key_id = await _encrypt_registration_request(
+                    db, request, locked_key=recovery_key
+                )
                 conflict = GpuRegistrationConflict(
                     conflict_id=generate_uuid(),
                     attempt_id=attempt.attempt_id,
@@ -1124,7 +1128,9 @@ async def _claim_attempt(
             status_code=409, detail="GPU registration nonce is no longer claimable."
         )
     lease_owner = generate_uuid()
-    ciphertext, key_id = _encrypt_registration_request(request)
+    ciphertext, key_id = await _encrypt_registration_request(
+        db, request, locked_key=recovery_key
+    )
     attempt = GpuRegistrationAttempt(
         attempt_id=generate_uuid(),
         nonce_id=nonce.nonce_id,
@@ -1215,7 +1221,8 @@ async def _locked_processing_snapshot(
         raise GpuRegistrationLeaseLost(
             "GPU registration processing lease is no longer authoritative."
         )
-    request = _decrypt_registration_request(
+    request = await _decrypt_registration_request(
+        db,
         attempt.request_payload_ciphertext,
         attempt.request_payload_key_id,
         attempt.request_sha256,
@@ -1920,7 +1927,8 @@ async def _verify_recorded_conflict(
         await db.commit()
         return "verifying"
     try:
-        persisted_request = _decrypt_registration_request(
+        persisted_request = await _decrypt_registration_request(
+            db,
             row.request_payload_ciphertext,
             row.request_payload_key_id,
             row.request_sha256,
@@ -2056,7 +2064,8 @@ async def _verify_recorded_conflict(
 
     now = _now()
     try:
-        current_request = _decrypt_registration_request(
+        current_request = await _decrypt_registration_request(
+            db,
             row.request_payload_ciphertext,
             row.request_payload_key_id,
             row.request_sha256,
@@ -2129,7 +2138,8 @@ async def _verify_recorded_conflict(
         final_state = "invalid"
     elif attempt.state == "processing":
         try:
-            primary_request = _decrypt_registration_request(
+            primary_request = await _decrypt_registration_request(
+                db,
                 attempt.request_payload_ciphertext,
                 attempt.request_payload_key_id,
                 attempt.request_sha256,
@@ -2387,6 +2397,11 @@ async def _run_registration_attempt(
                 status_code=404, detail="GPU registration attempt not found."
             )
         return await registration_attempt_response(db, attempt, expected_cert_hash)
+    except GpuRegistrationRecoveryKeyUnavailable:
+        # The durable ciphertext and processing lease remain recoverable. A
+        # restored key resumes this same attempt after the bounded lease.
+        await db.rollback()
+        raise
     except GpuHotplugError as exc:
         await db.rollback()
         attempt = await _mark_attempt_failed(

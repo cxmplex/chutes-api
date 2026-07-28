@@ -31,6 +31,12 @@ from api.gpu_hotplug_service import (
     get_gpu_hotplug_command,
     record_gpu_hotplug_ack,
 )
+from api.gpu_registration_keys import (
+    activate_gpu_registration_recovery_key_epoch,
+    cancel_gpu_registration_recovery_key_epoch,
+    retire_gpu_registration_recovery_key_epoch,
+    stage_gpu_registration_recovery_key_epoch,
+)
 from api.gpu_lifecycle_service import (
     GpuLifecycleError,
     authorize_gpu_recovery,
@@ -103,6 +109,10 @@ from api.host.schemas import (
     GpuReservationStateRequestV1,
     GpuSignedLaunchClaimsEnvelopeV1,
     GpuRecoveryAuthorizeRequestV1,
+    GpuRegistrationRecoveryKeyCancelRequest,
+    GpuRegistrationRecoveryKeyEpochResponse,
+    GpuRegistrationRecoveryKeyStageRequest,
+    GpuRegistrationRecoveryKeyTransitionRequest,
 )
 from api.server.gpu_infra import (
     authorize_legacy_gpu_cutover,
@@ -1142,6 +1152,96 @@ async def authorize_gpu_group_recovery_endpoint(
 
 
 @router.post(
+    "/admin/gpu/registration/recovery-keys/stage",
+    response_model=GpuRegistrationRecoveryKeyEpochResponse,
+)
+async def stage_gpu_registration_recovery_key_endpoint(
+    body: GpuRegistrationRecoveryKeyStageRequest,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(raise_not_found=False)),
+):
+    administrator = _require_admin(current_user)
+    return GpuRegistrationRecoveryKeyEpochResponse(
+        **(
+            await stage_gpu_registration_recovery_key_epoch(
+                db,
+                administrator_id=str(administrator.user_id),
+                request_id=body.request_id,
+                key_id=body.key_id,
+                required_replica_ids=body.required_replica_ids,
+            )
+        )
+    )
+
+
+@router.post(
+    "/admin/gpu/registration/recovery-keys/cancel",
+    response_model=GpuRegistrationRecoveryKeyEpochResponse,
+)
+async def cancel_gpu_registration_recovery_key_endpoint(
+    body: GpuRegistrationRecoveryKeyCancelRequest,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(raise_not_found=False)),
+):
+    administrator = _require_admin(current_user)
+    return GpuRegistrationRecoveryKeyEpochResponse(
+        **(
+            await cancel_gpu_registration_recovery_key_epoch(
+                db,
+                administrator_id=str(administrator.user_id),
+                request_id=body.request_id,
+                key_id=body.key_id,
+                reason=body.reason,
+            )
+        )
+    )
+
+
+@router.post(
+    "/admin/gpu/registration/recovery-keys/activate",
+    response_model=GpuRegistrationRecoveryKeyEpochResponse,
+)
+async def activate_gpu_registration_recovery_key_endpoint(
+    body: GpuRegistrationRecoveryKeyTransitionRequest,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(raise_not_found=False)),
+):
+    administrator = _require_admin(current_user)
+    return GpuRegistrationRecoveryKeyEpochResponse(
+        **(
+            await activate_gpu_registration_recovery_key_epoch(
+                db,
+                administrator_id=str(administrator.user_id),
+                request_id=body.request_id,
+                key_id=body.key_id,
+            )
+        )
+    )
+
+
+@router.post(
+    "/admin/gpu/registration/recovery-keys/retire",
+    response_model=GpuRegistrationRecoveryKeyEpochResponse,
+)
+async def retire_gpu_registration_recovery_key_endpoint(
+    body: GpuRegistrationRecoveryKeyTransitionRequest,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(raise_not_found=False)),
+):
+    administrator = _require_admin(current_user)
+    return GpuRegistrationRecoveryKeyEpochResponse(
+        **(
+            await retire_gpu_registration_recovery_key_epoch(
+                db,
+                administrator_id=str(administrator.user_id),
+                request_id=body.request_id,
+                key_id=body.key_id,
+            )
+        )
+    )
+
+
+@router.post(
     "/gpu/groups/{allocation_group_id}/lifecycle/operations/{operation_id}/host-lost",
     response_model=GpuLifecycleOperationV1,
     response_model_exclude_none=True,
@@ -1361,7 +1461,9 @@ async def list_hosts(
             await gpu_host_storage_readiness(
                 db,
                 h,
-                observed_live_storage_ids=observed_storage_by_host.get(h.host_id, set()),
+                observed_live_storage_ids=observed_storage_by_host.get(
+                    h.host_id, set()
+                ),
             )
             if h.compute_type == "gpu"
             else None

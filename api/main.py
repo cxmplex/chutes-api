@@ -60,6 +60,9 @@ from api.instance.util import start_instance_invalidation_listener
 from api.log import install_asyncio_exception_handler
 from api.client_ip import resolve_client_ip
 from api.storage.startup import require_chutefs_token_key_retention
+from api.gpu_registration_keys import (
+    require_gpu_registration_recovery_key_retention,
+)
 
 
 async def loop_lag_monitor(interval: float = 0.1, warn_threshold: float = 0.2):
@@ -212,6 +215,7 @@ async def ready(request: Request):
         # also the bounded per-replica acknowledgement path for epochs staged
         # after a rolling key distribution, so activation never needs a restart.
         await require_chutefs_token_key_retention()
+        await require_gpu_registration_recovery_key_retention()
         async with get_session() as session:
             await session.execute(text("SELECT 1"))
         async with get_session(readonly=True) as session:

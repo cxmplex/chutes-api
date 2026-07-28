@@ -1125,6 +1125,10 @@ class Settings(BaseSettings):
         os.getenv("GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY", "false").lower()
         == "true"
     )
+    gpu_registration_recovery_replica_id: str = os.getenv(
+        "GPU_REGISTRATION_RECOVERY_REPLICA_ID",
+        os.getenv("HOSTNAME", "local-dev"),
+    )
     gpu_launch_key_epoch: int = int(os.getenv("GPU_LAUNCH_KEY_EPOCH", "1"))
 
     @property
@@ -1188,8 +1192,8 @@ class Settings(BaseSettings):
         return dict(keys)
 
     @property
-    def gpu_registration_recovery_keys(self) -> Dict[str, Fernet]:
-        """Purpose-separated keys for short-lived Registration V2 recovery envelopes."""
+    def gpu_registration_recovery_key_materials(self) -> Dict[str, str]:
+        """Validated raw key material used for non-secret database fingerprints."""
 
         if self.gpu_registration_recovery_keys_json is None:
             if not self.gpu_registration_allow_insecure_dev_key:
@@ -1259,8 +1263,23 @@ class Settings(BaseSettings):
             raise ValueError(
                 "GPU registration recovery keys must not reuse a ChuteFS token key"
             )
+        if (
+            not isinstance(self.gpu_registration_recovery_replica_id, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                self.gpu_registration_recovery_replica_id,
+            )
+            is None
+        ):
+            raise ValueError("GPU_REGISTRATION_RECOVERY_REPLICA_ID is malformed")
+        return dict(keys)
+
+    @property
+    def gpu_registration_recovery_keys(self) -> Dict[str, Fernet]:
+        """Purpose-separated ciphers for short-lived Registration V2 envelopes."""
+
         result = {}
-        for key_id, secret in keys.items():
+        for key_id, secret in self.gpu_registration_recovery_key_materials.items():
             try:
                 result[key_id] = Fernet(secret.encode("ascii"))
             except (TypeError, ValueError) as exc:

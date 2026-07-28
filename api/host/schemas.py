@@ -15,6 +15,7 @@ import re
 import warnings
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import (
@@ -1620,6 +1621,96 @@ class GpuHostLossFinalizeRequestV1(FrozenWireModel):
         if not _HEX_64_RE.fullmatch(value):
             raise ValueError("receipt_sha256 must be 64 lowercase hexadecimal characters")
         return value
+
+
+class GpuRegistrationRecoveryKeyStageRequest(BaseModel):
+    """Administrator request to stage a key for an exact serving cohort."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    key_id: str
+    required_replica_ids: List[str] = Field(..., min_length=1, max_length=256)
+
+    @field_validator("request_id")
+    @classmethod
+    def _valid_request_id(cls, value: str) -> str:
+        try:
+            canonical = str(UUID(value))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("request_id must be a canonical UUID") from exc
+        if canonical != value:
+            raise ValueError("request_id must be a canonical UUID")
+        return value
+
+    @field_validator("key_id")
+    @classmethod
+    def _valid_key_id(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value) is None:
+            raise ValueError("key_id is malformed")
+        return value
+
+    @field_validator("required_replica_ids")
+    @classmethod
+    def _valid_replica_ids(cls, values: List[str]) -> List[str]:
+        if len(set(values)) != len(values):
+            raise ValueError("required_replica_ids must be unique")
+        if any(
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None
+            for value in values
+        ):
+            raise ValueError("required_replica_ids contains a malformed identity")
+        return sorted(values)
+
+
+class GpuRegistrationRecoveryKeyTransitionRequest(BaseModel):
+    """Administrator request to activate or retire one exact key epoch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    key_id: str
+
+    @field_validator("request_id")
+    @classmethod
+    def _valid_request_id(cls, value: str) -> str:
+        return GpuRegistrationRecoveryKeyStageRequest._valid_request_id(value)
+
+    @field_validator("key_id")
+    @classmethod
+    def _valid_key_id(cls, value: str) -> str:
+        return GpuRegistrationRecoveryKeyStageRequest._valid_key_id(value)
+
+
+class GpuRegistrationRecoveryKeyCancelRequest(
+    GpuRegistrationRecoveryKeyTransitionRequest
+):
+    """Administrator request to terminally cancel one staged key epoch."""
+
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def _valid_reason(cls, value: str) -> str:
+        canonical = value.strip()
+        if not canonical:
+            raise ValueError("reason must contain non-whitespace characters")
+        return canonical
+
+
+class GpuRegistrationRecoveryKeyEpochResponse(BaseModel):
+    """Stable persisted response for exact administrator operation replay."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    operation: Literal["stage", "activate", "retire", "cancel"]
+    key_id: str
+    predecessor_key_id: Optional[str] = None
+    state: Literal["staged", "active", "retired", "cancelled"]
+    active_key_id: Optional[str] = None
+    required_replica_ids: List[str] = Field(default_factory=list)
+    reason: Optional[str] = None
 
 
 class TdQuoteCommitmentV1(FrozenWireModel):

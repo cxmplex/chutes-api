@@ -77,6 +77,9 @@ from api.gpu_registration_service import (
     process_gpu_registration,
     registration_attempt_response,
 )
+from api.gpu_registration_keys import (
+    ensure_gpu_registration_recovery_key_authority,
+)
 from api.host.gpu_allocations import (
     GpuAllocationError,
     _active_gpu_release,
@@ -318,8 +321,12 @@ async def postgres_schema():
     )
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+    sessions = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    async with sessions() as session:
+        await ensure_gpu_registration_recovery_key_authority(session)
+        await session.commit()
     try:
-        yield sessionmaker(engine, class_=AsyncSession, expire_on_commit=False), schema
+        yield sessions, schema
     finally:
         await engine.dispose()
         async with admin.begin() as connection:
@@ -334,7 +341,8 @@ async def _apply_migration(
 ) -> None:
     migration = Path(__file__).resolve().parents[2] / "api/migrations" / migration_name
     up_sql, down_sql = migration.read_text().split("-- migrate:down", 1)
-    sql = up_sql if direction == "up" else f"BEGIN;\n{down_sql}\nCOMMIT;"
+    body = up_sql if direction == "up" else down_sql
+    sql = f"BEGIN;\n{body}\nCOMMIT;"
     parsed = urlsplit(TEST_DATABASE_URL.replace("+asyncpg", ""))
     connection_url = (
         f"postgresql://{parsed.username}@{parsed.hostname}:{parsed.port}{parsed.path}"

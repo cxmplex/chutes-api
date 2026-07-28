@@ -367,6 +367,8 @@ def test_key_epoch_ack_is_readiness_only_and_liveness_stays_independent():
 
     assert "require_chutefs_token_key_retention" not in ping
     assert "require_chutefs_token_key_retention" in ready
+    assert "require_gpu_registration_recovery_key_retention" not in ping
+    assert "require_gpu_registration_recovery_key_retention" in ready
 
 
 def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():

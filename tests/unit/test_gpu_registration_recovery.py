@@ -34,6 +34,24 @@ def test_registration_recovery_keyring_requires_active_valid_fernet_key(monkeypa
         _ = settings.gpu_registration_recovery_keys
 
 
+def test_registration_recovery_keyring_requires_valid_replica_id(monkeypatch):
+    key = Fernet.generate_key().decode("ascii")
+    monkeypatch.setattr(settings, "gpu_registration_recovery_key_id", "active")
+    monkeypatch.setattr(
+        settings,
+        "gpu_registration_recovery_keys_json",
+        json.dumps({"active": key}),
+    )
+    monkeypatch.setattr(
+        settings,
+        "gpu_registration_recovery_replica_id",
+        "not a pod identity",
+    )
+
+    with pytest.raises(ValueError, match="GPU_REGISTRATION_RECOVERY_REPLICA_ID"):
+        _ = settings.gpu_registration_recovery_keys
+
+
 def test_registration_recovery_keyring_rejects_cache_key_reuse(monkeypatch):
     key = Fernet.generate_key().decode("ascii")
     monkeypatch.setattr(settings, "gpu_registration_recovery_key_id", "active")
@@ -72,6 +90,7 @@ def test_registration_recovery_keys_use_external_secret_and_explicit_dev_opt_in(
     helpers = (root / "charts/templates/_helpers.tpl").read_text()
     assert "name: GPU_REGISTRATION_RECOVERY_KEY_ID" in helpers
     assert "name: GPU_REGISTRATION_RECOVERY_KEYS_JSON" in helpers
+    assert "name: GPU_REGISTRATION_RECOVERY_REPLICA_ID" in helpers
     assert helpers.count("name: gpu-registration-recovery-keys") == 2
     assert "GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY" not in helpers
 
