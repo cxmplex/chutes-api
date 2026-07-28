@@ -6,6 +6,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,8 +45,31 @@ def _now() -> datetime:
 
 def _retry_delay(attempt_count: int) -> timedelta:
     exponent = max(0, min(int(attempt_count or 0) - 1, 20))
-    return timedelta(
-        seconds=min(_RETRY_SECONDS * (2**exponent), _MAX_RETRY_SECONDS)
+    return timedelta(seconds=min(_RETRY_SECONDS * (2**exponent), _MAX_RETRY_SECONDS))
+
+
+def _mark_retry_alert(
+    row: GpuHotplugCommand,
+    observed_at: datetime,
+) -> Optional[dict[str, object]]:
+    if int(row.attempt_count or 0) < _ALERT_ATTEMPT_COUNT or row.alerted_at is not None:
+        return None
+    row.alerted_at = observed_at
+    return {
+        "command_id": row.command_id,
+        "host_id": row.host_id,
+        "reservation_id": row.reservation_id,
+        "attempt_count": row.attempt_count,
+        "next_attempt_at": row.next_attempt_at,
+        "last_dispatch_error": row.last_dispatch_error,
+    }
+
+
+def _emit_retry_alert(alert: Optional[dict[str, object]]) -> None:
+    if alert is None:
+        return
+    logger.bind(**alert).error(
+        "Durable GPU hotplug command exceeded the retry alert threshold."
     )
 
 
@@ -412,9 +436,14 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
             )
             await db.commit()
             return False
+        lease_expires_at = now + timedelta(seconds=_DISPATCH_LEASE_SECONDS)
         row.state = "leased"
         row.dispatch_lease_owner = lease_owner
-        row.dispatch_lease_expires_at = now + timedelta(seconds=_DISPATCH_LEASE_SECONDS)
+        row.dispatch_lease_expires_at = lease_expires_at
+        # An abandoned lease becomes due exactly when the lease expires. The
+        # retry selector treats this timestamp as a projection, not a second
+        # independent gate that can strand an expired command.
+        row.next_attempt_at = lease_expires_at
         row.attempt_count = int(row.attempt_count or 0) + 1
         row.updated_at = now
         await db.commit()
@@ -454,6 +483,7 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
             command_id=command.command_id,
         )
     except Exception as exc:
+        retry_alert = None
         async with get_session() as db:
             await acquire_gpu_lifecycle_lock(db)
             row = (
@@ -474,11 +504,12 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
                 row.updated_at = _now()
                 row.next_attempt_at = row.updated_at + _retry_delay(row.attempt_count)
                 row.last_dispatch_error = str(exc)[:2000]
-                if row.attempt_count >= _ALERT_ATTEMPT_COUNT:
-                    row.alerted_at = row.alerted_at or row.updated_at
+                retry_alert = _mark_retry_alert(row, row.updated_at)
                 await db.commit()
+        _emit_retry_alert(retry_alert)
         raise
 
+    retry_alert = None
     async with get_session() as db:
         await acquire_gpu_lifecycle_lock(db)
         row = (
@@ -500,10 +531,10 @@ async def dispatch_gpu_hotplug_command(command_id: str) -> bool:
         row.dispatched_at = _now()
         row.next_attempt_at = row.dispatched_at + _retry_delay(row.attempt_count)
         row.last_dispatch_error = None
-        if row.attempt_count >= _ALERT_ATTEMPT_COUNT:
-            row.alerted_at = row.alerted_at or row.dispatched_at
+        retry_alert = _mark_retry_alert(row, row.dispatched_at)
         row.updated_at = row.dispatched_at
         await db.commit()
+    _emit_retry_alert(retry_alert)
     return True
 
 
@@ -516,20 +547,19 @@ async def retry_due_gpu_hotplug_commands() -> None:
                     select(GpuHotplugCommand.command_id)
                     .where(
                         or_(
-                            GpuHotplugCommand.state == "pending",
+                            (
+                                (GpuHotplugCommand.state == "pending")
+                                & (GpuHotplugCommand.next_attempt_at <= now)
+                            ),
                             (
                                 (GpuHotplugCommand.state == "leased")
-                                & (
-                                    GpuHotplugCommand.dispatch_lease_expires_at
-                                    <= _now()
-                                )
+                                & (GpuHotplugCommand.dispatch_lease_expires_at <= now)
                             ),
                             (
                                 (GpuHotplugCommand.state == "dispatched")
                                 & (GpuHotplugCommand.next_attempt_at <= now)
                             ),
                         )
-                        & (GpuHotplugCommand.next_attempt_at <= now)
                     )
                     .order_by(
                         GpuHotplugCommand.next_attempt_at,

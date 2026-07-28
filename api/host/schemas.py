@@ -46,8 +46,12 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _CHANNEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 _HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 _BDF_RE = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
-_GPU_UUID_RE = re.compile(r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-_BOOT_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_GPU_UUID_RE = re.compile(
+    r"^GPU-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+_BOOT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 _PROCESS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _OCI_REPOSITORY_RE = re.compile(
     r"^[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
@@ -61,7 +65,9 @@ def canonical_json_bytes(value: BaseModel | Dict[str, Any]) -> bytes:
     """Return the only byte representation accepted for protocol signatures."""
 
     document = (
-        value.model_dump(mode="json", exclude_none=True) if isinstance(value, BaseModel) else value
+        value.model_dump(mode="json", exclude_none=True)
+        if isinstance(value, BaseModel)
+        else value
     )
     return json.dumps(
         document,
@@ -94,7 +100,9 @@ def _validate_b64(value: str, field_name: str, minimum: int, maximum: int) -> st
     except (ValueError, TypeError) as exc:
         raise ValueError(f"{field_name} must be canonical base64") from exc
     if not minimum <= len(decoded) <= maximum:
-        raise ValueError(f"{field_name} must encode between {minimum} and {maximum} bytes")
+        raise ValueError(
+            f"{field_name} must encode between {minimum} and {maximum} bytes"
+        )
     if base64.b64encode(decoded).decode("ascii") != value:
         raise ValueError(f"{field_name} must use canonical padded base64")
     return value
@@ -207,7 +215,9 @@ class EnrollmentVoucherResponseV2(FrozenWireModel):
 
 
 class EnrollmentKeyChallengeRequestV1(FrozenWireModel):
-    schema: Literal["chutes.host-enrollment-key-challenge"] = "chutes.host-enrollment-key-challenge"
+    schema: Literal["chutes.host-enrollment-key-challenge"] = (
+        "chutes.host-enrollment-key-challenge"
+    )
     version: Literal[1] = 1
     voucher: str = Field(..., min_length=67, max_length=512)
     ed25519_public_key: str
@@ -229,7 +239,9 @@ class EnrollmentKeyChallengeRequestV1(FrozenWireModel):
             {
                 "schema": self.schema,
                 "version": self.version,
-                "voucher_sha256": hashlib.sha256(self.voucher.encode("ascii")).hexdigest(),
+                "voucher_sha256": hashlib.sha256(
+                    self.voucher.encode("ascii")
+                ).hexdigest(),
                 "ed25519_public_key": self.ed25519_public_key,
                 "x25519_public_key": self.x25519_public_key,
             }
@@ -246,7 +258,9 @@ class EnrollmentKeyChallengeRequestV2(EnrollmentKeyChallengeRequestV1):
                 "schema": self.schema,
                 "version": self.version,
                 "compute_type": self.compute_type,
-                "voucher_sha256": hashlib.sha256(self.voucher.encode("ascii")).hexdigest(),
+                "voucher_sha256": hashlib.sha256(
+                    self.voucher.encode("ascii")
+                ).hexdigest(),
                 "ed25519_public_key": self.ed25519_public_key,
                 "x25519_public_key": self.x25519_public_key,
             }
@@ -254,7 +268,9 @@ class EnrollmentKeyChallengeRequestV2(EnrollmentKeyChallengeRequestV1):
 
 
 class EnrollmentKeyChallengeResponseV1(FrozenWireModel):
-    schema: Literal["chutes.host-enrollment-key-proof"] = "chutes.host-enrollment-key-proof"
+    schema: Literal["chutes.host-enrollment-key-proof"] = (
+        "chutes.host-enrollment-key-proof"
+    )
     version: Literal[1] = 1
     challenge_id: str = Field(default_factory=generate_uuid)
     server_ephemeral_public_key: str
@@ -284,7 +300,9 @@ class EnrollmentKeyChallengeResponseV2(EnrollmentKeyChallengeResponseV1):
 
 
 class HostEnrollmentRedemptionV1(FrozenWireModel):
-    schema: Literal["chutes.host-enrollment-redemption"] = "chutes.host-enrollment-redemption"
+    schema: Literal["chutes.host-enrollment-redemption"] = (
+        "chutes.host-enrollment-redemption"
+    )
     version: Literal[1] = 1
     voucher: str = Field(..., min_length=67, max_length=512)
     challenge_id: str = Field(..., min_length=1, max_length=256)
@@ -313,7 +331,9 @@ class HostEnrollmentRedemptionV1(FrozenWireModel):
             {
                 "schema": self.schema,
                 "version": self.version,
-                "voucher_sha256": hashlib.sha256(self.voucher.encode("ascii")).hexdigest(),
+                "voucher_sha256": hashlib.sha256(
+                    self.voucher.encode("ascii")
+                ).hexdigest(),
                 "challenge_id": self.challenge_id,
                 "challenge_plaintext": self.challenge_plaintext,
                 "ed25519_public_key": self.ed25519_public_key,
@@ -332,7 +352,9 @@ class HostEnrollmentRedemptionV2(HostEnrollmentRedemptionV1):
                 "schema": self.schema,
                 "version": self.version,
                 "compute_type": self.compute_type,
-                "voucher_sha256": hashlib.sha256(self.voucher.encode("ascii")).hexdigest(),
+                "voucher_sha256": hashlib.sha256(
+                    self.voucher.encode("ascii")
+                ).hexdigest(),
                 "challenge_id": self.challenge_id,
                 "challenge_plaintext": self.challenge_plaintext,
                 "ed25519_public_key": self.ed25519_public_key,
@@ -403,7 +425,9 @@ class HostIdentityDurabilityAckV1(FrozenWireModel):
 
 
 class HostProvisioningHeartbeatV1(FrozenWireModel):
-    schema: Literal["chutes.host-provisioning-heartbeat"] = "chutes.host-provisioning-heartbeat"
+    schema: Literal["chutes.host-provisioning-heartbeat"] = (
+        "chutes.host-provisioning-heartbeat"
+    )
     version: Literal[1] = 1
     enrollment_generation: int = Field(..., ge=1)
     key_generation: int = Field(..., ge=1)
@@ -412,7 +436,9 @@ class HostProvisioningHeartbeatV1(FrozenWireModel):
 
 
 class HostProvisioningStatusV1(FrozenWireModel):
-    schema: Literal["chutes.host-provisioning-status"] = "chutes.host-provisioning-status"
+    schema: Literal["chutes.host-provisioning-status"] = (
+        "chutes.host-provisioning-status"
+    )
     version: Literal[1] = 1
     host_id: str
     enrollment_generation: int = Field(..., ge=1)
@@ -497,7 +523,9 @@ class HostSocketChallengeV1(FrozenWireModel):
 
 
 class HostSocketAuthenticationV1(FrozenWireModel):
-    schema: Literal["chutes.host-socket-authentication"] = "chutes.host-socket-authentication"
+    schema: Literal["chutes.host-socket-authentication"] = (
+        "chutes.host-socket-authentication"
+    )
     version: Literal[1] = 1
     challenge_id: str
     session_id: str
@@ -541,7 +569,9 @@ class TdSocketChallengeV1(FrozenWireModel):
 
 
 class TdSocketAuthenticationV1(FrozenWireModel):
-    schema: Literal["chutes.td-socket-authentication"] = "chutes.td-socket-authentication"
+    schema: Literal["chutes.td-socket-authentication"] = (
+        "chutes.td-socket-authentication"
+    )
     version: Literal[1] = 1
     challenge_id: str
     session_id: str
@@ -615,7 +645,9 @@ class PcsMailboxEnvelopeV1(FrozenWireModel):
     algorithm: Literal["X25519-HKDF-SHA256-CHACHA20POLY1305"] = (
         "X25519-HKDF-SHA256-CHACHA20POLY1305"
     )
-    kdf_label: Literal["chutes/model-b/pcs-mailbox/v1"] = "chutes/model-b/pcs-mailbox/v1"
+    kdf_label: Literal["chutes/model-b/pcs-mailbox/v1"] = (
+        "chutes/model-b/pcs-mailbox/v1"
+    )
     sender_ephemeral_public_key: str
     nonce: str
     ciphertext: str
@@ -650,7 +682,9 @@ class PcsMailboxEnvelopeV1(FrozenWireModel):
 
 class PcsMailboxEnvelopeV2(PcsMailboxEnvelopeV1):
     version: Literal[2] = 2
-    kdf_label: Literal["chutes/model-b/pcs-mailbox/v2"] = "chutes/model-b/pcs-mailbox/v2"
+    kdf_label: Literal["chutes/model-b/pcs-mailbox/v2"] = (
+        "chutes/model-b/pcs-mailbox/v2"
+    )
     aad: PcsMailboxAadV2
 
 
@@ -706,13 +740,18 @@ class TdLaunchReservationClaimsV1(FrozenWireModel):
     @model_validator(mode="after")
     def _role_claims(self) -> "TdLaunchReservationClaimsV1":
         if self.role == "chute" and (
-            not self.chute_id or not self.container_repository or not self.container_manifest_digest
+            not self.chute_id
+            or not self.container_repository
+            or not self.container_manifest_digest
         ):
             raise ValueError("chute reservations require exact chute image intent")
         if self.role == "chute" and (
-            self.storage_intent_id is not None or self.storage_intent_generation is not None
+            self.storage_intent_id is not None
+            or self.storage_intent_generation is not None
         ):
-            raise ValueError("chute reservations must not contain storage launch intent")
+            raise ValueError(
+                "chute reservations must not contain storage launch intent"
+            )
         if self.role == "storage" and any(
             value is not None
             for value in (
@@ -722,11 +761,15 @@ class TdLaunchReservationClaimsV1(FrozenWireModel):
                 self.container_manifest_digest,
             )
         ):
-            raise ValueError("storage reservations must not contain chute workload intent")
+            raise ValueError(
+                "storage reservations must not contain chute workload intent"
+            )
         if self.role == "storage" and (
             not self.storage_intent_id or self.storage_intent_generation is None
         ):
-            raise ValueError("storage reservations require a validator-owned launch intent")
+            raise ValueError(
+                "storage reservations require a validator-owned launch intent"
+            )
         if self.expires_at <= self.issued_at:
             raise ValueError("reservation expiry must be after issuance")
         return self
@@ -743,17 +786,23 @@ class TdLaunchReservationClaimsV2(TdLaunchReservationClaimsV1):
     @model_validator(mode="after")
     def _gpu_storage_sibling_claims(self) -> "TdLaunchReservationClaimsV2":
         if self.role != "storage" or self.tee_type != "tdx":
-            raise ValueError("reservation v2 is reserved for TDX GPU-host storage siblings")
+            raise ValueError(
+                "reservation v2 is reserved for TDX GPU-host storage siblings"
+            )
         return self
 
 
 class StorageLaunchIntentClaimV1(FrozenWireModel):
-    schema: Literal["chutes.storage-launch-intent-claim"] = "chutes.storage-launch-intent-claim"
+    schema: Literal["chutes.storage-launch-intent-claim"] = (
+        "chutes.storage-launch-intent-claim"
+    )
     version: Literal[1] = 1
 
 
 class LaunchReservationResponseV1(FrozenWireModel):
-    schema: Literal["chutes.launch-reservation-result"] = "chutes.launch-reservation-result"
+    schema: Literal["chutes.launch-reservation-result"] = (
+        "chutes.launch-reservation-result"
+    )
     version: Literal[1] = 1
     token: str
     claims: TdLaunchReservationClaimsV1
@@ -776,7 +825,9 @@ class LaunchReservationResponseV2(LaunchReservationResponseV1):
 class GpuHostStorageReadinessV1(FrozenWireModel):
     """Validator-derived GPU L0 storage gate; never a physical-placement claim."""
 
-    schema: Literal["chutes.gpu-host-storage-readiness"] = "chutes.gpu-host-storage-readiness"
+    schema: Literal["chutes.gpu-host-storage-readiness"] = (
+        "chutes.gpu-host-storage-readiness"
+    )
     version: Literal[1] = 1
     host_id: str
     trusted_storage_ready: bool
@@ -808,7 +859,9 @@ class GpuInventoryDeviceV1(FrozenWireModel):
     reset_domain: str = Field(..., min_length=1, max_length=256)
     reset_members: List[str] = Field(..., min_length=1, max_length=256)
     numa_node: int = Field(..., ge=-1, le=2**31 - 1)
-    original_driver: str = Field(..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.+-]+$")
+    original_driver: str = Field(
+        ..., min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.+-]+$"
+    )
     attestation_certificate_sha256: str
 
     @field_validator("bdf")
@@ -930,7 +983,9 @@ class GpuInventoryFabricV1(FrozenWireModel):
     @field_validator("gpu_uuids")
     @classmethod
     def _canonical_uuids(cls, value: List[str]) -> List[str]:
-        if value != sorted(set(value)) or any(not _GPU_UUID_RE.fullmatch(item) for item in value):
+        if value != sorted(set(value)) or any(
+            not _GPU_UUID_RE.fullmatch(item) for item in value
+        ):
             raise ValueError("fabric GPU UUIDs must be sorted and unique")
         return value
 
@@ -955,7 +1010,9 @@ class GpuInventoryFabricV1(FrozenWireModel):
             )
             != self.fabric_id
         ):
-            raise ValueError("fabric_id does not match canonical GPU/NVSwitch membership")
+            raise ValueError(
+                "fabric_id does not match canonical GPU/NVSwitch membership"
+            )
         return self
 
 
@@ -992,11 +1049,15 @@ class GpuInventoryGroupV1(FrozenWireModel):
     model: str = Field(..., min_length=1, max_length=128)
     host_numa_nodes: int = Field(..., ge=1, le=256)
     devices: List[GpuInventoryDeviceV1] = Field(..., min_length=1, max_length=64)
-    nvswitches: List[GpuInventoryNvSwitchV1] = Field(default_factory=list, max_length=64)
+    nvswitches: List[GpuInventoryNvSwitchV1] = Field(
+        default_factory=list, max_length=64
+    )
     infiniband_devices: List[GpuInventoryInfinibandDeviceV1] = Field(
         default_factory=list, max_length=64
     )
-    nvlink_edges: List[GpuInventoryNvlinkEdgeV1] = Field(default_factory=list, max_length=4096)
+    nvlink_edges: List[GpuInventoryNvlinkEdgeV1] = Field(
+        default_factory=list, max_length=4096
+    )
     fabrics: List[GpuInventoryFabricV1] = Field(..., min_length=1, max_length=64)
     topology_fingerprint: str
 
@@ -1015,7 +1076,8 @@ class GpuInventoryGroupV1(FrozenWireModel):
         switch_bdfs = [item.bdf for item in self.nvswitches]
         ib_bdfs = [item.bdf for item in self.infiniband_devices]
         edge_keys = [
-            (item.source_uuid, item.target_uuid, item.link_count) for item in self.nvlink_edges
+            (item.source_uuid, item.target_uuid, item.link_count)
+            for item in self.nvlink_edges
         ]
         fabric_ids = [item.fabric_id for item in self.fabrics]
         if bdfs != sorted(set(bdfs)) or len(uuids) != len(set(uuids)):
@@ -1058,19 +1120,25 @@ class GpuInventoryGroupV1(FrozenWireModel):
             if not set(item.iommu_members).issubset(allowed_bdfs) or not set(
                 item.reset_members
             ).issubset(allowed_bdfs):
-                raise ValueError("IOMMU/reset domain contains an unassigned or unsafe PCI function")
+                raise ValueError(
+                    "IOMMU/reset domain contains an unassigned or unsafe PCI function"
+                )
             iommu_tuple = tuple(item.iommu_members)
             reset_tuple = tuple(item.reset_members)
             if (
                 item.iommu_group in iommu_memberships
                 and iommu_memberships[item.iommu_group] != iommu_tuple
             ):
-                raise ValueError("equal IOMMU domain IDs report contradictory membership")
+                raise ValueError(
+                    "equal IOMMU domain IDs report contradictory membership"
+                )
             if (
                 item.reset_domain in reset_memberships
                 and reset_memberships[item.reset_domain] != reset_tuple
             ):
-                raise ValueError("equal reset-domain IDs report contradictory membership")
+                raise ValueError(
+                    "equal reset-domain IDs report contradictory membership"
+                )
             iommu_memberships[item.iommu_group] = iommu_tuple
             reset_memberships[item.reset_domain] = reset_tuple
             if any(
@@ -1085,9 +1153,13 @@ class GpuInventoryGroupV1(FrozenWireModel):
                 for member in item.reset_members
             ):
                 raise ValueError("reset-domain membership is not reciprocal")
-        fingerprint_document = self.model_dump(mode="json", exclude={"topology_fingerprint"})
+        fingerprint_document = self.model_dump(
+            mode="json", exclude={"topology_fingerprint"}
+        )
         if canonical_sha256(fingerprint_document) != self.topology_fingerprint:
-            raise ValueError("topology_fingerprint does not match canonical group fields")
+            raise ValueError(
+                "topology_fingerprint does not match canonical group fields"
+            )
         return self
 
 
@@ -1111,7 +1183,9 @@ class GpuInventoryReportV1(FrozenWireModel):
     groups: List[GpuInventoryGroupV1] = Field(..., min_length=1, max_length=64)
     physical_host_trusted: Literal[False] = False
 
-    @field_validator("l0_manifest_sha256", "gpu_image_sha256", "profile_contract_sha256")
+    @field_validator(
+        "l0_manifest_sha256", "gpu_image_sha256", "profile_contract_sha256"
+    )
     @classmethod
     def _valid_digest(cls, value: str) -> str:
         value = value.lower()
@@ -1137,7 +1211,9 @@ class GpuInventoryReportV1(FrozenWireModel):
 
 
 class GpuInventoryReconcileResponseV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-inventory-reconciliation"] = "chutes.gpu-inventory-reconciliation"
+    schema: Literal["chutes.gpu-inventory-reconciliation"] = (
+        "chutes.gpu-inventory-reconciliation"
+    )
     version: Literal[1] = 1
     report_id: str
     report_generation: int = Field(..., ge=1)
@@ -1179,7 +1255,9 @@ class GpuPlatformReservationRequestV1(FrozenWireModel):
 
 
 class GpuMinerReservationRequestV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-miner-reservation-request"] = "chutes.gpu-miner-reservation-request"
+    schema: Literal["chutes.gpu-miner-reservation-request"] = (
+        "chutes.gpu-miner-reservation-request"
+    )
     version: Literal[1] = 1
     gpu_identifier: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
     gpu_count: int = Field(..., ge=1, le=64)
@@ -1228,7 +1306,9 @@ class GpuLaunchReservationClaimsV1(FrozenWireModel):
     gpu_bdfs: List[str] = Field(..., min_length=1, max_length=64)
     gpu_uuids: List[str] = Field(..., min_length=1, max_length=64)
     gpu_identifiers: List[str] = Field(..., min_length=1, max_length=64)
-    gpu_attestation_certificate_sha256s: List[str] = Field(..., min_length=1, max_length=64)
+    gpu_attestation_certificate_sha256s: List[str] = Field(
+        ..., min_length=1, max_length=64
+    )
     topology_fingerprint: str
     gpu_release_id: str
     gpu_profile_id: str
@@ -1307,7 +1387,9 @@ class GpuLaunchReservationClaimsV1(FrozenWireModel):
     @field_validator("gpu_uuids")
     @classmethod
     def _canonical_gpu_uuids(cls, value: List[str]) -> List[str]:
-        if value != sorted(set(value)) or any(not _GPU_UUID_RE.fullmatch(item) for item in value):
+        if value != sorted(set(value)) or any(
+            not _GPU_UUID_RE.fullmatch(item) for item in value
+        ):
             raise ValueError("assigned GPU UUIDs must be sorted and unique")
         return value
 
@@ -1327,7 +1409,9 @@ class GpuLaunchReservationClaimsV1(FrozenWireModel):
         if normalized != sorted(set(normalized)) or any(
             not _HEX_64_RE.fullmatch(item) for item in normalized
         ):
-            raise ValueError("GPU attestation certificate identities must be sorted unique sha256")
+            raise ValueError(
+                "GPU attestation certificate identities must be sorted unique sha256"
+            )
         return normalized
 
     @field_validator("launch_nonce")
@@ -1401,7 +1485,9 @@ class GpuLaunchReservationClaimsV1(FrozenWireModel):
                     for digest in self.manifest_tag_digests.values()
                 )
             ):
-                raise ValueError("platform GPU reservations require exact chute image intent")
+                raise ValueError(
+                    "platform GPU reservations require exact chute image intent"
+                )
             closure = {
                 "schema": "chutes.oci-descriptor-closure",
                 "version": 1,
@@ -1437,7 +1523,9 @@ class GpuLaunchReservationClaimsV1(FrozenWireModel):
 
 
 class GpuLaunchReservationResponseV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-launch-reservation-result"] = "chutes.gpu-launch-reservation-result"
+    schema: Literal["chutes.gpu-launch-reservation-result"] = (
+        "chutes.gpu-launch-reservation-result"
+    )
     version: Literal[1] = 1
     token: str
     claims: GpuLaunchReservationClaimsV1
@@ -1460,7 +1548,9 @@ class GpuSignedLaunchClaimsEnvelopeV1(FrozenWireModel):
     before either management stack can start.
     """
 
-    schema: Literal["chutes.gpu-signed-launch-claims"] = "chutes.gpu-signed-launch-claims"
+    schema: Literal["chutes.gpu-signed-launch-claims"] = (
+        "chutes.gpu-signed-launch-claims"
+    )
     version: Literal[1] = 1
     algorithm: Literal["ES256"] = "ES256"
     key_id: str
@@ -1484,8 +1574,13 @@ class GpuSignedLaunchClaimsEnvelopeV1(FrozenWireModel):
             decoded = base64.b64decode(value, validate=True)
         except (TypeError, ValueError) as exc:
             raise ValueError("GPU claim signature must be canonical base64") from exc
-        if not 64 <= len(decoded) <= 80 or base64.b64encode(decoded).decode("ascii") != value:
-            raise ValueError("GPU claim signature must be a canonical DER ECDSA signature")
+        if (
+            not 64 <= len(decoded) <= 80
+            or base64.b64encode(decoded).decode("ascii") != value
+        ):
+            raise ValueError(
+                "GPU claim signature must be a canonical DER ECDSA signature"
+            )
         return value
 
     @model_validator(mode="after")
@@ -1535,7 +1630,9 @@ class GpuQuoteCommitmentV1(FrozenWireModel):
 
 
 class GpuRegistrationSignatureV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-registration-signature"] = "chutes.gpu-registration-signature"
+    schema: Literal["chutes.gpu-registration-signature"] = (
+        "chutes.gpu-registration-signature"
+    )
     version: Literal[1] = 1
     server_id: str
     request_nonce: str
@@ -1579,7 +1676,9 @@ class GpuReservationStateRequestV1(FrozenWireModel):
 
 
 class GpuReservationQuarantineRequestV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-reservation-quarantine"] = "chutes.gpu-reservation-quarantine"
+    schema: Literal["chutes.gpu-reservation-quarantine"] = (
+        "chutes.gpu-reservation-quarantine"
+    )
     version: Literal[1] = 1
     reservation_id: str
     claims_sha256: str
@@ -1619,7 +1718,9 @@ class GpuHostLossFinalizeRequestV1(FrozenWireModel):
     def _valid_receipt_sha256(cls, value: str) -> str:
         value = value.lower()
         if not _HEX_64_RE.fullmatch(value):
-            raise ValueError("receipt_sha256 must be 64 lowercase hexadecimal characters")
+            raise ValueError(
+                "receipt_sha256 must be 64 lowercase hexadecimal characters"
+            )
         return value
 
 
@@ -1722,7 +1823,9 @@ class TdQuoteCommitmentV1(FrozenWireModel):
     release_target_sha256: str
     boot_generation: int = Field(..., ge=1)
 
-    @field_validator("reservation_sha256", "attested_spki_sha256", "release_target_sha256")
+    @field_validator(
+        "reservation_sha256", "attested_spki_sha256", "release_target_sha256"
+    )
     @classmethod
     def _valid_sha(cls, value: str) -> str:
         value = value.lower()
@@ -1740,7 +1843,9 @@ class TdQuoteCommitmentV1(FrozenWireModel):
 
 
 class TdRegistrationSignatureV1(FrozenWireModel):
-    schema: Literal["chutes.td-registration-signature"] = "chutes.td-registration-signature"
+    schema: Literal["chutes.td-registration-signature"] = (
+        "chutes.td-registration-signature"
+    )
     version: Literal[1] = 1
     server_id: str
     request_nonce: str
@@ -1815,7 +1920,9 @@ class RegistrySessionClaimsV1(FrozenWireModel):
 
 
 class RegistrySessionRequestV1(FrozenWireModel):
-    schema: Literal["chutes.registry-session-request"] = "chutes.registry-session-request"
+    schema: Literal["chutes.registry-session-request"] = (
+        "chutes.registry-session-request"
+    )
     version: Literal[1] = 1
     repository: str = Field(..., min_length=3, max_length=255)
     action: Literal["pull"] = "pull"
@@ -1867,7 +1974,9 @@ class HostEnrollmentVoucher(Base):
     claims = Column(JSONB, nullable=False)
     provider = Column(String, nullable=True)
     source = Column(String, nullable=True)
-    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    issued_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     expires_at = Column(DateTime(timezone=True), nullable=False)
     consumed_at = Column(DateTime(timezone=True), nullable=True)
     consumed_key_generation = Column(Integer, nullable=True)
@@ -1879,7 +1988,9 @@ class HostEnrollmentVoucher(Base):
             "enrollment_generation",
             name="uq_host_enrollment_generation",
         ),
-        CheckConstraint("tee_type IN ('sev-snp', 'tdx')", name="ck_host_voucher_tee_type"),
+        CheckConstraint(
+            "tee_type IN ('sev-snp', 'tdx')", name="ck_host_voucher_tee_type"
+        ),
         CheckConstraint(
             "(compute_type = 'cpu') OR (compute_type = 'gpu' AND tee_type = 'tdx')",
             name="ck_host_voucher_compute_type",
@@ -1903,14 +2014,18 @@ class HostEnrollmentVoucher(Base):
 class HostKeyGeneration(Base):
     __tablename__ = "host_key_generations"
 
-    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="CASCADE"), primary_key=True)
+    host_id = Column(
+        String, ForeignKey("hosts.host_id", ondelete="CASCADE"), primary_key=True
+    )
     generation = Column(Integer, primary_key=True)
     enrollment_generation = Column(Integer, nullable=False)
     ed25519_public_key = Column(String, nullable=False)
     ed25519_fingerprint = Column(String(64), nullable=False)
     x25519_public_key = Column(String, nullable=False)
     x25519_fingerprint = Column(String(64), nullable=False)
-    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    issued_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     last_used_at = Column(DateTime(timezone=True), nullable=True)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     revocation_reason = Column(Text, nullable=True)
@@ -1919,7 +2034,9 @@ class HostKeyGeneration(Base):
         UniqueConstraint("ed25519_fingerprint", name="uq_host_key_ed25519_fingerprint"),
         UniqueConstraint("x25519_fingerprint", name="uq_host_key_x25519_fingerprint"),
         CheckConstraint("generation > 0", name="ck_host_key_generation"),
-        CheckConstraint("enrollment_generation > 0", name="ck_host_key_enrollment_generation"),
+        CheckConstraint(
+            "enrollment_generation > 0", name="ck_host_key_enrollment_generation"
+        ),
         Index(
             "uq_host_key_active",
             "host_id",
@@ -1941,12 +2058,16 @@ class HostEnrollmentChallenge(Base):
     ed25519_public_key = Column(String, nullable=False)
     x25519_public_key = Column(String, nullable=False)
     challenge_hash = Column(String(64), nullable=False)
-    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    issued_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     expires_at = Column(DateTime(timezone=True), nullable=False)
     consumed_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
-        CheckConstraint("expires_at > issued_at", name="ck_host_enrollment_challenge_expiry"),
+        CheckConstraint(
+            "expires_at > issued_at", name="ck_host_enrollment_challenge_expiry"
+        ),
         Index("idx_host_enrollment_challenge_voucher", "voucher_id", "expires_at"),
     )
 
@@ -1955,14 +2076,18 @@ class HostPcsMailbox(Base):
     __tablename__ = "host_pcs_mailboxes"
 
     message_id = Column(String, primary_key=True, default=generate_uuid)
-    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="CASCADE"), nullable=False)
+    host_id = Column(
+        String, ForeignKey("hosts.host_id", ondelete="CASCADE"), nullable=False
+    )
     owner_hotkey = Column(String, nullable=False)
     enrollment_generation = Column(Integer, nullable=False)
     key_generation = Column(Integer, nullable=False)
     recipient_fingerprint = Column(String(64), nullable=False)
     envelope = Column(JSONB, nullable=False)
     envelope_sha256 = Column(String(64), nullable=False)
-    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    issued_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     expires_at = Column(DateTime(timezone=True), nullable=False)
     delivered_at = Column(DateTime(timezone=True), nullable=True)
     consumed_at = Column(DateTime(timezone=True), nullable=True)
@@ -2013,7 +2138,9 @@ class StorageLaunchIntent(Base):
     profile_id = Column(String, nullable=False)
     image_sha256 = Column(String(64), nullable=False)
     image_version = Column(String, nullable=False)
-    host_compute_type = Column(String, nullable=False, default="cpu", server_default="cpu")
+    host_compute_type = Column(
+        String, nullable=False, default="cpu", server_default="cpu"
+    )
     gpu_release_id = Column(
         String,
         ForeignKey("guest_releases.release_id", ondelete="RESTRICT"),
@@ -2030,7 +2157,9 @@ class StorageLaunchIntent(Base):
     launch_contract = Column(JSONB, nullable=True)
     state = Column(String, nullable=False, default="active", server_default="active")
     claim_generation = Column(Integer, nullable=False, default=0, server_default="0")
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     last_claimed_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -2089,13 +2218,17 @@ class TdLaunchReservation(Base):
     token_id = Column(String, nullable=False, unique=True)
     token_hash = Column(String(64), nullable=False, unique=True)
     owner_hotkey = Column(String, nullable=False)
-    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    host_id = Column(
+        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
+    )
     host_key_generation = Column(Integer, nullable=False)
     server_id = Column(String, nullable=False)
     role = Column(String, nullable=False)
     compute_type = Column(String, nullable=False, default="cpu", server_default="cpu")
     claims_version = Column(Integer, nullable=False, default=1, server_default="1")
-    host_compute_type = Column(String, nullable=False, default="cpu", server_default="cpu")
+    host_compute_type = Column(
+        String, nullable=False, default="cpu", server_default="cpu"
+    )
     gpu_release_id = Column(
         String,
         ForeignKey("guest_releases.release_id", ondelete="RESTRICT"),
@@ -2131,7 +2264,9 @@ class TdLaunchReservation(Base):
     release_target_sha256 = Column(String(64), nullable=False)
     claims = Column(JSONB, nullable=False)
     claims_sha256 = Column(String(64), nullable=True)
-    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    issued_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     expires_at = Column(DateTime(timezone=True), nullable=False)
     handed_to_host_at = Column(DateTime(timezone=True), nullable=True)
     consumed_at = Column(DateTime(timezone=True), nullable=True)
@@ -2159,7 +2294,9 @@ class TdLaunchReservation(Base):
             "AND active_cpu_release_id IS NOT NULL)",
             name="ck_td_reservation_claim_version",
         ),
-        CheckConstraint("tee_type IN ('sev-snp', 'tdx')", name="ck_td_reservation_tee_type"),
+        CheckConstraint(
+            "tee_type IN ('sev-snp', 'tdx')", name="ck_td_reservation_tee_type"
+        ),
         CheckConstraint(
             "host_key_generation > 0 AND boot_generation > 0",
             name="ck_td_reservation_generations",
@@ -2210,7 +2347,9 @@ class GpuInventoryReport(Base):
     __tablename__ = "gpu_inventory_reports"
 
     report_id = Column(String, primary_key=True, default=generate_uuid)
-    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    host_id = Column(
+        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
+    )
     host_key_generation = Column(Integer, nullable=False)
     host_boot_generation = Column(Integer, nullable=False)
     report_generation = Column(Integer, nullable=False)
@@ -2225,7 +2364,9 @@ class GpuInventoryReport(Base):
     claims_sha256 = Column(String(64), nullable=False)
     reconciliation_status = Column(String, nullable=False)
     failure_reason = Column(Text, nullable=True)
-    received_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    received_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     accepted_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -2275,7 +2416,9 @@ class GpuAllocationGroup(Base):
     __tablename__ = "gpu_allocation_groups"
 
     allocation_group_id = Column(String, primary_key=True, default=generate_uuid)
-    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    host_id = Column(
+        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
+    )
     host_key_generation = Column(Integer, nullable=False)
     host_boot_generation = Column(Integer, nullable=False)
     generation = Column(Integer, nullable=False)
@@ -2311,7 +2454,9 @@ class GpuAllocationGroup(Base):
         ),
         nullable=True,
     )
-    reservation_generation = Column(Integer, nullable=False, default=0, server_default="0")
+    reservation_generation = Column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     process_incarnation = Column(String, nullable=True)
     last_report_id = Column(
         String,
@@ -2332,7 +2477,9 @@ class GpuAllocationGroup(Base):
     failure_code = Column(String, nullable=True)
     failure_reason = Column(Text, nullable=True)
     failure_metadata = Column(JSONB(none_as_null=True), nullable=True)
-    discovered_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    discovered_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     available_at = Column(DateTime(timezone=True), nullable=True)
     reserved_at = Column(DateTime(timezone=True), nullable=True)
     launching_at = Column(DateTime(timezone=True), nullable=True)
@@ -2340,8 +2487,12 @@ class GpuAllocationGroup(Base):
     resetting_at = Column(DateTime(timezone=True), nullable=True)
     quarantined_at = Column(DateTime(timezone=True), nullable=True)
     retired_at = Column(DateTime(timezone=True), nullable=True)
-    last_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    last_seen_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -2421,7 +2572,14 @@ class GpuAllocationGroup(Base):
         CheckConstraint(
             "(state = 'quarantined' AND quarantined_at IS NOT NULL "
             "AND failure_code IS NOT NULL AND failure_reason IS NOT NULL) OR "
-            "(state <> 'quarantined' AND quarantined_at IS NULL "
+            "(state = 'release_pending' AND quarantined_at IS NULL "
+            "AND failure_code = 'gpu_inventory_changed_during_release' "
+            "AND failure_reason IS NOT NULL AND failure_metadata IS NOT NULL) OR "
+            "(state NOT IN ('quarantined', 'release_pending') "
+            "AND quarantined_at IS NULL "
+            "AND failure_code IS NULL AND failure_reason IS NULL "
+            "AND failure_metadata IS NULL) OR "
+            "(state = 'release_pending' AND quarantined_at IS NULL "
             "AND failure_code IS NULL AND failure_reason IS NULL "
             "AND failure_metadata IS NULL)",
             name="ck_gpu_allocation_group_failure",
@@ -2454,7 +2612,9 @@ class GpuLaunchReservation(Base):
     claims_sha256 = Column(String(64), nullable=False)
     owner_hotkey = Column(String, nullable=False)
     workload_owner = Column(String, nullable=False)
-    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
+    host_id = Column(
+        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
+    )
     host_key_generation = Column(Integer, nullable=False)
     host_boot_generation = Column(Integer, nullable=False)
     allocation_group_id = Column(
@@ -2505,8 +2665,12 @@ class GpuLaunchReservation(Base):
     descriptor_closure_sha256 = Column(String(64), nullable=True)
     allowed_manifests = Column(JSONB, nullable=False, default=list, server_default="[]")
     allowed_blobs = Column(JSONB, nullable=False, default=list, server_default="[]")
-    allowed_manifest_tags = Column(JSONB, nullable=False, default=list, server_default="[]")
-    manifest_tag_digests = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    allowed_manifest_tags = Column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    manifest_tag_digests = Column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
     launch_nonce = Column(String, nullable=False)
     state = Column(String, nullable=False)
     issued_at = Column(DateTime(timezone=True), nullable=False)
@@ -2671,7 +2835,9 @@ class RegistrySession(Base):
 
     session_id = Column(String, primary_key=True, default=generate_uuid)
     token_id = Column(String, nullable=False, unique=True)
-    server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
+    server_id = Column(
+        String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False
+    )
     scope_id = Column(String, nullable=False)
     launch_config_id = Column(
         String,
@@ -2688,10 +2854,16 @@ class RegistrySession(Base):
     manifest_digest = Column(String, nullable=False)
     allowed_manifests = Column(JSONB, nullable=False, default=list, server_default="[]")
     allowed_blobs = Column(JSONB, nullable=False, default=list, server_default="[]")
-    allowed_manifest_tags = Column(JSONB, nullable=False, default=list, server_default="[]")
-    manifest_tag_digests = Column(JSONB, nullable=False, default=dict, server_default="{}")
+    allowed_manifest_tags = Column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    manifest_tag_digests = Column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
     descriptor_closure_sha256 = Column(String(64), nullable=True)
-    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    issued_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     expires_at = Column(DateTime(timezone=True), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     last_used_at = Column(DateTime(timezone=True), nullable=True)

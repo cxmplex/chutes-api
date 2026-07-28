@@ -60,9 +60,13 @@ def _psql(sql: str, schema: str) -> subprocess.CompletedProcess:
 
 
 def _migration(name: str) -> tuple[str, str]:
-    return (MIGRATIONS / name).read_text(encoding="utf-8").split(
-        "-- migrate:down",
-        1,
+    return (
+        (MIGRATIONS / name)
+        .read_text(encoding="utf-8")
+        .split(
+            "-- migrate:down",
+            1,
+        )
     )
 
 
@@ -314,7 +318,18 @@ CREATE TABLE gpu_allocation_groups (
     reservation_id VARCHAR,
     reservation_generation INTEGER NOT NULL DEFAULT 0,
     process_incarnation VARCHAR,
-    recovery_started_at TIMESTAMPTZ
+    recovery_started_at TIMESTAMPTZ,
+    quarantined_at TIMESTAMPTZ,
+    failure_code VARCHAR,
+    failure_reason VARCHAR,
+    failure_metadata JSONB,
+    CONSTRAINT ck_gpu_allocation_group_failure CHECK (
+        (state = 'quarantined' AND quarantined_at IS NOT NULL
+         AND failure_code IS NOT NULL AND failure_reason IS NOT NULL)
+        OR (state <> 'quarantined' AND quarantined_at IS NULL
+            AND failure_code IS NULL AND failure_reason IS NULL
+            AND failure_metadata IS NULL)
+    )
 );
 CREATE TABLE server_attestations (attestation_id VARCHAR PRIMARY KEY);
 CREATE TABLE servers (
@@ -426,6 +441,32 @@ CREATE TABLE chutefs_launch_sessions (
             (
                 "default_chutefs_volume_bindings",
                 "chutefs_launch_sessions",
+                "launch_configs",
+                "storage_volumes",
+                "users",
+            ),
+            b"cannot roll back default ChuteFS volumes",
+        ),
+        (
+            CHUTEFS,
+            "chutefs_duplicate_completed_job_down",
+            CHUTEFS_PREDECESSOR,
+            """
+            INSERT INTO users(user_id) VALUES ('user');
+            INSERT INTO chutes(chute_id, user_id, node_selector)
+            VALUES ('chute', 'user', '{"compute_type":"cpu"}');
+            INSERT INTO jobs(job_id, user_id, finished_at)
+            VALUES ('job', 'user', NOW());
+            INSERT INTO launch_configs(
+                config_id, chute_id, job_id, user_id, compute_type, completed_at
+            ) VALUES
+                ('completed-a', 'chute', 'job', 'user', 'cpu', NOW()),
+                ('completed-b', 'chute', 'job', 'user', 'cpu', NOW());
+            """,
+            (
+                "default_chutefs_volume_bindings",
+                "chutefs_launch_sessions",
+                "jobs",
                 "launch_configs",
                 "storage_volumes",
                 "users",
@@ -795,7 +836,10 @@ def test_lifecycle_preflight_rejects_current_reservation_from_other_custody():
     try:
         result = _psql(LIFECYCLE_PREFLIGHT.read_text(encoding="utf-8"), schema)
         assert result.returncode == 0, result.stderr.decode()
-        assert b"gpu-node|server-current|group-current|1||{}|blocking_live" in result.stdout
+        assert (
+            b"gpu-node|server-current|group-current|1||{}|blocking_live"
+            in result.stdout
+        )
         assert b"repairable_live" not in result.stdout
     finally:
         _drop_schema(schema)
@@ -853,7 +897,9 @@ async def _assert_writer_cannot_cross_down(
     async def run_writer():
         try:
             await writer.execute(writer_sql)
-        except Exception as exc:  # exact error varies by PostgreSQL plan invalidation point
+        except (
+            Exception
+        ) as exc:  # exact error varies by PostgreSQL plan invalidation point
             return exc
         return None
 

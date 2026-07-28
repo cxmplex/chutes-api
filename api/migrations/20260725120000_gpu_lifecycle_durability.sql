@@ -486,7 +486,7 @@ CREATE TABLE IF NOT EXISTS gpu_registration_nonces (
     server_ip VARCHAR NOT NULL,
     nonce_value VARCHAR(64),
     nonce_hash VARCHAR(64) NOT NULL,
-    state VARCHAR NOT NULL,
+    state VARCHAR NOT NULL DEFAULT 'issued',
     issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL,
     claimed_attempt_id VARCHAR,
@@ -527,7 +527,7 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
     peer_certificate_pem TEXT NOT NULL,
     peer_certificate_sha256 VARCHAR(64) NOT NULL,
     peer_spki_sha256 VARCHAR(64) NOT NULL,
-    state VARCHAR NOT NULL,
+    state VARCHAR NOT NULL DEFAULT 'processing',
     processing_lease_owner VARCHAR,
     processing_lease_expires_at TIMESTAMPTZ,
     attestation_id VARCHAR REFERENCES server_attestations(attestation_id) ON DELETE RESTRICT,
@@ -750,7 +750,7 @@ $$;
 CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
     operation_id VARCHAR PRIMARY KEY,
     operation_type VARCHAR NOT NULL,
-    phase VARCHAR NOT NULL,
+    phase VARCHAR NOT NULL DEFAULT 'intent',
     host_id VARCHAR NOT NULL REFERENCES hosts(host_id) ON DELETE RESTRICT,
     host_key_generation INTEGER NOT NULL,
     host_boot_generation INTEGER NOT NULL,
@@ -826,18 +826,25 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
     CONSTRAINT ck_gpu_lifecycle_mode CHECK (management_mode IS NULL OR management_mode IN ('platform', 'miner')),
     CONSTRAINT ck_gpu_lifecycle_result CHECK (
         (phase = 'intent' AND physical_result IS NULL AND physical_result_sha256 IS NULL
-         AND receipt_id IS NULL AND local_release_ack IS NULL AND finalized_at IS NULL)
+         AND result_outcome IS NULL AND receipt_id IS NULL
+         AND receipt_sha256 IS NULL AND receipt_accepted_at IS NULL
+         AND local_release_ack IS NULL AND local_release_ack_sha256 IS NULL
+         AND local_release_acked_at IS NULL AND failure_code IS NULL
+         AND failure_reason IS NULL AND finalized_at IS NULL)
         OR (phase = 'physical_result' AND physical_result IS NOT NULL
          AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
          AND result_outcome IS NULL AND receipt_id IS NULL
          AND receipt_sha256 IS NULL AND receipt_accepted_at IS NULL
-         AND local_release_ack IS NULL AND finalized_at IS NULL)
+         AND local_release_ack IS NULL AND local_release_ack_sha256 IS NULL
+         AND local_release_acked_at IS NULL AND failure_code IS NULL
+         AND failure_reason IS NULL AND finalized_at IS NULL)
         OR (phase = 'receipt_accepted' AND physical_result IS NOT NULL
          AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
          AND result_outcome = 'accepted'
          AND receipt_id IS NOT NULL AND receipt_sha256 ~ '^[0-9a-f]{64}$'
          AND receipt_accepted_at IS NOT NULL AND local_release_ack IS NULL
          AND local_release_ack_sha256 IS NULL AND local_release_acked_at IS NULL
+         AND failure_code IS NULL AND failure_reason IS NULL
          AND finalized_at IS NULL)
         OR (phase = 'local_release_acked' AND physical_result IS NOT NULL
          AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
@@ -846,7 +853,9 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
          AND receipt_accepted_at IS NOT NULL
          AND local_release_ack IS NOT NULL
          AND local_release_ack_sha256 ~ '^[0-9a-f]{64}$'
-         AND local_release_acked_at IS NOT NULL AND finalized_at IS NULL)
+         AND local_release_acked_at IS NOT NULL
+         AND failure_code IS NULL AND failure_reason IS NULL
+         AND finalized_at IS NULL)
         OR (phase = 'finalized' AND physical_result IS NOT NULL
          AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
          AND result_outcome = 'accepted'
@@ -855,13 +864,15 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
          AND local_release_ack IS NOT NULL
          AND local_release_ack_sha256 ~ '^[0-9a-f]{64}$'
          AND local_release_acked_at IS NOT NULL
+         AND failure_code IS NULL AND failure_reason IS NULL
          AND finalized_at IS NOT NULL)
         OR (phase = 'quarantined' AND failure_code IS NOT NULL
          AND failure_reason IS NOT NULL AND finalized_at IS NOT NULL
          AND ((physical_result IS NULL AND physical_result_sha256 IS NULL
           AND result_outcome IS NULL AND receipt_id IS NULL
           AND receipt_sha256 IS NULL AND receipt_accepted_at IS NULL
-          AND local_release_ack IS NULL)
+          AND local_release_ack IS NULL AND local_release_ack_sha256 IS NULL
+          AND local_release_acked_at IS NULL)
           OR (physical_result IS NOT NULL
            AND physical_result_sha256 ~ '^[0-9a-f]{64}$'
            AND result_outcome IN ('accepted', 'quarantined')
@@ -880,11 +891,19 @@ CREATE TABLE IF NOT EXISTS gpu_lifecycle_operations (
 CREATE OR REPLACE FUNCTION enforce_gpu_lifecycle_transition()
 RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+    IF TG_OP IN ('DELETE', 'TRUNCATE') THEN
+        RAISE EXCEPTION 'GPU lifecycle operations are immutable audit rows';
+    END IF;
     IF TG_OP = 'INSERT' THEN
         IF NEW.phase <> 'intent' OR NEW.reporting_state <> 'pending' THEN
             RAISE EXCEPTION 'GPU lifecycle operations must begin at intent';
         END IF;
         RETURN NEW;
+    END IF;
+    IF OLD.phase IN ('finalized', 'quarantined')
+       AND to_jsonb(NEW) IS DISTINCT FROM to_jsonb(OLD)
+    THEN
+        RAISE EXCEPTION 'terminal GPU lifecycle evidence is immutable';
     END IF;
 
     IF NEW.operation_id IS DISTINCT FROM OLD.operation_id
@@ -954,14 +973,54 @@ BEGIN
     ) THEN
         RAISE EXCEPTION 'invalid GPU lifecycle phase transition % -> %', OLD.phase, NEW.phase;
     END IF;
+    IF NEW.phase = 'quarantined' AND NEW.phase IS DISTINCT FROM OLD.phase THEN
+        IF OLD.phase = 'intent' AND (
+            NEW.physical_result IS NOT NULL
+            OR NEW.physical_result_sha256 IS NOT NULL
+            OR NEW.result_outcome IS NOT NULL
+            OR NEW.receipt_id IS NOT NULL
+            OR NEW.receipt_sha256 IS NOT NULL
+            OR NEW.receipt_accepted_at IS NOT NULL
+            OR NEW.local_release_ack IS NOT NULL
+            OR NEW.local_release_ack_sha256 IS NOT NULL
+            OR NEW.local_release_acked_at IS NOT NULL
+        ) THEN
+            RAISE EXCEPTION 'intent quarantine cannot acquire lifecycle closure evidence';
+        ELSIF OLD.phase = 'physical_result' AND (
+            NEW.result_outcome IS DISTINCT FROM 'quarantined'
+            OR NEW.local_release_ack IS NOT NULL
+            OR NEW.local_release_ack_sha256 IS NOT NULL
+            OR NEW.local_release_acked_at IS NOT NULL
+        ) THEN
+            RAISE EXCEPTION 'physical-result quarantine has invalid receipt or ACK evidence';
+        ELSIF OLD.phase = 'receipt_accepted' AND (
+            NEW.result_outcome IS DISTINCT FROM 'accepted'
+            OR NEW.local_release_ack IS NOT NULL
+            OR NEW.local_release_ack_sha256 IS NOT NULL
+            OR NEW.local_release_acked_at IS NOT NULL
+        ) THEN
+            RAISE EXCEPTION 'receipt quarantine changed accepted closure evidence';
+        ELSIF OLD.phase = 'local_release_acked' AND (
+            NEW.result_outcome IS DISTINCT FROM 'accepted'
+            OR NEW.local_release_ack IS NULL
+            OR NEW.local_release_ack_sha256 IS NULL
+            OR NEW.local_release_acked_at IS NULL
+        ) THEN
+            RAISE EXCEPTION 'local-release quarantine lost accepted closure evidence';
+        END IF;
+    END IF;
     RETURN NEW;
 END
 $$;
 
 DROP TRIGGER IF EXISTS trg_gpu_lifecycle_transition ON gpu_lifecycle_operations;
 CREATE TRIGGER trg_gpu_lifecycle_transition
-BEFORE INSERT OR UPDATE ON gpu_lifecycle_operations
+BEFORE INSERT OR UPDATE OR DELETE ON gpu_lifecycle_operations
 FOR EACH ROW EXECUTE FUNCTION enforce_gpu_lifecycle_transition();
+DROP TRIGGER IF EXISTS trg_gpu_lifecycle_truncate ON gpu_lifecycle_operations;
+CREATE TRIGGER trg_gpu_lifecycle_truncate
+BEFORE TRUNCATE ON gpu_lifecycle_operations
+FOR EACH STATEMENT EXECUTE FUNCTION enforce_gpu_lifecycle_transition();
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_lifecycle_active_group_generation
     ON gpu_lifecycle_operations(allocation_group_id, allocation_group_generation)
@@ -1229,6 +1288,20 @@ ALTER TABLE gpu_allocation_groups ADD CONSTRAINT ck_gpu_allocation_group_owner C
         AND reservation_owner IS NULL AND reservation_id IS NULL
         AND process_incarnation IS NULL)
 );
+ALTER TABLE gpu_allocation_groups DROP CONSTRAINT IF EXISTS ck_gpu_allocation_group_failure;
+ALTER TABLE gpu_allocation_groups ADD CONSTRAINT ck_gpu_allocation_group_failure CHECK (
+    (state = 'quarantined' AND quarantined_at IS NOT NULL
+     AND failure_code IS NOT NULL AND failure_reason IS NOT NULL)
+    OR (state = 'release_pending' AND quarantined_at IS NULL
+        AND failure_code = 'gpu_inventory_changed_during_release'
+        AND failure_reason IS NOT NULL AND failure_metadata IS NOT NULL)
+    OR (state NOT IN ('quarantined', 'release_pending')
+        AND quarantined_at IS NULL AND failure_code IS NULL
+        AND failure_reason IS NULL AND failure_metadata IS NULL)
+    OR (state = 'release_pending' AND quarantined_at IS NULL
+        AND failure_code IS NULL AND failure_reason IS NULL
+        AND failure_metadata IS NULL)
+);
 
 -- migrate:down
 
@@ -1284,6 +1357,14 @@ BEGIN
 END
 $$;
 
+ALTER TABLE gpu_allocation_groups DROP CONSTRAINT IF EXISTS ck_gpu_allocation_group_failure;
+ALTER TABLE gpu_allocation_groups ADD CONSTRAINT ck_gpu_allocation_group_failure CHECK (
+    (state = 'quarantined' AND quarantined_at IS NOT NULL
+     AND failure_code IS NOT NULL AND failure_reason IS NOT NULL)
+    OR (state <> 'quarantined' AND quarantined_at IS NULL
+        AND failure_code IS NULL AND failure_reason IS NULL
+        AND failure_metadata IS NULL)
+);
 ALTER TABLE gpu_allocation_groups DROP CONSTRAINT IF EXISTS ck_gpu_allocation_group_owner;
 ALTER TABLE gpu_allocation_groups ADD CONSTRAINT ck_gpu_allocation_group_owner CHECK (
     (state IN ('discovered', 'available', 'retired')
@@ -1320,6 +1401,7 @@ DROP TABLE gpu_recovery_events;
 DROP TABLE gpu_host_loss_events;
 DROP TABLE gpu_recovery_authorizations;
 DROP FUNCTION forbid_gpu_recovery_audit_mutation();
+DROP TRIGGER IF EXISTS trg_gpu_lifecycle_truncate ON gpu_lifecycle_operations;
 DROP TRIGGER IF EXISTS trg_gpu_lifecycle_transition ON gpu_lifecycle_operations;
 DROP FUNCTION IF EXISTS enforce_gpu_lifecycle_transition();
 DROP TABLE gpu_lifecycle_operations;

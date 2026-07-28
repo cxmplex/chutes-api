@@ -225,9 +225,7 @@ def test_current_lineage_binds_certificate_and_operational_attestation():
 
 
 def test_revocation_preflight_and_binding_locks_follow_shared_order():
-    lock_source = inspect.getsource(
-        launch_sessions.lock_launch_storage_configurations
-    )
+    lock_source = inspect.getsource(launch_sessions.lock_launch_storage_configurations)
     lineage_source = inspect.getsource(launch_sessions._load_current_lineage)
 
     revocation_preflight = lock_source.index("_require_not_disabled")
@@ -276,12 +274,12 @@ def test_purge_and_account_erasure_do_not_prelock_the_user():
     )
     delete_source = inspect.getsource(storage_service.delete_volume)
     erasure_source = inspect.getsource(storage_service.prepare_user_storage_erasure)
-    assert delete_source.index("select(DefaultChuteFSVolumeBinding)") < delete_source.index(
-        "select(StorageVolume)"
-    )
-    assert erasure_source.index("select(DefaultChuteFSVolumeBinding)") < erasure_source.index(
-        "select(StorageVolume)"
-    )
+    assert delete_source.index(
+        "select(DefaultChuteFSVolumeBinding)"
+    ) < delete_source.index("select(StorageVolume)")
+    assert erasure_source.index(
+        "select(DefaultChuteFSVolumeBinding)"
+    ) < erasure_source.index("select(StorageVolume)")
 
 
 def test_rotation_migration_locks_and_guards_only_its_state():
@@ -341,7 +339,9 @@ def test_rotation_migration_locks_and_guards_only_its_state():
     ):
         assert f"NEW.{field} IS DISTINCT FROM OLD.{field}" in up
     assert "acknowledged_keyring_sha256 IS DISTINCT FROM expected_keyring_sha256" in up
-    assert "acknowledged_key_fingerprints IS DISTINCT FROM expected_key_fingerprints" in up
+    assert (
+        "acknowledged_key_fingerprints IS DISTINCT FROM expected_key_fingerprints" in up
+    )
     assert "fk_chutefs_launch_session_token_key" in up
     assert "require_active_chutefs_token_key_on_session_insert" in up
     assert "FOR SHARE" in up
@@ -373,7 +373,8 @@ def test_key_epoch_ack_is_readiness_only_and_liveness_stays_independent():
 
 def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
     migration = (
-        Path(__file__).parents[2] / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
+        Path(__file__).parents[2]
+        / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
     ).read_text()
     down = migration.split("-- migrate:down", maxsplit=1)[1]
     guard_end = down.index("$$;", down.index("DO $$"))
@@ -409,17 +410,22 @@ def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
     assert "storage_session_exchange_allowed" in guard
     assert "completed_at IS NOT NULL" not in guard
     assert "failed_at IS NULL AND completed_at IS NULL" in guard
+    assert "GROUP BY job_id" in guard
+    assert "HAVING COUNT(*) > 1" in guard
 
 
 def test_server_revocation_trigger_uses_distinct_identity_changes():
     migration = (
-        Path(__file__).parents[2] / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
+        Path(__file__).parents[2]
+        / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
     ).read_text()
     function = migration.split(
         "CREATE OR REPLACE FUNCTION revoke_chutefs_session_on_server_change()",
         maxsplit=1,
     )[1].split("$$;", maxsplit=1)[0]
-    assert "gpu_runtime_session_attestation_id\n            IS DISTINCT FROM" in function
+    assert (
+        "gpu_runtime_session_attestation_id\n            IS DISTINCT FROM" in function
+    )
     assert "attested_cert_pubkey_hash\n            IS DISTINCT FROM" in function
     assert "gpu_runtime_session_attestation_id IS NULL" not in function
 
@@ -435,11 +441,14 @@ def test_pruning_requires_all_authority_windows_to_expire_and_is_bounded():
 
 def test_token_key_retention_accepts_present_live_key():
     now = datetime.now(timezone.utc)
-    assert missing_retained_token_keys(
-        [("retained", now + timedelta(minutes=1))],
-        {"retained"},
-        now=now,
-    ) == []
+    assert (
+        missing_retained_token_keys(
+            [("retained", now + timedelta(minutes=1))],
+            {"retained"},
+            now=now,
+        )
+        == []
+    )
 
 
 def test_token_key_retention_rejects_absent_live_key():
@@ -453,11 +462,14 @@ def test_token_key_retention_rejects_absent_live_key():
 
 def test_token_key_retention_ignores_expired_session_key():
     now = datetime.now(timezone.utc)
-    assert missing_retained_token_keys(
-        [("expired", now - timedelta(microseconds=1))],
-        {"active"},
-        now=now,
-    ) == []
+    assert (
+        missing_retained_token_keys(
+            [("expired", now - timedelta(microseconds=1))],
+            {"active"},
+            now=now,
+        )
+        == []
+    )
 
 
 def test_startup_retains_keys_through_strict_refresh_expiry():

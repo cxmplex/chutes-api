@@ -1,5 +1,6 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -7,6 +8,8 @@ from api.gpu_contracts import GpuHotplugCommandAckV1
 from api.gpu_hotplug_service import (
     GpuHotplugError,
     _command_from_row,
+    _emit_retry_alert,
+    _mark_retry_alert,
     _new_command,
     record_gpu_hotplug_ack,
     require_gpu_hotplug_runtime_ack,
@@ -39,6 +42,10 @@ def _command_row():
         acknowledged_at=None,
         failure_code=None,
         failure_reason=None,
+        attempt_count=10,
+        next_attempt_at=datetime.now(timezone.utc),
+        alerted_at=None,
+        last_dispatch_error="focused retry failure",
         updated_at=None,
     )
 
@@ -337,9 +344,7 @@ async def test_runtime_gate_rejects_missing_pending_and_failed_hotplug(row_state
             row.acknowledged_at = row.updated_at
     db = _Db([command_row, _runtime_group(row)])
     with pytest.raises(GpuHotplugError, match="hotplug|custody"):
-        await require_gpu_hotplug_runtime_ack(
-            db, reservation, row.stable_server_id
-        )
+        await require_gpu_hotplug_runtime_ack(db, reservation, row.stable_server_id)
 
 
 @pytest.mark.asyncio
@@ -365,3 +370,29 @@ async def test_runtime_gate_does_not_apply_to_nonlegacy_reservation():
         db, _runtime_reservation(row, legacy=False), row.stable_server_id
     )
     db.execute.assert_not_awaited()
+
+
+def test_hotplug_retry_alert_is_persisted_and_emitted_once():
+    row = _command_row()
+    observed_at = datetime.now(timezone.utc)
+    first = _mark_retry_alert(row, observed_at)
+    second = _mark_retry_alert(row, observed_at)
+    assert first == {
+        "command_id": row.command_id,
+        "host_id": row.host_id,
+        "reservation_id": row.reservation_id,
+        "attempt_count": 10,
+        "next_attempt_at": row.next_attempt_at,
+        "last_dispatch_error": row.last_dispatch_error,
+    }
+    assert second is None
+    assert row.alerted_at == observed_at
+
+    bound = MagicMock()
+    with patch("api.gpu_hotplug_service.logger.bind", return_value=bound) as bind:
+        _emit_retry_alert(first)
+        _emit_retry_alert(second)
+    bind.assert_called_once_with(**first)
+    bound.error.assert_called_once_with(
+        "Durable GPU hotplug command exceeded the retry alert threshold."
+    )

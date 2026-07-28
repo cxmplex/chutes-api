@@ -590,6 +590,14 @@ BEGIN
                OR storage_session_exchange_allowed
                OR (failed_at IS NULL AND completed_at IS NULL)
        )
+       OR EXISTS (
+           SELECT 1
+             FROM launch_configs
+            WHERE job_id IS NOT NULL
+              AND failed_at IS NULL
+            GROUP BY job_id
+           HAVING COUNT(*) > 1
+       )
     THEN
         RAISE EXCEPTION
             'cannot roll back default ChuteFS volumes while migration-owned state exists';

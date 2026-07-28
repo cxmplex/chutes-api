@@ -34,6 +34,7 @@ from api.host import gpu_allocations
 from api.host.locks import acquire_gpu_lifecycle_lock
 from api.gpu_contracts import (
     GpuHotplugCommandAckV1,
+    GpuLifecycleOperationV1,
     GpuLocalReleaseAckV1,
     GpuPhysicalResultV1,
     GpuRegistrationRequestV2,
@@ -43,11 +44,13 @@ from api.gpu_contracts import (
 from api.gpu_lifecycle_service import (
     GpuLifecycleError,
     authorize_gpu_recovery,
+    create_gpu_lifecycle_operation,
     ensure_reservation_lifecycle_operation,
     finalize_gpu_host_loss,
     get_gpu_lifecycle_operation,
     record_gpu_local_release_ack,
     record_gpu_physical_result,
+    _revoke_unstarted_recovery,
     start_gpu_recovery,
 )
 from api.gpu_models import (
@@ -66,6 +69,7 @@ from api.gpu_hotplug_service import (
     dispatch_gpu_hotplug_command,
     get_gpu_hotplug_command,
     record_gpu_hotplug_ack,
+    retry_due_gpu_hotplug_commands,
 )
 from api.gpu_registration_service import (
     _claim_attempt,
@@ -1877,22 +1881,31 @@ async def test_phase_two_receipt_frontier_survives_fence_and_finalizes(
         assert row.result_outcome == "accepted"
         assert row.receipt_id == receipt.receipt_id
         assert row.receipt_sha256 == canonical_sha256(receipt)
+        assert row.failure_code is None
+        assert row.failure_reason is None
         if fence_kind == "inventory":
-            assert row.failure_code == "gpu_inventory_changed_during_release"
-            assert row.failure_reason is not None
+            assert group.failure_code == "gpu_inventory_changed_during_release"
+            assert group.failure_reason is not None
+            assert group.failure_metadata == {
+                "inventory_report_id": f"phase-two-{phase}-inventory-fence"
+            }
         else:
-            assert row.failure_code is None
-            assert row.failure_reason is None
+            assert group.failure_code is None
+            assert group.failure_reason is None
+            assert group.failure_metadata is None
         assert row.finalized_at is None
         assert group.state == "release_pending"
         assert reservation.state == "resetting"
         host = await session.get(Host, "gpu-host")
-        assert await record_gpu_physical_result(
-            session,
-            host,
-            operation.operation_id,
-            physical,
-        ) == receipt
+        assert (
+            await record_gpu_physical_result(
+                session,
+                host,
+                operation.operation_id,
+                physical,
+            )
+            == receipt
+        )
         exact_ack = ack or GpuLocalReleaseAckV1(
             operation_id=operation.operation_id,
             receipt_id=receipt.receipt_id,
@@ -2067,9 +2080,7 @@ async def test_gpu_credential_mutation_is_blocked_before_safe_release_frontier(
         assert key.revoked_at is None
 
 
-@pytest.mark.parametrize(
-    "frontier", ["local_release_acked"]
-)
+@pytest.mark.parametrize("frontier", ["local_release_acked"])
 @pytest.mark.parametrize("mutation", ["rotation", "revocation_then_rotation"])
 async def test_current_gpu_host_finishes_exact_release_after_credential_change(
     postgres_schema,
@@ -2633,12 +2644,15 @@ async def test_reservation_lifecycle_producers_use_two_phase_release_and_replay(
 
     async with sessions() as session:
         current_host = await session.get(Host, "gpu-host")
-        assert await record_gpu_physical_result(
-            session,
-            current_host,
-            operation.operation_id,
-            physical,
-        ) == receipt
+        assert (
+            await record_gpu_physical_result(
+                session,
+                current_host,
+                operation.operation_id,
+                physical,
+            )
+            == receipt
+        )
         replayed = await record_gpu_local_release_ack(
             session,
             current_host,
@@ -2887,7 +2901,7 @@ async def test_new_host_boot_quarantines_unreset_gpu_ownership(postgres_schema):
         await session.commit()
 
 
-async def test_old_key_forced_recovery_bridges_to_current_signed_inventory(
+async def test_old_key_forced_recovery_reauthorizes_after_expiry(
     postgres_schema,
 ):
     sessions, _schema = postgres_schema
@@ -2967,6 +2981,181 @@ async def test_old_key_forced_recovery_bridges_to_current_signed_inventory(
         assert reservation.host_key_generation == 1
         assert group.host_key_generation == 2
         assert group.state == "quarantined"
+        first_authorization_id = envelope.authorization_id
+        first_operation_id = envelope.operation.operation_id
+        expired_at = authorization.expires_at + timedelta(seconds=1)
+        with patch(
+            "api.gpu_lifecycle_service._now",
+            return_value=expired_at,
+        ):
+            successor = await authorize_gpu_recovery(
+                session,
+                response.claims.allocation_group_id,
+                GpuRecoveryAuthorizeRequestV1(
+                    report_id=report_claims.report_id,
+                    reason="replace expired rotated-key authorization",
+                ),
+                authorized_by="admin",
+            )
+        successor_authorization = await session.get(
+            GpuRecoveryAuthorization,
+            successor.authorization_id,
+        )
+        expired_operation = await session.get(
+            GpuLifecycleOperation,
+            first_operation_id,
+        )
+        assert successor.authorization_id != first_authorization_id
+        assert successor.operation.operation_id != first_operation_id
+        assert expired_operation.phase == "quarantined"
+        assert expired_operation.failure_code == "gpu_recovery_authorization_expired"
+        assert successor_authorization.prior_host_key_generation == 1
+        assert successor_authorization.prior_host_boot_generation == 1
+        assert successor_authorization.host_key_generation == 2
+        assert successor_authorization.host_boot_generation == 1
+        assert reservation.host_key_generation == 1
+        assert group.host_key_generation == 2
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(GpuRecoveryEvent)
+                .where(
+                    GpuRecoveryEvent.operation_id == first_operation_id,
+                    GpuRecoveryEvent.state == "revoked",
+                )
+            )
+            == 1
+        )
+        await session.commit()
+
+
+async def test_revoked_recovery_history_survives_projection_clear_and_restart(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        response = await reserve_gpu_group(session, "gpu-host", _request())
+        host = await session.get(Host, "gpu-host")
+        await claim_gpu_reservation(
+            session,
+            host,
+            GpuReservationClaimRequestV1(
+                token=response.token,
+                claims_sha256=response.claims_sha256,
+            ),
+        )
+        await fence_gpu_host_authority(
+            session,
+            "gpu-host",
+            code="test_restart_key_rotation",
+            reason="key rotated before durable recovery restart",
+        )
+        prior_key = await session.get(HostKeyGeneration, ("gpu-host", 1))
+        prior_key.revoked_at = datetime.now(timezone.utc)
+        prior_key.revocation_reason = "rotated"
+        session.add(
+            HostKeyGeneration(
+                host_id="gpu-host",
+                generation=2,
+                enrollment_generation=2,
+                ed25519_public_key="restart-rotated-ed25519",
+                ed25519_fingerprint="3" * 64,
+                x25519_public_key="restart-rotated-x25519",
+                x25519_fingerprint="4" * 64,
+            )
+        )
+        host.active_key_generation = 2
+        await session.flush()
+        first_report = _current_host_report(
+            host,
+            "restart-recovery-report-key-2",
+        )
+        reconciled = await gpu_allocations.reconcile_gpu_inventory(
+            session,
+            host,
+            first_report,
+        )
+        assert reconciled.status == "quarantined"
+        historical_now = datetime.now(timezone.utc) - timedelta(minutes=30)
+        with patch(
+            "api.gpu_lifecycle_service._now",
+            return_value=historical_now,
+        ):
+            first = await authorize_gpu_recovery(
+                session,
+                response.claims.allocation_group_id,
+                GpuRecoveryAuthorizeRequestV1(
+                    report_id=first_report.report_id,
+                    reason="authorization that lapses before response recovery",
+                ),
+                authorized_by="admin",
+            )
+        authorization = await session.get(
+            GpuRecoveryAuthorization,
+            first.authorization_id,
+        )
+        group = await session.get(
+            GpuAllocationGroup,
+            response.claims.allocation_group_id,
+        )
+        revoke_time = datetime.now(timezone.utc)
+        assert authorization.expires_at < revoke_time
+        await _revoke_unstarted_recovery(
+            session,
+            authorization,
+            group,
+            revoke_time,
+            failure_code="gpu_recovery_authorization_expired",
+            failure_reason=("GPU recovery authorization expired before presentation."),
+        )
+        assert group.recovery_authorization_id is None
+        assert group.host_key_generation == 2
+        await session.commit()
+
+    async with sessions() as session:
+        host = await session.get(Host, "gpu-host")
+        fresh_report = _current_host_report(
+            host,
+            "restart-recovery-fresh-report-key-2",
+        )
+        reconciled = await gpu_allocations.reconcile_gpu_inventory(
+            session,
+            host,
+            fresh_report,
+        )
+        assert reconciled.status == "quarantined"
+        await session.commit()
+
+    async with sessions() as session:
+        group = await session.get(
+            GpuAllocationGroup,
+            response.claims.allocation_group_id,
+        )
+        assert group.recovery_authorization_id is None
+        successor = await authorize_gpu_recovery(
+            session,
+            response.claims.allocation_group_id,
+            GpuRecoveryAuthorizeRequestV1(
+                report_id=fresh_report.report_id,
+                reason="resume from durable revoked predecessor history",
+            ),
+            authorized_by="admin",
+        )
+        successor_authorization = await session.get(
+            GpuRecoveryAuthorization,
+            successor.authorization_id,
+        )
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            response.claims.reservation_id,
+        )
+        assert successor.authorization_id != first.authorization_id
+        assert successor_authorization.prior_host_key_generation == 1
+        assert successor_authorization.prior_host_boot_generation == 1
+        assert successor_authorization.host_key_generation == 2
+        assert reservation.host_key_generation == 1
+        assert group.host_key_generation == 2
         await session.commit()
 
 
@@ -3058,6 +3247,79 @@ async def test_permanent_host_loss_cannot_reenter_forced_recovery(
         assert group.state == reservation.state == "quarantined"
         assert group.available_at is None
         assert reservation.released_at is None
+
+
+async def test_ownerless_permanent_host_loss_cannot_start_ordinary_lifecycle(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    (
+        operation,
+        _result,
+        _receipt,
+        _ack,
+        _authorization_id,
+    ) = await _seed_recovery_lifecycle_phase(
+        sessions,
+        "ownerless",
+        "receipt_accepted",
+    )
+    async with sessions() as session:
+        row = await session.get(GpuLifecycleOperation, operation.operation_id)
+        await finalize_gpu_host_loss(
+            session,
+            operation.operation_id,
+            GpuHostLossFinalizeRequestV1(
+                operation_id=operation.operation_id,
+                allocation_group_id=operation.allocation_group_id,
+                allocation_group_generation=operation.allocation_group_generation,
+                receipt_sha256=row.receipt_sha256,
+                reason="ownerless L0 custody journal is permanently lost",
+            ),
+            authorized_by="admin-user",
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        host = await session.get(Host, "gpu-host")
+        group = await session.get(GpuAllocationGroup, operation.allocation_group_id)
+        bypass = GpuLifecycleOperationV1(
+            operation_id=str(uuid.uuid4()),
+            operation_type="pre_slot_claim_quarantine",
+            host_id=host.host_id,
+            host_key_generation=group.host_key_generation,
+            host_boot_generation=group.host_boot_generation,
+            allocation_group_id=group.allocation_group_id,
+            allocation_group_generation=group.generation,
+            topology_fingerprint=group.topology_fingerprint,
+            gpu_bdfs=list(group.gpu_bdfs),
+            gpu_uuids=list(group.gpu_uuids),
+            owner_hotkey=host.miner_hotkey,
+        )
+        with pytest.raises(
+            GpuLifecycleError,
+            match="Permanently lost GPU custody cannot begin another lifecycle operation",
+        ):
+            await create_gpu_lifecycle_operation(session, host, bypass)
+        await session.rollback()
+
+    async with sessions() as session:
+        group = await session.get(GpuAllocationGroup, operation.allocation_group_id)
+        assert group.state == "quarantined"
+        assert group.failure_code == "gpu_host_permanently_lost"
+        assert group.available_at is None
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(GpuLifecycleOperation)
+                .where(
+                    GpuLifecycleOperation.allocation_group_id
+                    == operation.allocation_group_id,
+                )
+            )
+            == 1
+        )
 
 
 async def test_old_boot_ownerless_recovery_bridges_to_current_signed_inventory(
@@ -3567,12 +3829,16 @@ async def test_same_boot_inventory_preserves_recovery_authorization_report(
 ):
     sessions, _schema = postgres_schema
     await _seed(sessions)
-    operation, result, _receipt, _ack, authorization_id = (
-        await _seed_recovery_lifecycle_phase(
-            sessions,
-            recovery_mode,
-            "physical_result",
-        )
+    (
+        operation,
+        result,
+        _receipt,
+        _ack,
+        authorization_id,
+    ) = await _seed_recovery_lifecycle_phase(
+        sessions,
+        recovery_mode,
+        "physical_result",
     )
     async with sessions() as session:
         host = await session.get(Host, "gpu-host")
@@ -3636,12 +3902,16 @@ async def test_initial_forced_recovery_reclaim_requires_host_latest_inventory(
 ):
     sessions, _schema = postgres_schema
     await _seed(sessions)
-    operation, result, _receipt, _ack, authorization_id = (
-        await _seed_recovery_lifecycle_phase(
-            sessions,
-            "forced",
-            "physical_result",
-        )
+    (
+        operation,
+        result,
+        _receipt,
+        _ack,
+        authorization_id,
+    ) = await _seed_recovery_lifecycle_phase(
+        sessions,
+        "forced",
+        "physical_result",
     )
     async with sessions() as session:
         host = await session.get(Host, "gpu-host")
@@ -3720,9 +3990,7 @@ async def test_initial_forced_recovery_reclaim_requires_host_latest_inventory(
             ).model_dump(mode="json")
             changed_group = _inventory_group()
             changed_group.pop("topology_fingerprint", None)
-            changed_group["devices"][0][
-                "attestation_certificate_sha256"
-            ] = "f" * 64
+            changed_group["devices"][0]["attestation_certificate_sha256"] = "f" * 64
             changed_group["topology_fingerprint"] = canonical_sha256(changed_group)
             report_data["groups"] = [changed_group]
             contradictory = GpuInventoryReportV1.model_validate(report_data)
@@ -3736,9 +4004,7 @@ async def test_initial_forced_recovery_reclaim_requires_host_latest_inventory(
                     host_boot_generation=contradictory.host_boot_generation,
                     report_generation=contradictory.report_generation,
                     gpu_release_id=contradictory.gpu_release_id,
-                    profile_contract_sha256=(
-                        contradictory.profile_contract_sha256
-                    ),
+                    profile_contract_sha256=(contradictory.profile_contract_sha256),
                     topology_fingerprint=reported_group.topology_fingerprint,
                     claims=contradictory.model_dump(mode="json"),
                     claims_sha256=canonical_sha256(contradictory),
@@ -3889,19 +4155,26 @@ async def test_post_physical_recovery_resumes_across_boot_and_finalizes(
 ):
     sessions, _schema = postgres_schema
     await _seed(sessions)
-    operation, result, receipt, ack, authorization_id = (
-        await _seed_recovery_lifecycle_phase(sessions, recovery_mode, phase)
-    )
+    (
+        operation,
+        result,
+        receipt,
+        ack,
+        authorization_id,
+    ) = await _seed_recovery_lifecycle_phase(sessions, recovery_mode, phase)
 
     async with sessions() as session:
         host = await session.get(Host, "gpu-host")
         group = await session.get(GpuAllocationGroup, operation.allocation_group_id)
         original_report_id = group.last_report_id
-        assert await advance_gpu_host_boot(
-            session,
-            host,
-            "22222222-2222-2222-2222-222222222222",
-        ) == 2
+        assert (
+            await advance_gpu_host_boot(
+                session,
+                host,
+                "22222222-2222-2222-2222-222222222222",
+            )
+            == 2
+        )
         await session.commit()
 
     async with sessions() as session:
@@ -4293,7 +4566,8 @@ async def test_inventory_mismatch_never_releases_reset_journal(
             return
 
         assert row.phase == phase
-        assert row.failure_code == "gpu_inventory_changed_during_release"
+        assert row.failure_code is None
+        assert group.failure_code == "gpu_inventory_changed_during_release"
         assert group.state == "release_pending"
         public = await get_gpu_lifecycle_operation(
             session,
@@ -4453,8 +4727,7 @@ async def test_inventory_reconciliation_cannot_release_protected_lifecycle_state
         report_data.update(
             {
                 "report_id": f"{protected_state}-{report_variant}-next-boot",
-                "report_generation": int(host.gpu_inventory_report_generation or 0)
-                + 1,
+                "report_generation": int(host.gpu_inventory_report_generation or 0) + 1,
                 "host_boot_id": host.boot_id,
                 "host_boot_generation": host.boot_generation,
             }
@@ -4463,9 +4736,7 @@ async def test_inventory_reconciliation_cannot_release_protected_lifecycle_state
             changed_group = _inventory_group()
             changed_group.pop("topology_fingerprint", None)
             if report_variant == "topology":
-                changed_group["devices"][0][
-                    "attestation_certificate_sha256"
-                ] = "f" * 64
+                changed_group["devices"][0]["attestation_certificate_sha256"] = "f" * 64
             else:
                 changed_group["reported_profile_id"] = "unsupported-profile"
             changed_group["topology_fingerprint"] = canonical_sha256(changed_group)
@@ -4511,14 +4782,17 @@ async def test_inventory_reconciliation_cannot_release_protected_lifecycle_state
             if protected_state == "recovery_required":
                 assert group.failure_code == "gpu_inventory_changed_during_release"
                 assert row.phase == "finalized"
-                assert await session.scalar(
-                    select(func.count())
-                    .select_from(GpuRecoveryEvent)
-                    .where(
-                        GpuRecoveryEvent.operation_id == operation.operation_id,
-                        GpuRecoveryEvent.state == "revoked",
+                assert (
+                    await session.scalar(
+                        select(func.count())
+                        .select_from(GpuRecoveryEvent)
+                        .where(
+                            GpuRecoveryEvent.operation_id == operation.operation_id,
+                            GpuRecoveryEvent.state == "revoked",
+                        )
                     )
-                ) == 1
+                    == 1
+                )
         await session.commit()
 
 
@@ -4557,9 +4831,7 @@ async def test_unstarted_recovery_requires_latest_inventory_and_allows_successor
         ).model_dump(mode="json")
         if newer_variant == "conflicting":
             changed_group = dict(report_data["groups"][0])
-            changed_group["devices"] = [
-                dict(item) for item in changed_group["devices"]
-            ]
+            changed_group["devices"] = [dict(item) for item in changed_group["devices"]]
             changed_group["devices"][0]["attestation_certificate_sha256"] = "f" * 64
             changed_group.pop("topology_fingerprint", None)
             changed_group["topology_fingerprint"] = canonical_sha256(changed_group)
@@ -4618,22 +4890,28 @@ async def test_unstarted_recovery_requires_latest_inventory_and_allows_successor
         )
         assert old_operation.phase == "quarantined"
         assert old_operation.failure_code == "gpu_recovery_inventory_superseded"
-        assert await session.scalar(
-            select(func.count())
-            .select_from(GpuRecoveryEvent)
-            .where(
-                GpuRecoveryEvent.operation_id == first.operation.operation_id,
-                GpuRecoveryEvent.state == "revoked",
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(GpuRecoveryEvent)
+                .where(
+                    GpuRecoveryEvent.operation_id == first.operation.operation_id,
+                    GpuRecoveryEvent.state == "revoked",
+                )
             )
-        ) == 1
-        assert await session.scalar(
-            select(func.count())
-            .select_from(GpuRecoveryEvent)
-            .where(
-                GpuRecoveryEvent.operation_id == first.operation.operation_id,
-                GpuRecoveryEvent.state == "started",
+            == 1
+        )
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(GpuRecoveryEvent)
+                .where(
+                    GpuRecoveryEvent.operation_id == first.operation.operation_id,
+                    GpuRecoveryEvent.state == "started",
+                )
             )
-        ) == 0
+            == 0
+        )
         await session.commit()
 
 
@@ -4726,31 +5004,40 @@ async def test_completed_recovery_invalidation_keeps_terminal_replay_immutable(
         } == row_snapshot
         assert group.state == "quarantined"
         assert group.recovery_authorization_id == operation.recovery_authorization_id
-        assert await session.scalar(
-            select(func.count())
-            .select_from(GpuRecoveryEvent)
-            .where(
-                GpuRecoveryEvent.operation_id == operation.operation_id,
-                GpuRecoveryEvent.state == "completed",
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(GpuRecoveryEvent)
+                .where(
+                    GpuRecoveryEvent.operation_id == operation.operation_id,
+                    GpuRecoveryEvent.state == "completed",
+                )
             )
-        ) == 1
-        assert await session.scalar(
-            select(func.count())
-            .select_from(GpuRecoveryEvent)
-            .where(
-                GpuRecoveryEvent.operation_id == operation.operation_id,
-                GpuRecoveryEvent.state == "revoked",
+            == 1
+        )
+        assert (
+            await session.scalar(
+                select(func.count())
+                .select_from(GpuRecoveryEvent)
+                .where(
+                    GpuRecoveryEvent.operation_id == operation.operation_id,
+                    GpuRecoveryEvent.state == "revoked",
+                )
             )
-        ) == 1
+            == 1
+        )
         assert (
             await get_gpu_lifecycle_operation(session, host, operation.operation_id)
         ).model_dump(mode="json") == terminal_bytes
-        assert await record_gpu_physical_result(
-            session,
-            host,
-            operation.operation_id,
-            physical,
-        ) == receipt
+        assert (
+            await record_gpu_physical_result(
+                session,
+                host,
+                operation.operation_id,
+                physical,
+            )
+            == receipt
+        )
         assert (
             await record_gpu_local_release_ack(
                 session,
@@ -5683,8 +5970,8 @@ def _registration_competitor(
 
 
 async def _prepare_registration_conflict(session, *, suffix: str):
-    response, primary, primary_cert, primary_spki = (
-        await _prepare_registration_request(session, "miner")
+    response, primary, primary_cert, primary_spki = await _prepare_registration_request(
+        session, "miner"
     )
     attempt, lease_owner, conflict = await _claim_attempt(
         session,
@@ -5912,7 +6199,9 @@ async def test_registration_claim_and_completed_replay_preserve_mode_owners(
         )
         assert lease_owner is not None
         assert conflict is None
-        assert attempt.request_payload_key_id == settings.gpu_registration_recovery_key_id
+        assert (
+            attempt.request_payload_key_id == settings.gpu_registration_recovery_key_id
+        )
         assert request.nonce not in attempt.request_payload_ciphertext
         assert request.launch_reservation not in attempt.request_payload_ciphertext
         reservation = await session.get(
@@ -6031,9 +6320,7 @@ async def test_completed_registration_replay_separates_registration_and_current_
         if latest_variant == "contradictory":
             changed_group = _inventory_group()
             changed_group.pop("topology_fingerprint", None)
-            changed_group["devices"][0][
-                "attestation_certificate_sha256"
-            ] = "f" * 64
+            changed_group["devices"][0]["attestation_certificate_sha256"] = "f" * 64
             changed_group["topology_fingerprint"] = canonical_sha256(changed_group)
             report_data["groups"] = [changed_group]
         current_report = GpuInventoryReportV1.model_validate(report_data)
@@ -6122,10 +6409,13 @@ async def test_completed_registration_replay_separates_registration_and_current_
         assert second.state == "completed"
         assert second.runtime_session is not None
         assert second.runtime_session != first.runtime_session
-        assert second.model_dump(
-            mode="json",
-            exclude={"runtime_session", "runtime_session_expires_at"},
-        ) == first_stable
+        assert (
+            second.model_dump(
+                mode="json",
+                exclude={"runtime_session", "runtime_session_expires_at"},
+            )
+            == first_stable
+        )
 
 
 async def test_failed_gpu_runtime_attestation_persists_normal_delete_intent(
@@ -6237,15 +6527,19 @@ async def test_failed_gpu_runtime_attestation_persists_normal_delete_intent(
             )
         ).scalar_one()
         failed_attestation = (
-            await session.execute(
-                select(ServerAttestation)
-                .where(
-                    ServerAttestation.server_id == response.claims.server_id,
-                    ServerAttestation.verification_error.is_not(None),
+            (
+                await session.execute(
+                    select(ServerAttestation)
+                    .where(
+                        ServerAttestation.server_id == response.claims.server_id,
+                        ServerAttestation.verification_error.is_not(None),
+                    )
+                    .order_by(ServerAttestation.created_at.desc())
                 )
-                .order_by(ServerAttestation.created_at.desc())
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         assert failed_attestation is not None
         assert failed_attestation.verification_error == (
             "GPU runtime re-attestation requires fresh NVIDIA evidence."
@@ -6626,8 +6920,9 @@ async def test_legacy_hotplug_starts_full_replay_window_only_when_response_ready
         assert first.registration_id == registration_id
         assert first.attestation_id == attestation_id
         assert first.runtime_session is not None
-        assert first.registration_replay_until - completed.response_ready_at == timedelta(
-            minutes=15
+        assert (
+            first.registration_replay_until - completed.response_ready_at
+            == timedelta(minutes=15)
         )
         assert completed.response_ready_at - completed.completed_at > timedelta(
             minutes=15
@@ -7151,8 +7446,7 @@ async def test_registration_conflict_transient_verifier_failure_retries_same_row
         assert conflict.last_attempt_at is not None
         assert conflict.next_attempt_at > conflict.last_attempt_at
         assert (
-            conflict.last_transient_error_code
-            == "AttestationVerifierUnavailableError"
+            conflict.last_transient_error_code == "AttestationVerifierUnavailableError"
         )
         assert conflict.request_payload_ciphertext == ciphertext
         assert conflict.request_payload_key_id == key_id
@@ -7320,8 +7614,8 @@ async def test_primary_verifier_outage_preserves_processing_attempt_for_lease_re
     sessions, _schema = postgres_schema
     await _seed(sessions)
     async with sessions() as session:
-        _response, request, cert_pem, spki_sha256 = (
-            await _prepare_registration_request(session, "miner")
+        _response, request, cert_pem, spki_sha256 = await _prepare_registration_request(
+            session, "miner"
         )
         attempt, lease_owner, conflict = await _claim_attempt(
             session,
@@ -7479,6 +7773,77 @@ async def test_hotplug_dispatch_refuses_quarantined_custody_without_send(
         assert row.ack is None
         assert row.ack_sha256 is None
         assert row.acknowledged_at is None
+
+
+async def test_expired_hotplug_lease_is_due_even_with_stale_future_retry_time(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        response = await reserve_gpu_group(session, "gpu-host", _request())
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            response.claims.reservation_id,
+        )
+        command = _new_command(
+            SimpleNamespace(
+                legacy_migration_id="expired-lease-migration",
+                server_id=reservation.server_id,
+                reservation_id=reservation.reservation_id,
+                claims_sha256=reservation.claims_sha256,
+                process_incarnation=reservation.process_incarnation,
+                host_id=reservation.host_id,
+                host_key_generation=reservation.host_key_generation,
+                host_boot_generation=reservation.host_boot_generation,
+                reservation_generation=reservation.reservation_generation,
+                allocation_group_id=reservation.allocation_group_id,
+                allocation_group_generation=reservation.allocation_group_generation,
+            )
+        )
+        now = datetime.now(timezone.utc)
+        session.add(
+            GpuHotplugCommand(
+                command_id=command.command_id,
+                host_id=command.host_id,
+                host_key_generation=command.host_key_generation,
+                host_boot_generation=command.host_boot_generation,
+                reservation_id=command.reservation_id,
+                reservation_generation=command.reservation_generation,
+                claims_sha256=command.claims_sha256,
+                allocation_group_id=command.allocation_group_id,
+                allocation_group_generation=command.allocation_group_generation,
+                process_incarnation=command.process_incarnation,
+                stable_server_id=command.stable_server_id,
+                migration_id=command.migration_id,
+                payload=command.payload.model_dump(mode="json"),
+                payload_sha256=command.payload_sha256,
+                state="leased",
+                dispatch_lease_owner="crashed-worker",
+                dispatch_lease_expires_at=now - timedelta(seconds=1),
+                attempt_count=1,
+                next_attempt_at=now + timedelta(hours=1),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.commit()
+
+    @asynccontextmanager
+    async def scoped_session():
+        async with sessions() as session:
+            yield session
+
+    dispatch = AsyncMock()
+    with (
+        patch("api.gpu_hotplug_service.get_session", scoped_session),
+        patch(
+            "api.gpu_hotplug_service.dispatch_gpu_hotplug_command",
+            dispatch,
+        ),
+    ):
+        await retry_due_gpu_hotplug_commands()
+    dispatch.assert_awaited_once_with(command.command_id)
 
 
 async def test_registration_cleanup_scrubs_every_nonce_and_token_payload_copy(

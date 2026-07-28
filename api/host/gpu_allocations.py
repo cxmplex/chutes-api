@@ -260,20 +260,19 @@ async def _require_resumable_legacy_migration(
                 .order_by(GpuLifecycleOperation.created_at.desc())
                 .with_for_update()
             )
-        ).scalars().first()
+        )
+        .scalars()
+        .first()
         if prior_reservation is not None
         else None
     )
     physical_result = (
-        dict(accepted_reset.physical_result or {})
-        if accepted_reset is not None
-        else {}
+        dict(accepted_reset.physical_result or {}) if accepted_reset is not None else {}
     )
     qemu_reset_proven = bool(
         prior_reservation is not None
         and accepted_reset is not None
-        and canonical_sha256(physical_result)
-        == accepted_reset.physical_result_sha256
+        and canonical_sha256(physical_result) == accepted_reset.physical_result_sha256
         and physical_result.get("qemu_absent") is True
         and physical_result.get("reset_succeeded") is True
         and physical_result.get("original_drivers_restored") is True
@@ -529,9 +528,7 @@ async def _assert_platform_workload_current(
     if request.job_id is not None:
         job = (
             await db.execute(
-                select(Job)
-                .where(Job.job_id == request.job_id)
-                .with_for_update(of=Job)
+                select(Job).where(Job.job_id == request.job_id).with_for_update(of=Job)
             )
         ).scalar_one_or_none()
         if (
@@ -1875,7 +1872,9 @@ async def reconcile_gpu_inventory(
                 (allocation_group.allocation_group_id, allocation_group.generation),
                 [],
             )
-            operation = matching_operations[0] if len(matching_operations) == 1 else None
+            operation = (
+                matching_operations[0] if len(matching_operations) == 1 else None
+            )
             if allocation_group.state == "recovery_required":
                 # The finalized operation and its response bytes are immutable.
                 # Revoke only the completed recovery authorization and fence the
@@ -1949,7 +1948,10 @@ async def reconcile_gpu_inventory(
                     metadata={"inventory_report_id": report.report_id},
                     now=now,
                 )
-            elif operation is not None and operation.phase in {"intent", "physical_result"}:
+            elif operation is not None and operation.phase in {
+                "intent",
+                "physical_result",
+            }:
                 # Before an accepted receipt the stable quarantine transition can
                 # close the operation immediately (and, for a stored result, mint
                 # the exact quarantined receipt that L0 may replay).
@@ -1965,11 +1967,15 @@ async def reconcile_gpu_inventory(
                 "receipt_accepted",
                 "local_release_acked",
             }:
-                # The accepted receipt/ACK bytes remain authoritative, but their
-                # finalization must not make a now-conflicting group available.
-                operation.failure_code = "gpu_inventory_changed_during_release"
-                operation.failure_reason = reason
-                operation.updated_at = now
+                # The accepted receipt/ACK bytes remain a successful immutable
+                # frontier. Record the independent custody fence on the group;
+                # finalization atomically terminalizes the operation as
+                # quarantined after the exact local-release ACK is durable.
+                allocation_group.failure_code = "gpu_inventory_changed_during_release"
+                allocation_group.failure_reason = reason
+                allocation_group.failure_metadata = {
+                    "inventory_report_id": report.report_id,
+                }
                 allocation_group.last_seen_at = now
                 allocation_group.updated_at = now
             else:
@@ -2282,9 +2288,7 @@ def _latest_gpu_inventory_matches_group(
         and claims.gpu_release_id == group.gpu_release_id
         and claims.profile_contract_sha256 == group.profile_contract_sha256
         and report.topology_fingerprint == group.topology_fingerprint
-        and (
-            not require_group_report_link or group.last_report_id == report.report_id
-        )
+        and (not require_group_report_link or group.last_report_id == report.report_id)
     )
 
 
@@ -2394,8 +2398,7 @@ async def _replay_reclaimed_gpu_group(
             select(GpuInventoryReport)
             .where(
                 GpuInventoryReport.host_id == host.host_id,
-                GpuInventoryReport.host_key_generation
-                == host.active_key_generation,
+                GpuInventoryReport.host_key_generation == host.active_key_generation,
                 GpuInventoryReport.host_boot_generation == host.boot_generation,
                 GpuInventoryReport.report_generation
                 == host.gpu_inventory_report_generation,
@@ -2848,22 +2851,19 @@ async def reserve_gpu_group(
                 .with_for_update()
             )
         ).scalar_one_or_none()
-        if (
-            not _latest_gpu_inventory_matches_group(
-                host,
-                group,
-                current_report,
-                require_group_report_link=False,
-            )
-            or (
-                expected_inventory_report_id is not None
-                and (
-                    current_report is None
-                    or current_report.report_id != expected_inventory_report_id
-                    or not hmac.compare_digest(
-                        current_report.claims_sha256,
-                        expected_inventory_report_sha256 or "",
-                    )
+        if not _latest_gpu_inventory_matches_group(
+            host,
+            group,
+            current_report,
+            require_group_report_link=False,
+        ) or (
+            expected_inventory_report_id is not None
+            and (
+                current_report is None
+                or current_report.report_id != expected_inventory_report_id
+                or not hmac.compare_digest(
+                    current_report.claims_sha256,
+                    expected_inventory_report_sha256 or "",
                 )
             )
         ):
@@ -3925,10 +3925,12 @@ async def quarantine_gpu_reservation_control_plane(
     if reservation.state in {"released", "expired"}:
         return
     now = _utcnow()
-    _operation, _operation_reservation, phase_two_preserved = (
-        await _terminalize_lifecycle_before_quarantine(
-            db, group, code=code, reason=reason, now=now
-        )
+    (
+        _operation,
+        _operation_reservation,
+        phase_two_preserved,
+    ) = await _terminalize_lifecycle_before_quarantine(
+        db, group, code=code, reason=reason, now=now
     )
     if phase_two_preserved:
         await db.flush()
@@ -3969,10 +3971,12 @@ async def quarantine_gpu_reservation(
     ):
         raise GpuAllocationError("GPU quarantine request does not match reservation.")
     now = _utcnow()
-    _operation, _operation_reservation, phase_two_preserved = (
-        await _terminalize_lifecycle_before_quarantine(
-            db, group, code=code, reason=reason, now=now
-        )
+    (
+        _operation,
+        _operation_reservation,
+        phase_two_preserved,
+    ) = await _terminalize_lifecycle_before_quarantine(
+        db, group, code=code, reason=reason, now=now
     )
     if phase_two_preserved:
         await db.flush()
