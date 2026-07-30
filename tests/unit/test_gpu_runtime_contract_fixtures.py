@@ -23,10 +23,14 @@ from api.gpu_contracts import (
     GpuSourceReaderResultV1,
 )
 from api.gpu_lifecycle_service import (
-    _intent_document,
+    GpuLifecycleError,
+    gpu_lifecycle_intent_document,
     gpu_lifecycle_operation_response,
+    gpu_recovery_authorization_bytes,
+    gpu_recovery_authorization_document,
 )
 from api.gpu_models import GpuLifecycleOperation
+from api.host.schemas import canonical_json_bytes
 
 _FIXTURE = Path(__file__).parents[1] / "fixtures" / "gpu_runtime_contracts_v1_v2.json"
 _FIXTURE_SHA256 = "7507236b19f25ca4eb753fb3c16c31cbdc23b6e07052b559cabeef84ce720fab"
@@ -92,11 +96,75 @@ def test_lifecycle_v1_fixture_bytes_validate() -> None:
     GpuHotplugCommandAckV1.model_validate(lifecycle["hotplug_failed"])
 
 
+def test_lifecycle_dispatch_projection_matches_shared_fixture_bytes() -> None:
+    lifecycle = _load_fixture()["lifecycle_v1"]
+    response = GpuLifecycleOperationV1.model_validate(lifecycle["intents"][-1])
+    expected = lifecycle["recovery_authorization"]["operation"]
+
+    document = gpu_lifecycle_intent_document(response)
+
+    assert document == expected
+    assert canonical_json_bytes(document) == canonical_json_bytes(expected)
+    assert not {"group_state", "created_at", "updated_at"}.intersection(document)
+
+
+def test_recovery_authorization_uses_one_shared_canonical_document() -> None:
+    lifecycle = _load_fixture()["lifecycle_v1"]
+    expected = lifecycle["recovery_authorization"]
+    envelope = GpuRecoveryAuthorizationEnvelopeV1.model_validate(expected)
+
+    document = gpu_recovery_authorization_document(envelope)
+
+    assert document == expected
+    assert document["operation"] == gpu_lifecycle_intent_document(envelope.operation)
+    assert gpu_recovery_authorization_bytes(envelope) == canonical_json_bytes(expected)
+
+
+def test_recovery_authorization_omits_optional_fields_and_rejects_response_fields() -> None:
+    lifecycle = _load_fixture()["lifecycle_v1"]
+    reference = GpuRecoveryAuthorizationEnvelopeV1.model_validate(
+        lifecycle["recovery_authorization"]
+    )
+    ownerless_response = GpuLifecycleOperationV1.model_validate(lifecycle["intents"][4])
+    ownerless_intent = GpuLifecycleOperationV1.model_validate(
+        gpu_lifecycle_intent_document(ownerless_response)
+    )
+    envelope = reference.model_copy(
+        update={
+            "authorization_id": ownerless_intent.recovery_authorization_id,
+            "operation": ownerless_intent,
+        }
+    )
+
+    document = gpu_recovery_authorization_document(envelope)
+
+    assert not {
+        "reservation_id",
+        "reservation_generation",
+        "claims_sha256",
+        "process_incarnation",
+        "stable_server_id",
+        "management_mode",
+        "migration_id",
+    }.intersection(document["operation"])
+    assert b"null" not in gpu_recovery_authorization_bytes(envelope)
+
+    contaminated = envelope.model_copy(
+        update={
+            "operation": ownerless_intent.model_copy(
+                update={"group_state": "resetting"}
+            )
+        }
+    )
+    with pytest.raises(GpuLifecycleError, match="accepts an intent only"):
+        gpu_recovery_authorization_document(contaminated)
+
+
 @pytest.mark.asyncio
 async def test_service_projection_matches_quarantined_fixture_bytes() -> None:
     item = _load_fixture()["lifecycle_v1"]["quarantined_frontiers"][-1]
     wire = GpuLifecycleOperationV1.model_validate(item)
-    intent = _intent_document(wire)
+    intent = gpu_lifecycle_intent_document(wire)
     row = GpuLifecycleOperation(
         operation_id=wire.operation_id,
         operation_type=wire.operation_type,

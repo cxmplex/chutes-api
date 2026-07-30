@@ -23,6 +23,8 @@ from api.constants import (
     AGENT_COMMAND_CHANNEL,
     SERVER_ID_HEADER,
 )
+from api.gpu_contracts import GpuLifecycleOperationV1
+from api.gpu_lifecycle_service import gpu_lifecycle_intent_document
 from tests.unit.test_cpu_scheduler import (
     FakeRedis,
     FakeResult,
@@ -138,6 +140,78 @@ class TestSendAgentCommand:
             "status": "ok",
             "detail": "closed",
         }
+
+
+class TestSendGpuReservationTeardown:
+    @pytest.mark.asyncio
+    async def test_dispatches_strict_intent_instead_of_response_projection(self):
+        session = FakeSession({})
+        operation = GpuLifecycleOperationV1(
+            operation_id="10000000-0000-4000-8000-000000000004",
+            operation_type="normal_delete",
+            phase="intent",
+            host_id="host-1",
+            host_key_generation=2,
+            host_boot_generation=3,
+            allocation_group_id="group-1",
+            allocation_group_generation=4,
+            reservation_id="reservation-1",
+            reservation_generation=5,
+            claims_sha256="a" * 64,
+            process_incarnation="process-1",
+            topology_fingerprint="b" * 64,
+            gpu_bdfs=["0000:01:00.0"],
+            gpu_uuids=["GPU-00000000-0000-0000-0000-000000000001"],
+            owner_hotkey="owner-1",
+            stable_server_id="server-1",
+            management_mode="platform",
+            group_state="resetting",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        reservation = SimpleNamespace(
+            host_id="host-1",
+            state="resetting",
+            teardown_command_id="command-1",
+        )
+        request_teardown = AsyncMock(return_value=reservation)
+        ensure_operation = AsyncMock(return_value=operation)
+        record_dispatch = AsyncMock()
+        guard = MagicMock()
+        send = AsyncMock(return_value="command-1")
+
+        with (
+            patch("api.database.get_session", _session_ctx(session)),
+            patch(
+                "api.host.gpu_allocations.request_gpu_teardown",
+                request_teardown,
+            ),
+            patch(
+                "api.gpu_lifecycle_service.ensure_reservation_lifecycle_operation",
+                ensure_operation,
+            ),
+            patch(
+                "api.host.gpu_allocations.record_gpu_command_dispatch",
+                record_dispatch,
+            ),
+            patch("api.host.locks.assert_gpu_external_work_allowed", guard),
+            patch.object(ac, "send_agent_command", send),
+        ):
+            result = await ac.send_gpu_reservation_teardown(
+                "reservation-1", reason="operator deletion"
+            )
+
+        assert result == "command-1"
+        target, command, payload = send.await_args.args
+        assert (target, command) == ("host-1", "delete_gpu")
+        assert payload["lifecycle_operation"] == gpu_lifecycle_intent_document(
+            operation
+        )
+        assert not {"group_state", "created_at", "updated_at"}.intersection(
+            payload["lifecycle_operation"]
+        )
+        assert send.await_args.kwargs == {"command_id": "command-1"}
+        assert session.committed
 
 
 class TestAgentLiveness:

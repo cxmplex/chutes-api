@@ -20,8 +20,13 @@ from api.host.gpu_allocations import (
     reserve_gpu_group,
     sign_gpu_launch_claims,
 )
-from api.gpu_contracts import GpuPhysicalResultV1
-from api.gpu_contracts import GpuRegistrationNonceRequestV2
+from api.gpu_contracts import (
+    GpuLifecycleOperationV1,
+    GpuPhysicalResultV1,
+    GpuRecoveryAuthorizationEnvelopeV1,
+    GpuRegistrationNonceRequestV2,
+)
+from api.gpu_lifecycle_service import gpu_recovery_authorization_document
 from api.gpu_registration_service import issue_gpu_registration_nonce
 from api.host.schemas import (
     GpuInventoryGroupV1,
@@ -775,14 +780,28 @@ async def test_recovery_dispatch_commits_before_guard_and_reuses_operation_id(
             calls.append("rollback")
 
     db = Db()
-    operation = SimpleNamespace(
+    operation = GpuLifecycleOperationV1(
+        operation_id="10000000-0000-4000-8000-000000000005",
+        operation_type="ownerless_group_recovery",
+        phase="intent",
         host_id="host-1",
-        operation_id="operation-1",
-        model_dump=lambda **_kwargs: {"operation_id": "operation-1"},
+        host_key_generation=2,
+        host_boot_generation=3,
+        allocation_group_id="group-1",
+        allocation_group_generation=4,
+        topology_fingerprint="a" * 64,
+        gpu_bdfs=["0000:01:00.0"],
+        gpu_uuids=["GPU-00000000-0000-0000-0000-000000000001"],
+        owner_hotkey="owner-1",
+        recovery_authorization_id="authorization-1",
     )
-    envelope = SimpleNamespace(
+    envelope = GpuRecoveryAuthorizationEnvelopeV1(
+        authorization_id="authorization-1",
         operation=operation,
-        model_dump=lambda **_kwargs: {"authorization_id": "authorization-1"},
+        inventory_report_id="report-1",
+        inventory_report_sha256="b" * 64,
+        recovery_nonce="c" * 64,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
 
     async def authorize(current_db, *_args, **_kwargs):
@@ -813,5 +832,17 @@ async def test_recovery_dispatch_commits_before_guard_and_reuses_operation_id(
         "send",
         "host-1",
         "recover_gpu_group",
-        "operation-1",
+        operation.operation_id,
     )
+    payload = calls[2][4]
+    assert payload["authorization"] == gpu_recovery_authorization_document(envelope)
+    assert payload["lifecycle_operation"] is payload["authorization"]["operation"]
+    assert not {
+        "reservation_id",
+        "reservation_generation",
+        "claims_sha256",
+        "process_incarnation",
+        "stable_server_id",
+        "management_mode",
+        "migration_id",
+    }.intersection(payload["lifecycle_operation"])

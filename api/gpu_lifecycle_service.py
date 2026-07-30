@@ -40,6 +40,7 @@ from api.host.schemas import (
     GpuLaunchReservation,
     GpuHostLossFinalizeRequestV1,
     GpuRecoveryAuthorizeRequestV1,
+    canonical_json_bytes,
     canonical_sha256,
 )
 from api.server.schemas import Host
@@ -76,12 +77,33 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _intent_document(intent: GpuLifecycleOperationV1) -> dict:
-    return intent.model_dump(
+def gpu_lifecycle_intent_document(operation: GpuLifecycleOperationV1) -> dict:
+    """Project any lifecycle response onto the strict immutable intent wire shape."""
+
+    return operation.model_dump(
         mode="json",
         exclude_none=True,
         exclude=_INTENT_OUTPUT_FIELDS,
     )
+
+
+def gpu_recovery_authorization_document(
+    envelope: GpuRecoveryAuthorizationEnvelopeV1,
+) -> dict:
+    """Return the one recovery document accepted for persistence and dispatch."""
+
+    _assert_intent_input(envelope.operation)
+    document = envelope.model_dump(mode="json", exclude_none=True)
+    document["operation"] = gpu_lifecycle_intent_document(envelope.operation)
+    return document
+
+
+def gpu_recovery_authorization_bytes(
+    envelope: GpuRecoveryAuthorizationEnvelopeV1,
+) -> bytes:
+    """Return canonical bytes for exact recovery-authorization comparisons."""
+
+    return canonical_json_bytes(gpu_recovery_authorization_document(envelope))
 
 
 def _result_document(result: GpuPhysicalResultV1) -> dict:
@@ -1197,7 +1219,10 @@ async def _validate_recovery_authorization(
             raise GpuLifecycleError("GPU recovery prior reservation custody changed.")
     if envelope is not None:
         expected = await _recovery_authorization_envelope(db, authorization)
-        if canonical_sha256(envelope) != canonical_sha256(expected):
+        if not secrets.compare_digest(
+            gpu_recovery_authorization_bytes(envelope),
+            gpu_recovery_authorization_bytes(expected),
+        ):
             raise GpuLifecycleError("GPU recovery envelope changed canonical bytes.")
         if not secrets.compare_digest(
             hashlib.sha256(envelope.recovery_nonce.encode("ascii")).hexdigest(),
@@ -1378,7 +1403,7 @@ async def create_gpu_lifecycle_operation(
             "Ordinary lifecycle intent cannot carry recovery prior lineage."
         )
     _assert_intent_input(intent)
-    intent_document = _intent_document(intent)
+    intent_document = gpu_lifecycle_intent_document(intent)
     intent_sha256 = canonical_sha256(intent_document)
     await acquire_gpu_lifecycle_lock(db)
     existing = (

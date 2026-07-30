@@ -42,6 +42,7 @@ from api.gpu_lifecycle_service import (
     authorize_gpu_recovery,
     create_gpu_lifecycle_operation,
     get_gpu_lifecycle_operation,
+    gpu_recovery_authorization_document,
     finalize_gpu_host_loss,
     record_gpu_local_release_ack,
     record_gpu_physical_result,
@@ -1125,12 +1126,11 @@ async def authorize_gpu_group_recovery_endpoint(
             body,
             authorized_by=str(current_user.user_id),
         )
+        authorization_document = gpu_recovery_authorization_document(result)
         await db.commit()
         payload = {
-            "authorization": result.model_dump(mode="json"),
-            "lifecycle_operation": result.operation.model_dump(
-                mode="json", exclude_none=True
-            ),
+            "authorization": authorization_document,
+            "lifecycle_operation": authorization_document["operation"],
         }
         try:
             assert_gpu_external_work_allowed(db, "GPU recovery command dispatch")

@@ -387,6 +387,7 @@ async def send_gpu_reservation_teardown(
         from api.database import get_session
         from api.gpu_lifecycle_service import (
             ensure_reservation_lifecycle_operation,
+            gpu_lifecycle_intent_document,
         )
         from api.host.gpu_allocations import (
             record_gpu_command_dispatch,
@@ -431,9 +432,7 @@ async def send_gpu_reservation_teardown(
             "delete_gpu",
             {
                 "reservation_id": reservation_id,
-                "lifecycle_operation": operation.model_dump(
-                    mode="json", exclude_none=True
-                ),
+                "lifecycle_operation": gpu_lifecycle_intent_document(operation),
                 "reason": reason,
             },
             command_id=command_id,
