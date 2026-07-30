@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from cryptography.fernet import Fernet
 
+from api import gpu_registration_keys
 from api.config import settings
 
 
@@ -83,6 +86,59 @@ def test_registration_recovery_keyring_rejects_chutefs_key_reuse(monkeypatch):
 
     with pytest.raises(ValueError, match="must not reuse a ChuteFS token key"):
         _ = settings.gpu_registration_recovery_keys
+
+
+@pytest.mark.asyncio
+async def test_missing_referenced_predecessor_blocks_only_decrypt_and_recovers(
+    monkeypatch,
+):
+    active_material = Fernet.generate_key().decode("ascii")
+    predecessor_material = Fernet.generate_key().decode("ascii")
+    predecessor_id = "retiring-key"
+    predecessor_sha256 = gpu_registration_keys.registration_recovery_key_fingerprints(
+        {predecessor_id: predecessor_material}
+    )[predecessor_id]
+    db = SimpleNamespace(
+        get=AsyncMock(
+            return_value=SimpleNamespace(
+                state="retiring",
+                key_sha256=predecessor_sha256,
+            )
+        )
+    )
+    monkeypatch.setattr(settings, "gpu_registration_recovery_key_id", "active-key")
+    monkeypatch.setattr(
+        settings,
+        "gpu_registration_recovery_keys_json",
+        json.dumps({"active-key": active_material}),
+    )
+
+    with pytest.raises(
+        gpu_registration_keys.GpuRegistrationRecoveryKeyUnavailable,
+        match="Persisted GPU registration recovery key",
+    ) as unavailable:
+        await gpu_registration_keys.load_registration_recovery_cipher(
+            db,
+            predecessor_id,
+        )
+    assert unavailable.value.status_code == 503
+    assert unavailable.value.headers == {"Retry-After": "5"}
+
+    monkeypatch.setattr(
+        settings,
+        "gpu_registration_recovery_keys_json",
+        json.dumps(
+            {
+                "active-key": active_material,
+                predecessor_id: predecessor_material,
+            }
+        ),
+    )
+    restored = await gpu_registration_keys.load_registration_recovery_cipher(
+        db,
+        predecessor_id,
+    )
+    assert restored.decrypt(restored.encrypt(b"durable-request")) == b"durable-request"
 
 
 def test_registration_recovery_keys_use_external_secret_and_explicit_dev_opt_in():

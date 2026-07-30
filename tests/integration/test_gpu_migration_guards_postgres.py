@@ -610,8 +610,8 @@ CREATE TABLE chutefs_launch_sessions (
             ROTATION_PREDECESSOR,
             f"""
             INSERT INTO chutefs_token_key_epochs(
-                key_id, state, required_replica_ids
-            ) VALUES ('key-v1', 'staged', '["test-replica"]');
+                key_id, key_sha256, state, required_replica_ids
+            ) VALUES ('key-v1', '{"a" * 64}', 'staged', '["test-replica"]');
             INSERT INTO chutefs_token_key_replica_acks(
                 replica_id, key_id, key_ids, key_fingerprints, keyring_sha256
             ) VALUES (

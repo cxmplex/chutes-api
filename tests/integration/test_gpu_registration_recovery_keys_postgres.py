@@ -26,6 +26,8 @@ from api.gpu_registration_keys import (
     activate_gpu_registration_recovery_key_epoch,
     cancel_gpu_registration_recovery_key_epoch,
     ensure_gpu_registration_recovery_key_authority,
+    gpu_registration_recovery_key_retention_status,
+    load_registration_recovery_cipher,
     lock_active_registration_recovery_key,
     retire_gpu_registration_recovery_key_epoch,
     stage_gpu_registration_recovery_key_epoch,
@@ -512,6 +514,62 @@ async def test_retirement_blocks_attempt_then_conflict_and_exact_replay_is_stabl
         selected_id, _ = await lock_active_registration_recovery_key(session)
         assert selected_id == successor_id
         await session.rollback()
+
+        successor_material = settings.gpu_registration_recovery_key_materials[
+            successor_id
+        ]
+        _configure_keyring(
+            monkeypatch,
+            {successor_id: successor_material},
+            successor_id,
+        )
+        degraded = await gpu_registration_recovery_key_retention_status(session)
+        assert degraded.missing_referenced_key_ids == (active_id,)
+        await session.commit()
+        with pytest.raises(
+            GpuRegistrationRecoveryKeyUnavailable,
+            match="Persisted GPU registration recovery key",
+        ) as unavailable:
+            await load_registration_recovery_cipher(session, active_id)
+        assert unavailable.value.status_code == 503
+        assert unavailable.value.headers == {"Retry-After": "5"}
+        await session.rollback()
+
+        retained_keyring = {
+            **materials,
+            successor_id: successor_material,
+        }
+        _configure_keyring(
+            monkeypatch,
+            retained_keyring,
+            successor_id,
+        )
+        restored = await gpu_registration_recovery_key_retention_status(session)
+        assert restored.missing_referenced_key_ids == ()
+        assert await load_registration_recovery_cipher(session, active_id) is not None
+        await session.commit()
+
+        _configure_keyring(
+            monkeypatch,
+            materials,
+            active_id,
+        )
+        with pytest.raises(
+            GpuRegistrationRecoveryKeyUnavailable,
+            match="Database-active GPU registration recovery key",
+        ):
+            await gpu_registration_recovery_key_retention_status(session)
+        await session.rollback()
+
+        _configure_keyring(
+            monkeypatch,
+            retained_keyring,
+            successor_id,
+        )
+        assert (
+            await gpu_registration_recovery_key_retention_status(session)
+        ).missing_referenced_key_ids == ()
+        await session.commit()
 
         with pytest.raises(HTTPException, match="nonterminal reference"):
             await retire_gpu_registration_recovery_key_epoch(

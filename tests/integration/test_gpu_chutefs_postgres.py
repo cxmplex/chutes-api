@@ -44,6 +44,7 @@ from api.server.schemas import (
 from api.server.util import get_public_key_hash
 from api.server.service import delete_server
 from api.storage import launch_sessions, service
+from api.storage import startup as storage_startup
 from api.storage.startup import token_key_fingerprints, token_keyset_sha256
 from api.storage.router import issue_default_volume_grant
 from api.storage.schemas import DefaultGrantRequest
@@ -286,13 +287,18 @@ async def _install_launch_erasure_migration(db: AsyncSession) -> None:
 
 async def _ensure_test_token_key_epoch(db: AsyncSession) -> str:
     key_id = settings.chutefs_token_key_id
+    keys = settings.chutefs_token_keys
+    fingerprints = token_key_fingerprints(keys)
+    storage_startup._VALIDATED_TOKEN_KEY_FINGERPRINTS = {
+        key_id: fingerprints[key_id]
+    }
     existing = await db.get(ChuteFSTokenKeyEpoch, key_id)
     if existing is not None:
         return key_id
-    keys = settings.chutefs_token_keys
     replica_id = "chutefs-test-replica"
     epoch = ChuteFSTokenKeyEpoch(
         key_id=key_id,
+        key_sha256=fingerprints[key_id],
         state="staged",
         required_replica_ids=[replica_id],
     )

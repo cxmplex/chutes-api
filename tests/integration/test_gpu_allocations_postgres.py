@@ -345,6 +345,7 @@ async def postgres_schema():
         replica_id = "gpu-allocation-test-replica"
         epoch = ChuteFSTokenKeyEpoch(
             key_id=key_id,
+            key_sha256=token_key_fingerprints(keys)[key_id],
             state="staged",
             required_replica_ids=[replica_id],
         )

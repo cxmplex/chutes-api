@@ -126,10 +126,11 @@ async def _bootstrap_epoch(db: AsyncSession, key_id: str = "bootstrap-key") -> N
     await db.execute(
         text(
             "INSERT INTO chutefs_token_key_epochs "
-            "(key_id, state, required_replica_ids) "
-            "VALUES (:key_id, 'staged', '[\"bootstrap-replica\"]'::jsonb)"
+            "(key_id, key_sha256, state, required_replica_ids) "
+            "VALUES (:key_id, :key_sha256, 'staged', "
+            "'[\"bootstrap-replica\"]'::jsonb)"
         ),
-        {"key_id": key_id},
+        {"key_id": key_id, "key_sha256": "a" * 64},
     )
     await db.execute(
         text(
@@ -251,8 +252,8 @@ async def test_rotation_down_rejects_nonbootstrap_history_without_catalog_damage
     await db.execute(
         text(
             "INSERT INTO chutefs_token_key_epochs "
-            "(key_id, predecessor_key_id, state, required_replica_ids) "
-            "VALUES ('successor-key', 'bootstrap-key', 'staged', "
+            "(key_id, predecessor_key_id, key_sha256, state, required_replica_ids) "
+            "VALUES ('successor-key', 'bootstrap-key', repeat('c', 64), 'staged', "
             "'[\"bootstrap-replica\"]'::jsonb)"
         )
     )

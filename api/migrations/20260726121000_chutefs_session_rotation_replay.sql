@@ -109,6 +109,7 @@ $$;
 CREATE TABLE IF NOT EXISTS chutefs_token_key_epochs (
     key_id VARCHAR PRIMARY KEY,
     predecessor_key_id VARCHAR REFERENCES chutefs_token_key_epochs(key_id) ON DELETE RESTRICT,
+    key_sha256 VARCHAR(64) NOT NULL,
     state VARCHAR NOT NULL,
     required_replica_ids JSONB NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS chutefs_token_key_epochs (
     retired_at TIMESTAMPTZ,
     CONSTRAINT ck_chutefs_token_key_epoch_state CHECK (
         state IN ('staged', 'active', 'retiring', 'retired')
+        AND key_sha256 ~ '^[0-9a-f]{64}$'
     ),
     CONSTRAINT ck_chutefs_token_key_epoch_replicas CHECK (
         jsonb_typeof(required_replica_ids) = 'array'
@@ -207,6 +209,7 @@ BEGIN
     IF TG_OP = 'UPDATE' AND (
         NEW.key_id IS DISTINCT FROM OLD.key_id
         OR NEW.predecessor_key_id IS DISTINCT FROM OLD.predecessor_key_id
+        OR NEW.key_sha256 IS DISTINCT FROM OLD.key_sha256
         OR NEW.required_replica_ids IS DISTINCT FROM OLD.required_replica_ids
         OR NEW.created_at IS DISTINCT FROM OLD.created_at
     ) THEN
@@ -232,8 +235,18 @@ BEGIN
             IF acknowledged_key_ids IS NULL
                OR acknowledged_keyring_sha256 IS NULL
                OR NOT acknowledged_key_ids ? NEW.key_id
+               OR acknowledged_key_fingerprints ->> NEW.key_id
+                    IS DISTINCT FROM NEW.key_sha256
                OR (NEW.predecessor_key_id IS NOT NULL
-                   AND NOT acknowledged_key_ids ? NEW.predecessor_key_id)
+                   AND (
+                       NOT acknowledged_key_ids ? NEW.predecessor_key_id
+                       OR acknowledged_key_fingerprints ->> NEW.predecessor_key_id
+                            IS DISTINCT FROM (
+                                SELECT predecessor.key_sha256
+                                  FROM chutefs_token_key_epochs predecessor
+                                 WHERE predecessor.key_id = NEW.predecessor_key_id
+                            )
+                   ))
                OR NOT EXISTS (
                    SELECT 1
                      FROM chutefs_token_key_replica_acks fresh_ack

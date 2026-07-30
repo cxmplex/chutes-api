@@ -22,6 +22,7 @@ from api.gpu_models import (
     GpuRegistrationRecoveryKeyEpochOperation,
     GpuRegistrationRecoveryKeyReplicaAck,
 )
+from api.key_authority_types import KeyAuthorityRefreshResult
 
 RECOVERY_KEY_EPOCH_ADVISORY_LOCK = "chutes.gpu-registration-recovery-key-epochs.v1"
 RECOVERY_KEY_ACK_MAX_AGE_SECONDS = 120
@@ -239,7 +240,7 @@ async def _acknowledge_configured_epochs(
         epoch.key_id
         for epoch in epochs
         if epoch.state in {"staged", "active", "retiring"}
-        and epoch.key_id in fingerprints
+        and fingerprints.get(epoch.key_id) == epoch.key_sha256
     )
     stale_acknowledgements = list(
         (
@@ -358,7 +359,7 @@ async def _ensure_authority_locked(
     for epoch in epochs:
         configured_fingerprint = fingerprints.get(epoch.key_id)
         if (
-            epoch.state in {"staged", "active", "retiring"}
+            epoch.state in {"staged", "active"}
             and configured_fingerprint is not None
             and configured_fingerprint != epoch.key_sha256
         ):
@@ -371,21 +372,6 @@ async def _ensure_authority_locked(
                 f"Database-active GPU registration recovery key {epoch.key_id!r} "
                 "is absent from this replica."
             )
-    references = await _nonterminal_key_references(db)
-    epochs_by_id = {epoch.key_id: epoch for epoch in epochs}
-    missing = sorted(
-        key_id
-        for key_id in references
-        if key_id not in ciphers
-        or key_id not in epochs_by_id
-        or epochs_by_id[key_id].state not in {"active", "retiring"}
-    )
-    if missing:
-        raise GpuRegistrationRecoveryKeyUnavailable(
-            "GPU registration recovery-key retention failed for nonterminal key "
-            "IDs: " + ", ".join(missing)
-        )
-
     await _acknowledge_configured_epochs(
         db,
         epochs=epochs,
@@ -470,11 +456,41 @@ async def ensure_gpu_registration_recovery_key_authority(
     return active.key_id, cipher
 
 
-async def require_gpu_registration_recovery_key_retention() -> None:
-    """Acknowledge this replica and fail readiness if recovery is impossible."""
+async def gpu_registration_recovery_key_retention_status(
+    db: AsyncSession,
+) -> KeyAuthorityRefreshResult:
+    """Refresh authority state and classify unavailable persisted dependencies."""
+
+    await ensure_gpu_registration_recovery_key_authority(db)
+    epochs = await _locked_epochs(db)
+    epochs_by_id = {epoch.key_id: epoch for epoch in epochs}
+    references = await _nonterminal_key_references(db)
+    materials = settings.gpu_registration_recovery_key_materials
+    ciphers = settings.gpu_registration_recovery_keys
+    fingerprints = registration_recovery_key_fingerprints(materials)
+    missing = sorted(
+        key_id
+        for key_id in references
+        if key_id not in ciphers
+        or key_id not in epochs_by_id
+        or epochs_by_id[key_id].state not in {"active", "retiring"}
+        or fingerprints.get(key_id) != epochs_by_id[key_id].key_sha256
+    )
+    return KeyAuthorityRefreshResult(
+        missing_referenced_key_ids=tuple(missing),
+    )
+
+
+async def require_gpu_registration_recovery_key_retention() -> KeyAuthorityRefreshResult:
+    """Acknowledge this replica and report unavailable retained request keys.
+
+    Active/staged authority corruption remains fatal. A missing predecessor
+    used by a nonterminal attempt or conflict degrades readiness while the
+    operation-specific decrypt path continues to fail closed with Retry-After.
+    """
 
     async with get_session() as db:
-        await ensure_gpu_registration_recovery_key_authority(db)
+        return await gpu_registration_recovery_key_retention_status(db)
 
 
 async def stage_gpu_registration_recovery_key_epoch(

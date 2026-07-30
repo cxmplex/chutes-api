@@ -13,6 +13,7 @@ from api.gpu_registration_keys import (
     RECOVERY_KEY_ACK_MAX_AGE_SECONDS,
     require_gpu_registration_recovery_key_retention,
 )
+from api.key_authority_types import KeyAuthorityRefreshResult
 from api.storage.startup import (
     TOKEN_KEY_ACK_MAX_AGE_SECONDS,
     require_chutefs_token_key_retention,
@@ -27,13 +28,20 @@ class _AuthorityState:
     initialized: bool = False
     last_success_monotonic: float | None = None
     last_error: str | None = None
+    missing_referenced_key_ids: tuple[str, ...] = ()
 
 
 _AUTHORITY_STATES = {
     "chutefs_token": _AuthorityState(TOKEN_KEY_ACK_MAX_AGE_SECONDS),
     "gpu_registration_recovery": _AuthorityState(RECOVERY_KEY_ACK_MAX_AGE_SECONDS),
 }
-_AUTHORITY_REFRESHERS: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = (
+_AUTHORITY_REFRESHERS: tuple[
+    tuple[
+        str,
+        Callable[[], Awaitable[KeyAuthorityRefreshResult | None]],
+    ],
+    ...,
+] = (
     ("chutefs_token", require_chutefs_token_key_retention),
     (
         "gpu_registration_recovery",
@@ -42,11 +50,19 @@ _AUTHORITY_REFRESHERS: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = (
 )
 
 
-def _mark_success(authority: str) -> None:
+def _mark_success(
+    authority: str,
+    result: KeyAuthorityRefreshResult | None,
+) -> None:
     state = _AUTHORITY_STATES[authority]
     state.initialized = True
     state.last_success_monotonic = time.monotonic()
     state.last_error = None
+    state.missing_referenced_key_ids = (
+        result.missing_referenced_key_ids
+        if isinstance(result, KeyAuthorityRefreshResult)
+        else ()
+    )
 
 
 def _mark_failure(authority: str, exc: Exception) -> None:
@@ -60,7 +76,7 @@ async def initialize_key_authorities() -> None:
     first_error: Exception | None = None
     for authority, refresh in _AUTHORITY_REFRESHERS:
         try:
-            await refresh()
+            result = await refresh()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -69,7 +85,7 @@ async def initialize_key_authorities() -> None:
             if first_error is None:
                 first_error = exc
         else:
-            _mark_success(authority)
+            _mark_success(authority, result)
     if first_error is not None:
         raise first_error
 
@@ -79,14 +95,14 @@ async def refresh_key_authority_acks_once() -> None:
 
     for authority, refresh in _AUTHORITY_REFRESHERS:
         try:
-            await refresh()
+            result = await refresh()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             _mark_failure(authority, exc)
             logger.exception(f"Failed to refresh {authority} key-authority ACK")
         else:
-            _mark_success(authority)
+            _mark_success(authority, result)
 
 
 async def key_authority_ack_refresh_loop(
@@ -118,6 +134,7 @@ def key_authority_health() -> dict[str, dict[str, object]]:
             and state.last_error is None
             and age is not None
             and not stale
+            and not state.missing_referenced_key_ids
         )
         if ready:
             status = "ready"
@@ -131,6 +148,16 @@ def key_authority_health() -> dict[str, dict[str, object]]:
                 f"Last successful key-authority ACK is older than "
                 f"{state.max_age_seconds} seconds."
             )
+        elif state.last_error is not None:
+            status = "degraded"
+            error = state.last_error
+        elif state.missing_referenced_key_ids:
+            status = "degraded"
+            error = (
+                "Database-referenced predecessor keys are unavailable on this "
+                "replica: "
+                + ", ".join(state.missing_referenced_key_ids)
+            )
         else:
             status = "degraded"
             error = state.last_error
@@ -140,6 +167,9 @@ def key_authority_health() -> dict[str, dict[str, object]]:
             "ack_age_seconds": age,
             "max_ack_age_seconds": state.max_age_seconds,
             "last_error": error,
+            "missing_referenced_key_ids": list(
+                state.missing_referenced_key_ids
+            ),
         }
     return health
 

@@ -17,6 +17,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
+from api import key_authority_health as authority_health
 from api.config import settings
 from api.server.schemas import (
     ChuteFSLaunchSession,
@@ -228,7 +229,7 @@ async def test_same_key_ids_with_different_secret_bytes_cannot_activate(
     await storage_startup.require_chutefs_token_key_retention()
 
     _configure(monkeypatch, replica_id="pod-a", new_secret="n" * 32)
-    with pytest.raises(HTTPException, match="same complete keyring"):
+    with pytest.raises(HTTPException, match="fresh acknowledgement"):
         await key_epochs.activate_token_key_epoch(
             db,
             administrator_id="support-user",
@@ -238,14 +239,16 @@ async def test_same_key_ids_with_different_secret_bytes_cannot_activate(
     await db.rollback()
     assert (await db.get(ChuteFSTokenKeyEpoch, "old-key")).state == "active"
     assert (await db.get(ChuteFSTokenKeyEpoch, "new-key")).state == "staged"
-    assert (
-        await db.scalar(
-            select(func.count())
-            .select_from(ChuteFSTokenKeyReplicaAck)
-            .where(ChuteFSTokenKeyReplicaAck.key_id == "new-key")
-        )
-        == 2
+    acknowledgements = list(
+        (
+            await db.scalars(
+                select(ChuteFSTokenKeyReplicaAck)
+                .where(ChuteFSTokenKeyReplicaAck.key_id == "new-key")
+                .order_by(ChuteFSTokenKeyReplicaAck.replica_id)
+            )
+        ).all()
     )
+    assert [ack.replica_id for ack in acknowledgements] == ["pod-a"]
 
 
 async def test_stale_replica_ack_cannot_activate_and_replacement_cohort_can(
@@ -408,6 +411,90 @@ async def test_retirement_requires_access_refresh_and_response_replay_expiry(
         request_id=str(uuid.uuid4()),
         key_id="new-key",
     )
+
+    referenced_session = await db.scalar(
+        select(ChuteFSLaunchSession).where(
+            ChuteFSLaunchSession.token_key_id == "old-key"
+        )
+    )
+    assert referenced_session is not None
+    _configure(
+        monkeypatch,
+        replica_id="pod-a",
+        keys={"new-key": "n" * 32},
+        active_key_id="new-key",
+    )
+    degraded = await storage_startup.require_chutefs_token_key_retention()
+    assert degraded.missing_referenced_key_ids == ("old-key",)
+    with pytest.raises(HTTPException, match="token key is unavailable") as unavailable:
+        launch_sessions._derived_token(
+            referenced_session,
+            launch_sessions._ACCESS_PREFIX,
+            "access",
+        )
+    assert unavailable.value.status_code == 503
+
+    monkeypatch.setattr(
+        authority_health,
+        "_AUTHORITY_STATES",
+        {"chutefs_token": authority_health._AuthorityState(120)},
+    )
+    _configure(
+        monkeypatch,
+        replica_id="pod-a",
+        keys={"old-key": "x" * 32, "new-key": "n" * 32},
+        active_key_id="new-key",
+    )
+    wrong_material = await storage_startup.require_chutefs_token_key_retention()
+    assert wrong_material.missing_referenced_key_ids == ("old-key",)
+    authority_health._mark_success("chutefs_token", wrong_material)
+    wrong_health = authority_health.key_authority_health()["chutefs_token"]
+    assert wrong_health["status"] == "degraded"
+    assert wrong_health["ready"] is False
+    with pytest.raises(HTTPException, match="token key is unavailable") as mismatch:
+        launch_sessions._derived_token(
+            referenced_session,
+            launch_sessions._ACCESS_PREFIX,
+            "access",
+        )
+    assert mismatch.value.status_code == 503
+
+    _configure(
+        monkeypatch,
+        replica_id="pod-a",
+        keys={"old-key": "o" * 32, "new-key": "n" * 32},
+        active_key_id="new-key",
+    )
+    restored = await storage_startup.require_chutefs_token_key_retention()
+    assert restored.missing_referenced_key_ids == ()
+    authority_health._mark_success("chutefs_token", restored)
+    restored_health = authority_health.key_authority_health()["chutefs_token"]
+    assert restored_health["status"] == "ready"
+    assert restored_health["ready"] is True
+    assert launch_sessions._derived_token(
+        referenced_session,
+        launch_sessions._ACCESS_PREFIX,
+        "access",
+    ).startswith(launch_sessions._ACCESS_PREFIX)
+
+    _configure(
+        monkeypatch,
+        replica_id="pod-a",
+        keys={"old-key": "o" * 32},
+        active_key_id="old-key",
+    )
+    with pytest.raises(RuntimeError, match="active key fingerprint"):
+        await storage_startup.require_chutefs_token_key_retention()
+
+    _configure(
+        monkeypatch,
+        replica_id="pod-a",
+        keys={"old-key": "o" * 32, "new-key": "n" * 32},
+        active_key_id="new-key",
+    )
+    assert (
+        await storage_startup.require_chutefs_token_key_retention()
+    ).missing_referenced_key_ids == ()
 
     with pytest.raises(HTTPException, match="unexpired session authority"):
         await key_epochs.retire_token_key_epoch(

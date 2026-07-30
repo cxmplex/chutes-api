@@ -18,7 +18,10 @@ from api.server.schemas import (
     ChuteFSTokenKeyEpochOperation,
     ChuteFSTokenKeyReplicaAck,
 )
-from api.storage.startup import TOKEN_KEY_ACK_MAX_AGE_SECONDS
+from api.storage.startup import (
+    TOKEN_KEY_ACK_MAX_AGE_SECONDS,
+    token_key_fingerprints,
+)
 
 TOKEN_KEY_EPOCH_ADVISORY_LOCK = "chutes.chutefs-token-key-epochs.v1"
 _OPERATION_SCHEMA = "chutes.chutefs-token-key-epoch-operation.v1"
@@ -184,9 +187,25 @@ async def stage_token_key_epoch(
             status_code=status.HTTP_409_CONFLICT,
             detail="ChuteFS token key ID already has an epoch.",
         )
+    configured_fingerprints = token_key_fingerprints(
+        settings.chutefs_token_keys
+    )
+    target_fingerprint = configured_fingerprints.get(key_id)
+    if (
+        target_fingerprint is None
+        or configured_fingerprints.get(active.key_id) != active.key_sha256
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The handling API replica does not hold the exact ChuteFS "
+                "token-key material required to stage this epoch."
+            ),
+        )
     epoch = ChuteFSTokenKeyEpoch(
         key_id=key_id,
         predecessor_key_id=active.key_id,
+        key_sha256=target_fingerprint,
         state="staged",
         required_replica_ids=required_replica_ids,
     )
@@ -252,10 +271,19 @@ async def activate_token_key_epoch(
             status_code=status.HTTP_409_CONFLICT,
             detail="ChuteFS token key epoch is not the staged successor of the active key.",
         )
-    if key_id not in settings.chutefs_token_keys:
+    configured_fingerprints = token_key_fingerprints(
+        settings.chutefs_token_keys
+    )
+    if (
+        configured_fingerprints.get(target.key_id) != target.key_sha256
+        or configured_fingerprints.get(active.key_id) != active.key_sha256
+    ):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="The handling API replica does not hold the staged ChuteFS token key.",
+            detail=(
+                "The handling API replica does not hold the exact staged and "
+                "active ChuteFS token-key material."
+            ),
         )
 
     acknowledgements = list(
@@ -294,6 +322,10 @@ async def activate_token_key_epoch(
         if (
             key_id not in acknowledgement.key_ids
             or active.key_id not in acknowledgement.key_ids
+            or acknowledgement.key_fingerprints.get(key_id)
+            != target.key_sha256
+            or acknowledgement.key_fingerprints.get(active.key_id)
+            != active.key_sha256
             or acknowledgement.key_ids != first.key_ids
             or acknowledgement.key_fingerprints != first.key_fingerprints
             or acknowledgement.keyring_sha256 != first.keyring_sha256

@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from api.config import settings
 from api.instance import util as instance_util
@@ -19,6 +20,15 @@ from api.storage import launch_sessions
 from api.storage import service as storage_service
 from api.storage import startup as storage_startup
 from api.storage.startup import missing_retained_token_keys, token_keyset_sha256
+
+
+@pytest.fixture(autouse=True)
+def _validated_test_token_material(monkeypatch):
+    monkeypatch.setattr(
+        storage_startup,
+        "token_key_material_is_validated",
+        lambda _key_id, _secret: True,
+    )
 
 
 def _row(**updates):
@@ -117,6 +127,44 @@ def test_retained_token_key_replays_after_active_key_rotation(monkeypatch):
 
     assert after_rotation == before_rotation
     assert new_session != before_rotation
+
+
+def test_missing_referenced_predecessor_blocks_only_replay_and_recovers(monkeypatch):
+    row = _row(token_key_id="old-key")
+    monkeypatch.setattr(settings, "chutefs_token_key_id", "new-key")
+    monkeypatch.setattr(
+        settings,
+        "chutefs_token_keys_json",
+        json.dumps({"old-key": "o" * 32, "new-key": "n" * 32}),
+    )
+    expected = launch_sessions._derived_token(
+        row,
+        launch_sessions._ACCESS_PREFIX,
+        "access",
+    )
+
+    monkeypatch.setattr(
+        settings,
+        "chutefs_token_keys_json",
+        json.dumps({"new-key": "n" * 32}),
+    )
+    with pytest.raises(HTTPException, match="token key is unavailable") as unavailable:
+        launch_sessions._derived_token(
+            row,
+            launch_sessions._ACCESS_PREFIX,
+            "access",
+        )
+    assert unavailable.value.status_code == 503
+
+    monkeypatch.setattr(
+        settings,
+        "chutefs_token_keys_json",
+        json.dumps({"old-key": "o" * 32, "new-key": "n" * 32}),
+    )
+    assert (
+        launch_sessions._derived_token(row, launch_sessions._ACCESS_PREFIX, "access")
+        == expected
+    )
 
 
 def test_keyring_rejects_missing_active_and_duplicate_ids(monkeypatch):

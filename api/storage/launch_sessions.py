@@ -41,6 +41,7 @@ from api.server.schemas import (
     StorageVolume,
 )
 from api.server.util import _get_client_certificate, get_public_key_hash
+from api.storage import startup as storage_startup
 from api.storage.schemas import LaunchStorageContext, LaunchStorageSessionResponse
 from api.storage.key_epochs import lock_token_key_epoch_for_session
 from api.user.schemas import User
@@ -267,7 +268,10 @@ def _canonical_digest(value: str) -> str:
 
 def _token_key(key_id: str) -> bytes:
     key = settings.chutefs_token_keys.get(key_id)
-    if key is None:
+    if (
+        key is None
+        or not storage_startup.token_key_material_is_validated(key_id, key)
+    ):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The ChuteFS session token key is unavailable.",
@@ -329,7 +333,16 @@ async def _active_token_key_id(db: AsyncSession) -> str:
             )
         ).scalars()
     )
-    if len(key_ids) != 1 or key_ids[0] not in settings.chutefs_token_keys:
+    key = (
+        settings.chutefs_token_keys.get(key_ids[0])
+        if len(key_ids) == 1
+        else None
+    )
+    if (
+        len(key_ids) != 1
+        or key is None
+        or not storage_startup.token_key_material_is_validated(key_ids[0], key)
+    ):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The database-active ChuteFS token key is unavailable.",

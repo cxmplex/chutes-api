@@ -3130,6 +3130,7 @@ class ChuteFSTokenKeyEpoch(Base):
         ForeignKey("chutefs_token_key_epochs.key_id", ondelete="RESTRICT"),
         nullable=True,
     )
+    key_sha256 = Column(String(64), nullable=False)
     state = Column(String, nullable=False)
     required_replica_ids = Column(JSONB, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -3145,7 +3146,8 @@ class ChuteFSTokenKeyEpoch(Base):
             postgresql_where=state == "active",
         ),
         CheckConstraint(
-            "state IN ('staged', 'active', 'retiring', 'retired')",
+            "state IN ('staged', 'active', 'retiring', 'retired') "
+            "AND key_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_chutefs_token_key_epoch_state",
         ),
         CheckConstraint(

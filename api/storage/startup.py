@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from datetime import datetime, timezone
 from typing import Iterable, Mapping
@@ -11,10 +12,12 @@ from sqlalchemy import text
 
 from api.config import settings
 from api.database import engine
+from api.key_authority_types import KeyAuthorityRefreshResult
 
 _KEY_EPOCH_ADVISORY_LOCK = "chutes.chutefs-token-key-epochs.v1"
 TOKEN_KEY_ACK_MAX_AGE_SECONDS = 120
 _TOKEN_KEY_ACK_REFRESH_SECONDS = 30
+_VALIDATED_TOKEN_KEY_FINGERPRINTS: dict[str, str] = {}
 
 
 def missing_retained_token_keys(
@@ -46,6 +49,14 @@ def token_key_fingerprints(keys: Mapping[str, str]) -> dict[str, str]:
     }
 
 
+def token_key_material_is_validated(key_id: str, secret: str) -> bool:
+    """Return whether configured bytes match the immutable database epoch."""
+
+    expected = _VALIDATED_TOKEN_KEY_FINGERPRINTS.get(key_id)
+    actual = token_key_fingerprints({key_id: secret})[key_id]
+    return expected is not None and hmac.compare_digest(actual, expected)
+
+
 def token_keyset_sha256(keys: Mapping[str, str]) -> str:
     """Fingerprint the canonical IDs and actual key bytes without persisting secrets."""
 
@@ -58,8 +69,16 @@ def token_keyset_sha256(keys: Mapping[str, str]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-async def require_chutefs_token_key_retention() -> None:
-    """Acknowledge the configured key set and enforce database-active key authority."""
+async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
+    """Acknowledge this replica and report unavailable retained session keys.
+
+    An absent or mismatched database-active key remains fatal. A predecessor
+    key that is needed only to reconstruct a persisted session response is a
+    readiness degradation instead: requests that need that exact key still fail
+    closed in ``launch_sessions._token_key``.
+    """
+
+    global _VALIDATED_TOKEN_KEY_FINGERPRINTS
 
     configured_keys = settings.chutefs_token_keys
     configured_key_ids = sorted(configured_keys)
@@ -83,7 +102,7 @@ async def require_chutefs_token_key_retention() -> None:
         epoch_rows = (
             await connection.execute(
                 text(
-                    "SELECT key_id, state FROM chutefs_token_key_epochs "
+                    "SELECT key_id, state, key_sha256 FROM chutefs_token_key_epochs "
                     "ORDER BY created_at, key_id"
                 )
             )
@@ -96,43 +115,44 @@ async def require_chutefs_token_key_retention() -> None:
             await connection.execute(
                 text(
                     "INSERT INTO chutefs_token_key_epochs "
-                    "(key_id, state, required_replica_ids) "
-                    "VALUES (:key_id, 'staged', CAST(:replicas AS jsonb))"
+                    "(key_id, key_sha256, state, required_replica_ids) "
+                    "VALUES (:key_id, :key_sha256, 'staged', "
+                    "CAST(:replicas AS jsonb))"
                 ),
                 {
                     "key_id": settings.chutefs_token_key_id,
+                    "key_sha256": key_fingerprints[
+                        settings.chutefs_token_key_id
+                    ],
                     "replicas": json.dumps([replica_id], separators=(",", ":")),
                 },
             )
-            epoch_rows = [(settings.chutefs_token_key_id, "staged")]
+            epoch_rows = [
+                (
+                    settings.chutefs_token_key_id,
+                    "staged",
+                    key_fingerprints[settings.chutefs_token_key_id],
+                )
+            ]
 
         if not bootstrap:
-            active_fingerprints = (
-                await connection.execute(
-                    text(
-                        "SELECT DISTINCT ack.key_fingerprints ->> epoch.key_id "
-                        "FROM chutefs_token_key_epochs epoch "
-                        "JOIN chutefs_token_key_replica_acks ack "
-                        "ON ack.key_id = epoch.key_id "
-                        "WHERE epoch.state = 'active' "
-                        "AND ack.replica_id IN ("
-                        "SELECT jsonb_array_elements_text(epoch.required_replica_ids))"
-                    )
-                )
-            ).scalars().all()
-            active_key_ids = [key_id for key_id, state in epoch_rows if state == "active"]
+            active_epochs = [
+                (key_id, key_sha256)
+                for key_id, state, key_sha256 in epoch_rows
+                if state == "active"
+            ]
             if (
-                len(active_key_ids) != 1
-                or len(active_fingerprints) != 1
-                or key_fingerprints.get(active_key_ids[0]) != active_fingerprints[0]
+                len(active_epochs) != 1
+                or key_fingerprints.get(active_epochs[0][0])
+                != active_epochs[0][1]
             ):
                 raise RuntimeError(
                     "ChuteFS token key activation barrier rejected this replica's "
                     "active key fingerprint"
                 )
 
-        for key_id, _state in epoch_rows:
-            if key_id not in configured_keys:
+        for key_id, _state, expected_fingerprint in epoch_rows:
+            if key_fingerprints.get(key_id) != expected_fingerprint:
                 continue
             await connection.execute(
                 text(
@@ -206,13 +226,22 @@ async def require_chutefs_token_key_retention() -> None:
                 )
             )
         ).all()
-    missing = missing_retained_token_keys(
+        epoch_fingerprints = {
+            key_id: key_sha256
+            for key_id, _state, key_sha256 in epoch_rows
+        }
+
+    validated_fingerprints = {
+        key_id: expected_fingerprint
+        for key_id, expected_fingerprint in epoch_fingerprints.items()
+        if key_fingerprints.get(key_id) == expected_fingerprint
+    }
+    unavailable = missing_retained_token_keys(
         rows,
-        set(configured_keys),
+        set(validated_fingerprints),
         now=now,
     )
-    if missing:
-        raise RuntimeError(
-            "ChuteFS token key retention barrier failed for active key ids: "
-            + ", ".join(missing)
-        )
+    _VALIDATED_TOKEN_KEY_FINGERPRINTS = validated_fingerprints
+    return KeyAuthorityRefreshResult(
+        missing_referenced_key_ids=tuple(unavailable),
+    )
