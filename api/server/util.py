@@ -78,7 +78,11 @@ def get_nonce_expiry_seconds(minutes: int = 10) -> int:
     return minutes * 60
 
 
-def extract_client_cert_hash(require_proxy_verified: bool = False):
+def extract_client_cert_hash(
+    require_proxy_verified: bool = False,
+    *,
+    map_to_http: bool = True,
+):
     """Dependency: the client cert's pubkey hash.
 
     require_proxy_verified=False (default; attestation/registration + per-volume key release): the
@@ -97,7 +101,13 @@ def extract_client_cert_hash(require_proxy_verified: bool = False):
             raise
         except Exception as e:
             logger.error(f"Boot attestation failed, could not extract client cert:\n{e}")
-            raise NoClientCertError(detail=str(e))
+            if not map_to_http and isinstance(e, NoClientCertError):
+                raise
+            # Dependencies execute before route handlers; expose only a safe response.
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No client certificate found.",
+            ) from e
 
     return _extract_request_client_cert
 
@@ -120,7 +130,10 @@ def extract_client_cert_pem(require_proxy_verified: bool = False):
             raise
         except Exception as e:
             logger.error(f"Could not extract client cert PEM:\n{e}")
-            raise NoClientCertError(detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="No client certificate found.",
+            ) from e
 
     return _extract_request_client_cert_pem
 
@@ -1299,9 +1312,18 @@ async def verify_gpu_evidence(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, _stderr = await process.communicate()
+            stdout, stderr = await process.communicate()
+            stderr_output = stderr.decode(errors="replace").strip() if stderr else ""
 
             if process.returncode != 0:
+                stdout_output = stdout.decode(errors="replace").strip() if stdout else ""
+                verifier_output = "\n".join(
+                    output for output in (stderr_output, stdout_output) if output
+                )
+                logger.error(
+                    "GPU evidence verification failed "
+                    f"(chutes-nvattest exit={process.returncode}):\n{verifier_output}"
+                )
                 raise InvalidGpuEvidenceError()
 
             try:
@@ -1314,7 +1336,10 @@ async def verify_gpu_evidence(
                 raise InvalidGpuEvidenceError(
                     "NVIDIA verifier output does not match nonce/evidence cardinality."
                 )
-            logger.info("GPU evidence verified successfully.")
+            logger.info(
+                "GPU evidence verified successfully."
+                + (f"\n{stderr_output}" if stderr_output else "")
+            )
             return result
 
     except FileNotFoundError as e:

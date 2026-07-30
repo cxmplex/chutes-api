@@ -34,7 +34,7 @@ from api.host.locks import (
     assert_gpu_external_work_allowed,
 )
 from api.util import notify_deleted, notify_job_deleted, semcomp
-from api.log import instance_logger, bound_logger, LifecycleEvent
+from api.log import instance_logger, bound_logger, LifecycleEvent, update_log_context
 from api.bounty.util import (
     create_bounty_if_not_exists,
     get_bounty_amount,
@@ -52,7 +52,11 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from api.server.client import TeeServerClient
 from api.server.schemas import Server
 from api.node.schemas import Node
-from api.server.exceptions import GetEvidenceError, MeasurementMismatchError
+from api.server.exceptions import (
+    AttestationError,
+    GetEvidenceError,
+    MeasurementMismatchError,
+)
 from api.server.util import verify_quote, verify_gpu_evidence
 from api.server.util import get_public_key_hash, _get_client_certificate
 
@@ -1046,6 +1050,9 @@ async def load_launch_config_from_jwt(
     *,
     acquire_lifecycle_lock: bool = True,
 ) -> LaunchConfig:
+    # Launch JWT endpoints have no miner header, so bind config identity before any
+    # authentication or lifecycle-lock failure can occur.
+    update_log_context(config_id=config_id)
     if acquire_lifecycle_lock:
         await acquire_gpu_lifecycle_lock(db)
     detail = "Missing or invalid launch config JWT"
@@ -1062,6 +1069,10 @@ async def load_launch_config_from_jwt(
                 .scalar_one_or_none()
             )
             if config:
+                update_log_context(
+                    chute_id=config.chute_id,
+                    miner_hotkey=config.miner_hotkey,
+                )
                 expected_identity = launch_identity_claims(config)
                 expected_exchange = bool(config.storage_session_exchange_allowed)
                 token_identity = {
@@ -1301,6 +1312,10 @@ async def verify_tee_chute(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Attestation service unavailable. The chute attestation proxy could not be reached or returned an error. Please ensure the server is accessible and the attestation service is running.",
         )
+    except AttestationError as exc:
+        # The detection layer logged the private reason with ambient instance identity;
+        # this HTTP boundary returns only the domain status and safe message.
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
     except HTTPException:
         raise
     except Exception as exc:

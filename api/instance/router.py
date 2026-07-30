@@ -107,6 +107,7 @@ from api.server.schemas import (
 from api.storage.service import ensure_default_volume_binding
 from api.rate_limit import rate_limit
 from api.server.exceptions import (
+    AttestationError,
     InstanceNotFoundError,
     ChuteNotTeeError,
     NonceError,
@@ -133,14 +134,15 @@ from api.util import (
 )
 from api.encrypted_logs.capture import start_encrypted_log_capture
 from api.metrics.launch_config import track_failure as track_launch_config_failure
-from api.log import instance_logger, LifecycleEvent
+from api.log import instance_logger, LifecycleEvent, update_log_context
 from api.bounty.util import check_bounty_exists
 from starlette.responses import StreamingResponse
 from api.graval_worker import graval_encrypt, verify_proof, generate_fs_hash
 from taskiq import TaskiqResultTimeoutError
 from watchtower import is_kubernetes_env, verify_expected_command, verify_fs_hash
+from api.request_context import bind_request_context
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(bind_request_context)])
 
 _EXTERNAL_VALUE_UNSET = object()
 _ACTIVATION_ATTEMPT_EXTRA_KEY = "_launch_activation_attempt_v1"
@@ -2467,6 +2469,11 @@ async def _validate_launch_config_instance(
                 detail="Duplicate GPUs in request!",
             )
         node_ids = [node["uuid"] for node in args.gpus]
+
+    # Capture chute_id before the try/except: db.rollback() expires ORM attributes, so
+    # accessing launch_config.chute_id afterwards could trigger sync IO in this async flow
+    # and mask the original validation failure with MissingGreenlet.
+    chute_id = launch_config.chute_id
     try:
         nodes = await _validate_nodes(
             db,
@@ -2604,6 +2611,11 @@ async def _validate_launch_config_instance(
                 {"config_id": config_id},
             )
             await error_session.commit()
+        # Raw SQL bypasses the LaunchConfig verification_error listener, so account for
+        # this failure explicitly using the pre-rollback chute identity.
+        track_launch_config_failure(
+            chute_id, "invalid GPU/nodes configuration provided"
+        )
         raise
 
     if not is_cpu:
@@ -2717,6 +2729,15 @@ async def _validate_launch_config_instance(
                 logger.warning(
                     f"CLLMV V2 session key decryption error (pre-0.5.5): {exc}"
                 )
+
+    # Instance resolve point shared by TEE and non-TEE launch flows: bind the full
+    # identity set so downstream attestation failures remain correlatable.
+    update_log_context(
+        instance_id=instance.instance_id,
+        config_id=launch_config.config_id,
+        chute_id=launch_config.chute_id,
+        miner_hotkey=launch_config.miner_hotkey,
+    )
 
     return launch_config, nodes, instance, validator_pubkey
 
@@ -4735,7 +4756,11 @@ async def validate_tee_launch_config_instance(
     asyncio.create_task(_maybe_start_log_capture(instance, config_id))
 
     assert_gpu_external_work_allowed(db, "legacy chute NVIDIA evidence verification")
-    await verify_gpu_evidence(args.gpu_evidence, expected_nonce)
+    try:
+        await verify_gpu_evidence(args.gpu_evidence, expected_nonce)
+    except AttestationError as exc:
+        # The verifier logged the private reason; expose only its safe domain response.
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
 
     request_body = await request.json()
 

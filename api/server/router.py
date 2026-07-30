@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, DatabaseError
 from loguru import logger
+from api.request_context import bind_request_context
 
 from api.database import get_db_session
 from api.config import (
@@ -166,7 +167,10 @@ async def _runtime_expected_cert_hash(
     """
 
     try:
-        return await extract_client_cert_hash(require_proxy_verified=True)(request)
+        return await extract_client_cert_hash(
+            require_proxy_verified=True,
+            map_to_http=False,
+        )(request)
     except NoClientCertError:
         server = await db.get(Server, server_id)
         cpu_reservation = (
@@ -192,7 +196,7 @@ async def _runtime_expected_cert_hash(
         return server.attested_cert_pubkey_hash.lower()
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(bind_request_context)])
 
 
 # Registered-server Boot Attestation Endpoints
@@ -260,12 +264,9 @@ async def verify_boot_attestation(
         )
 
         return BootAttestationResponse(luks_quote_nonce=luks_quote_nonce)
-    except NonceError as e:
-        logger.warning(f"Boot attestation nonce error: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except AttestationError as e:
-        logger.warning(f"Boot attestation failed: {str(e)}")
-        raise e
+        # Detection sites log private details; this boundary returns only safe domain data.
+        raise HTTPException(status_code=e.http_status, detail=e.message)
     except Exception as e:
         logger.error(f"Unexpected error in boot attestation: {str(e)}")
         raise HTTPException(
@@ -1035,8 +1036,7 @@ async def attest_luks(
             k3s_encryption_key=result.k3s_encryption_key,
         )
     except AttestationError as e:
-        logger.warning(f"LUKS attest quote verification failed: {str(e)}")
-        raise e
+        raise HTTPException(status_code=e.http_status, detail=e.message)
     except HTTPException:
         raise
     except Exception as e:
@@ -1150,6 +1150,9 @@ async def create_server(
             f"Server registration failed: server_id={args.id} host={args.host} miner_hotkey={hotkey} error={e.detail}"
         )
         raise e
+    except AttestationError as e:
+        # register_server preserves the original domain error after cleaning up its row.
+        raise HTTPException(status_code=e.http_status, detail=e.message)
     except HTTPException:
         # Re-raise HTTPExceptions (like blacklist, node conflicts, invalid host) as-is
         raise
@@ -1442,7 +1445,14 @@ async def get_runtime_nonce(
 
         actual_ip = request.state.client_ip
         if server.ip != actual_ip:
-            raise Exception()
+            logger.warning(
+                f"Runtime nonce IP mismatch: server_id={server_id} "
+                f"registered_ip={server.ip} request_ip={actual_ip}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Request source IP does not match the registered server IP.",
+            )
 
         context = await runtime_attestation_context_for_server_db(db, server)
         # The context is an immutable snapshot. Release GPU lifecycle and row
@@ -1465,7 +1475,7 @@ async def get_runtime_nonce(
     except ServerNotFoundError as e:
         raise e
     except AttestationError as e:
-        raise e
+        raise HTTPException(status_code=e.http_status, detail=e.message)
     except HTTPException:
         raise
     except Exception as e:
@@ -1524,14 +1534,10 @@ async def verify_runtime_attestation(
 
     except ServerNotFoundError as e:
         raise e
+    except AttestationError as e:
+        raise HTTPException(status_code=e.http_status, detail=e.message)
     except HTTPException:
         raise
-    except NonceError as e:
-        logger.warning(f"Runtime attestation nonce error: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except AttestationError as e:
-        logger.warning(f"Runtime attestation failed: {str(e)}")
-        raise e
     except Exception as e:
         logger.error(f"Unexpected error in runtime attestation: {str(e)}")
         raise HTTPException(

@@ -11,6 +11,7 @@ import secrets
 from typing import Awaitable, Callable, Dict, Any, Optional
 from fastapi import HTTPException, Header, Request, status
 from loguru import logger
+from api.log import server_logger, LifecycleEvent, update_log_context
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, exists, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -691,6 +692,12 @@ async def process_boot_attestation(
     server = await _registered_boot_server(
         db, server_ip, args, nonce_context, expected_cert_hash
     )
+    update_log_context(
+        server_id=server.server_id,
+        ip=server_ip,
+        miner_hotkey=server.miner_hotkey,
+        server_name=server.name,
+    )
     logger.info(
         f"Processing boot attestation for server {server.server_id} "
         f"(miner: {server.miner_hotkey}, IP: {server_ip})"
@@ -880,16 +887,13 @@ async def register_server(db: AsyncSession, args: ServerArgs, miner_hotkey: str)
                 db, miner_hotkey, server.server_id, args.gpus, "0", func.now()
             )
 
-    except AttestationError as e:
+    except AttestationError:
         # Clean up orphan server: _track_server committed before verify_server failed.
+        # Preserve the original domain category, status, and safe client message.
         await db.rollback()
         await db.execute(delete(Server).where(Server.server_id == args.id))
         await db.commit()
-        error_detail = e.detail if hasattr(e, "detail") else str(e)
-        logger.error(
-            f"Server registration failed - attestation error: name={args.name or args.id} host={args.host} miner_hotkey={miner_hotkey} error={error_detail}"
-        )
-        raise ServerRegistrationError(f"Server registration failed - {error_detail}")
+        raise
     except IntegrityError as e:
         await db.rollback()
         # Clean up orphan server when IntegrityError came from _track_nodes.
@@ -2588,6 +2592,7 @@ async def verify_server(
     failure_reason = ""
     quote = None
     measurement_config = None
+    update_log_context(server_id=server.server_id, ip=server.ip, miner_hotkey=miner_hotkey)
     try:
         client = TeeServerClient(server)
 
@@ -2661,42 +2666,16 @@ async def verify_server(
 
         return measurement_config.version
 
-    except GetEvidenceError as e:
-        failure_reason = "Failed to get attestation evidence."
-        logger.error(
-            f"Server verification failed - GetEvidenceError: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
-        )
-        raise e
-    except (InvalidQuoteError, MeasurementMismatchError) as e:
-        logger.error(
-            f"Server verification failed - quote error: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
-        )
-        failure_reason = "Server verification failed: invalid quote"
-        raise e
-    except InvalidGpuEvidenceError as e:
-        logger.error(
-            f"Server verification failed - invalid GPU evidence: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
-        )
-        failure_reason = "Server verification failed: invalid GPU evidence"
-        raise e
-    except GpuEvidenceError as e:
-        logger.error(
-            f"Server verification failed - GPU evidence error: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
-        )
-        failure_reason = "Server verification failed: Failed to verify GPU evidence"
-        raise e
-    except InvalidCpuBenchmarkError as e:
-        logger.error(
-            f"Server verification failed - invalid CPU benchmark: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={e.detail}"
-        )
-        failure_reason = "Server verification failed: invalid CPU benchmark"
-        raise e
+    except AttestationError as e:
+        logger.error(f"Server verification failed [{e.code}]: {e.message}")
+        failure_reason = e.message
+        raise
     except Exception as e:
-        logger.error(
-            f"Unexpected error during server verification: server_id={server.server_id} ip={server.ip} miner_hotkey={miner_hotkey} error={str(e)}"
+        server_logger(server, event=LifecycleEvent.SERVER_VERIFY).error(
+            f"Unexpected error during server verification: {e}"
         )
         failure_reason = "Unexpected error during server verification."
-        raise e
+        raise
     finally:
         if failure_reason:
             measurement_version = (
@@ -2779,6 +2758,7 @@ async def check_server_ownership(
         if not membership:
             raise ServerNotFoundError(server_id)
 
+    update_log_context(server_id=server.server_id, ip=server.ip, miner_hotkey=miner_hotkey)
     return server
 
 
@@ -2806,6 +2786,7 @@ async def get_server_by_name(
     server = result.scalar_one_or_none()
     if not server:
         raise ServerNotFoundError(f"{server_name}")
+    update_log_context(server_id=server.server_id, ip=server.ip, miner_hotkey=miner_hotkey)
     return server
 
 
@@ -2837,6 +2818,7 @@ async def get_server_by_name_or_id(
     server = result.scalar_one_or_none()
     if not server:
         raise ServerNotFoundError(server_name_or_id)
+    update_log_context(server_id=server.server_id, ip=server.ip, miner_hotkey=miner_hotkey)
     return server
 
 
@@ -2894,6 +2876,9 @@ async def process_runtime_attestation(
         db, server_id, miner_hotkey, expected_cert_hash
     )
     if server.ip != actual_ip:
+        logger.warning(
+            f"Runtime attestation IP mismatch: registered={server.ip} request={actual_ip}"
+        )
         raise MeasurementMismatchError(
             "Runtime attestation source IP does not match the registered server."
         )
