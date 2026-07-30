@@ -299,6 +299,7 @@ def _server_row(
     self_registered=True,
     created_at=OLD,
     attested_cert=None,
+    attested_cert_pubkey_hash=None,
 ):
     return SimpleNamespace(
         server_id=server_id,
@@ -306,7 +307,7 @@ def _server_row(
         self_registered=self_registered,
         created_at=created_at,
         attested_cert=attested_cert,
-        attested_cert_pubkey_hash=None,
+        attested_cert_pubkey_hash=attested_cert_pubkey_hash,
         miner_hotkey="hk-miner",
         compute_type="cpu",
         measurement_name="cpu-measurement",
@@ -731,6 +732,19 @@ def _auth_session(server=None, host=None, *, attestation=None):
     )
 
 
+class TestLegacyAgentSessionRejection:
+    @pytest.mark.asyncio
+    async def test_unbound_session_is_disconnected_immediately(self, clean_sio):
+        ss.sio.agent_sessions["srv-1"] = "sess-1"
+        ss.sio.agent_meta["sess-1"] = {"hotkey": "hk", "server_id": "srv-1"}
+        session = FakeSession({})
+        with patch.object(ss, "get_session", _session_ctx(session)):
+            assert await ss._validate_agent_session("sess-1") is False
+        assert ss.sio.agent_meta == {}
+        assert ss.sio.agent_sessions == {}
+        clean_sio.disconnect.assert_awaited_once_with("sess-1")
+
+
 class TestAgentAuthenticate:
     @pytest.mark.asyncio
     async def test_model_a_server_session_bound(self, clean_sio, pass_auth):
@@ -738,7 +752,12 @@ class TestAgentAuthenticate:
         key, cert_pem = _attested_keypair_and_cert()
         headers = dict(AGENT_HEADERS)
         headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(key, "srv-1:12345:sockets-attest")
-        session = _auth_session(server=_server_row(attested_cert=cert_pem))
+        session = _auth_session(
+            server=_server_row(
+                attested_cert=cert_pem,
+                attested_cert_pubkey_hash="a" * 64,
+            )
+        )
         online = AsyncMock()
         with (
             patch.object(ss, "get_session", _session_ctx(session)),
@@ -746,10 +765,61 @@ class TestAgentAuthenticate:
         ):
             assert await ss.agent_authenticate("sess-1", headers) is True
         assert ss.sio.agent_sessions == {"srv-1": "sess-1"}
-        assert ss.sio.agent_meta == {"sess-1": {"hotkey": "hk-miner", "server_id": "srv-1"}}
+        assert ss.sio.agent_meta == {
+            "sess-1": {
+                "hotkey": "hk-miner",
+                "server_id": "srv-1",
+                "attested_spki_sha256": "a" * 64,
+            }
+        }
         online.assert_awaited_once_with("srv-1")
         assert clean_sio.emit.await_args.args[0] == "auth_success"
         clean_sio.disconnect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_bound_reauthentication_evicts_legacy_socket(
+        self, clean_sio, pass_auth
+    ):
+        key, cert_pem = _attested_keypair_and_cert()
+        headers = dict(AGENT_HEADERS)
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(
+            key, "srv-1:12345:sockets-attest"
+        )
+        server = _server_row(
+            attested_cert=cert_pem,
+            attested_cert_pubkey_hash="a" * 64,
+        )
+        ss.sio.agent_sessions["srv-1"] = "sess-legacy"
+        ss.sio.agent_meta["sess-legacy"] = {
+            "hotkey": "hk-miner",
+            "server_id": "srv-1",
+        }
+        with (
+            patch.object(ss, "get_session", _session_ctx(_auth_session(server=server))),
+            patch.object(ss, "mark_agent_online", AsyncMock()),
+        ):
+            assert await ss.agent_authenticate("sess-new", headers) is True
+        assert ss.sio.agent_sessions == {"srv-1": "sess-new"}
+        assert set(ss.sio.agent_meta) == {"sess-new"}
+        assert ss.sio.agent_meta["sess-new"]["attested_spki_sha256"] == "a" * 64
+        clean_sio.disconnect.assert_awaited_once_with("sess-legacy")
+
+    @pytest.mark.asyncio
+    async def test_missing_attested_spki_rejected(self, clean_sio, pass_auth):
+        key, cert_pem = _attested_keypair_and_cert()
+        headers = dict(AGENT_HEADERS)
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(
+            key, "srv-1:12345:sockets-attest"
+        )
+        session = _auth_session(server=_server_row(attested_cert=cert_pem))
+        with (
+            patch.object(ss, "get_session", _session_ctx(session)),
+            patch.object(ss, "mark_agent_online", AsyncMock()),
+        ):
+            assert await ss.agent_authenticate("sess-1", headers) is False
+        assert ss.sio.agent_sessions == {}
+        assert ss.sio.agent_meta == {}
+        clean_sio.disconnect.assert_awaited_once_with("sess-1")
 
     @pytest.mark.asyncio
     async def test_newer_failed_attestation_rejects_valid_td_channel(
@@ -760,7 +830,10 @@ class TestAgentAuthenticate:
         headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(
             key, "srv-1:12345:sockets-attest"
         )
-        server = _server_row(attested_cert=cert_pem)
+        server = _server_row(
+            attested_cert=cert_pem,
+            attested_cert_pubkey_hash="a" * 64,
+        )
         session = _auth_session(
             server=server,
             attestation=_current_cpu_attestation(server, failed=True),
@@ -780,7 +853,12 @@ class TestAgentAuthenticate:
         """The miner-hotkey signature alone (which the untrusted L0 host also has) must NOT bind a
         self-registered TD's channel -- without the attested-key signature, auth fails closed."""
         _key, cert_pem = _attested_keypair_and_cert()
-        session = _auth_session(server=_server_row(attested_cert=cert_pem))
+        session = _auth_session(
+            server=_server_row(
+                attested_cert=cert_pem,
+                attested_cert_pubkey_hash="a" * 64,
+            )
+        )
         with (
             patch.object(ss, "get_session", _session_ctx(session)),
             patch.object(ss, "mark_agent_online", AsyncMock()),
@@ -937,6 +1015,7 @@ class TestAgentStatusEvent:
         online = AsyncMock()
         handler = AsyncMock()
         with (
+            patch.object(ss, "_validate_agent_session", AsyncMock(return_value=True)),
             patch.object(ss, "mark_agent_online", online),
             patch.object(ss, "handle_agent_status", handler),
         ):
@@ -959,7 +1038,10 @@ class TestAgentCommandAckEvent:
     async def test_ack_forwarded(self, clean_sio):
         ss.sio.agent_meta["sess-1"] = {"hotkey": "hk", "server_id": "srv-1"}
         handler = AsyncMock()
-        with patch.object(ss, "handle_agent_command_ack", handler):
+        with (
+            patch.object(ss, "_validate_agent_session", AsyncMock(return_value=True)),
+            patch.object(ss, "handle_agent_command_ack", handler),
+        ):
             await ss.agent_command_ack("sess-1", {"command_id": "cmd-1", "status": "ok"})
         handler.assert_awaited_once_with("srv-1", {"command_id": "cmd-1", "status": "ok"})
 
@@ -967,7 +1049,10 @@ class TestAgentCommandAckEvent:
     async def test_non_dict_ack_wrapped(self, clean_sio):
         ss.sio.agent_meta["sess-1"] = {"hotkey": "hk", "server_id": "srv-1"}
         handler = AsyncMock()
-        with patch.object(ss, "handle_agent_command_ack", handler):
+        with (
+            patch.object(ss, "_validate_agent_session", AsyncMock(return_value=True)),
+            patch.object(ss, "handle_agent_command_ack", handler),
+        ):
             await ss.agent_command_ack("sess-1", "weird")
         handler.assert_awaited_once_with("srv-1", {"data": "weird"})
 

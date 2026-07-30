@@ -104,7 +104,9 @@ async def _validate_agent_session(session_id: str) -> bool:
                 except HTTPException:
                     valid = False
         else:
-            valid = True
+            # Session state is process-local and cannot survive a rolling restart. Any metadata
+            # without a generation/SPKI binding was created by legacy code and must reauthenticate.
+            valid = False
     if not valid:
         sio.agent_meta.pop(session_id, None)
         if sio.agent_sessions.get(meta["server_id"]) == session_id:
@@ -336,12 +338,12 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
         # Self-registered CPU-TEE server: the miner-hotkey signature alone does NOT bind this
         # command channel to the TD. Require the registration-bound in-TEE key as well.
         attest_sig = headers.get(cst.ATTEST_SIGNATURE_HEADER)
-        if not server.attested_cert:
+        if not server.attested_cert or not server.attested_cert_pubkey_hash:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
-                    f"Server {server_id} has no attestation-bound cert on record; cannot bind "
-                    "its command channel to the attested TD. Re-register (POST /servers/cpu/register)."
+                    f"Server {server_id} has no complete attestation-bound certificate identity; "
+                    "re-register (POST /servers/cpu/register) before opening its command channel."
                 ),
             )
         if not attest_sig or not _verify_attested_socket_signature(
@@ -354,13 +356,18 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
                     f"server {server_id}; only the in-TEE attested key may hold its command channel."
                 ),
             )
+        previous = sio.agent_sessions.get(server_id)
+        if previous is not None and previous != session_id:
+            # Remove authority before requesting transport teardown so an in-flight event from
+            # the replaced socket cannot pass validation while disconnect is being delivered.
+            sio.agent_meta.pop(previous, None)
+            await sio.disconnect(previous)
         sio.agent_sessions[server_id] = session_id
         agent_meta = {
             "hotkey": hotkey,
             "server_id": server_id,
+            "attested_spki_sha256": server.attested_cert_pubkey_hash.lower(),
         }
-        if getattr(server, "attested_cert_pubkey_hash", None):
-            agent_meta["attested_spki_sha256"] = server.attested_cert_pubkey_hash
         sio.agent_meta[session_id] = agent_meta
         await mark_agent_online(server_id)
         logger.success(
