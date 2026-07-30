@@ -113,32 +113,67 @@ jobs:
           root=E.parse('release-unit.xml').getroot();
           skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
           assert skipped == 0, f'{skipped} release unit tests skipped'"
-      - name: Run mandatory real-Postgres release tests
+      - name: Run every mandatory real-PostgreSQL suite
         run: >-
           uv run pytest -q
-          tests/integration/test_releases_postgres.py
-          --junitxml=release-postgres.xml
-      - name: Reject skipped real-Postgres release tests
+          tests/integration/*_postgres.py
+          --junitxml=postgres-remediation.xml
+      - name: Reject skipped real-PostgreSQL tests
         run: >-
           uv run python -c
           "import xml.etree.ElementTree as E;
-          root=E.parse('release-postgres.xml').getroot();
+          root=E.parse('postgres-remediation.xml').getroot();
           skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
-          assert skipped == 0, f'{skipped} real-Postgres release tests skipped'"
-      - name: Run mandatory real-Postgres storage tests
+          assert skipped == 0, f'{skipped} mandatory real-PostgreSQL tests skipped'"
+
+  cross-repository-contracts:
+    runs-on: ubuntu-latest
+    env:
+      CHUTES_CROSS_REPO_ROOT: ${{ github.workspace }}/cohort
+    steps:
+      - name: Check out API under the cohort root
+        uses: actions/checkout@v4
+        with:
+          path: cohort/chutes-api
+      - name: Check out miner contract producer/consumer
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/chutes-miner
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: cohort/chutes-miner
+      - name: Check out sek8s contract producer/consumer
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/sek8s
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: cohort/sek8s
+      - name: Check out SDK contract producer/consumer
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/chutes
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.CROSS_REPO_READ_TOKEN || github.token }}
+          path: cohort/chutes
+      - uses: astral-sh/setup-uv@v6
+      - name: Install API test dependencies
+        working-directory: cohort/chutes-api
+        run: uv sync --extra dev
+      - name: Execute four-repository producer/consumer fixtures
+        working-directory: cohort/chutes-api
         run: >-
           uv run pytest -q
-          tests/integration/test_storage_reconciliation_postgres.py
-          tests/integration/test_model_access_routes_postgres.py
-          -m "not cross_repo"
-          --junitxml=storage-postgres.xml
-      - name: Reject skipped storage tests
+          tests/unit/test_gpu_cross_worktree_contracts.py
+          --junitxml=cross-repository-contracts.xml
+      - name: Reject skipped cross-repository fixtures
+        working-directory: cohort/chutes-api
         run: >-
           uv run python -c
           "import xml.etree.ElementTree as E;
-          root=E.parse('storage-postgres.xml').getroot();
+          root=E.parse('cross-repository-contracts.xml').getroot();
           skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
-          assert skipped == 0, f'{skipped} real-Postgres storage tests skipped'"
+          assert skipped == 0, f'{skipped} cross-repository fixtures skipped'"
 
   api-runtime-cosign:
     runs-on: ubuntu-latest
