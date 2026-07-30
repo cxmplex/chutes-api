@@ -32,7 +32,11 @@ from api.server.gpu_sessions import (
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
     GPU_RUNTIME_SESSION_PURPOSES,
 )
-from api.storage.schemas import LaunchStorageContext
+from api.storage.schemas import (
+    LaunchStorageContext,
+    LaunchStorageExchangeResponse,
+    LaunchStorageSessionResponse,
+)
 from cross_repo_tests import repository_root
 
 
@@ -277,6 +281,62 @@ def test_runtime_purposes_and_launch_storage_context_match_consumers(monkeypatch
     parsed = sdk_context._parse_context(context)
     assert parsed.default_volume_id == context["default_volume_id"]
     assert parsed.management_mode == context["management_mode"]
+
+
+def test_launch_storage_exchange_is_exact_producer_to_consumer_bytes():
+    context = LaunchStorageContext(
+        user_id="user-1",
+        chute_id="chute-1",
+        config_id="config-1",
+        instance_id="instance-1",
+        job_id=None,
+        compute_type="gpu",
+        management_mode="miner",
+        server_id="server-1",
+        default_volume_id="volume-1",
+        verified_at="2026-07-25T00:00:00+00:00",
+    )
+    session = LaunchStorageSessionResponse(
+        access_token="access-token",
+        access_expires_at="2026-07-25T00:15:00+00:00",
+        refresh_token="refresh-token",
+        refresh_expires_at="2026-07-26T00:00:00+00:00",
+        allowed_operations=["put", "get", "list", "delete"],
+        generation=1,
+    )
+    produced = (
+        LaunchStorageExchangeResponse(
+            launch_context=context,
+            storage_session=session,
+        ).model_dump_json()
+        + "\n"
+    ).encode("ascii")
+    api_fixture = (
+        _repository("api") / "tests/fixtures/launch_storage_exchange_v1.json"
+    ).read_bytes()
+    sdk_fixture = (
+        _repository("sdk") / "tests/fixtures/launch_storage_exchange_v1.json"
+    ).read_bytes()
+    assert produced == api_fixture == sdk_fixture
+
+    payload = json.loads(produced)
+    assert list(payload["storage_session"]) == [
+        "schema",
+        "version",
+        "access_token",
+        "access_expires_at",
+        "refresh_token",
+        "refresh_expires_at",
+        "allowed_operations",
+        "generation",
+    ]
+    sdk_context = _import_from_path(
+        "cross_worktree_launch_context_bytes",
+        _repository("sdk") / "chutes/util/launch_context.py",
+    )
+    parsed = sdk_context.install_launch_context(payload)
+    assert parsed.default_volume_id == context.default_volume_id
+    assert parsed.management_mode == context.management_mode
 
 
 def test_full_gpu_provenance_fixture_is_one_canonical_document():
