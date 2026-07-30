@@ -475,6 +475,11 @@ async def redeem_enrollment_voucher(
             key_generation=host.active_key_generation,
             provisioning_state=host.provisioning_state,
         )
+    # GPU enrollment always carries storage. CPU storage is an explicit operator opt-in and must
+    # survive identity/key rotation rather than being derived from compute type on every redeem.
+    storage_enabled_after_enrollment = request_compute == "gpu" or bool(
+        host is not None and host.storage_enabled
+    )
     if host is None:
         host = Host(
             host_id=voucher.host_id,
@@ -485,7 +490,7 @@ async def redeem_enrollment_voucher(
             compute_type=request_compute,
             release_channel=voucher.channel,
             capacity=1,
-            storage_enabled=request_compute == "gpu",
+            storage_enabled=storage_enabled_after_enrollment,
         )
         db.add(host)
         await db.flush()
@@ -534,7 +539,7 @@ async def redeem_enrollment_voucher(
     host.miner_hotkey = voucher.owner_hotkey
     host.tee_type = voucher.tee_type
     host.compute_type = request_compute
-    host.storage_enabled = request_compute == "gpu"
+    host.storage_enabled = storage_enabled_after_enrollment
     host.release_channel = voucher.channel
     host.enrollment_generation = voucher.enrollment_generation
     host.active_key_generation = next_key_generation

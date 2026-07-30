@@ -40,9 +40,11 @@ from api.host.reservations import (
     resolve_launch_reservation,
 )
 from api.host.schemas import (
+    EnrollmentKeyChallengeRequestV1,
     EnrollmentKeyChallengeRequestV2,
     EnrollmentVoucherMintRequestV1,
     EnrollmentVoucherMintRequestV2,
+    HostEnrollmentRedemptionV1,
     HostEnrollmentRedemptionV2,
     HostEnrollmentVoucher,
     GpuHostStorageReadinessV1,
@@ -1140,6 +1142,110 @@ async def test_returning_host_repairs_inherited_intent_without_sibling_coupling(
 
         assert repaired is None
         assert intent.state == "superseded"
+
+
+async def _complete_cpu_enrollment(sessions, host_id: str):
+    mint_request = EnrollmentVoucherMintRequestV1(
+        host_id=host_id,
+        tee_type="tdx",
+        channel="seedless",
+    )
+    ed25519 = Ed25519PrivateKey.generate()
+    x25519 = X25519PrivateKey.generate()
+    ed_public = base64.b64encode(
+        ed25519.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    ).decode()
+    x_public = base64.b64encode(
+        x25519.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    ).decode()
+
+    async with sessions() as session:
+        voucher = await mint_enrollment_voucher(session, "owner", mint_request)
+    challenge_request = EnrollmentKeyChallengeRequestV1(
+        voucher=voucher.voucher,
+        ed25519_public_key=ed_public,
+        x25519_public_key=x_public,
+        ed25519_signature=base64.b64encode(b"x" * 64).decode(),
+    )
+    challenge_request = challenge_request.model_copy(
+        update={
+            "ed25519_signature": base64.b64encode(
+                ed25519.sign(challenge_request.signing_bytes())
+            ).decode()
+        }
+    )
+    async with sessions() as session:
+        challenge = await create_enrollment_key_challenge(session, challenge_request)
+
+    peer = X25519PublicKey.from_public_bytes(
+        base64.b64decode(challenge.server_ephemeral_public_key)
+    )
+    key = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=bytes.fromhex(hashlib.sha256(voucher.voucher.encode("ascii")).hexdigest()),
+        info=b"chutes/model-b/enrollment-x25519-proof/v1",
+    ).derive(x25519.exchange(peer))
+    signing_aad = challenge_request.signing_bytes() + challenge.challenge_id.encode("ascii")
+    plaintext = ChaCha20Poly1305(key).decrypt(
+        base64.b64decode(challenge.nonce),
+        base64.b64decode(challenge.ciphertext),
+        signing_aad,
+    )
+    redemption = HostEnrollmentRedemptionV1(
+        voucher=voucher.voucher,
+        challenge_id=challenge.challenge_id,
+        challenge_plaintext=base64.b64encode(plaintext).decode(),
+        ed25519_public_key=ed_public,
+        x25519_public_key=x_public,
+        ed25519_signature=base64.b64encode(b"x" * 64).decode(),
+    )
+    redemption = redemption.model_copy(
+        update={
+            "ed25519_signature": base64.b64encode(
+                ed25519.sign(redemption.signing_bytes())
+            ).decode()
+        }
+    )
+    async with sessions() as session:
+        return await redeem_enrollment_voucher(session, redemption)
+
+
+async def test_cpu_reenrollment_preserves_explicit_storage_opt_in(postgres_schema):
+    sessions, _schema = postgres_schema
+    async with sessions() as session:
+        session.add(
+            MetagraphNode(
+                hotkey="owner",
+                netuid=64,
+                checksum="cpu-storage-reenrollment",
+                coldkey="coldkey",
+            )
+        )
+        await session.commit()
+
+    first = await _complete_cpu_enrollment(sessions, "cpu-storage-host")
+    assert first.version == 1
+    async with sessions() as session:
+        host = await session.get(Host, "cpu-storage-host")
+        assert host.storage_enabled is False
+        host.storage_enabled = True
+        await session.commit()
+
+    second = await _complete_cpu_enrollment(sessions, "cpu-storage-host")
+    assert second.version == 1
+    async with sessions() as session:
+        host = await session.get(Host, "cpu-storage-host")
+        assert host.compute_type == "cpu"
+        assert host.storage_enabled is True
+        assert host.enrollment_generation == 2
+        assert host.active_key_generation == 2
 
 
 async def test_concurrent_voucher_minting_uses_monotonic_generations(

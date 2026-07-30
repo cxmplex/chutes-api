@@ -3251,6 +3251,100 @@ async def test_delete_object_uses_bounded_fence_pages(pg_session, monkeypatch):
     ).scalar_one() == 0
 
 
+async def test_overwrite_quota_reserves_positive_delta_and_releases_expiry(pg_session):
+    db, redis = pg_session
+    server = await _server(db, redis, "quota-delta-target", "quota-delta-host")
+    user = await db.get(User, USER_ID)
+    user.storage_volume_quota_bytes = 10
+    user.storage_aggregate_quota_bytes = 100
+    await db.commit()
+
+    volume = await _volume(db, 1)
+    volume.quota_bytes = 10
+    predecessor = await _object(
+        db,
+        volume,
+        "quota-delta-predecessor",
+        sha256="a" * 64,
+        size_bytes=8,
+        object_key="quota-delta-key",
+    )
+    await _placement(db, predecessor, server, status="present")
+    volume.used_bytes = 8
+    await db.commit()
+
+    expired_ids = []
+
+    async def reserve_then_expire(current_volume, key, size):
+        generation, _ = await service.plan_object_placement(
+            db, current_volume, str(uuid.uuid4()), key, size
+        )
+        placement = (
+            await db.execute(
+                select(ReplicaPlacement).where(
+                    ReplicaPlacement.object_id == generation.object_id
+                )
+            )
+        ).scalar_one()
+        placement.pending_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await db.commit()
+        expired_ids.append(generation.object_id)
+        return generation
+
+    for size in (7, 8, 10):
+        replacement = await reserve_then_expire(volume, predecessor.object_key, size)
+        assert replacement.expected_predecessor_id == predecessor.object_id
+
+    with pytest.raises(HTTPException) as volume_limit:
+        await service.plan_object_placement(
+            db, volume, str(uuid.uuid4()), predecessor.object_key, 11
+        )
+    assert volume_limit.value.status_code == 413
+    assert "Volume quota exceeded" in volume_limit.value.detail
+    await db.rollback()
+
+    # Exercise aggregate accounting separately: 16 committed bytes plus a 2-byte overwrite delta
+    # exactly fits; a 3-byte delta does not. Expired reservations from the first volume stay free.
+    user = await db.get(User, USER_ID)
+    user.storage_volume_quota_bytes = 100
+    user.storage_aggregate_quota_bytes = 18
+    await db.commit()
+    aggregate_volume = await _volume(db, 1)
+    aggregate_volume.quota_bytes = 100
+    aggregate_predecessor = await _object(
+        db,
+        aggregate_volume,
+        "aggregate-delta-predecessor",
+        sha256="b" * 64,
+        size_bytes=8,
+        object_key="aggregate-delta-key",
+    )
+    await _placement(db, aggregate_predecessor, server, status="present")
+    aggregate_volume.used_bytes = 8
+    await db.commit()
+
+    replacement = await reserve_then_expire(
+        aggregate_volume, aggregate_predecessor.object_key, 10
+    )
+    assert replacement.expected_predecessor_id == aggregate_predecessor.object_id
+    with pytest.raises(HTTPException) as aggregate_limit:
+        await service.plan_object_placement(
+            db,
+            aggregate_volume,
+            str(uuid.uuid4()),
+            aggregate_predecessor.object_key,
+            11,
+        )
+    assert aggregate_limit.value.status_code == 413
+    assert "Account storage quota exceeded" in aggregate_limit.value.detail
+    await db.rollback()
+
+    summary = await service.reconcile_storage(db)
+    assert summary["expired_reservations"] == len(expired_ids) == 4
+    for object_id in expired_ids:
+        assert (await db.get(StorageObject, object_id)).lifecycle_state == "tombstoned"
+
+
 async def test_duplicate_commit_is_idempotent_and_accounts_once(pg_session):
     db, redis = pg_session
     server = await _server(db, redis, "duplicate-target", "duplicate-host")

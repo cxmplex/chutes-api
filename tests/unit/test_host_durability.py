@@ -215,6 +215,7 @@ class _Db:
         self.key = key
         self.execute_values = []
         self.commit_count = 0
+        self.info = {}
 
     async def get(self, model, _identity):
         if model is Host:
@@ -230,6 +231,7 @@ class _Db:
 
     async def commit(self):
         self.commit_count += 1
+        self.info.clear()
 
 
 def _load_node_agent_modules(monkeypatch):
@@ -342,5 +344,8 @@ async def test_cross_repo_socket_challenge_and_signature_interoperate(monkeypatc
             HostSocketAuthenticationV1.model_validate(authentication),
         )
     assert verified is host
-    assert database.commit_count == 1
+    # Challenge publication commits the lifecycle-locked validation before Redis, then
+    # authentication commits the post-consumption lineage recheck.
+    assert database.commit_count == 2
+    assert database.info == {}
     assert not redis.values

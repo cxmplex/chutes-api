@@ -2188,16 +2188,42 @@ async def plan_object_placement(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    pending_predecessor = aliased(StorageObject, name="quota_predecessor")
+    active_pending_placement = exists(
+        select(1).where(
+            ReplicaPlacement.object_id == StorageObject.object_id,
+            ReplicaPlacement.status == "pending",
+            ReplicaPlacement.pending_deadline > func.now(),
+        )
+    ).correlate(StorageObject)
+    pending_reservation_bytes = func.greatest(
+        StorageObject.projected_size_bytes
+        - func.coalesce(pending_predecessor.size_bytes, 0),
+        0,
+    )
     pending_volume_bytes = (
         await db.execute(
-            select(func.coalesce(func.sum(StorageObject.projected_size_bytes), 0)).where(
+            select(func.coalesce(func.sum(pending_reservation_bytes), 0))
+            .select_from(StorageObject)
+            .outerjoin(
+                pending_predecessor,
+                pending_predecessor.object_id == StorageObject.expected_predecessor_id,
+            )
+            .where(
                 StorageObject.volume_id == locked_volume.volume_id,
                 StorageObject.lifecycle_state == OBJECT_PENDING,
+                active_pending_placement,
             )
         )
     ).scalar_one()
+    predecessor_size = int(predecessor.size_bytes or 0) if predecessor is not None else 0
+    requested_reservation_bytes = max(0, size_bytes - predecessor_size)
     volume_limit = min(int(locked_volume.quota_bytes), per_volume_entitlement)
-    projected = int(locked_volume.used_bytes) + int(pending_volume_bytes or 0) + size_bytes
+    projected = (
+        int(locked_volume.used_bytes)
+        + int(pending_volume_bytes or 0)
+        + requested_reservation_bytes
+    )
     if projected > volume_limit:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -2214,16 +2240,26 @@ async def plan_object_placement(
     ).scalar_one()
     aggregate_pending = (
         await db.execute(
-            select(func.coalesce(func.sum(StorageObject.projected_size_bytes), 0))
+            select(func.coalesce(func.sum(pending_reservation_bytes), 0))
+            .select_from(StorageObject)
             .join(StorageVolume, StorageVolume.volume_id == StorageObject.volume_id)
+            .outerjoin(
+                pending_predecessor,
+                pending_predecessor.object_id == StorageObject.expected_predecessor_id,
+            )
             .where(
                 StorageVolume.user_id == locked_volume.user_id,
                 StorageVolume.deleted.is_(False),
                 StorageObject.lifecycle_state == OBJECT_PENDING,
+                active_pending_placement,
             )
         )
     ).scalar_one()
-    aggregate_projected = int(aggregate_used or 0) + int(aggregate_pending or 0) + size_bytes
+    aggregate_projected = (
+        int(aggregate_used or 0)
+        + int(aggregate_pending or 0)
+        + requested_reservation_bytes
+    )
     if aggregate_projected > aggregate_entitlement:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -3764,6 +3800,7 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
     summary = {
         "gc_deleted_object_placements": 0,
         "reaped_abandoned": 0,
+        "expired_reservations": 0,
         "retired_volume_generations": 0,
         "volume_key_cache_tasks_requeued": 0,
         "object_delete_generations_retired": 0,
@@ -3848,6 +3885,43 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
         if completed:
             summary["object_delete_fences_completed"] += 1
         remaining_delete_budget -= len(generations)
+
+    reservation_expiry_now = datetime.now(timezone.utc)
+    active_reservation_placement = exists(
+        select(1).where(
+            ReplicaPlacement.object_id == StorageObject.object_id,
+            ReplicaPlacement.status == "pending",
+            ReplicaPlacement.pending_deadline > reservation_expiry_now,
+        )
+    ).correlate(StorageObject)
+    expired_reservations = list(
+        (
+            await db.execute(
+                select(StorageObject)
+                .where(
+                    StorageObject.lifecycle_state == OBJECT_PENDING,
+                    ~active_reservation_placement,
+                )
+                .order_by(StorageObject.created_at, StorageObject.object_id)
+                .limit(max_objects)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for obj in expired_reservations:
+        obj.lifecycle_state = OBJECT_TOMBSTONED
+        obj.tombstoned_at = reservation_expiry_now
+        summary["expired_reservations"] += 1
+    if expired_reservations:
+        await db.flush()
+        summary["erase_tasks_enqueued"] += await _enqueue_erase_tasks_for_generations(
+            db,
+            expired_reservations,
+            reason="expired_placement_reservation",
+            now=reservation_expiry_now,
+        )
 
     abandon_cutoff = datetime.now(timezone.utc) - timedelta(seconds=_ABANDONED_OBJECT_TTL_SECONDS)
     abandoned = list(
