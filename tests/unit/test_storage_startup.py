@@ -1,8 +1,11 @@
 """Startup ordering for schema migrations and per-worker storage reconciliation."""
 
+import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.engine import make_url
 
 from api.database import migrations
 
@@ -48,11 +51,71 @@ class FakeProcess:
         return b"migration output", b""
 
 
-def test_historical_baseline_never_marks_enforced_storage_chain_applied():
+def test_historical_baseline_is_exact_immutable_production_set():
     versions = migrations.historical_migration_versions()
-    assert versions
-    assert all(version < migrations.TRACKED_MIGRATION_BASELINE for version in versions)
-    assert migrations.TRACKED_MIGRATION_BASELINE not in versions
+    assert versions == sorted(set(versions))
+    assert len(versions) == 64
+    assert (
+        hashlib.sha256(("\n".join(versions) + "\n").encode("ascii")).hexdigest()
+        == "bbe1008b2619eb1821d40aac9fb91bc68afd2216eb5cbf2d4ebb4a1c9cea399d"
+    )
+    branch_added_sub_threshold = {
+        "20260528120000",
+        "20260529150000",
+        "20260529160000",
+        "20260603120000",
+        "20260603170000",
+        "20260604120000",
+        "20260605120000",
+        "20260605130000",
+        "20260607120000",
+        "20260610120000",
+        "20260629120000",
+        "20260703120000",
+        "20260703130000",
+        "20260703140000",
+        "20260704160000",
+        "20260706120000",
+    }
+    assert branch_added_sub_threshold.isdisjoint(versions)
+
+
+def test_dbmate_url_preserves_reserved_credentials_ipv6_and_query(monkeypatch):
+    source = (
+        "postgresql+asyncpg://us%2Fer:p%40ss%3Aword@[2001:db8::1]:5432/"
+        "db%2Fname?application_name=a%20b&options=-c%20x%3Dy"
+    )
+    monkeypatch.setattr(migrations, "settings", SimpleNamespace(sqlalchemy=source))
+    rendered = migrations.dbmate_url()
+    parsed = make_url(rendered)
+    assert parsed.drivername == "postgresql"
+    assert parsed.username == "us/er"
+    assert parsed.password == "p@ss:word"
+    assert parsed.host == "2001:db8::1"
+    assert parsed.database == "db%2Fname"
+    assert dict(parsed.query) == {
+        "application_name": "a b",
+        "options": "-c x=y",
+    }
+    assert "us%2Fer:p%40ss%3Aword@[2001:db8::1]" in rendered
+
+
+def test_dbmate_url_adds_local_sslmode_without_corrupting_query(monkeypatch):
+    source = "postgresql+asyncpg://user:p%40ss@127.0.0.1:5432/db?foo=a%26b"
+    monkeypatch.setattr(migrations, "settings", SimpleNamespace(sqlalchemy=source))
+    parsed = make_url(migrations.dbmate_url())
+    assert parsed.password == "p@ss"
+    assert dict(parsed.query) == {"foo": "a&b", "sslmode": "disable"}
+
+
+def test_dbmate_url_preserves_explicit_local_sslmode(monkeypatch):
+    source = (
+        "postgresql+asyncpg://user:pass@localhost:5432/db"
+        "?sslmode=require&application_name=api"
+    )
+    monkeypatch.setattr(migrations, "settings", SimpleNamespace(sqlalchemy=source))
+    parsed = make_url(migrations.dbmate_url())
+    assert dict(parsed.query) == {"application_name": "api", "sslmode": "require"}
 
 
 def test_server_health_has_post_remediation_forward_migration():
