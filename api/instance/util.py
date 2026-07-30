@@ -25,6 +25,7 @@ from api.constants import (
 )
 
 from api.chute.schemas import Chute
+from api.instance.locking import prepare_instance_terminal_writes
 from api.instance.schemas import Instance, LaunchConfig
 from api.config import settings
 from api.job.schemas import Job
@@ -233,6 +234,7 @@ async def _execute_instance_deletion(
     config_id: str = None,
 ) -> bool:
     """Actually delete an instance from the database."""
+    deleted_info = None
     async with get_session() as session:
         lineage = (
             await session.execute(
@@ -243,38 +245,42 @@ async def _execute_instance_deletion(
                 ).where(Instance.instance_id == instance_id)
             )
         ).one_or_none()
+        await prepare_instance_terminal_writes(
+            session,
+            [instance_id],
+            complete_launch_configs=True,
+        )
         delete_result = await session.execute(
             text("DELETE FROM instances WHERE instance_id = :instance_id"),
             {"instance_id": instance_id},
         )
         if delete_result.rowcount > 0:
-            await invalidate_instance_cache(chute_id, instance_id=instance_id)
             await session.execute(
                 text(
                     "UPDATE instance_audit SET deletion_reason = :reason WHERE instance_id = :instance_id"
                 ),
                 {"instance_id": instance_id, "reason": reason},
             )
-            await session.commit()
-            logger.warning(f"INSTANCE DELETED: {instance_id}: {reason}")
-
-            await cleanup_instance_conn_tracking(chute_id, instance_id)
-
-            asyncio.create_task(
-                notify_deleted(
-                    _InstanceInfo(
-                        instance_id,
-                        miner_hotkey,
-                        chute_id,
-                        config_id or (lineage.config_id if lineage else None),
-                        lineage.server_id if lineage else None,
-                        lineage.gpu_management_mode if lineage else None,
-                    ),
-                    message=f"Instance {instance_id} of miner {miner_hotkey} has been deleted: {reason}",
-                )
+            deleted_info = _InstanceInfo(
+                instance_id,
+                miner_hotkey,
+                chute_id,
+                config_id or (lineage.config_id if lineage else None),
+                lineage.server_id if lineage else None,
+                lineage.gpu_management_mode if lineage else None,
             )
-            return True
-    return False
+            await session.commit()
+
+    if deleted_info is None:
+        return False
+    logger.warning(f"INSTANCE DELETED: {instance_id}: {reason}")
+    await invalidate_instance_cache(chute_id, instance_id=instance_id)
+    await cleanup_instance_conn_tracking(chute_id, instance_id)
+    await notify_deleted(
+        deleted_info,
+        message=f"Instance {instance_id} of miner {miner_hotkey} has been deleted: {reason}",
+    )
+    return True
 
 
 async def _check_cascade_and_delete(
@@ -335,12 +341,14 @@ async def disable_instance(
     # monotonically increasing epoch is part of every launch-storage session,
     # so an expired Redis key can never resurrect prior authority.
     async with get_session() as db:
-        await acquire_gpu_lifecycle_lock(db)
+        await prepare_instance_terminal_writes(
+            db,
+            [instance_id],
+            complete_launch_configs=False,
+        )
         instance = (
             await db.execute(
-                select(Instance)
-                .where(Instance.instance_id == instance_id)
-                .with_for_update()
+                select(Instance).where(Instance.instance_id == instance_id)
             )
         ).scalar_one_or_none()
         if instance is not None:
@@ -1200,6 +1208,11 @@ RETURNING instances.instance_id;
     try:
         async with get_session() as session:
             await session.execute(text("SET LOCAL lock_timeout = '1s'"))
+            await prepare_instance_terminal_writes(
+                session,
+                [instance_id],
+                complete_launch_configs=False,
+            )
             await session.execute(text(query), {"instance_id": instance_id})
             logger.success(f"Updated instance shutdown timestamp: {instance_id=}")
     except Exception as exc:
@@ -1549,7 +1562,13 @@ async def purge(target, reason, valid_termination=False):
     ).warning(
         f"purging instance {target.instance_id} (chute {target.chute_id}): {reason}"
     )
+    job_to_notify = None
     async with get_session() as session:
+        await prepare_instance_terminal_writes(
+            session,
+            [target.instance_id],
+            complete_launch_configs=True,
+        )
         await session.execute(
             text("DELETE FROM instances WHERE instance_id = :instance_id"),
             {"instance_id": target.instance_id},
@@ -1575,14 +1594,16 @@ async def purge(target, reason, valid_termination=False):
             .scalar_one_or_none()
         )
         if job and not job.finished_at:
+            job_to_notify = job
             job.status = "error"
             job.error_detail = f"Instance failed monitoring probes: {reason=}"
             job.miner_terminated = True
             job.finished_at = func.now()
-            await notify_job_deleted(job)
 
         await session.commit()
 
+    if job_to_notify is not None:
+        await notify_job_deleted(job_to_notify)
     await cleanup_instance_conn_tracking(target.chute_id, target.instance_id)
 
 

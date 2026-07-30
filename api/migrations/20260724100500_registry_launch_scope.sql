@@ -63,35 +63,6 @@ BEGIN
 END
 $$;
 
-CREATE OR REPLACE FUNCTION revoke_registry_scope_on_instance_terminal()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    target_config_id TEXT;
-BEGIN
-    IF TG_OP = 'DELETE' THEN
-        target_config_id := OLD.config_id;
-    ELSIF NEW.verification_error IS NOT NULL
-          OR NEW.stop_billing_at IS NOT NULL
-          OR (NEW.verified AND NOT NEW.active) THEN
-        target_config_id := NEW.config_id;
-    END IF;
-    IF target_config_id IS NOT NULL THEN
-        PERFORM revoke_launch_registry_scope(target_config_id);
-    END IF;
-    IF TG_OP = 'DELETE' THEN
-        RETURN OLD;
-    END IF;
-    RETURN NEW;
-END
-$$;
-
-DROP TRIGGER IF EXISTS trg_instance_terminal_registry_scope ON instances;
-CREATE TRIGGER trg_instance_terminal_registry_scope
-AFTER UPDATE OF active, verified, verification_error, stop_billing_at OR DELETE ON instances
-FOR EACH ROW EXECUTE FUNCTION revoke_registry_scope_on_instance_terminal();
-
 CREATE OR REPLACE FUNCTION revoke_registry_scope_on_launch_terminal()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -189,10 +160,8 @@ BEGIN
 END
 $$;
 
-DROP TRIGGER IF EXISTS trg_instance_terminal_registry_scope ON instances;
 DROP TRIGGER IF EXISTS trg_launch_terminal_registry_scope ON launch_configs;
 DROP TRIGGER IF EXISTS trg_job_terminal_registry_scope ON jobs;
-DROP FUNCTION IF EXISTS revoke_registry_scope_on_instance_terminal();
 DROP FUNCTION IF EXISTS revoke_registry_scope_on_launch_terminal();
 DROP FUNCTION IF EXISTS revoke_registry_scope_on_job_terminal();
 DROP FUNCTION IF EXISTS revoke_launch_registry_scope(TEXT);

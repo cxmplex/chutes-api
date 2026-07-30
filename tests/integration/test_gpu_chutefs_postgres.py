@@ -29,6 +29,7 @@ from api.chute.schemas import Chute
 from api.config import settings
 from api.image.schemas import Image
 from api.instance import util as instance_util
+from api.instance.locking import prepare_instance_terminal_writes
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2
 from api.job.schemas import Job
@@ -345,7 +346,6 @@ async def test_timestamped_migration_applies_with_durable_constraints(pg_session
             "'trg_revoke_chutefs_session_on_config_failure', "
             "'trg_revoke_chutefs_session_on_server_change', "
             "'trg_revoke_chutefs_session_on_reservation_change', "
-            "'trg_complete_launch_config_on_instance_terminal', "
             "'trg_complete_launch_config_on_job_terminal', "
             "'trg_prevent_user_delete_before_chutefs_erasure')"
         )
@@ -368,7 +368,7 @@ async def test_timestamped_migration_applies_with_durable_constraints(pg_session
         )
     )
     assert active_unique == 1
-    assert trigger_count == 8
+    assert trigger_count == 7
     assert chute_foreign_key == 0
 
 
@@ -496,6 +496,11 @@ async def test_instance_and_chute_deletion_do_not_delete_binding(pg_session):
     db.add_all([config, instance])
     await db.commit()
 
+    await prepare_instance_terminal_writes(
+        db,
+        [instance.instance_id],
+        complete_launch_configs=True,
+    )
     await db.delete(instance)
     await db.commit()
     assert await db.get(DefaultChuteFSVolumeBinding, binding.binding_id) is not None
@@ -512,6 +517,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     monkeypatch,
 ):
     db, redis = pg_session
+    await _install_launch_erasure_migration(db)
     await _ensure_test_token_key_epoch(db)
     chute = await _chute(db, storage_pg.USER_ID, f"session-{uuid.uuid4().hex}")
     _, cert = _identity("launch-session")
@@ -673,11 +679,19 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     current_instance = await db.get(Instance, instance_id)
     assert current_instance is not None
     prior_revocation_epoch = current_instance.storage_revocation_epoch
+    await prepare_instance_terminal_writes(
+        db,
+        [instance_id],
+        complete_launch_configs=False,
+    )
     current_instance.active = False
     await db.commit()
     await db.refresh(current_instance)
     assert current_instance.storage_revocation_epoch == prior_revocation_epoch + 1
-    with pytest.raises(HTTPException, match="inactive"):
+    with pytest.raises(
+        HTTPException,
+        match="inactive|invalid, expired, or revoked",
+    ):
         await launch_sessions.authorize_default_volume(
             db,
             f"Bearer {rotated.access_token}",
@@ -1180,6 +1194,11 @@ async def test_account_delete_stages_then_waits_for_launch_and_key_shred(
         == 2
     )
 
+    await prepare_instance_terminal_writes(
+        db,
+        [instance.instance_id],
+        complete_launch_configs=True,
+    )
     await db.delete(instance)
     await db.commit()
     await db.refresh(config)

@@ -3689,6 +3689,7 @@ async def _retire_gpu_runtime_lineage(
     remove_nodes: bool = False,
     successful: bool = False,
 ) -> None:
+    from api.instance.locking import lock_launch_configs_before_instances
     from api.instance.schemas import Instance, LaunchConfig, instance_nodes
     from api.job.schemas import Job
     from api.node.schemas import Node
@@ -3742,6 +3743,26 @@ async def _retire_gpu_runtime_lineage(
         .all()
     )
     instance_ids = sorted(set(instance_ids))
+    config_ids = list(
+        (
+            await db.execute(
+                select(LaunchConfig.config_id)
+                .where(
+                    LaunchConfig.gpu_launch_reservation_id
+                    == reservation.reservation_id
+                )
+                .order_by(LaunchConfig.config_id)
+            )
+        ).scalars()
+    )
+    if not db.info.get(GPU_LIFECYCLE_LOCK_INFO_KEY):
+        raise RuntimeError("GPU runtime retirement requires lifecycle custody")
+    await lock_launch_configs_before_instances(
+        db,
+        config_ids=config_ids,
+        instance_ids=instance_ids,
+        acquire_lifecycle=False,
+    )
     launch_update = update(LaunchConfig).where(
         LaunchConfig.gpu_launch_reservation_id == reservation.reservation_id,
         LaunchConfig.failed_at.is_(None),

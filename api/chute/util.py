@@ -69,6 +69,7 @@ from api.chute.schemas import Chute, NodeSelector, ChuteShare, LLMDetail
 from api.user.schemas import User, InvocationQuota, InvocationDiscount, PriceOverride
 from api.user.service import chutes_user_id
 from api.miner_client import sign_request
+from api.instance.locking import prepare_instance_terminal_writes
 from api.instance.schemas import Instance
 from api.instance.util import (
     LeastConnManager,
@@ -1918,6 +1919,11 @@ async def invoke(
                     # Handle the case where encryption V2 is in use and the instance needs a new key exchange.
                     if error_message == "KEY_EXCHANGE_REQUIRED":
                         # NOTE: Could probably just re-validate rather than deleting the instance, but this ensures no shenanigans are afoot.
+                        await prepare_instance_terminal_writes(
+                            session,
+                            [target.instance_id],
+                            complete_launch_configs=True,
+                        )
                         delete_result = await session.execute(
                             text("DELETE FROM instances WHERE instance_id = :instance_id"),
                             {"instance_id": target.instance_id},
@@ -1936,11 +1942,9 @@ async def invoke(
                             await cleanup_instance_conn_tracking(
                                 target.chute_id, target.instance_id
                             )
-                            asyncio.create_task(
-                                notify_deleted(
-                                    target,
-                                    message=f"Instance {target.instance_id} of miner {target.miner_hotkey} responded with a 426 error, indicating a new key exchange is required.",
-                                )
+                            await notify_deleted(
+                                target,
+                                message=f"Instance {target.instance_id} of miner {target.miner_hotkey} responded with a 426 error, indicating a new key exchange is required.",
                             )
 
                     elif error_message not in ("RATE_LIMIT", "BAD_REQUEST"):

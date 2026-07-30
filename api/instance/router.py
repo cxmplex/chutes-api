@@ -54,6 +54,7 @@ from api.chute.util import get_manual_boost, is_shared
 from api.bounty.util import claim_bounty, calculate_bounty_boost
 from api.secret.schemas import Secret
 from api.image.schemas import Image  # noqa
+from api.instance.locking import prepare_instance_terminal_writes
 from api.instance.schemas import (
     LaunchConfigArgs,
     LaunchConfigResponse,
@@ -4973,6 +4974,11 @@ async def delayed_instance_tls_check(instance_id: str):
                 )
                 if attempt == 3:
                     logger.error(reason)
+                    await prepare_instance_terminal_writes(
+                        session,
+                        [instance.instance_id],
+                        complete_launch_configs=True,
+                    )
                     await session.delete(instance)
                     await session.execute(
                         text(
@@ -4984,7 +4990,7 @@ async def delayed_instance_tls_check(instance_id: str):
                     await invalidate_instance_cache(
                         instance.chute_id, instance_id=instance.instance_id
                     )
-                    asyncio.create_task(notify_deleted(instance))
+                    await notify_deleted(instance)
                 else:
                     logger.warning(reason)
             else:
@@ -5019,6 +5025,11 @@ async def delayed_instance_fs_check(instance_id: str):
                 f"{instance.instance_id=} {instance.miner_hotkey=} {instance.chute_id=}"
             )
             logger.warning(reason)
+            await prepare_instance_terminal_writes(
+                session,
+                [instance.instance_id],
+                complete_launch_configs=True,
+            )
             await session.delete(instance)
             await session.execute(
                 text(
@@ -5027,7 +5038,7 @@ async def delayed_instance_fs_check(instance_id: str):
                 {"instance_id": instance.instance_id, "reason": reason},
             )
             await session.commit()
-            asyncio.create_task(notify_deleted(instance))
+            await notify_deleted(instance)
         else:
             logger.success(
                 f"Successfully verified FS hash {instance.instance_id=} {instance.miner_hotkey=} {instance.chute_id=}"
@@ -5399,6 +5410,11 @@ async def activate_launch_config_instance(
                 f"Instance took too long to activate ({startup_seconds:.0f}s > "
                 f"{max_startup_seconds}s max)"
             )
+            await prepare_instance_terminal_writes(
+                db,
+                [instance.instance_id],
+                complete_launch_configs=True,
+            )
             await db.delete(instance)
             await db.execute(
                 text(
@@ -5408,7 +5424,7 @@ async def activate_launch_config_instance(
                 {"instance_id": instance.instance_id, "reason": reason},
             )
             await db.commit()
-            asyncio.create_task(notify_deleted(instance))
+            await notify_deleted(instance)
             raise HTTPException(
                 status_code=status.HTTP_410_GONE,
                 detail=reason,
@@ -5490,6 +5506,11 @@ async def activate_launch_config_instance(
                 f"Private chute chute_id={chute.chute_id} name={chute.name} "
                 f"already has >= target_count={target_count} active instances"
             )
+            await prepare_instance_terminal_writes(
+                db,
+                [instance.instance_id],
+                complete_launch_configs=True,
+            )
             await db.delete(instance)
             await db.execute(
                 text(
@@ -5499,7 +5520,7 @@ async def activate_launch_config_instance(
                 {"instance_id": instance.instance_id, "reason": reason},
             )
             await db.commit()
-            asyncio.create_task(notify_deleted(instance))
+            await notify_deleted(instance)
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
                 detail=reason,
@@ -5614,6 +5635,11 @@ async def activate_launch_config_instance(
     instance.active = True
     instance.activated_at = func.now()
     if launch_config.job_id or is_private:
+        await prepare_instance_terminal_writes(
+            db,
+            [instance.instance_id],
+            complete_launch_configs=False,
+        )
         instance.stop_billing_at = func.now() + timedelta(
             seconds=chute.shutdown_after_seconds or 300
         )
@@ -5823,6 +5849,11 @@ async def _validate_legacy_filesystem(
                     f"{expected_hash=} for {image_id=} {patch_version=} but received {response_body['fsv']}"
                 )
                 logger.error(reason)
+                await prepare_instance_terminal_writes(
+                    db,
+                    [instance.instance_id],
+                    complete_launch_configs=False,
+                )
                 launch_config.failed_at = func.now()
                 launch_config.verification_error = reason
                 await db.delete(instance)
@@ -5833,7 +5864,7 @@ async def _validate_legacy_filesystem(
                     {"instance_id": instance.instance_id, "reason": reason},
                 )
                 await db.commit()
-                asyncio.create_task(notify_deleted(instance))
+                await notify_deleted(instance)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=launch_config.verification_error,
@@ -5900,7 +5931,7 @@ async def _verify_job_ports(
                 # notifier is Redis-backed and must not race a rollback of
                 # the state it announces.
                 await db.commit()
-                asyncio.create_task(notify_deleted(instance))
+                await notify_deleted(instance)
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Failed port verification on {port_map=}",
@@ -5995,6 +6026,11 @@ async def _build_launch_config_verified_response(
             )
         except Exception as exc:
             await db.rollback()
+            await prepare_instance_terminal_writes(
+                db,
+                [storage_instance_id],
+                complete_launch_configs=False,
+            )
             await db.execute(
                 text(
                     "UPDATE launch_configs "
@@ -6089,6 +6125,11 @@ async def verify_graval_launch_config_instance(
             f"{instance.miner_hotkey=} took {delta} seconds, exceeding maximum estimate of {max_duration}"
         )
         logger.error(reason)
+        await prepare_instance_terminal_writes(
+            db,
+            [instance.instance_id],
+            complete_launch_configs=False,
+        )
         launch_config.failed_at = func.now()
         launch_config.verification_error = reason
         await db.delete(instance)
@@ -6099,9 +6140,7 @@ async def verify_graval_launch_config_instance(
             {"instance_id": instance.instance_id, "reason": reason},
         )
         await db.commit()
-        asyncio.create_task(
-            notify_deleted(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
-        )
+        await notify_deleted(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=launch_config.verification_error,
@@ -6126,6 +6165,11 @@ async def verify_graval_launch_config_instance(
             f"{instance.miner_hotkey=} was invalid: {exc}\n{traceback.format_exc()}"
         )
         logger.error(reason)
+        await prepare_instance_terminal_writes(
+            db,
+            [instance.instance_id],
+            complete_launch_configs=False,
+        )
         launch_config.failed_at = func.now()
         launch_config.verification_error = reason
         await db.delete(instance)
@@ -6136,9 +6180,7 @@ async def verify_graval_launch_config_instance(
             {"instance_id": instance.instance_id, "reason": reason},
         )
         await db.commit()
-        asyncio.create_task(
-            notify_deleted(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
-        )
+        await notify_deleted(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=launch_config.verification_error,
@@ -6199,6 +6241,11 @@ async def verify_graval_launch_config_instance(
             f"instance_id={instance.instance_id} miner_hotkey={instance.miner_hotkey}: "
             f"{proof_error or 'proof rejected'}"
         )
+        await prepare_instance_terminal_writes(
+            db,
+            [instance.instance_id],
+            complete_launch_configs=False,
+        )
         launch_config.failed_at = func.now()
         launch_config.verification_error = reason
         await db.delete(instance)
@@ -6210,9 +6257,7 @@ async def verify_graval_launch_config_instance(
             {"instance_id": instance.instance_id, "reason": reason},
         )
         await db.commit()
-        asyncio.create_task(
-            notify_deleted(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
-        )
+        await notify_deleted(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=reason,
@@ -6542,6 +6587,11 @@ async def disable_instance_endpoint(
             detail=f"Instance with {chute_id=} {instance_id=} associated with {hotkey=} not found",
         )
     logger.info(f"INSTANCE DISABLE: {instance_id=} {hotkey=}")
+    await prepare_instance_terminal_writes(
+        db,
+        [instance_id],
+        complete_launch_configs=False,
+    )
     instance.active = False
     await db.commit()
     await invalidate_instance_cache(chute_id, instance_id=instance_id)
@@ -6646,8 +6696,11 @@ async def delete_instance(
 
     evict_instance_ssl(instance_id)
 
-    if instance.config is not None and instance.config.failed_at is None:
-        instance.config.completed_at = func.now()
+    await prepare_instance_terminal_writes(
+        db,
+        [instance_id],
+        complete_launch_configs=True,
+    )
     await db.delete(instance)
 
     # Update instance audit table.

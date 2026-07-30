@@ -185,7 +185,6 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
         assert {path.name.split("_", 1)[0] for path in _migration_paths()} <= versions
         assert {
             "trg_prevent_user_delete_before_chutefs_erasure",
-            "trg_complete_launch_config_on_instance_terminal",
             "trg_complete_launch_config_on_job_terminal",
             "trg_launch_terminal_registry_scope",
         } <= triggers

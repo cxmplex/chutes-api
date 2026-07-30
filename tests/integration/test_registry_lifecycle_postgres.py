@@ -36,7 +36,7 @@ def _psql(sql: str, schema: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_instance_and_job_terminal_events_revoke_registry_sessions():
+def test_explicit_launch_and_job_terminal_events_revoke_registry_sessions():
     schema = f"registry_lifecycle_{uuid.uuid4().hex}"
     migration = (
         Path(__file__).resolve().parents[2]
@@ -130,6 +130,13 @@ def test_instance_and_job_terminal_events_revoke_registry_sessions():
             FROM launch_configs WHERE config_id = 'config-instance';
             SELECT revoked_at IS NOT NULL
             FROM registry_sessions WHERE session_id = 'session-instance';
+            UPDATE launch_configs
+               SET registry_scope_active = FALSE, registry_scope_revoked_at = NOW()
+             WHERE config_id = 'config-instance';
+            SELECT registry_scope_active, registry_scope_revoked_at IS NOT NULL
+            FROM launch_configs WHERE config_id = 'config-instance';
+            SELECT revoked_at IS NOT NULL
+            FROM registry_sessions WHERE session_id = 'session-instance';
             """,
             schema,
         )
@@ -138,7 +145,7 @@ def test_instance_and_job_terminal_events_revoke_registry_sessions():
             line
             for line in instance_lifecycle.stdout.decode().splitlines()
             if "|" in line or line in {"t", "f"}
-        ][-2:] == ["f|t", "t"]
+        ][-4:] == ["t|f", "f", "f|t", "t"]
 
         job_lifecycle = _psql(
             f"""
@@ -184,6 +191,9 @@ def test_instance_and_job_terminal_events_revoke_registry_sessions():
             SELECT COUNT(*) FROM pg_trigger
              WHERE NOT tgisinternal
                AND tgname = 'trg_launch_terminal_registry_scope';
+            SELECT COUNT(*) FROM pg_trigger
+             WHERE NOT tgisinternal
+               AND tgname = 'trg_instance_terminal_registry_scope';
             """,
             schema,
         )
@@ -191,6 +201,7 @@ def test_instance_and_job_terminal_events_revoke_registry_sessions():
         assert [line for line in catalog.stdout.decode().splitlines() if line] == [
             "2",
             "1",
+            "0",
         ]
 
         cleanup = _psql(

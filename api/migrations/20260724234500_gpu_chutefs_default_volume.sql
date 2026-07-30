@@ -495,38 +495,6 @@ CREATE TRIGGER trg_revoke_chutefs_session_on_reservation_change
 AFTER UPDATE OF state ON gpu_launch_reservations
 FOR EACH ROW EXECUTE FUNCTION revoke_chutefs_session_on_reservation_change();
 
-CREATE OR REPLACE FUNCTION complete_launch_config_on_instance_terminal()
-RETURNS trigger
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    target_config_id VARCHAR;
-BEGIN
-    target_config_id := CASE WHEN TG_OP = 'DELETE' THEN OLD.config_id ELSE NEW.config_id END;
-    IF target_config_id IS NOT NULL
-       AND (
-           TG_OP = 'DELETE'
-           OR (
-               NOT NEW.active
-               AND NOT NEW.verified
-               AND (OLD.active OR OLD.verified)
-           )
-       )
-    THEN
-        UPDATE launch_configs
-           SET completed_at = COALESCE(completed_at, NOW())
-         WHERE config_id = target_config_id
-           AND failed_at IS NULL;
-    END IF;
-    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
-END
-$$;
-
-DROP TRIGGER IF EXISTS trg_complete_launch_config_on_instance_terminal ON instances;
-CREATE TRIGGER trg_complete_launch_config_on_instance_terminal
-AFTER DELETE OR UPDATE OF active, verified ON instances
-FOR EACH ROW EXECUTE FUNCTION complete_launch_config_on_instance_terminal();
-
 CREATE OR REPLACE FUNCTION complete_launch_config_on_job_terminal()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -654,8 +622,6 @@ DROP TRIGGER IF EXISTS trg_prevent_user_delete_before_chutefs_erasure ON users;
 DROP FUNCTION IF EXISTS prevent_user_delete_before_chutefs_erasure();
 DROP TRIGGER IF EXISTS trg_complete_launch_config_on_job_terminal ON jobs;
 DROP FUNCTION IF EXISTS complete_launch_config_on_job_terminal();
-DROP TRIGGER IF EXISTS trg_complete_launch_config_on_instance_terminal ON instances;
-DROP FUNCTION IF EXISTS complete_launch_config_on_instance_terminal();
 DROP TRIGGER IF EXISTS trg_revoke_chutefs_session_on_server_change ON servers;
 DROP FUNCTION IF EXISTS revoke_chutefs_session_on_server_change();
 DROP TRIGGER IF EXISTS trg_revoke_chutefs_session_on_config_failure ON launch_configs;

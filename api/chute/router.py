@@ -63,6 +63,7 @@ from api.bounty.util import (
     set_chute_disabled,
     bounty_lifetime_for,
 )
+from api.instance.locking import prepare_instance_terminal_writes
 from api.instance.schemas import Instance
 from api.instance.util import get_chute_target_manager, cleanup_instance_conn_tracking
 from api.user.schemas import User, PriceOverride
@@ -695,6 +696,7 @@ async def make_public(
     # validation, but NOT IN with empty set matches everything in SQLAlchemy).
     deleted_chutes = []
     cpu_teardowns = []
+    stale_bounty_ids = []
     if not kept_public_ids:
         logger.error(
             "make_public: kept_public_ids is empty after processing, skipping stale cleanup"
@@ -732,6 +734,11 @@ async def make_public(
             )
             instance_ids = [inst.instance_id for inst in stale.instances]
             if instance_ids:
+                await prepare_instance_terminal_writes(
+                    db,
+                    instance_ids,
+                    complete_launch_configs=True,
+                )
                 await db.execute(
                     text(
                         "UPDATE instance_audit SET valid_termination = true, "
@@ -755,13 +762,15 @@ async def make_public(
                     "status": "deleted",
                 }
             )
-            await delete_bounty(stale.chute_id)
+            stale_bounty_ids.append(stale.chute_id)
             await db.delete(stale)
 
     # Single atomic commit for all changes.
     await db.commit()
 
-    # Post-commit: publish Redis notifications and create bounties.
+    # Post-commit: mutate Redis bounty state and publish notifications.
+    for stale_chute_id in stale_bounty_ids:
+        await delete_bounty(stale_chute_id)
     for reason, chute_id, version, job_only in notifications:
         await settings.redis_client.publish(
             "miner_broadcast",
@@ -1540,6 +1549,20 @@ async def delete_chute(
     ).all()
 
     # Delete all of the instances first, and mark the deletions as valid so the miners aren't penalized.
+    target_instance_ids = list(
+        (
+            await db.execute(
+                select(Instance.instance_id)
+                .where(Instance.chute_id == chute.chute_id)
+                .order_by(Instance.instance_id)
+            )
+        ).scalars()
+    )
+    await prepare_instance_terminal_writes(
+        db,
+        target_instance_ids,
+        complete_launch_configs=True,
+    )
     result = await db.execute(
         text("DELETE FROM instances WHERE chute_id = :chute_id RETURNING instance_id"),
         {"chute_id": chute.chute_id},
@@ -2065,8 +2088,18 @@ async def _deploy_chute(
                 .scalars()
                 .all()
             )
+            deleted_instances = list(instances)
+            await prepare_instance_terminal_writes(
+                db,
+                [instance.instance_id for instance in instances],
+                complete_launch_configs=True,
+            )
             for instance in instances:
                 await db.delete(instance)
+            # Release lifecycle custody before platform GPU teardown opens its
+            # own durable lifecycle transaction.
+            await db.commit()
+            for instance in deleted_instances:
                 await notify_deleted(instance, "Chute updated with use_rolling_update=False")
     else:
         await settings.redis_client.publish(
@@ -2599,6 +2632,7 @@ async def update_common_attributes(
         chute.scaling_threshold = args.scaling_threshold
 
     # Handle disabled field
+    deleted_instances = []
     if args.disabled is not None:
         chute.disabled = args.disabled
 
@@ -2619,6 +2653,11 @@ async def update_common_attributes(
                     f"Disabling private chute {chute.chute_id} ({chute.name}), "
                     f"terminating {len(instance_ids)} instances"
                 )
+                await prepare_instance_terminal_writes(
+                    db,
+                    instance_ids,
+                    complete_launch_configs=True,
+                )
                 await db.execute(
                     text(
                         "UPDATE instance_audit SET valid_termination = true, "
@@ -2627,9 +2666,11 @@ async def update_common_attributes(
                     {"instance_ids": instance_ids},
                 )
                 for inst in chute.instances:
+                    deleted_instances.append(inst)
                     await db.delete(inst)
-                    await notify_deleted(inst, "chute disabled")
 
     await db.commit()
+    for instance in deleted_instances:
+        await notify_deleted(instance, "chute disabled")
     await db.refresh(chute)
     return chute

@@ -23,6 +23,7 @@ from api.job.schemas import Job
 from api.job.response import JobResponse
 from api.user.schemas import User, JobQuota
 from api.user.service import get_current_user
+from api.instance.locking import prepare_instance_terminal_writes
 from api.instance.util import load_job_from_jwt, create_job_jwt
 from api.instance.schemas import LaunchConfig
 
@@ -411,6 +412,22 @@ async def complete_job(
         elif job.status.startswith("complete"):
             job.status = "complete"
 
+    config_ids = list(
+        (
+            await db.execute(
+                select(LaunchConfig.config_id)
+                .where(LaunchConfig.job_id == job.job_id)
+                .order_by(LaunchConfig.config_id)
+                .execution_options(autoflush=False)
+            )
+        ).scalars()
+    )
+    await prepare_instance_terminal_writes(
+        db,
+        [job.instance.instance_id] if job.instance else [],
+        config_ids=config_ids,
+        complete_launch_configs=False,
+    )
     job.updated_at = func.now()
     job.finished_at = func.now()
     await db.execute(

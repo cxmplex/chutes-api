@@ -300,8 +300,15 @@ def test_disable_persists_revocation_epoch_before_redis_fast_path():
     durable_commit = source.index("await db.commit()", durable_epoch)
     redis_publish = source.index("settings.redis_client.client.set", durable_commit)
     assert durable_epoch < durable_commit < redis_publish
-    assert ".with_for_update()" in source[:durable_epoch]
-    assert "await acquire_gpu_lifecycle_lock(db)" in source[:durable_epoch]
+    assert "prepare_instance_terminal_writes" in source[:durable_epoch]
+    terminal_source = inspect.getsource(instance_util.prepare_instance_terminal_writes)
+    assert "lock_launch_configs_before_instances" in terminal_source
+    ordered_source = inspect.getsource(
+        launch_sessions.lock_launch_configs_before_instances
+    )
+    assert ordered_source.index("acquire_gpu_lifecycle_lock") < ordered_source.index(
+        "select(LaunchConfig.config_id)"
+    ) < ordered_source.rindex("select(Instance.instance_id)")
 
     migration = (
         Path(__file__).parents[2]
@@ -319,24 +326,29 @@ def test_revocation_preflight_and_binding_locks_follow_shared_order():
 
     revocation_preflight = lock_source.index("_require_not_disabled")
     user_lock = lock_source.index("select(User)")
-    lifecycle_lock = lock_source.index("await acquire_gpu_lifecycle_lock")
-    configuration_lock = lock_source.index("select(LaunchConfig)", user_lock)
-    instance_lock = lock_source.index("select(Instance)", configuration_lock)
+    ordered_launch_rows = lock_source.index("lock_launch_configs_before_instances")
+    configuration_reload = lock_source.index("select(LaunchConfig)", user_lock)
     session_lock = lock_source.index(
         "select(ChuteFSLaunchSession)",
-        instance_lock,
+        configuration_reload,
+    )
+    ordered_source = inspect.getsource(
+        launch_sessions.lock_launch_configs_before_instances
     )
 
     assert (
         revocation_preflight
         < user_lock
-        < lifecycle_lock
-        < configuration_lock
-        < instance_lock
+        < ordered_launch_rows
+        < configuration_reload
         < session_lock
     )
+    assert ordered_source.index("acquire_gpu_lifecycle_lock") < ordered_source.index(
+        "select(LaunchConfig.config_id)"
+    ) < ordered_source.rindex("select(Instance.instance_id)")
     assert ".order_by(User.user_id)" in lock_source
-    assert ".order_by(LaunchConfig.config_id)" in lock_source
+    assert ".order_by(LaunchConfig.config_id)" in ordered_source
+    assert ".order_by(Instance.instance_id)" in ordered_source
     assert "actual_config_owners != expected_config_owners" in lock_source
     assert "_require_not_disabled" not in lineage_source
     assert lineage_source.index("_current_attestation") < lineage_source.index(

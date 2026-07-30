@@ -18,11 +18,9 @@ from sqlalchemy.orm import aliased, joinedload, lazyload
 
 from api.chute.schemas import Chute
 from api.config import settings
-from api.host.locks import (
-    acquire_gpu_lifecycle_lock,
-    assert_gpu_external_work_allowed,
-)
+from api.host.locks import assert_gpu_external_work_allowed
 from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
+from api.instance.locking import lock_launch_configs_before_instances
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import (
     _decode_chutes_jwt,
@@ -152,7 +150,10 @@ async def lock_launch_storage_configurations(
     # then launch configuration and identity rows. This matches binding
     # creation, scheduling, and launch activation without holding row locks
     # across the Redis revocation preflight above.
-    await acquire_gpu_lifecycle_lock(db)
+    await lock_launch_configs_before_instances(
+        db,
+        config_ids=ordered_ids,
+    )
     locked_configs = list(
         (
             await db.execute(
@@ -160,7 +161,6 @@ async def lock_launch_storage_configurations(
                 .where(LaunchConfig.config_id.in_(ordered_ids))
                 .order_by(LaunchConfig.config_id)
                 .options(lazyload("*"))
-                .with_for_update(of=LaunchConfig)
                 .execution_options(populate_existing=True)
             )
         )
@@ -179,14 +179,6 @@ async def lock_launch_storage_configurations(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Launch storage configuration ownership is no longer current.",
         )
-    await db.execute(
-        select(Instance)
-        .where(Instance.config_id.in_(ordered_ids))
-        .order_by(Instance.config_id, Instance.instance_id)
-        .options(lazyload("*"))
-        .with_for_update(of=Instance)
-        .execution_options(populate_existing=True)
-    )
     await db.execute(
         select(ChuteFSLaunchSession)
         .where(ChuteFSLaunchSession.config_id.in_(ordered_ids))
