@@ -35,6 +35,7 @@ from api.config import (
 from api.database import get_session
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2, purge_and_notify
+from api.host.locks import acquire_gpu_lifecycle_lock
 from api.host.reservations import (
     LaunchReservationError,
     create_launch_reservation,
@@ -63,6 +64,19 @@ DEFAULT_CPU_DISK_GB = 10
 # that loses the race just skips its tick.
 SCHEDULER_LOCK_KEY = "cpu_scheduler:lock"
 SCHEDULER_LOCK_TTL = 120
+SCHEDULER_LOCK_RENEW_INTERVAL_SECONDS = SCHEDULER_LOCK_TTL // 3
+SCHEDULER_LOCK_RELEASE_SCRIPT = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+end
+return 0
+"""
+SCHEDULER_LOCK_RENEW_SCRIPT = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("expire", KEYS[1], ARGV[2])
+end
+return 0
+"""
 # Age out scheduler-minted launch configs that were never verified: a TD that never boots, an
 # image pull that hangs, or an agent that disconnected between the online check and pub/sub
 # delivery would otherwise hold the chute at "pending >= target" and occupy its server forever.
@@ -121,6 +135,56 @@ async def _active_reservation_count(session, chute_id: str, job_id: str | None =
         ).scalar()
         or 0
     )
+
+
+async def _lock_host_with_capacity(session, host_id: str) -> Host | None:
+    """Lock and re-read a host, then fence reservation creation on durable capacity.
+
+    The Redis scheduler lease is an optimization and can expire during a slow tick. Every
+    scheduler replica therefore takes the lifecycle advisory lock followed by the selected Host
+    row and recomputes durable usage immediately before creating a launch reservation.
+    """
+
+    await acquire_gpu_lifecycle_lock(session)
+    host = (
+        await session.execute(
+            select(Host)
+            .where(Host.host_id == host_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if host is None or (host.capacity or 0) <= 0:
+        return None
+    used = int(
+        (
+            await session.execute(
+                select(func.count(Server.server_id)).where(
+                    Server.host_id == host_id,
+                    Server.self_registered.is_(True),
+                    Server.storage_role.is_(False),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    reserved = int(
+        (
+            await session.execute(
+                select(func.count(TdLaunchReservation.reservation_id)).where(
+                    TdLaunchReservation.host_id == host_id,
+                    TdLaunchReservation.role == "chute",
+                    TdLaunchReservation.consumed_at.is_(None),
+                    TdLaunchReservation.invalidated_at.is_(None),
+                    TdLaunchReservation.expires_at > func.now(),
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    if used + reserved >= host.capacity:
+        return None
+    return host
 
 
 def _server_fits(server: Server, req_cores: int, req_ram: int) -> bool:
@@ -647,6 +711,14 @@ async def _launch_on_host(
             profile_id = matching_names[0]
         process_incarnation = uuid.uuid4().hex
         server_id = f"chute-{process_incarnation}"
+        locked_host = await _lock_host_with_capacity(session, host.host_id)
+        if locked_host is None:
+            await session.rollback()
+            logger.info(
+                f"Skipping host {host.host_id}: durable capacity was exhausted before reservation"
+            )
+            return False
+        host = locked_host
         try:
             reservation, reservation_token = await create_launch_reservation(
                 session,
@@ -1008,10 +1080,32 @@ async def schedule_once() -> None:
                     )
 
 
+class SchedulerLeaseLost(RuntimeError):
+    """Raised when a scheduler replica no longer owns its distributed lease."""
+
+
+async def _renew_scheduler_lock(lock_id: str) -> None:
+    while True:
+        await asyncio.sleep(SCHEDULER_LOCK_RENEW_INTERVAL_SECONDS)
+        renewed = await settings.redis_client.eval(
+            SCHEDULER_LOCK_RENEW_SCRIPT,
+            1,
+            SCHEDULER_LOCK_KEY,
+            lock_id,
+            SCHEDULER_LOCK_TTL,
+        )
+        if not renewed:
+            raise SchedulerLeaseLost("CPU scheduler lost its distributed lease")
+
+
+async def _run_scheduler_tick() -> None:
+    await expire_stale_launch_configs()
+    await schedule_once()
+
+
 async def _tick_with_lock() -> None:
-    """Run one scheduler tick under the distributed lock (autoscaler_lock pattern: SET NX with
-    TTL + value-checked release). A replica that loses the race skips its tick -- without this,
-    two replicas double-dispatch every deploy."""
+    """Run one scheduler tick under an owner-renewed, atomically released Redis lease."""
+
     lock_id = str(uuid.uuid4())
     acquired = await settings.redis_client.set(
         SCHEDULER_LOCK_KEY, lock_id, nx=True, ex=SCHEDULER_LOCK_TTL
@@ -1019,13 +1113,37 @@ async def _tick_with_lock() -> None:
     if not acquired:
         logger.debug("CPU scheduler lock held by another replica; skipping tick")
         return
+    tick_task = asyncio.create_task(_run_scheduler_tick())
+    renew_task = asyncio.create_task(_renew_scheduler_lock(lock_id))
     try:
-        await expire_stale_launch_configs()
-        await schedule_once()
+        done, _ = await asyncio.wait(
+            {tick_task, renew_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if renew_task in done:
+            lease_error = renew_task.exception()
+            if not tick_task.done():
+                tick_task.cancel()
+                await asyncio.gather(tick_task, return_exceptions=True)
+            if lease_error is not None:
+                raise lease_error
+            raise SchedulerLeaseLost("CPU scheduler lease renewal stopped unexpectedly")
+        await tick_task
     finally:
-        current = await settings.redis_client.get(SCHEDULER_LOCK_KEY)
-        if current and (current.decode() if isinstance(current, bytes) else current) == lock_id:
-            await settings.redis_client.delete(SCHEDULER_LOCK_KEY)
+        if not tick_task.done():
+            tick_task.cancel()
+            await asyncio.gather(tick_task, return_exceptions=True)
+        if not renew_task.done():
+            renew_task.cancel()
+            await asyncio.gather(renew_task, return_exceptions=True)
+        try:
+            await settings.redis_client.eval(
+                SCHEDULER_LOCK_RELEASE_SCRIPT,
+                1,
+                SCHEDULER_LOCK_KEY,
+                lock_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - the TTL remains the fail-safe release
+            logger.warning(f"Could not release CPU scheduler lease atomically: {exc}")
 
 
 async def main() -> None:

@@ -9,12 +9,14 @@ routed by its (entity, column) signature, so the tests pin the real query shapes
 without depending on SQL string rendering.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.dialects import postgresql
 
 import api.cpu_scheduler as cs
 from api.config import (
@@ -33,6 +35,8 @@ class FakeRedis:
     def __init__(self):
         self.store = {}
         self.published = []
+        self.eval_calls = []
+        self.renewals = []
 
     async def get(self, key):
         return self.store.get(key)
@@ -64,6 +68,25 @@ class FakeRedis:
 
     async def expire(self, key, ttl):
         return key in self.store
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        assert numkeys == 1
+        key, owner, *args = keys_and_args
+        self.eval_calls.append((script, key, owner, tuple(args)))
+        current = self.store.get(key)
+        if isinstance(current, bytes):
+            current = current.decode()
+        if isinstance(owner, bytes):
+            owner = owner.decode()
+        if current != owner:
+            return 0
+        if script == cs.SCHEDULER_LOCK_RELEASE_SCRIPT:
+            self.store.pop(key, None)
+            return 1
+        if script == cs.SCHEDULER_LOCK_RENEW_SCRIPT:
+            self.renewals.append((key, owner, int(args[0])))
+            return 1
+        raise AssertionError("Unexpected Redis script")
 
     async def publish(self, channel, payload):
         self.published.append((channel, payload))
@@ -126,11 +149,15 @@ class FakeSession:
         self.handlers = handlers
         self.added = []
         self.committed = False
+        self.rolled_back = False
         self.executed = []
+        self.statements = []
+        self.info = {}
 
     async def execute(self, stmt, params=None):
         key = _stmt_key(stmt)
         self.executed.append((key, params))
+        self.statements.append(stmt)
         if key not in self.handlers:
             raise AssertionError(f"Unexpected query in test: {key}")
         handler = self.handlers[key]
@@ -147,6 +174,10 @@ class FakeSession:
 
     async def commit(self):
         self.committed = True
+
+    async def rollback(self):
+        self.rolled_back = True
+        self.info.clear()
 
     async def refresh(self, obj):
         return None
@@ -836,6 +867,60 @@ class TestDispatchDeploy:
         assert session.added[0].user_id == job.user_id
 
 
+class TestHostCapacityFence:
+    @pytest.mark.asyncio
+    async def test_locks_lifecycle_then_current_host_and_rechecks_capacity(self):
+        host = SimpleNamespace(host_id="host-1", capacity=2)
+        session = FakeSession(
+            {
+                "text:other": FakeResult(),
+                "Host.Host": FakeResult(items=[host]),
+                "Server.count": FakeResult(scalar=1),
+                "TdLaunchReservation.count": FakeResult(scalar=0),
+            }
+        )
+
+        assert await cs._lock_host_with_capacity(session, host.host_id) is host
+        assert [key for key, _params in session.executed] == [
+            "text:other",
+            "Host.Host",
+            "Server.count",
+            "TdLaunchReservation.count",
+        ]
+        host_statement = session.statements[1]
+        host_sql = str(host_statement.compile(dialect=postgresql.dialect()))
+        assert "FOR UPDATE" in host_sql
+        assert host_statement.get_execution_options()["populate_existing"] is True
+
+        server_sql = str(session.statements[2].compile(dialect=postgresql.dialect()))
+        assert "servers.host_id =" in server_sql
+        assert "servers.self_registered IS true" in server_sql
+        assert "servers.storage_role IS false" in server_sql
+
+        reservation_sql = str(
+            session.statements[3].compile(dialect=postgresql.dialect())
+        )
+        assert "td_launch_reservations.host_id =" in reservation_sql
+        assert "td_launch_reservations.role =" in reservation_sql
+        assert "td_launch_reservations.consumed_at IS NULL" in reservation_sql
+        assert "td_launch_reservations.invalidated_at IS NULL" in reservation_sql
+        assert "td_launch_reservations.expires_at > now()" in reservation_sql
+
+    @pytest.mark.asyncio
+    async def test_fails_closed_when_locked_capacity_is_exhausted(self):
+        host = SimpleNamespace(host_id="host-1", capacity=2)
+        session = FakeSession(
+            {
+                "text:other": FakeResult(),
+                "Host.Host": FakeResult(items=[host]),
+                "Server.count": FakeResult(scalar=1),
+                "TdLaunchReservation.count": FakeResult(scalar=1),
+            }
+        )
+
+        assert await cs._lock_host_with_capacity(session, host.host_id) is None
+
+
 class TestLaunchOnHost:
     @pytest.fixture(autouse=True)
     def _container_digest(self, monkeypatch):
@@ -843,6 +928,13 @@ class TestLaunchOnHost:
             "api.image.forge.get_image_digest",
             AsyncMock(return_value=f"sha256:{'a' * 64}"),
         )
+
+        async def lock_current_host(session, host_id):
+            handler = session.handlers["Host.Host"]
+            hosts = handler._items if isinstance(handler, FakeResult) else handler[0]._items
+            return next(host for host in hosts if host.host_id == host_id)
+
+        monkeypatch.setattr(cs, "_lock_host_with_capacity", lock_current_host)
 
     def _handlers(self, hosts, used_rows=None, chute_host_ids=(set(), set())):
         active_release = SimpleNamespace(
@@ -1019,6 +1111,27 @@ class TestLaunchOnHost:
         send.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_final_capacity_recheck_blocks_stale_candidate(
+        self, mock_settings, monkeypatch
+    ):
+        handlers = self._handlers([self._host(capacity=1)])
+        session = FakeSession(handlers)
+        send = AsyncMock(return_value="cmd-1")
+        reserve = AsyncMock()
+        monkeypatch.setattr(cs, "_lock_host_with_capacity", AsyncMock(return_value=None))
+        with (
+            patch("api.cpu_scheduler.send_agent_command", send),
+            patch("api.cpu_scheduler.is_agent_online", AsyncMock(return_value=True)),
+            patch("api.cpu_scheduler.create_launch_reservation", reserve),
+        ):
+            launched = await cs._launch_on_host(session, _chute(), 2, 4)
+
+        assert not launched
+        assert session.rolled_back
+        reserve.assert_not_awaited()
+        send.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_zero_schedulable_storage_host_is_never_dispatched(self, mock_settings):
         handlers = self._handlers([self._host(capacity=0)])
         launched, send = await self._run(handlers)
@@ -1111,6 +1224,64 @@ class TestTickWithLock:
             with pytest.raises(RuntimeError):
                 await cs._tick_with_lock()
         assert cs.SCHEDULER_LOCK_KEY not in fake_redis.store
+
+    @pytest.mark.asyncio
+    async def test_long_tick_renews_only_its_owned_lock(
+        self, mock_settings, fake_redis, monkeypatch
+    ):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def long_tick():
+            entered.set()
+            await release.wait()
+
+        monkeypatch.setattr(cs, "SCHEDULER_LOCK_RENEW_INTERVAL_SECONDS", 0.001)
+        with (
+            patch("api.cpu_scheduler.expire_stale_launch_configs", AsyncMock()),
+            patch("api.cpu_scheduler.schedule_once", AsyncMock(side_effect=long_tick)),
+        ):
+            task = asyncio.create_task(cs._tick_with_lock())
+            await entered.wait()
+            for _ in range(100):
+                if fake_redis.renewals:
+                    break
+                await asyncio.sleep(0.001)
+            release.set()
+            await task
+
+        assert fake_redis.renewals
+        assert all(owner == fake_redis.renewals[0][1] for _key, owner, _ttl in fake_redis.renewals)
+        assert cs.SCHEDULER_LOCK_KEY not in fake_redis.store
+
+    @pytest.mark.asyncio
+    async def test_lost_lease_cancels_tick_and_preserves_successor(
+        self, mock_settings, fake_redis, monkeypatch
+    ):
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_tick():
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(cs, "SCHEDULER_LOCK_RENEW_INTERVAL_SECONDS", 0.001)
+        with (
+            patch("api.cpu_scheduler.expire_stale_launch_configs", AsyncMock()),
+            patch("api.cpu_scheduler.schedule_once", AsyncMock(side_effect=blocked_tick)),
+        ):
+            task = asyncio.create_task(cs._tick_with_lock())
+            await entered.wait()
+            fake_redis.store[cs.SCHEDULER_LOCK_KEY] = "successor"
+            with pytest.raises(cs.SchedulerLeaseLost):
+                await task
+
+        assert cancelled.is_set()
+        assert fake_redis.store[cs.SCHEDULER_LOCK_KEY] == "successor"
 
     @pytest.mark.asyncio
     async def test_lock_not_deleted_when_value_changed(self, mock_settings, fake_redis):
