@@ -46,6 +46,8 @@ from api.server.schemas import (
     GpuInfraAbandonResponseV1,
     GpuInfraCloseRequestV1,
     GpuInfraCloseResponseV1,
+    GpuDecommissionRequestV1,
+    GpuDecommissionResponseV1,
     GpuInfraMigrationPromoteRequestV1,
     GpuInfraMigrationPromoteResponseV1,
     GpuInfraMigrationRefreshRequestV1,
@@ -88,6 +90,7 @@ from api.server.gpu_infra import (
     close_legacy_gpu_sources,
     complete_gpu_infra_migration,
     confirm_gpu_infra,
+    decommission_gpu_server,
     lease_gpu_infra,
     promote_gpu_infra_migration,
     refresh_gpu_infra_migration,
@@ -631,6 +634,33 @@ async def close_gpu_infra_endpoint(
         expected_cert_hash,
         body,
     )
+    await db.commit()
+    return result
+
+
+@router.post(
+    "/gpu/{server_id}/decommission",
+    response_model=GpuDecommissionResponseV1,
+)
+async def decommission_gpu_server_endpoint(
+    server_id: str,
+    body: GpuDecommissionRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _: User = Depends(
+        get_current_user(
+            purpose="tee",
+            raise_not_found=False,
+            registered_to=settings.netuid,
+        )
+    ),
+):
+    if not hotkey:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Hotkey header required",
+        )
+    result = await decommission_gpu_server(db, server_id, hotkey, body)
     await db.commit()
     return result
 

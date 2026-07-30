@@ -23,7 +23,8 @@ from api.host.reservations import (
     observe_gpu_storage_liveness,
 )
 from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation, RegistrySession
-from api.instance.schemas import Instance
+from api.instance.schemas import Instance, instance_nodes
+from api.node.schemas import Node
 from api.server.gpu_sessions import (
     _current_attestation,
     _latest_attestation_attempt,
@@ -36,6 +37,8 @@ from api.server.schemas import (
     GpuInfraAcknowledgeResponseV1,
     GpuInfraCloseRequestV1,
     GpuInfraCloseResponseV1,
+    GpuDecommissionRequestV1,
+    GpuDecommissionResponseV1,
     GpuInfraConfirmRequestV1,
     GpuInfraConfirmResponseV1,
     GpuInfraCustody,
@@ -61,6 +64,8 @@ from api.server.schemas import (
     GpuLegacyHostConfirmResponseV1,
     GpuLegacyMigration,
     GpuMinerIdentity,
+    GpuServerDecommission,
+    ChuteFSLaunchSession,
     Host,
     LuksCapabilityPurpose,
     LuksVolumeGenerationLease,
@@ -1695,7 +1700,7 @@ async def seal_gpu_infra_for_reservation(
         or custody.reservation_generation != reservation.reservation_generation
         or custody.allocation_group_id != reservation.allocation_group_id
         or custody.allocation_group_generation != reservation.allocation_group_generation
-        or custody.state == "conflict"
+        or custody.state in {"conflict", "decommissioned"}
     ):
         raise GpuInfraError("Miner GPU teardown does not own current gpu-infra custody.")
     _abandon_locked(custody, preserve_rollback=True)
@@ -1741,7 +1746,7 @@ async def force_seal_gpu_infra_from_recovery(
         != reservation.allocation_group_generation
         or custody.management_mode != reservation.management_mode
         or custody.migration_id != reservation.legacy_migration_id
-        or custody.state == "conflict"
+        or custody.state in {"conflict", "decommissioned"}
     ):
         raise GpuInfraError(
             "Forced recovery source-reader result differs from current gpu-infra custody."
@@ -1780,3 +1785,365 @@ async def require_gpu_infra_sealed(
         or custody.guest_closed_generation != custody.confirmed_generation
     ):
         raise GpuInfraError("Miner GPU reset cannot release an unclosed gpu-infra generation.")
+
+
+def _gpu_reservation_decommissionable(reservation: GpuLaunchReservation) -> bool:
+    if reservation.state == "released":
+        return bool(
+            reservation.reset_completed_at is not None
+            and reservation.released_at is not None
+        )
+    if reservation.state == "expired":
+        return bool(
+            reservation.claimed_at is None
+            and reservation.launching_at is None
+            and reservation.running_at is None
+            and reservation.launch_dispatched_at is None
+        )
+    return False
+
+
+def _gpu_decommission_response(audit: GpuServerDecommission) -> GpuDecommissionResponseV1:
+    return GpuDecommissionResponseV1.model_validate(audit.response_json)
+
+
+async def decommission_gpu_server(
+    db: AsyncSession,
+    server_id: str,
+    owner_hotkey: str,
+    request: GpuDecommissionRequestV1,
+) -> GpuDecommissionResponseV1:
+    """Irreversibly close a terminal GPU server without deleting its audit graph.
+
+    Authentication and the initial ownership lookup happen before the global GPU
+    lifecycle lock. The authoritative server, custody, migration and reservation
+    rows are then re-read under locks, so a concurrent launch/reset can only win
+    before this transition or observe the immutable terminal record afterwards.
+    """
+
+    observed = (
+        await db.execute(
+            select(Server).where(
+                Server.server_id == server_id,
+                Server.miner_hotkey == owner_hotkey,
+            )
+        )
+    ).scalar_one_or_none()
+    if observed is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="GPU server not found.",
+        )
+
+    await acquire_gpu_lifecycle_lock(db)
+    server = (
+        await db.execute(
+            select(Server)
+            .where(
+                Server.server_id == server_id,
+                Server.miner_hotkey == owner_hotkey,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="GPU server not found.",
+        )
+
+    audits = list(
+        (
+            await db.execute(
+                select(GpuServerDecommission)
+                .where(
+                    or_(
+                        GpuServerDecommission.server_id == server_id,
+                        GpuServerDecommission.request_id == request.request_id,
+                    )
+                )
+                .order_by(GpuServerDecommission.server_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if audits:
+        audit = audits[0]
+        if (
+            len(audits) != 1
+            or audit.server_id != server_id
+            or audit.request_id != request.request_id
+            or audit.owner_hotkey != owner_hotkey
+            or audit.reason != request.reason
+        ):
+            _conflict("GPU decommission request identity was already consumed.")
+        return _gpu_decommission_response(audit)
+
+    if server.compute_type != "gpu":
+        _conflict("Only GPU servers can use GPU decommissioning.")
+
+    reservations = list(
+        (
+            await db.execute(
+                select(GpuLaunchReservation)
+                .where(GpuLaunchReservation.server_id == server_id)
+                .order_by(
+                    GpuLaunchReservation.reservation_generation,
+                    GpuLaunchReservation.reservation_id,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any(not _gpu_reservation_decommissionable(item) for item in reservations):
+        _conflict("GPU reservations must prove pre-launch expiry or completed physical reset.")
+
+    active_instance = (
+        await db.execute(
+            select(Instance.instance_id)
+            .outerjoin(
+                instance_nodes,
+                instance_nodes.c.instance_id == Instance.instance_id,
+            )
+            .outerjoin(Node, Node.uuid == instance_nodes.c.node_id)
+            .where(
+                or_(Instance.server_id == server_id, Node.server_id == server_id),
+                Instance.active.is_(True),
+            )
+            .limit(1)
+            .with_for_update(of=Instance)
+        )
+    ).scalar_one_or_none()
+    if active_instance is not None:
+        _conflict("Active GPU instances must be terminalized before decommissioning.")
+
+    nodes = list(
+        (
+            await db.execute(
+                select(Node)
+                .where(Node.server_id == server_id)
+                .order_by(Node.uuid)
+                .with_for_update(of=Node)
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
+
+    custody = (
+        await db.execute(
+            select(GpuInfraCustody)
+            .where(GpuInfraCustody.server_id == server_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if custody is not None and (
+        custody.state != "sealed"
+        or custody.guest_closed_at is None
+        or custody.guest_closed_generation != custody.confirmed_generation
+    ):
+        _conflict("GPU infrastructure custody must be sealed and guest-closed first.")
+
+    migrations = list(
+        (
+            await db.execute(
+                select(GpuLegacyMigration)
+                .where(
+                    or_(
+                        GpuLegacyMigration.legacy_server_id == server_id,
+                        GpuLegacyMigration.target_server_id == server_id,
+                    )
+                )
+                .order_by(GpuLegacyMigration.migration_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any(item.state not in {"completed", "decommissioned"} for item in migrations):
+        _conflict("Legacy GPU migration must complete before decommissioning.")
+
+    cutovers = list(
+        (
+            await db.execute(
+                select(GpuLegacyCutoverAuthorization)
+                .where(
+                    or_(
+                        GpuLegacyCutoverAuthorization.legacy_server_id == server_id,
+                        GpuLegacyCutoverAuthorization.target_server_id == server_id,
+                    )
+                )
+                .order_by(GpuLegacyCutoverAuthorization.authorization_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if any(item.state != "consumed" for item in cutovers):
+        _conflict("Outstanding legacy GPU cutover authority must be consumed first.")
+
+    vm_config = (
+        await db.execute(
+            select(VmCacheConfig)
+            .where(
+                VmCacheConfig.miner_hotkey == owner_hotkey,
+                VmCacheConfig.vm_name == server.name,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    vm_has_active_custody = vm_config is not None and (
+        bool(vm_config.volume_passphrases)
+        or bool(vm_config.volume_generation_leases)
+        or vm_config.k3s_encryption_key is not None
+    )
+    vm_custody_was_migrated = any(
+        item.legacy_server_id == server_id
+        and item.legacy_vm_name == server.name
+        and item.state in {"completed", "decommissioned"}
+        for item in migrations
+    )
+    if vm_has_active_custody and not vm_custody_was_migrated:
+        _conflict("Legacy GPU key custody must be closed before decommissioning.")
+
+    identity = (
+        await db.execute(
+            select(GpuMinerIdentity)
+            .where(GpuMinerIdentity.server_id == server_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+
+    now = _now()
+    for node in nodes:
+        node.verified_at = None
+        node.verification_error = "GPU server decommissioned"
+        node.gpu_retired_at = now
+
+    if vm_has_active_custody:
+        vm_config.volume_passphrases = {}
+        vm_config.volume_generation_leases = {}
+        vm_config.k3s_encryption_key = None
+        vm_config.updated_at = now
+
+    if custody is not None:
+        for name in (
+            "current_passphrase",
+            "pending_passphrase",
+            "retiring_passphrase",
+            "k3s_encryption_key",
+            "rollback_passphrase",
+        ):
+            setattr(custody, name, None)
+        for name in (
+            "active_key_slot",
+            "pending_key_slot",
+            "retiring_key_slot",
+            "lease_id",
+            "lease_generation",
+            "lease_expires_at",
+            "lease_attestation_id",
+            "lease_cert_hash",
+            "lease_session_jti",
+            "pending_marker_sha256",
+            "rollback_generation",
+            "rollback_key_slot",
+        ):
+            setattr(custody, name, None)
+        custody.state = "decommissioned"
+        custody.decommission_request_id = request.request_id
+        custody.decommissioned_at = now
+        custody.updated_at = now
+
+    for migration in migrations:
+        if migration.state == "decommissioned":
+            continue
+        migration.storage_current_passphrase = None
+        migration.storage_pending_passphrase = None
+        migration.storage_lease = None
+        migration.cache_current_passphrase = None
+        migration.cache_pending_passphrase = None
+        migration.cache_lease = None
+        migration.k3s_encryption_key = None
+        migration.postgres_password = None
+        migration.source_capability_hash = None
+        migration.source_capability_expires_at = None
+        migration.state = "decommissioned"
+        migration.decommission_request_id = request.request_id
+        migration.decommissioned_at = now
+        migration.updated_at = now
+
+    if identity is not None:
+        identity.legacy_vm_name = None
+        identity.updated_at = now
+
+    await db.execute(
+        update(ServerAttestation)
+        .where(
+            ServerAttestation.server_id == server_id,
+            ServerAttestation.gpu_retired_at.is_(None),
+        )
+        .values(gpu_retired_at=now)
+    )
+    await db.execute(
+        update(RegistrySession)
+        .where(RegistrySession.server_id == server_id, RegistrySession.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    await db.execute(
+        update(ChuteFSLaunchSession)
+        .where(
+            ChuteFSLaunchSession.server_id == server_id,
+            ChuteFSLaunchSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+
+    reservation = reservations[-1] if reservations else None
+    response = GpuDecommissionResponseV1(
+        server_id=server_id,
+        request_id=request.request_id,
+        decommissioned_at=now,
+        status="decommissioned",
+    )
+    audit = GpuServerDecommission(
+        server_id=server_id,
+        request_id=request.request_id,
+        owner_hotkey=owner_hotkey,
+        reason=request.reason,
+        host_id=(custody.host_id if custody is not None else reservation.host_id if reservation else None),
+        reservation_id=(custody.reservation_id if custody is not None else reservation.reservation_id if reservation else None),
+        reservation_generation=(custody.reservation_generation if custody is not None else reservation.reservation_generation if reservation else None),
+        allocation_group_id=(custody.allocation_group_id if custody is not None else reservation.allocation_group_id if reservation else None),
+        allocation_group_generation=(custody.allocation_group_generation if custody is not None else reservation.allocation_group_generation if reservation else None),
+        migration_ids=[item.migration_id for item in migrations],
+        response_json=response.model_dump(mode="json"),
+        decommissioned_at=now,
+    )
+
+    if server.gpu_retired_at is None:
+        server.gpu_retired_at = now
+        server.gpu_retirement_reason = request.reason
+    server.gpu_launch_reservation_id = None
+    server.gpu_allocation_group_id = None
+    server.gpu_allocation_group_generation = None
+    server.gpu_management_mode = None
+    server.gpu_process_incarnation = None
+    server.gpu_topology_fingerprint = None
+    server.gpu_runtime_session_attestation_id = None
+    server.gpu_runtime_session_expires_at = None
+    server.attested_cert = None
+    server.attested_cert_pubkey_hash = None
+    server.external_host = None
+    server.external_ports = None
+    server.last_health_at = None
+    await db.flush()
+    db.add(audit)
+    await db.flush()
+    return response

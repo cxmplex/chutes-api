@@ -9,6 +9,7 @@ import secrets
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
@@ -820,9 +821,10 @@ def _empty_server_retirement_result():
 
 @pytest.mark.asyncio
 async def test_delete_server_success(mock_db_session, sample_server):
-    """Test successful server deletion (preserves LUKS config for potential reboot)."""
+    """CPU servers retain the generic deletion behavior."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
+    sample_server.compute_type = "cpu"
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         mock_db_session.execute.return_value = _empty_server_retirement_result()
@@ -831,6 +833,22 @@ async def test_delete_server_success(mock_db_session, sample_server):
         assert result is True
         mock_db_session.delete.assert_called_once()
         mock_db_session.commit.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_delete_gpu_server_requires_explicit_decommission(
+    mock_db_session, sample_server
+):
+    sample_server.compute_type = "gpu"
+    with (
+        patch("api.server.service.check_server_ownership", return_value=sample_server),
+        pytest.raises(HTTPException, match="explicit decommission endpoint") as exc,
+    ):
+        await delete_server(mock_db_session, sample_server.server_id, sample_server.miner_hotkey)
+
+    assert exc.value.status_code == 409
+    mock_db_session.delete.assert_not_called()
+    mock_db_session.commit.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1199,6 +1217,7 @@ async def test_server_lifecycle_flow(mock_db_session, sample_server, server_args
     assert owned_server == sample_server
 
     # Step 3: Delete server
+    sample_server.compute_type = "cpu"
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         mock_db_session.execute.return_value = _empty_server_retirement_result()
         deleted = await delete_server(mock_db_session, "test-server-123", miner_hotkey)

@@ -686,6 +686,46 @@ class GpuInfraCloseResponseV1(BaseModel):
     status: Literal["closed"]
 
 
+class GpuDecommissionRequestV1(BaseModel):
+    """Owner-authorized terminalization of a closed GPU server."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-decommission-request"] = (
+        "chutes.gpu-decommission-request"
+    )
+    version: Literal[1] = 1
+    request_id: str
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("request_id")
+    @classmethod
+    def _canonical_request_id(cls, value: str) -> str:
+        canonical = str(uuid.UUID(value))
+        if canonical != value:
+            raise ValueError("request_id must be a canonical UUID")
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def _nonblank_reason(cls, value: str) -> str:
+        canonical = value.strip()
+        if not canonical:
+            raise ValueError("reason must contain non-whitespace characters")
+        return canonical
+
+
+class GpuDecommissionResponseV1(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema: Literal["chutes.gpu-decommissioned"] = "chutes.gpu-decommissioned"
+    version: Literal[1] = 1
+    server_id: str
+    request_id: str
+    decommissioned_at: datetime
+    status: Literal["decommissioned"]
+
+
 class GpuLegacyCloseRequestV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -2389,6 +2429,8 @@ class GpuLegacyMigration(Base):
     failure_reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    decommission_request_id = Column(String, nullable=True)
+    decommissioned_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint(
@@ -2401,7 +2443,8 @@ class GpuLegacyMigration(Base):
             name="uq_gpu_legacy_migration_target",
         ),
         CheckConstraint(
-            "state IN ('guest_closed', 'ready', 'leased', 'promoted', 'completed', 'abandoned')",
+            "state IN ('guest_closed', 'ready', 'leased', 'promoted', 'completed', "
+            "'decommissioned', 'abandoned')",
             name="ck_gpu_legacy_migration_state",
         ),
         CheckConstraint(
@@ -2436,7 +2479,7 @@ class GpuLegacyMigration(Base):
             "OR (state IN ('ready', 'leased') AND host_confirmed_at IS NOT NULL) "
             "OR (state = 'promoted' AND promoted_at IS NOT NULL "
             "AND promoted_marker_sha256 IS NOT NULL AND promoted_summary IS NOT NULL) "
-            "OR (state = 'completed' AND promoted_at IS NOT NULL "
+            "OR (state IN ('completed', 'decommissioned') AND promoted_at IS NOT NULL "
             "AND discarded_at IS NOT NULL AND completed_at IS NOT NULL "
             "AND storage_current_passphrase IS NULL "
             "AND storage_pending_passphrase IS NULL AND storage_lease IS NULL "
@@ -2447,6 +2490,13 @@ class GpuLegacyMigration(Base):
             "AND source_capability_expires_at IS NULL) "
             "OR state = 'abandoned'",
             name="ck_gpu_legacy_migration_progress",
+        ),
+        CheckConstraint(
+            "(state = 'decommissioned' AND decommission_request_id IS NOT NULL "
+            "AND decommissioned_at IS NOT NULL) OR "
+            "(state <> 'decommissioned' AND decommission_request_id IS NULL "
+            "AND decommissioned_at IS NULL)",
+            name="ck_gpu_legacy_migration_decommission",
         ),
         Index("idx_gpu_legacy_migrations_host_state", "host_id", "state"),
     )
@@ -2483,7 +2533,7 @@ class GpuInfraCustody(Base):
     pending_passphrase = Column(Text, nullable=True)
     retiring_passphrase = Column(Text, nullable=True)
     retiring_key_slot = Column(Integer, nullable=True)
-    k3s_encryption_key = Column(Text, nullable=False)
+    k3s_encryption_key = Column(Text, nullable=True)
     confirmed_generation = Column(Integer, nullable=False, default=0, server_default="0")
     active_key_slot = Column(Integer, nullable=True)
     pending_key_slot = Column(Integer, nullable=True)
@@ -2513,6 +2563,8 @@ class GpuInfraCustody(Base):
     )
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    decommission_request_id = Column(String, nullable=True)
+    decommissioned_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -2539,7 +2591,8 @@ class GpuInfraCustody(Base):
             name="ck_gpu_infra_slots",
         ),
         CheckConstraint(
-            "state IN ('current', 'leased', 'awaiting_ack', 'sealed', 'conflict')",
+            "state IN ('current', 'leased', 'awaiting_ack', 'sealed', "
+            "'decommissioned', 'conflict')",
             name="ck_gpu_infra_state",
         ),
         CheckConstraint(
@@ -2551,7 +2604,7 @@ class GpuInfraCustody(Base):
             "AND lease_cert_hash ~ '^[0-9a-f]{64}$' AND lease_session_jti IS NOT NULL "
             "AND (pending_marker_sha256 IS NULL "
             "OR pending_marker_sha256 ~ '^[0-9a-f]{64}$')) "
-            "OR (state IN ('current', 'sealed', 'conflict') "
+            "OR (state IN ('current', 'sealed', 'decommissioned', 'conflict') "
             "AND pending_passphrase IS NULL AND pending_key_slot IS NULL "
             "AND lease_id IS NULL AND lease_generation IS NULL "
             "AND lease_expires_at IS NULL AND lease_attestation_id IS NULL "
@@ -2567,9 +2620,28 @@ class GpuInfraCustody(Base):
             name="ck_gpu_infra_rollback_shape",
         ),
         CheckConstraint(
-            "(state = 'sealed' AND sealed_at IS NOT NULL) "
-            "OR (state <> 'sealed' AND sealed_at IS NULL)",
+            "(state IN ('sealed', 'decommissioned') AND sealed_at IS NOT NULL) "
+            "OR (state NOT IN ('sealed', 'decommissioned') AND sealed_at IS NULL)",
             name="ck_gpu_infra_seal_shape",
+        ),
+        CheckConstraint(
+            "(state = 'decommissioned' "
+            "AND decommission_request_id IS NOT NULL AND decommissioned_at IS NOT NULL "
+            "AND guest_closed_at IS NOT NULL "
+            "AND guest_closed_generation = confirmed_generation "
+            "AND current_passphrase IS NULL AND pending_passphrase IS NULL "
+            "AND retiring_passphrase IS NULL AND k3s_encryption_key IS NULL "
+            "AND active_key_slot IS NULL AND pending_key_slot IS NULL "
+            "AND retiring_key_slot IS NULL "
+            "AND lease_id IS NULL AND lease_generation IS NULL "
+            "AND lease_expires_at IS NULL AND lease_attestation_id IS NULL "
+            "AND lease_cert_hash IS NULL AND lease_session_jti IS NULL "
+            "AND pending_marker_sha256 IS NULL "
+            "AND rollback_generation IS NULL AND rollback_key_slot IS NULL "
+            "AND rollback_passphrase IS NULL) OR "
+            "(state <> 'decommissioned' AND decommission_request_id IS NULL "
+            "AND decommissioned_at IS NULL AND k3s_encryption_key IS NOT NULL)",
+            name="ck_gpu_infra_decommission",
         ),
         Index(
             "idx_gpu_infra_host",
@@ -2584,6 +2656,203 @@ class GpuInfraCustody(Base):
             postgresql_where=lease_expires_at.isnot(None),
         ),
     )
+
+
+class GpuServerDecommission(Base):
+    """Immutable terminal audit record for one retired GPU server."""
+
+    __tablename__ = "gpu_server_decommissions"
+
+    server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    request_id = Column(String, nullable=False, unique=True)
+    owner_hotkey = Column(String, nullable=False)
+    reason = Column(Text, nullable=False)
+    host_id = Column(String, nullable=True)
+    reservation_id = Column(String, nullable=True)
+    reservation_generation = Column(Integer, nullable=True)
+    allocation_group_id = Column(String, nullable=True)
+    allocation_group_generation = Column(Integer, nullable=True)
+    migration_ids = Column(JSONB, nullable=False, default=list, server_default="[]")
+    response_json = Column(JSONB, nullable=False)
+    decommissioned_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "length(reason) BETWEEN 1 AND 2000 "
+            "AND jsonb_typeof(migration_ids) = 'array' "
+            "AND jsonb_typeof(response_json) = 'object' "
+            "AND ((reservation_id IS NULL AND reservation_generation IS NULL) OR "
+            "(reservation_id IS NOT NULL AND reservation_generation > 0)) "
+            "AND ((allocation_group_id IS NULL AND allocation_group_generation IS NULL) OR "
+            "(allocation_group_id IS NOT NULL AND allocation_group_generation > 0))",
+            name="ck_gpu_server_decommission_audit",
+        ),
+        Index("idx_gpu_server_decommissions_owner", "owner_hotkey", "decommissioned_at"),
+    )
+
+
+_GPU_DECOMMISSION_AUDIT_FUNCTION = DDL(
+    """
+CREATE OR REPLACE FUNCTION preserve_gpu_server_decommission_audit()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'gpu server decommission audit rows are immutable';
+END
+$$
+"""
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_AUDIT_DROP_TRIGGER = DDL(
+    "DROP TRIGGER IF EXISTS preserve_gpu_server_decommission_audit ON gpu_server_decommissions"
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_AUDIT_CREATE_TRIGGER = DDL(
+    """
+CREATE TRIGGER preserve_gpu_server_decommission_audit
+BEFORE UPDATE OR DELETE ON gpu_server_decommissions
+FOR EACH ROW EXECUTE FUNCTION preserve_gpu_server_decommission_audit()
+"""
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_TERMINAL_FUNCTION = DDL(
+    """
+CREATE OR REPLACE FUNCTION preserve_gpu_decommission_terminal()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    _terminal_at TIMESTAMPTZ;
+    _terminal_reason TEXT;
+BEGIN
+    IF TG_TABLE_NAME = 'servers' THEN
+        SELECT decommissioned_at, reason
+          INTO _terminal_at, _terminal_reason
+          FROM gpu_server_decommissions
+         WHERE server_id = OLD.server_id;
+        IF FOUND THEN
+            IF TG_OP = 'UPDATE'
+               AND OLD.gpu_retired_at IS NULL
+               AND NEW.gpu_retired_at = _terminal_at
+               AND NEW.gpu_retirement_reason = _terminal_reason
+               AND NEW.gpu_launch_reservation_id IS NULL
+               AND NEW.gpu_allocation_group_id IS NULL
+               AND NEW.gpu_allocation_group_generation IS NULL
+               AND NEW.gpu_management_mode IS NULL
+               AND NEW.gpu_process_incarnation IS NULL
+               AND NEW.gpu_topology_fingerprint IS NULL
+               AND NEW.gpu_runtime_session_attestation_id IS NULL
+               AND NEW.gpu_runtime_session_expires_at IS NULL
+               AND NEW.attested_cert IS NULL
+               AND NEW.attested_cert_pubkey_hash IS NULL
+               AND NEW.external_host IS NULL
+               AND NEW.external_ports IS NULL
+               AND NEW.last_health_at IS NULL
+               AND (
+                   to_jsonb(NEW) - ARRAY[
+                       'updated_at', 'gpu_retired_at', 'gpu_retirement_reason',
+                       'gpu_launch_reservation_id', 'gpu_allocation_group_id',
+                       'gpu_allocation_group_generation', 'gpu_management_mode',
+                       'gpu_process_incarnation', 'gpu_topology_fingerprint',
+                       'gpu_runtime_session_attestation_id',
+                       'gpu_runtime_session_expires_at', 'attested_cert',
+                       'attested_cert_pubkey_hash', 'external_host',
+                       'external_ports', 'last_health_at'
+                   ]::text[]
+               ) IS NOT DISTINCT FROM (
+                   to_jsonb(OLD) - ARRAY[
+                       'updated_at', 'gpu_retired_at', 'gpu_retirement_reason',
+                       'gpu_launch_reservation_id', 'gpu_allocation_group_id',
+                       'gpu_allocation_group_generation', 'gpu_management_mode',
+                       'gpu_process_incarnation', 'gpu_topology_fingerprint',
+                       'gpu_runtime_session_attestation_id',
+                       'gpu_runtime_session_expires_at', 'attested_cert',
+                       'attested_cert_pubkey_hash', 'external_host',
+                       'external_ports', 'last_health_at'
+                   ]::text[]
+               ) THEN
+                RETURN NEW;
+            END IF;
+            IF TG_OP = 'UPDATE' AND NEW IS NOT DISTINCT FROM OLD THEN
+                RETURN NEW;
+            END IF;
+            RAISE EXCEPTION 'decommissioned GPU server rows are immutable';
+        END IF;
+    ELSIF TG_OP = 'INSERT' THEN
+        IF TG_TABLE_NAME = 'gpu_infra_custodies' AND EXISTS (
+            SELECT 1 FROM gpu_server_decommissions
+             WHERE server_id = NEW.server_id
+        ) THEN
+            RAISE EXCEPTION 'decommissioned GPU custody cannot be recreated';
+        ELSIF TG_TABLE_NAME = 'gpu_legacy_migrations' AND EXISTS (
+            SELECT 1 FROM gpu_server_decommissions
+             WHERE server_id = NEW.legacy_server_id
+                OR server_id = NEW.target_server_id
+        ) THEN
+            RAISE EXCEPTION 'decommissioned GPU migration lineage cannot be recreated';
+        END IF;
+        RETURN NEW;
+    ELSIF (to_jsonb(OLD)->>'state') = 'decommissioned' THEN
+        IF TG_OP = 'UPDATE' AND NEW IS NOT DISTINCT FROM OLD THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'decommissioned GPU custody and migration rows are immutable';
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END
+$$
+"""
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_TERMINAL_DROP_SERVER = DDL(
+    "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_server ON servers"
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_TERMINAL_DROP_CUSTODY = DDL(
+    "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_custody "
+    "ON gpu_infra_custodies"
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_TERMINAL_DROP_MIGRATION = DDL(
+    "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_migration "
+    "ON gpu_legacy_migrations"
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_TERMINAL_CREATE_SERVER = DDL(
+    "CREATE TRIGGER preserve_gpu_decommissioned_server "
+    "BEFORE UPDATE OR DELETE ON servers FOR EACH ROW "
+    "EXECUTE FUNCTION preserve_gpu_decommission_terminal()"
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_TERMINAL_CREATE_CUSTODY = DDL(
+    "CREATE TRIGGER preserve_gpu_decommissioned_custody "
+    "BEFORE INSERT OR UPDATE OR DELETE ON gpu_infra_custodies FOR EACH ROW "
+    "EXECUTE FUNCTION preserve_gpu_decommission_terminal()"
+).execute_if(dialect="postgresql")
+_GPU_DECOMMISSION_TERMINAL_CREATE_MIGRATION = DDL(
+    "CREATE TRIGGER preserve_gpu_decommissioned_migration "
+    "BEFORE INSERT OR UPDATE OR DELETE ON gpu_legacy_migrations FOR EACH ROW "
+    "EXECUTE FUNCTION preserve_gpu_decommission_terminal()"
+).execute_if(dialect="postgresql")
+for ddl in (
+    _GPU_DECOMMISSION_AUDIT_FUNCTION,
+    _GPU_DECOMMISSION_AUDIT_DROP_TRIGGER,
+    _GPU_DECOMMISSION_AUDIT_CREATE_TRIGGER,
+    _GPU_DECOMMISSION_TERMINAL_FUNCTION,
+    _GPU_DECOMMISSION_TERMINAL_DROP_SERVER,
+    _GPU_DECOMMISSION_TERMINAL_DROP_CUSTODY,
+    _GPU_DECOMMISSION_TERMINAL_DROP_MIGRATION,
+    _GPU_DECOMMISSION_TERMINAL_CREATE_SERVER,
+    _GPU_DECOMMISSION_TERMINAL_CREATE_CUSTODY,
+    _GPU_DECOMMISSION_TERMINAL_CREATE_MIGRATION,
+):
+    # The audit table has only a Server FK, so SQLAlchemy may create it before
+    # gpu_legacy_migrations and gpu_infra_custodies. Install the cross-table
+    # triggers only after the complete metadata graph exists.
+    event.listen(Base.metadata, "after_create", ddl)
 
 
 class ContentHolding(Base):

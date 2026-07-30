@@ -150,10 +150,12 @@ from api.server.schemas import (
     ChuteFSTokenKeyEpoch,
     ChuteFSTokenKeyReplicaAck,
     DefaultChuteFSVolumeBinding,
+    GpuDecommissionRequestV1,
     GpuInfraCustody,
     GpuLegacyCloseRequestV1,
     GpuLegacyMigration,
     GpuMinerIdentity,
+    GpuServerDecommission,
     Server,
     ServerAttestation,
     RuntimeAttestationArgs,
@@ -162,7 +164,7 @@ from api.server.schemas import (
     StorageVolumeKey,
     VmCacheConfig,
 )
-from api.server.gpu_infra import close_legacy_gpu_sources
+from api.server.gpu_infra import close_legacy_gpu_sources, decommission_gpu_server
 from api.server.gpu_infra import (
     _capability_hash,
     _migration_capability,
@@ -191,6 +193,7 @@ from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import load_launch_config_from_jwt
 from api.metagraph import MetagraphNode
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -8208,3 +8211,113 @@ async def test_verified_registration_conflict_cannot_fence_changed_lineage(
         assert reservation.quarantined_at is None
         assert group.state == "launching"
         assert group.quarantined_at is None
+
+
+async def test_gpu_decommission_rejects_active_and_serializes_exact_retry(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        session.add_all(
+            [
+                Server(
+                    server_id="decommission-active",
+                    ip="192.0.2.80",
+                    miner_hotkey="owner",
+                    name="decommission-active",
+                    netuid=64,
+                    compute_type="gpu",
+                ),
+                VmCacheConfig(
+                    miner_hotkey="owner",
+                    vm_name="decommission-active",
+                    volume_passphrases={"storage": "encrypted-active-secret"},
+                    volume_epochs={},
+                    volume_generation_leases={},
+                ),
+                Server(
+                    server_id="decommission-registered",
+                    ip="192.0.2.81",
+                    miner_hotkey="owner",
+                    name="decommission-registered",
+                    netuid=64,
+                    compute_type="gpu",
+                ),
+            ]
+        )
+        await session.commit()
+
+    request = GpuDecommissionRequestV1(
+        request_id="22222222-2222-2222-2222-222222222222",
+        reason="hardware permanently removed",
+    )
+    async with sessions() as session:
+        with pytest.raises(HTTPException, match="Legacy GPU key custody") as exc:
+            await decommission_gpu_server(
+                session,
+                "decommission-active",
+                "owner",
+                request,
+            )
+        assert exc.value.status_code == 409
+        await session.rollback()
+
+    async def terminalize():
+        async with sessions() as session:
+            result = await decommission_gpu_server(
+                session,
+                "decommission-registered",
+                "owner",
+                request,
+            )
+            await session.commit()
+            return result
+
+    first, replay = await asyncio.gather(terminalize(), terminalize())
+    assert first == replay
+
+    async with sessions() as session:
+        audits = list(
+            (await session.execute(select(GpuServerDecommission))).scalars()
+        )
+        assert len(audits) == 1
+        assert audits[0].response_json == first.model_dump(mode="json")
+        retained = await session.get(Server, "decommission-registered")
+        assert retained is not None
+        assert retained.gpu_retired_at is not None
+        audits[0].reason = "attempted audit rewrite"
+        with pytest.raises(DBAPIError, match="decommission audit rows are immutable"):
+            await session.flush()
+
+
+async def test_gpu_decommission_clean_create_all_installs_terminal_triggers(
+    postgres_schema,
+):
+    sessions, schema = postgres_schema
+    expected = {
+        ("gpu_server_decommissions", "preserve_gpu_server_decommission_audit"),
+        ("servers", "preserve_gpu_decommissioned_server"),
+        ("gpu_infra_custodies", "preserve_gpu_decommissioned_custody"),
+        ("gpu_legacy_migrations", "preserve_gpu_decommissioned_migration"),
+    }
+    async with sessions() as session:
+        installed = set(
+            (
+                await session.execute(
+                    text(
+                        """
+                        SELECT event_object_table, trigger_name
+                          FROM information_schema.triggers
+                         WHERE trigger_schema = :schema
+                           AND trigger_name = ANY(:trigger_names)
+                        """
+                    ),
+                    {
+                        "schema": schema,
+                        "trigger_names": [trigger for _, trigger in sorted(expected)],
+                    },
+                )
+            ).all()
+        )
+    assert installed == expected

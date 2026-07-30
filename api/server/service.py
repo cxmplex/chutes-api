@@ -3853,12 +3853,12 @@ async def delete_server(db: AsyncSession, server_id: str, miner_hotkey: str) -> 
         ServerNotFoundError: If server not found
     """
     server = await check_server_ownership(db, server_id, miner_hotkey)
-    if server.compute_type == "gpu" and server.gpu_launch_reservation_id:
+    if server.compute_type == "gpu":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "Reservation-owned GPU servers require the exact teardown/reset "
-                "lifecycle before retirement."
+                "GPU servers retain immutable lineage and require the explicit "
+                "decommission endpoint after teardown/reset."
             ),
         )
     config_ids = list(
