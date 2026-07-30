@@ -208,6 +208,7 @@ async def test_shared_job_uses_job_owner_with_chute_image_owner():
         (
             owner,
             version,
+            image_ref,
             repository,
             manifest,
             descriptor,
@@ -225,6 +226,7 @@ async def test_shared_job_uses_job_owner_with_chute_image_owner():
         )
     assert owner == "job-owner"
     assert version == "v1"
+    assert image_ref == "publisher/image:latest"
     assert repository == "publisher/image"
     assert manifest == root
     assert descriptor["manifest_tag_digests"] == {tag: signature}
@@ -338,6 +340,7 @@ async def test_platform_dispatch_rejects_miner_managed_server_before_config_crea
             server,
             SimpleNamespace(),
             None,
+            SimpleNamespace(),
             SimpleNamespace(),
         )
 

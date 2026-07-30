@@ -107,6 +107,7 @@ from api.host.schemas import (
     EnrollmentVoucherMintRequestV2,
     GpuMinerReservationRequestV1,
     GpuPlatformReservationRequestV1,
+    GpuPlatformWorkloadIdentityV1,
     HostEnrollmentRedemptionV2,
     HostKeyGeneration,
     GpuReservationClaimRequestV1,
@@ -188,11 +189,12 @@ from api.server.schemas import (
 from api.server.util import decrypt_passphrase, encrypt_passphrase
 from api.user.schemas import User
 from api.image.schemas import Image
+from api.job.schemas import Job
 from api.chute.schemas import Chute, NodeSelector
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import load_launch_config_from_jwt
 from api.metagraph import MetagraphNode
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -625,6 +627,7 @@ def _trusted_platform_workload(owner: str = "platform-workload-owner"):
     return (
         owner,
         "1",
+        f"{owner}/image:reserved",
         f"{owner}/image",
         root_manifest,
         {
@@ -643,9 +646,28 @@ async def _reserve_platform_group(
     owner: str = "platform-workload-owner",
     server_id: str = "platform-server",
 ):
+    root_manifest = f"sha256:{'9' * 64}"
+    identity = GpuPlatformWorkloadIdentityV1(
+        workload_owner=owner,
+        chute_id="platform-chute",
+        job_id=None,
+        chute_version="1",
+        chute_revision=None,
+        image_id="platform-image",
+        image_ref=f"{owner}/image:reserved",
+        container_repository=f"{owner}/image",
+        container_manifest_digest=root_manifest,
+        ref_str="entrypoint:handler",
+        chutes_version="0.6.0",
+        allow_external_egress=False,
+        lock_modules=False,
+        disk_gb=10,
+        job_method=None,
+        job_ports=[],
+    )
     with patch(
         "api.host.gpu_allocations._assert_platform_workload_current",
-        AsyncMock(return_value=None),
+        AsyncMock(return_value=identity),
     ):
         return await reserve_gpu_group(
             session,
@@ -662,8 +684,182 @@ async def _reserve_platform_group(
         )
 
 
+@pytest.mark.parametrize("mutation", ["chute", "image", "job"])
+async def test_platform_identity_recheck_refreshes_preloaded_rows(
+    postgres_schema,
+    mutation,
+):
+    sessions, _schema = postgres_schema
+    request = GpuPlatformReservationRequestV1(
+        server_id="identity-server",
+        process_incarnation="identity-process",
+        gpu_identifier="b200",
+        gpu_count=8,
+        minimum_vram_mib=196608,
+        chute_id="identity-chute",
+        job_id="identity-job",
+    )
+    async with sessions() as stale_session:
+        user_id = "identity-user"
+        await stale_session.execute(
+            User.__table__.insert().values(
+                user_id=user_id,
+                coldkey="identity-coldkey",
+                username="publisher",
+                fingerprint_hash="identity-fingerprint",
+            )
+        )
+        image = Image(
+            image_id="identity-image",
+            artifact_id="identity-artifact",
+            user_id=user_id,
+            name="image",
+            tag="stable",
+            status="built and pushed",
+            compute_type="gpu",
+        )
+        selector = NodeSelector(
+            compute_type="gpu",
+            gpu_count=8,
+            include=["b200"],
+        )
+        chute = Chute(
+            chute_id="identity-chute",
+            user_id=user_id,
+            image_id=image.image_id,
+            name="identity-chute",
+            cords=[],
+            jobs=[{"name": "notebook", "ports": []}],
+            node_selector=selector,
+            code="from chutes import Chute",
+            filename="identity.py",
+            ref_str="entrypoint:handler",
+            version="version-1",
+            chutes_version="0.6.1",
+            tee=True,
+        )
+        job = Job(
+            job_id="identity-job",
+            user_id=user_id,
+            chute_id=chute.chute_id,
+            version=chute.version,
+            chutes_version=chute.chutes_version,
+            method="notebook",
+            job_args={"_disk_gb": 64},
+            node_selector=selector.model_dump(mode="json"),
+            status="pending",
+            miner_history=[],
+            compute_multiplier=1.0,
+        )
+        stale_session.add(image)
+        await stale_session.flush()
+        stale_session.add_all([chute, job])
+        await stale_session.commit()
+
+        # Materialize the old rows in this identity map before another session
+        # changes one of the authority-bearing inputs.
+        await stale_session.get(Chute, chute.chute_id)
+        await stale_session.get(Image, image.image_id)
+        await stale_session.get(Job, job.job_id)
+
+        async with sessions() as mutator:
+            if mutation == "chute":
+                await mutator.execute(
+                    update(Chute)
+                    .where(Chute.chute_id == chute.chute_id)
+                    .values(ref_str="replacement:handler")
+                )
+            elif mutation == "image":
+                await mutator.execute(
+                    update(Image)
+                    .where(Image.image_id == image.image_id)
+                    .values(tag="replacement")
+                )
+            else:
+                await mutator.execute(
+                    update(Job)
+                    .where(Job.job_id == job.job_id)
+                    .values(job_args={"_disk_gb": 96})
+                )
+            await mutator.commit()
+
+        kwargs = dict(
+            expected_owner=user_id,
+            expected_version="version-1",
+            expected_image_ref="publisher/image:stable",
+            expected_repository="publisher/image",
+            expected_manifest_digest=f"sha256:{'9' * 64}",
+        )
+        if mutation == "image":
+            with pytest.raises(gpu_allocations.GpuAllocationError, match="changed"):
+                await gpu_allocations._assert_platform_workload_current(
+                    stale_session,
+                    request,
+                    **kwargs,
+                )
+        else:
+            identity = await gpu_allocations._assert_platform_workload_current(
+                stale_session,
+                request,
+                **kwargs,
+            )
+            if mutation == "chute":
+                assert identity.ref_str == "replacement:handler"
+            else:
+                assert identity.disk_gb == 96
+        await stale_session.rollback()
+
+
 async def test_gpu_allocation_migration_round_trip(postgres_schema):
     sessions, schema = postgres_schema
+
+    async def workload_identity_catalog():
+        async with sessions() as session:
+            return tuple(
+                (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT 'column|' || column_name || '|' || data_type || '|' ||
+                                   COALESCE(character_maximum_length::text, '')
+                              FROM information_schema.columns
+                             WHERE table_schema = :schema
+                               AND table_name = 'gpu_launch_reservations'
+                               AND column_name IN (
+                                   'workload_identity',
+                                   'workload_identity_sha256'
+                               )
+                            UNION ALL
+                            SELECT 'constraint|' || constraint_row.conname || '|' ||
+                                   regexp_replace(
+                                       pg_get_constraintdef(constraint_row.oid, true),
+                                       '::text',
+                                       '',
+                                       'g'
+                                   )
+                              FROM pg_constraint AS constraint_row
+                              JOIN pg_class AS relation
+                                ON relation.oid = constraint_row.conrelid
+                              JOIN pg_namespace AS namespace
+                                ON namespace.oid = relation.relnamespace
+                             WHERE namespace.nspname = :schema
+                               AND relation.relname = 'gpu_launch_reservations'
+                               AND constraint_row.conname IN (
+                                   'ck_gpu_launch_digests',
+                                   'ck_gpu_launch_descriptor_closure',
+                                   'ck_gpu_launch_workload'
+                               )
+                             ORDER BY 1
+                            """
+                        ),
+                        {"schema": schema},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+    create_all_catalog = await workload_identity_catalog()
     await _apply_migration(
         schema,
         "down",
@@ -752,6 +948,8 @@ async def test_gpu_allocation_migration_round_trip(postgres_schema):
         assert conflict_columns == {
             column.name for column in GpuRegistrationConflict.__table__.columns
         }
+
+    assert await workload_identity_catalog() == create_all_catalog
 
 
 async def test_concurrent_double_reservation_has_one_winner(postgres_schema):
@@ -1330,6 +1528,7 @@ async def test_concurrent_platform_and_miner_reservation_choose_one_manager(
         return (
             "owner",
             "1",
+            "owner/image:reserved",
             "owner/image",
             root_manifest,
             {

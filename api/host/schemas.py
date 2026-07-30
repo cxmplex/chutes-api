@@ -1254,6 +1254,74 @@ class GpuPlatformReservationRequestV1(FrozenWireModel):
         return value
 
 
+class GpuPlatformJobPortV1(FrozenWireModel):
+    """One exact externally published job port."""
+
+    port: int = Field(..., ge=1, le=65535)
+    proto: Literal["tcp", "udp", "http"]
+
+
+class GpuPlatformWorkloadIdentityV1(FrozenWireModel):
+    """Immutable chute/job identity captured when a platform GPU is reserved."""
+
+    schema: Literal["chutes.gpu-platform-workload-identity"] = (
+        "chutes.gpu-platform-workload-identity"
+    )
+    version: Literal[1] = 1
+    workload_owner: str = Field(..., min_length=1, max_length=256)
+    chute_id: str = Field(..., min_length=1, max_length=256)
+    job_id: Optional[str] = Field(None, min_length=1, max_length=256)
+    chute_version: str = Field(..., min_length=1, max_length=256)
+    chute_revision: Optional[str] = Field(None, pattern=r"^[0-9a-fA-F]{40}$")
+    image_id: str = Field(..., min_length=1, max_length=256)
+    image_ref: str = Field(..., min_length=3, max_length=512)
+    container_repository: str = Field(..., min_length=1, max_length=512)
+    container_manifest_digest: str
+    ref_str: str = Field(..., min_length=3, max_length=256)
+    chutes_version: Optional[str] = Field(None, min_length=1, max_length=128)
+    allow_external_egress: bool
+    lock_modules: bool
+    disk_gb: int = Field(..., ge=1, le=1000)
+    job_method: Optional[str] = Field(None, min_length=1, max_length=256)
+    job_ports: List[GpuPlatformJobPortV1] = Field(default_factory=list, max_length=64)
+
+    @field_validator("workload_owner", "chute_id", "job_id", "image_id")
+    @classmethod
+    def _valid_ids(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not _ID_RE.fullmatch(value):
+            raise ValueError("GPU workload identity has an invalid identifier")
+        return value
+
+    @field_validator("container_repository")
+    @classmethod
+    def _valid_repository(cls, value: str) -> str:
+        if not _OCI_REPOSITORY_RE.fullmatch(value):
+            raise ValueError("GPU workload identity repository is not canonical")
+        return value
+
+    @field_validator("container_manifest_digest")
+    @classmethod
+    def _valid_manifest_digest(cls, value: str) -> str:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError("GPU workload identity manifest is not canonical")
+        return value
+
+    @model_validator(mode="after")
+    def _exact_shape(self) -> "GpuPlatformWorkloadIdentityV1":
+        if (
+            self.image_ref != self.image_ref.lower()
+            or ":" not in self.image_ref
+            or self.image_ref.rsplit(":", 1)[0] != self.container_repository
+        ):
+            raise ValueError("GPU workload image reference is not canonical")
+        if self.job_id is None:
+            if self.job_method is not None or self.job_ports:
+                raise ValueError("cord workloads cannot carry job identity")
+        elif self.job_method is None:
+            raise ValueError("GPU job identity requires its method")
+        return self
+
+
 class GpuMinerReservationRequestV1(FrozenWireModel):
     schema: Literal["chutes.gpu-miner-reservation-request"] = (
         "chutes.gpu-miner-reservation-request"
@@ -2668,6 +2736,8 @@ class GpuLaunchReservation(Base):
     container_repository = Column(String, nullable=True)
     container_manifest_digest = Column(String, nullable=True)
     chute_version = Column(String, nullable=True)
+    workload_identity = Column(JSONB(none_as_null=True), nullable=True)
+    workload_identity_sha256 = Column(Text, nullable=True)
     descriptor_closure_sha256 = Column(String(64), nullable=True)
     allowed_manifests = Column(JSONB, nullable=False, default=list, server_default="[]")
     allowed_blobs = Column(JSONB, nullable=False, default=list, server_default="[]")
@@ -2761,8 +2831,35 @@ class GpuLaunchReservation(Base):
             name="ck_gpu_launch_digests",
         ),
         CheckConstraint(
-            "(management_mode = 'platform' AND chute_id IS NOT NULL "
-            "AND legacy_vm_name IS NULL AND legacy_migration_id IS NULL "
+            "((management_mode = 'platform' "
+            "AND chute_version IS NOT NULL "
+            "AND jsonb_typeof(workload_identity) = 'object' "
+            "AND workload_identity_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND descriptor_closure_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND jsonb_typeof(allowed_manifests) = 'array' "
+            "AND jsonb_array_length(allowed_manifests) > 0 "
+            "AND jsonb_typeof(allowed_blobs) = 'array' "
+            "AND jsonb_array_length(allowed_blobs) > 0 "
+            "AND jsonb_typeof(allowed_manifest_tags) = 'array' "
+            "AND jsonb_array_length(allowed_manifest_tags) > 0 "
+            "AND jsonb_typeof(manifest_tag_digests) = 'object' "
+            "AND manifest_tag_digests <> '{}'::jsonb) OR "
+            "(management_mode = 'miner' "
+            "AND chute_version IS NULL "
+            "AND workload_identity IS NULL "
+            "AND workload_identity_sha256 IS NULL "
+            "AND descriptor_closure_sha256 IS NULL "
+            "AND allowed_manifests = '[]'::jsonb "
+            "AND allowed_blobs = '[]'::jsonb "
+            "AND allowed_manifest_tags = '[]'::jsonb "
+            "AND manifest_tag_digests = '{}'::jsonb))",
+            name="ck_gpu_launch_descriptor_closure",
+        ),
+        CheckConstraint(
+            "((management_mode = 'platform' "
+            "AND legacy_vm_name IS NULL "
+            "AND legacy_migration_id IS NULL "
+            "AND chute_id IS NOT NULL "
             "AND chute_version IS NOT NULL "
             "AND container_repository IS NOT NULL "
             "AND container_manifest_digest ~ '^sha256:[0-9a-f]{64}$' "
@@ -2778,14 +2875,16 @@ class GpuLaunchReservation(Base):
             "(management_mode = 'miner' "
             "AND ((legacy_vm_name IS NULL AND legacy_migration_id IS NULL) OR "
             "(legacy_vm_name IS NOT NULL AND legacy_migration_id IS NOT NULL)) "
-            "AND chute_id IS NULL AND job_id IS NULL "
+            "AND chute_id IS NULL "
+            "AND job_id IS NULL "
             "AND chute_version IS NULL "
-            "AND container_repository IS NULL AND container_manifest_digest IS NULL "
+            "AND container_repository IS NULL "
+            "AND container_manifest_digest IS NULL "
             "AND descriptor_closure_sha256 IS NULL "
             "AND allowed_manifests = '[]'::jsonb "
             "AND allowed_blobs = '[]'::jsonb "
             "AND allowed_manifest_tags = '[]'::jsonb "
-            "AND manifest_tag_digests = '{}'::jsonb)",
+            "AND manifest_tag_digests = '{}'::jsonb))",
             name="ck_gpu_launch_workload",
         ),
         CheckConstraint(

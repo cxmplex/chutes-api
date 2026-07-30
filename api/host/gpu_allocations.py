@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import lazyload
 
 from api.config import settings
 from api.database import generate_uuid
@@ -27,6 +28,7 @@ from api.host.schemas import (
     GpuLaunchReservationResponseV1,
     GpuMinerReservationRequestV1,
     GpuPlatformReservationRequestV1,
+    GpuPlatformWorkloadIdentityV1,
     GpuQuoteCommitmentV1,
     GpuReservationClaimRequestV1,
     GpuReservationStateRequestV1,
@@ -52,6 +54,7 @@ from api.server.schemas import (
 )
 
 GPU_RESERVATION_LIFETIME_SECONDS = 900
+DEFAULT_GPU_DISK_GB = 10
 _GPU_RECOVERY_RECLAIM_REPLAY_SECONDS = 15 * 60
 _ACTIVE_RESERVATION_STATES = {
     "reserved",
@@ -380,10 +383,127 @@ async def _preverify_active_gpu_release(db: AsyncSession, host_id: str) -> None:
         ) from exc
 
 
+def _platform_image_ref(image: Any, image_username: str) -> str:
+    image_ref = f"{image_username}/{image.name}:{image.tag}".lower()
+    if image.patch_version not in (None, "initial"):
+        image_ref += f"-{image.patch_version}"
+    return image_ref
+
+
+def _platform_job_ports(chute: Any, job: Any | None) -> list[dict[str, Any]]:
+    if job is None:
+        return []
+    for definition in chute.jobs or []:
+        if definition.get("name") == job.method:
+            return [
+                {
+                    "port": int(port["port"]),
+                    "proto": str(port.get("proto") or "tcp").lower(),
+                }
+                for port in (definition.get("ports") or [])
+                if port.get("port")
+            ]
+    return []
+
+
+def _platform_workload_identity(
+    chute: Any,
+    image: Any,
+    job: Any | None,
+    *,
+    image_username: str,
+    manifest_digest: str,
+) -> GpuPlatformWorkloadIdentityV1:
+    """Build the only mutable-database projection allowed into GPU dispatch."""
+
+    if (
+        chute.image_id != image.image_id
+        or image.user_id != chute.user_id
+        or image.compute_type != "gpu"
+        or image.status != "built and pushed"
+        or chute.disabled
+        or not chute.tee
+    ):
+        raise GpuAllocationError("Platform GPU chute/image identity is no longer current.")
+    if job is not None and (
+        job.chute_id != chute.chute_id
+        or job.version != chute.version
+        or job.chutes_version != chute.chutes_version
+        or job.finished_at is not None
+        or job.gpu_management_mode not in {None, "platform"}
+    ):
+        raise GpuAllocationError("Platform GPU job identity is no longer current.")
+    image_ref = _platform_image_ref(image, image_username)
+    return GpuPlatformWorkloadIdentityV1(
+        workload_owner=job.user_id if job is not None else chute.user_id,
+        chute_id=chute.chute_id,
+        job_id=job.job_id if job is not None else None,
+        chute_version=job.version if job is not None else chute.version,
+        chute_revision=chute.revision,
+        image_id=image.image_id,
+        image_ref=image_ref,
+        container_repository=image_ref.rsplit(":", 1)[0],
+        container_manifest_digest=manifest_digest,
+        ref_str=chute.ref_str,
+        chutes_version=(
+            job.chutes_version if job is not None else chute.chutes_version
+        ),
+        allow_external_egress=bool(chute.allow_external_egress),
+        lock_modules=bool(chute.standard_template or chute.lock_modules),
+        disk_gb=(
+            int((job.job_args or {}).get("_disk_gb") or DEFAULT_GPU_DISK_GB)
+            if job is not None
+            else DEFAULT_GPU_DISK_GB
+        ),
+        job_method=job.method if job is not None else None,
+        job_ports=_platform_job_ports(chute, job),
+    )
+
+
+def _validated_platform_workload_identity(
+    reservation: GpuLaunchReservation,
+) -> GpuPlatformWorkloadIdentityV1 | None:
+    """Validate the persisted snapshot and its reservation-row projection."""
+
+    if reservation.management_mode == "miner":
+        if (
+            reservation.workload_identity is not None
+            or reservation.workload_identity_sha256 is not None
+        ):
+            raise GpuAllocationError("Miner GPU reservation carries platform workload identity.")
+        return None
+    try:
+        identity = GpuPlatformWorkloadIdentityV1.model_validate(
+            reservation.workload_identity
+        )
+    except (TypeError, ValueError) as exc:
+        raise GpuAllocationError(
+            "Persisted platform GPU workload identity is malformed."
+        ) from exc
+    if (
+        not reservation.workload_identity_sha256
+        or not secrets.compare_digest(
+            canonical_sha256(identity),
+            reservation.workload_identity_sha256,
+        )
+        or identity.workload_owner != reservation.workload_owner
+        or identity.chute_id != reservation.chute_id
+        or identity.job_id != reservation.job_id
+        or identity.chute_version != reservation.chute_version
+        or identity.container_repository != reservation.container_repository
+        or identity.container_manifest_digest
+        != reservation.container_manifest_digest
+    ):
+        raise GpuAllocationError(
+            "Persisted platform GPU workload identity does not match its reservation."
+        )
+    return identity
+
+
 async def _trusted_platform_workload(
     db: AsyncSession,
     request: GpuPlatformReservationRequestV1,
-) -> tuple[str, str, str, str, dict[str, Any]]:
+) -> tuple[str, str, str, str, str, dict[str, Any]]:
     from api.chute.schemas import Chute, NodeSelector
     from api.image.forge import get_image_digest
     from api.image.schemas import Image
@@ -442,9 +562,7 @@ async def _trusted_platform_workload(
         raise GpuAllocationError(
             "GPU reservation request does not match chute/job include, exclude, count, or VRAM."
         )
-    image_ref = f"{image.user.username}/{image.name}:{image.tag}".lower()
-    if image.patch_version not in (None, "initial"):
-        image_ref += f"-{image.patch_version}"
+    image_ref = _platform_image_ref(image, image.user.username)
     repository = image_ref.rsplit(":", 1)[0]
     assert_gpu_external_work_allowed(db, "registry image digest resolution")
     try:
@@ -477,6 +595,7 @@ async def _trusted_platform_workload(
     return (
         job.user_id if job is not None else chute.user_id,
         job.version if job is not None else chute.version,
+        image_ref,
         repository,
         manifest_digest,
         closure_document,
@@ -489,8 +608,10 @@ async def _assert_platform_workload_current(
     *,
     expected_owner: str,
     expected_version: str,
+    expected_image_ref: str,
     expected_repository: str,
-) -> None:
+    expected_manifest_digest: str,
+) -> GpuPlatformWorkloadIdentityV1:
     """Revalidate descriptor-resolution inputs after acquiring trust-bearing locks."""
 
     from api.chute.schemas import Chute, NodeSelector
@@ -500,7 +621,9 @@ async def _assert_platform_workload_current(
     chute = (
         await db.execute(
             select(Chute)
+            .options(lazyload("*"))
             .where(Chute.chute_id == request.chute_id)
+            .execution_options(populate_existing=True)
             .with_for_update(of=Chute)
         )
     ).scalar_one_or_none()
@@ -511,7 +634,9 @@ async def _assert_platform_workload_current(
     image = (
         await db.execute(
             select(Image)
+            .options(lazyload("*"))
             .where(Image.image_id == chute.image_id)
+            .execution_options(populate_existing=True)
             .with_for_update(of=Image)
         )
     ).scalar_one_or_none()
@@ -528,7 +653,11 @@ async def _assert_platform_workload_current(
     if request.job_id is not None:
         job = (
             await db.execute(
-                select(Job).where(Job.job_id == request.job_id).with_for_update(of=Job)
+                select(Job)
+                .options(lazyload("*"))
+                .where(Job.job_id == request.job_id)
+                .execution_options(populate_existing=True)
+                .with_for_update(of=Job)
             )
         ).scalar_one_or_none()
         if (
@@ -549,9 +678,13 @@ async def _assert_platform_workload_current(
         )
     except ValueError as exc:
         raise GpuAllocationError("GPU workload selector is malformed.") from exc
-    image_ref = f"{image.user.username}/{image.name}:{image.tag}".lower()
-    if image.patch_version not in (None, "initial"):
-        image_ref += f"-{image.patch_version}"
+    # User.username has no post-creation mutation path. Derive the publisher
+    # namespace from the descriptor-resolved repository instead of inverting the
+    # established User -> GPU lifecycle lock order with a late User row lock.
+    publisher_username, separator, _image_path = expected_repository.partition("/")
+    if not separator or not publisher_username:
+        raise GpuAllocationError("GPU workload repository has no publisher namespace.")
+    image_ref = _platform_image_ref(image, publisher_username)
     current_owner = job.user_id if job is not None else chute.user_id
     current_version = job.version if job is not None else chute.version
     if (
@@ -561,11 +694,19 @@ async def _assert_platform_workload_current(
         or request.minimum_vram_mib < int(selector.min_vram_gb_per_gpu or 0) * 1024
         or current_owner != expected_owner
         or current_version != expected_version
+        or image_ref != expected_image_ref
         or image_ref.rsplit(":", 1)[0] != expected_repository
     ):
         raise GpuAllocationError(
             "GPU workload changed while its registry descriptor closure was resolved."
         )
+    return _platform_workload_identity(
+        chute,
+        image,
+        job,
+        image_username=publisher_username,
+        manifest_digest=expected_manifest_digest,
+    )
 
 
 def _gpu_release_target_sha256(
@@ -2516,7 +2657,7 @@ async def reserve_gpu_group(
     recovery_authorization_id: Optional[str] = None,
     observed_live_storage_ids: Optional[set[str]] = None,
     trusted_platform_workload: Optional[
-        tuple[str, str, str, str, dict[str, Any]]
+        tuple[str, str, str, str, str, dict[str, Any]]
     ] = None,
 ) -> GpuLaunchReservationResponseV1:
     """Lock one exact available group and create its capability in one transaction."""
@@ -2550,6 +2691,7 @@ async def reserve_gpu_group(
         (
             workload_owner,
             chute_version,
+            image_ref,
             container_repository,
             container_manifest_digest,
             descriptor_closure,
@@ -2561,6 +2703,7 @@ async def reserve_gpu_group(
     else:
         workload_owner = None
         chute_version = None
+        image_ref = None
         container_repository = None
         container_manifest_digest = None
         descriptor_closure = {
@@ -2573,13 +2716,16 @@ async def reserve_gpu_group(
     if not db.info.get(GPU_LIFECYCLE_LOCK_INFO_KEY):
         await _preverify_active_gpu_release(db, host_id)
     await acquire_gpu_lifecycle_lock(db)
+    workload_identity = None
     if isinstance(request, GpuPlatformReservationRequestV1):
-        await _assert_platform_workload_current(
+        workload_identity = await _assert_platform_workload_current(
             db,
             request,
             expected_owner=workload_owner,
             expected_version=chute_version,
+            expected_image_ref=image_ref,
             expected_repository=container_repository,
+            expected_manifest_digest=container_manifest_digest,
         )
     host = await _host_lock(db, host_id)
     if expected_owner_hotkey is not None and host.miner_hotkey != expected_owner_hotkey:
@@ -3093,6 +3239,16 @@ async def reserve_gpu_group(
         container_repository=claims.container_repository,
         container_manifest_digest=claims.container_manifest_digest,
         chute_version=chute_version,
+        workload_identity=(
+            workload_identity.model_dump(mode="json", exclude_none=True)
+            if workload_identity is not None
+            else None
+        ),
+        workload_identity_sha256=(
+            canonical_sha256(workload_identity)
+            if workload_identity is not None
+            else None
+        ),
         descriptor_closure_sha256=descriptor_closure["descriptor_closure_sha256"],
         allowed_manifests=descriptor_closure["allowed_manifests"],
         allowed_blobs=descriptor_closure["allowed_blobs"],
@@ -3213,6 +3369,7 @@ async def reserve_gpu_group(
 def _validate_row_claims(
     reservation: GpuLaunchReservation,
 ) -> GpuLaunchReservationClaimsV1:
+    _validated_platform_workload_identity(reservation)
     try:
         claims = GpuLaunchReservationClaimsV1.model_validate(reservation.claims)
     except ValueError as exc:

@@ -19,10 +19,33 @@ BEGIN
 END
 $$;
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'gpu_launch_reservations'
+          AND column_name = 'workload_identity'
+    ) AND EXISTS (
+        SELECT 1
+        FROM gpu_launch_reservations
+        WHERE management_mode = 'platform'
+    ) THEN
+        RAISE EXCEPTION
+            'cannot migrate pre-identity platform GPU reservations; retire them before upgrade';
+    END IF;
+END
+$$;
+
 ALTER TABLE gpu_launch_reservations
     ADD COLUMN IF NOT EXISTS descriptor_closure_sha256 TEXT;
 ALTER TABLE gpu_launch_reservations
     ADD COLUMN IF NOT EXISTS chute_version TEXT;
+ALTER TABLE gpu_launch_reservations
+    ADD COLUMN IF NOT EXISTS workload_identity JSONB;
+ALTER TABLE gpu_launch_reservations
+    ADD COLUMN IF NOT EXISTS workload_identity_sha256 TEXT;
 ALTER TABLE gpu_launch_reservations
     ADD COLUMN IF NOT EXISTS allowed_manifests JSONB NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE gpu_launch_reservations
@@ -82,6 +105,8 @@ ALTER TABLE gpu_launch_reservations
         (
             management_mode = 'platform'
             AND chute_version IS NOT NULL
+            AND jsonb_typeof(workload_identity) = 'object'
+            AND workload_identity_sha256 ~ '^[0-9a-f]{64}$'
             AND descriptor_closure_sha256 ~ '^[0-9a-f]{64}$'
             AND jsonb_typeof(allowed_manifests) = 'array'
             AND jsonb_array_length(allowed_manifests) > 0
@@ -96,6 +121,8 @@ ALTER TABLE gpu_launch_reservations
         (
             management_mode = 'miner'
             AND chute_version IS NULL
+            AND workload_identity IS NULL
+            AND workload_identity_sha256 IS NULL
             AND descriptor_closure_sha256 IS NULL
             AND allowed_manifests = '[]'::jsonb
             AND allowed_blobs = '[]'::jsonb
@@ -441,6 +468,8 @@ BEGIN
     ) OR EXISTS (
         SELECT 1 FROM gpu_launch_reservations
          WHERE chute_version IS NOT NULL
+            OR workload_identity IS NOT NULL
+            OR workload_identity_sha256 IS NOT NULL
             OR descriptor_closure_sha256 IS NOT NULL
             OR allowed_manifests <> '[]'::jsonb
             OR allowed_blobs <> '[]'::jsonb
@@ -551,4 +580,6 @@ ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS allowed_manifest_tags;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS allowed_blobs;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS allowed_manifests;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS descriptor_closure_sha256;
+ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS workload_identity_sha256;
+ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS workload_identity;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS chute_version;

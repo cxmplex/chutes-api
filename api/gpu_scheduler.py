@@ -7,13 +7,14 @@ import api.logging_bootstrap  # noqa: F401
 import asyncio
 import sys
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import and_, exists, func, or_, select, text
-from sqlalchemy.orm import joinedload
+from sqlalchemy.orm import joinedload, lazyload
 
 import api.database.orms  # noqa: F401
 from api.agent_channel import (
@@ -25,11 +26,14 @@ from api.chute.schemas import Chute, NodeSelector
 from api.config import settings
 from api.database import engine, get_session
 from api.host.gpu_allocations import (
+    DEFAULT_GPU_DISK_GB,
     GpuAllocationError,
     _latest_gpu_inventory_matches_group,
     _preverify_active_gpu_release,
     _expire_locked_reservations,
     _locked_reservation_group,
+    _platform_workload_identity,
+    _validated_platform_workload_identity,
     gpu_reservation_token,
     quarantine_gpu_reservation_control_plane,
     record_gpu_command_dispatch,
@@ -50,7 +54,9 @@ from api.host.schemas import (
     GpuInventoryReportV1,
     GpuLaunchReservation,
     GpuPlatformReservationRequestV1,
+    GpuPlatformWorkloadIdentityV1,
 )
+from api.image.schemas import Image
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2
 from api.job.schemas import Job
@@ -81,7 +87,6 @@ TEARDOWN_RETRY_SECONDS = 45
 HOST_LOSS_GRACE_SECONDS = 180
 ACTIVATION_TIMEOUT_SECONDS = 900
 CLAIMED_LAUNCH_TIMEOUT_SECONDS = 900
-DEFAULT_GPU_DISK_GB = 10
 _ACTIVE_RESERVATION_STATES = {
     "reserved",
     "claimed",
@@ -665,6 +670,7 @@ async def _create_platform_launch_config(
     chute: Chute,
     job: Optional[Job],
     default_volume,
+    workload_identity: GpuPlatformWorkloadIdentityV1,
 ) -> tuple[LaunchConfig, str]:
     if (
         server.gpu_management_mode != "platform"
@@ -739,27 +745,18 @@ async def _create_platform_launch_config(
     )
     session.add(config)
     await session.flush()
-    return config, _platform_launch_token(config, chute, job)
+    return config, _platform_launch_token(config, workload_identity)
 
 
 def _platform_launch_token(
     config: LaunchConfig,
-    chute: Chute,
-    job: Optional[Job],
+    workload_identity: GpuPlatformWorkloadIdentityV1,
 ) -> str:
     return create_launch_jwt_v2(
         config,
-        egress=chute.allow_external_egress,
-        lock_modules=(
-            True
-            if chute.standard_template
-            else (chute.lock_modules if chute.lock_modules is not None else False)
-        ),
-        disk_gb=(
-            int((job.job_args or {}).get("_disk_gb") or DEFAULT_GPU_DISK_GB)
-            if job is not None
-            else DEFAULT_GPU_DISK_GB
-        ),
+        egress=workload_identity.allow_external_egress,
+        lock_modules=workload_identity.lock_modules,
+        disk_gb=workload_identity.disk_gb,
     )
 
 
@@ -804,8 +801,10 @@ async def _dispatch_workload(reservation_id: str) -> bool:
         reservation = (
             await session.execute(
                 select(GpuLaunchReservation)
+                .options(lazyload("*"))
                 .where(GpuLaunchReservation.reservation_id == reservation_id)
-                .with_for_update()
+                .execution_options(populate_existing=True)
+                .with_for_update(of=GpuLaunchReservation)
             )
         ).scalar_one_or_none()
         if (
@@ -823,28 +822,45 @@ async def _dispatch_workload(reservation_id: str) -> bool:
         server = (
             await session.execute(
                 select(Server)
+                .options(lazyload("*"))
                 .where(Server.server_id == reservation.server_id)
-                .with_for_update()
+                .execution_options(populate_existing=True)
+                .with_for_update(of=Server)
             )
         ).scalar_one_or_none()
         chute = (
+            await session.execute(
+                select(Chute)
+                .options(lazyload("*"))
+                .where(Chute.chute_id == reservation.chute_id)
+                .execution_options(populate_existing=True)
+                .with_for_update(of=Chute)
+            )
+        ).scalar_one_or_none()
+        image = (
             (
                 await session.execute(
-                    select(Chute)
-                    .options(joinedload(Chute.image))
-                    .where(Chute.chute_id == reservation.chute_id)
-                    .with_for_update()
+                    select(Image)
+                    .options(lazyload("*"))
+                    .where(
+                        Image.image_id
+                        == (chute.image_id if chute is not None else None)
+                    )
+                    .execution_options(populate_existing=True)
+                    .with_for_update(of=Image)
                 )
-            )
-            .unique()
-            .scalar_one_or_none()
+            ).scalar_one_or_none()
+            if chute is not None
+            else None
         )
         job = (
             (
                 await session.execute(
                     select(Job)
+                    .options(lazyload("*"))
                     .where(Job.job_id == reservation.job_id)
-                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                    .with_for_update(of=Job)
                 )
             ).scalar_one_or_none()
             if reservation.job_id
@@ -853,9 +869,10 @@ async def _dispatch_workload(reservation_id: str) -> bool:
         if (
             server is None
             or chute is None
+            or image is None
             or chute.disabled
             or not chute.tee
-            or chute.image.compute_type != "gpu"
+            or image.compute_type != "gpu"
             or reservation.chute_id != launch_hint.chute_id
             or reservation.job_id != launch_hint.job_id
             or (reservation.job_id is not None and job is None)
@@ -866,15 +883,40 @@ async def _dispatch_workload(reservation_id: str) -> bool:
             raise GpuAllocationError(
                 "Platform GPU workload owner, server, or attestation lineage disappeared."
             )
+        workload_identity = _validated_platform_workload_identity(reservation)
+        if workload_identity is None:
+            raise GpuAllocationError(
+                "Platform GPU reservation has no immutable workload identity."
+            )
+        publisher_username, separator, _image_path = (
+            workload_identity.container_repository.partition("/")
+        )
+        if not separator or not publisher_username:
+            raise GpuAllocationError(
+                "Platform GPU workload repository has no publisher namespace."
+            )
+        current_workload_identity = _platform_workload_identity(
+            chute,
+            image,
+            job,
+            image_username=publisher_username,
+            manifest_digest=reservation.container_manifest_digest,
+        )
+        if current_workload_identity != workload_identity:
+            raise GpuAllocationError(
+                "Platform GPU workload identity changed after reservation."
+            )
         config = (
             (
                 await session.execute(
                     select(LaunchConfig)
+                    .options(lazyload("*"))
                     .where(
                         LaunchConfig.gpu_launch_reservation_id
                         == reservation.reservation_id
                     )
-                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                    .with_for_update(of=LaunchConfig)
                 )
             )
             .unique()
@@ -888,6 +930,7 @@ async def _dispatch_workload(reservation_id: str) -> bool:
                 chute,
                 job,
                 default_volume,
+                workload_identity,
             )
         else:
             if (
@@ -895,6 +938,7 @@ async def _dispatch_workload(reservation_id: str) -> bool:
                 or config.server_id != server.server_id
                 or config.chute_id != reservation.chute_id
                 or config.job_id != reservation.job_id
+                or config.user_id != workload_identity.workload_owner
                 or config.container_repository != reservation.container_repository
                 or config.container_manifest_digest
                 != reservation.container_manifest_digest
@@ -904,53 +948,50 @@ async def _dispatch_workload(reservation_id: str) -> bool:
                 raise GpuAllocationError(
                     "Platform GPU launch config no longer matches its reservation."
                 )
-            token = _platform_launch_token(config, chute, job)
-        reservation.workload_dispatched_at = _utcnow()
-        command_id = reservation.workload_command_id or str(uuid.uuid4())
-        reservation.workload_command_id = command_id
-        await session.commit()
-        config_id = config.config_id
-        server_id = server.server_id
-        external_ports = server.external_ports
-    assert_gpu_external_work_allowed(session, "GPU workload agent liveness preflight")
-    if not await is_agent_online(server_id):
-        return False
-    ports = {"primary": 8000, "logging": 8001}
-    if semcomp(chute.chutes_version or "0.0.0", "0.6.0") >= 0:
-        ports["attestation"] = 8002
-    disk_gb = (
-        int((job.job_args or {}).get("_disk_gb") or DEFAULT_GPU_DISK_GB)
-        if job is not None
-        else DEFAULT_GPU_DISK_GB
-    )
-    assert_gpu_external_work_allowed(session, "GPU workload command dispatch")
-    await send_agent_command(
-        server_id,
-        "deploy_chute",
-        {
+            token = _platform_launch_token(config, workload_identity)
+        ports = {"primary": 8000, "logging": 8001}
+        if semcomp(workload_identity.chutes_version or "0.0.0", "0.6.0") >= 0:
+            ports["attestation"] = 8002
+        command_payload = {
             "reservation_id": reservation_id,
             "gpu_launch_reservation_id": reservation_id,
-            "server_id": server_id,
-            "chute_id": chute.chute_id,
-            "job_id": job.job_id if job is not None else None,
-            "version": chute.version,
-            "config_id": config_id,
+            "server_id": server.server_id,
+            "chute_id": workload_identity.chute_id,
+            "job_id": workload_identity.job_id,
+            "version": workload_identity.chute_version,
+            "config_id": config.config_id,
             "token": token,
-            "image": _chute_image_ref(chute),
-            "image_digest": reservation.container_manifest_digest,
+            "image": workload_identity.image_ref,
+            "image_digest": workload_identity.container_manifest_digest,
             "registry": settings.registry_external_host,
             "registry_insecure": settings.registry_insecure,
-            "ref_str": chute.ref_str,
-            "chutes_version": chute.chutes_version,
+            "ref_str": workload_identity.ref_str,
+            "chutes_version": workload_identity.chutes_version,
             "validator": settings.validator_ss58,
             "tee": True,
             "compute_type": "gpu",
             "env_type": "tee",
             "ports": ports,
-            "external_ports": external_ports,
-            "disk_gb": disk_gb,
-            "job_ports": _job_ports(chute, job.method) if job is not None else [],
-        },
+            "external_ports": deepcopy(server.external_ports),
+            "disk_gb": workload_identity.disk_gb,
+            "job_ports": [
+                item.model_dump(mode="json")
+                for item in workload_identity.job_ports
+            ],
+        }
+        reservation.workload_dispatched_at = _utcnow()
+        command_id = reservation.workload_command_id or str(uuid.uuid4())
+        reservation.workload_command_id = command_id
+        await session.commit()
+        server_id = command_payload["server_id"]
+    assert_gpu_external_work_allowed(session, "GPU workload agent liveness preflight")
+    if not await is_agent_online(server_id):
+        return False
+    assert_gpu_external_work_allowed(session, "GPU workload command dispatch")
+    await send_agent_command(
+        server_id,
+        "deploy_chute",
+        command_payload,
         command_id=command_id,
     )
     return True
