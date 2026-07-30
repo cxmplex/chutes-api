@@ -410,14 +410,27 @@ class TestCurrentAttestedServerFilter:
 
 class TestExpireStaleLaunchConfigs:
     @pytest.mark.asyncio
-    async def test_expiry_updates_only_scheduler_minted_configs(self, mock_settings):
-        expired_row = SimpleNamespace(config_id="cfg-1", chute_id="chute-1", server_id="srv-1")
+    async def test_expiry_updates_every_pending_config_class(self, mock_settings):
+        expired_row = SimpleNamespace(config_id="cfg-1", chute_id="chute-1", server_id=None)
         session = FakeSession({"text:update_launch_configs": FakeResult(rows=[expired_row])})
-        with patch("api.cpu_scheduler.get_session", _session_ctx(session)):
+        captured = {}
+        real_text = cs.text
+
+        def capture_sql(statement):
+            captured["sql"] = statement
+            return real_text(statement)
+
+        with (
+            patch("api.cpu_scheduler.get_session", _session_ctx(session)),
+            patch("api.cpu_scheduler.text", side_effect=capture_sql),
+        ):
             await cs.expire_stale_launch_configs()
         assert session.committed
         key, params = session.executed[0]
         assert key == "text:update_launch_configs"
+        assert "server_id IS NOT NULL" not in captured["sql"]
+        assert "completed_at IS NULL" in captured["sql"]
+        assert "verified_at IS NULL" in captured["sql"]
         # Claimed (retrieved) configs get a doubled window before being declared dead.
         assert params == {
             "ttl": cs.LAUNCH_CONFIG_EXPIRY_SECONDS,

@@ -1447,19 +1447,31 @@ class Server(Base):
     # Model A rows remain NULL because they retain their independent miner-auth architecture.
     launch_reservation_id = Column(
         String,
-        ForeignKey("td_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "td_launch_reservations.reservation_id",
+            name="fk_servers_launch_reservation",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     launch_boot_generation = Column(Integer, nullable=True)
     # GPU reservations intentionally use a separate claims/table contract from CPU V1.
     gpu_launch_reservation_id = Column(
         String,
-        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "gpu_launch_reservations.reservation_id",
+            name="fk_servers_gpu_launch_reservation",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     gpu_allocation_group_id = Column(
         String,
-        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "gpu_allocation_groups.allocation_group_id",
+            name="fk_servers_gpu_allocation_group",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     gpu_allocation_group_generation = Column(Integer, nullable=True)

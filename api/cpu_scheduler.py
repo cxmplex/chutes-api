@@ -694,20 +694,18 @@ async def _launch_on_host(
 
 
 async def expire_stale_launch_configs() -> None:
-    """Fail scheduler-minted (server_id-stamped) launch configs that never verified.
+    """Fail every unverified, nonterminal launch config after its bounded claim window.
 
-    Never-claimed configs (agent vanished between dispatch and claim) expire after the base
-    window; claimed-but-unverified configs (retrieved_at set: the TD is actively pulling/booting,
-    possibly a multi-GB cold pull) get a doubled window before being declared dead so an
-    in-flight verification isn't yanked out from under the agent. Scoped to server_id IS NOT
-    NULL so the GPU launch-config flow (miner-side bookkeeping, its own JWT expiry) is untouched.
+    Never-claimed CPU, GPU, miner-managed, and unassigned configs expire after the base window.
+    Claimed-but-unverified configs get a doubled window for image pulls and boot before they are
+    terminalized. No pending config class may remain indefinitely and block owner erasure.
     """
     async with get_session() as session:
         result = await session.execute(
             text(
                 "UPDATE launch_configs SET failed_at = NOW(), "
                 "verification_error = 'expired: never verified within the scheduler window' "
-                "WHERE server_id IS NOT NULL AND verified_at IS NULL AND failed_at IS NULL "
+                "WHERE verified_at IS NULL AND failed_at IS NULL AND completed_at IS NULL "
                 "AND created_at < NOW() - make_interval(secs => :ttl) "
                 "AND (retrieved_at IS NULL "
                 "     OR created_at < NOW() - make_interval(secs => :claimed_ttl)) "

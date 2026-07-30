@@ -148,18 +148,30 @@ class Instance(Base):
     # through, and no per-miner control plane). NULL for the legacy miner-run GPU/CPU path.
     server_id = Column(
         String,
-        ForeignKey("servers.server_id", ondelete="SET NULL"),
+        ForeignKey(
+            "servers.server_id",
+            name="fk_instances_server",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     )
     gpu_management_mode = Column(String, nullable=True)
     gpu_launch_reservation_id = Column(
         String,
-        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "gpu_launch_reservations.reservation_id",
+            name="fk_instances_gpu_launch_reservation",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     gpu_allocation_group_id = Column(
         String,
-        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "gpu_allocation_groups.allocation_group_id",
+            name="fk_instances_gpu_allocation_group",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     gpu_allocation_group_generation = Column(Integer, nullable=True)
@@ -269,13 +281,21 @@ class LaunchConfig(Base):
     # propagated to the created Instance. NULL for the legacy miner-run path.
     server_id = Column(
         String,
-        ForeignKey("servers.server_id", ondelete="SET NULL"),
+        ForeignKey(
+            "servers.server_id",
+            name="fk_launch_configs_server",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     gpu_management_mode = Column(String, nullable=True)
     gpu_launch_reservation_id = Column(
         String,
-        ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "gpu_launch_reservations.reservation_id",
+            name="fk_launch_configs_gpu_launch_reservation",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     container_repository = Column(String, nullable=True)

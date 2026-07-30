@@ -77,7 +77,11 @@ class Node(Base):
     verified_at = Column(DateTime(timezone=True))
     gpu_allocation_group_id = Column(
         String,
-        ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
+        ForeignKey(
+            "gpu_allocation_groups.allocation_group_id",
+            name="fk_nodes_gpu_allocation_group",
+            ondelete="RESTRICT",
+        ),
         nullable=True,
     )
     gpu_allocation_group_generation = Column(Integer, nullable=True)

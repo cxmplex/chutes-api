@@ -33,6 +33,18 @@ ALTER TABLE gpu_launch_reservations
     ADD COLUMN IF NOT EXISTS manifest_tag_digests JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE registry_sessions
     ADD COLUMN IF NOT EXISTS manifest_tag_digests JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE registry_sessions DROP CONSTRAINT IF EXISTS ck_registry_session_closure;
+ALTER TABLE registry_sessions
+    ADD CONSTRAINT ck_registry_session_closure CHECK (
+        jsonb_typeof(allowed_manifests) = 'array'
+        AND jsonb_typeof(allowed_blobs) = 'array'
+        AND jsonb_typeof(allowed_manifest_tags) = 'array'
+        AND jsonb_typeof(manifest_tag_digests) = 'object'
+        AND (
+            descriptor_closure_sha256 IS NULL
+            OR descriptor_closure_sha256 ~ '^[0-9a-f]{64}$'
+        )
+    );
 ALTER TABLE gpu_launch_reservations
     ADD COLUMN IF NOT EXISTS launch_command_id TEXT;
 ALTER TABLE gpu_launch_reservations
@@ -153,8 +165,7 @@ CREATE INDEX IF NOT EXISTS idx_gpu_launch_reservations_platform_workload
 ALTER TABLE launch_configs
     ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
 ALTER TABLE launch_configs
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT
-        REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT;
 ALTER TABLE launch_configs
     DROP CONSTRAINT IF EXISTS ck_launch_config_gpu_manager;
 ALTER TABLE launch_configs
@@ -183,13 +194,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_launch_configs_gpu_reservation
 ALTER TABLE instances
     ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
 ALTER TABLE instances
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT
-        REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT;
 ALTER TABLE instances
-    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT
-        REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT;
+    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT;
 ALTER TABLE instances
     ADD COLUMN IF NOT EXISTS gpu_allocation_group_generation INTEGER;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_launch_configs_gpu_launch_reservation'
+          AND conrelid = 'launch_configs'::regclass
+    ) THEN
+        ALTER TABLE launch_configs
+            ADD CONSTRAINT fk_launch_configs_gpu_launch_reservation
+            FOREIGN KEY (gpu_launch_reservation_id)
+            REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_instances_gpu_launch_reservation'
+          AND conrelid = 'instances'::regclass
+    ) THEN
+        ALTER TABLE instances
+            ADD CONSTRAINT fk_instances_gpu_launch_reservation
+            FOREIGN KEY (gpu_launch_reservation_id)
+            REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_instances_gpu_allocation_group'
+          AND conrelid = 'instances'::regclass
+    ) THEN
+        ALTER TABLE instances
+            ADD CONSTRAINT fk_instances_gpu_allocation_group
+            FOREIGN KEY (gpu_allocation_group_id)
+            REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT;
+    END IF;
+END
+$$;
 ALTER TABLE instances
     ADD COLUMN IF NOT EXISTS gpu_process_incarnation TEXT;
 ALTER TABLE instances DROP CONSTRAINT IF EXISTS ck_instances_gpu_manager;
@@ -491,6 +534,17 @@ ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS launch_ack_status;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS launch_ack_at;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS launch_dispatched_at;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS launch_command_id;
+ALTER TABLE registry_sessions DROP CONSTRAINT IF EXISTS ck_registry_session_closure;
+ALTER TABLE registry_sessions
+    ADD CONSTRAINT ck_registry_session_closure CHECK (
+        jsonb_typeof(allowed_manifests) = 'array'
+        AND jsonb_typeof(allowed_blobs) = 'array'
+        AND jsonb_typeof(allowed_manifest_tags) = 'array'
+        AND (
+            descriptor_closure_sha256 IS NULL
+            OR descriptor_closure_sha256 ~ '^[0-9a-f]{64}$'
+        )
+    );
 ALTER TABLE registry_sessions DROP COLUMN IF EXISTS manifest_tag_digests;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS manifest_tag_digests;
 ALTER TABLE gpu_launch_reservations DROP COLUMN IF EXISTS allowed_manifest_tags;

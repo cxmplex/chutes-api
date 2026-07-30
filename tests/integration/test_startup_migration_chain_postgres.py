@@ -15,10 +15,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 import api.database.orms  # noqa: F401
 import api.gpu_scheduler as gpu_scheduler
 from api.database import Base
-from api.database.migrations import (
-    TRACKED_MIGRATION_BASELINE,
-    historical_migration_versions,
-)
+from api.database.migrations import historical_migration_versions
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -38,11 +35,14 @@ def nv_attest():
     yield
 
 
-def _migration_paths(*, floor: str = TRACKED_MIGRATION_BASELINE) -> list[Path]:
+def _migration_paths(*, floor: str | None = None) -> list[Path]:
+    production_base = set(historical_migration_versions())
     return sorted(
         path
         for path in MIGRATIONS.glob("*.sql")
-        if path.name.split("_", 1)[0].isdigit() and path.name.split("_", 1)[0] >= floor
+        if (version := path.name.split("_", 1)[0]).isdigit()
+        and version not in production_base
+        and (floor is None or version >= floor)
     )
 
 
@@ -137,15 +137,22 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
                 .scalars()
                 .all()
             )
-            node_gpu_foreign_keys = {
-                row.column_name: (row.constraint_count, row.constraint_names)
+            lineage_foreign_keys = {
+                (row.table_name, row.column_name): (
+                    row.constraint_count,
+                    row.constraint_names,
+                    row.delete_actions,
+                )
                 for row in (
                     await connection.execute(
                         text(
-                            "SELECT attribute.attname AS column_name, "
+                            "SELECT relation.relname AS table_name, "
+                            "attribute.attname AS column_name, "
                             "COUNT(*) AS constraint_count, "
                             "ARRAY_AGG(constraint_row.conname ORDER BY "
-                            "constraint_row.conname) AS constraint_names "
+                            "constraint_row.conname) AS constraint_names, "
+                            "ARRAY_AGG(constraint_row.confdeltype::text ORDER BY "
+                            "constraint_row.conname) AS delete_actions "
                             "FROM pg_constraint AS constraint_row "
                             "JOIN pg_class AS relation "
                             "ON relation.oid = constraint_row.conrelid "
@@ -155,12 +162,18 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
                             "ON attribute.attrelid = relation.oid "
                             "AND attribute.attnum = ANY(constraint_row.conkey) "
                             "WHERE namespace.oid = current_schema()::regnamespace "
-                            "AND relation.relname = 'nodes' "
                             "AND constraint_row.contype = 'f' "
-                            "AND attribute.attname IN "
-                            "('gpu_launch_reservation_id', "
-                            "'gpu_inventory_report_id') "
-                            "GROUP BY attribute.attname"
+                            "AND (relation.relname, attribute.attname) IN ("
+                            "('servers', 'launch_reservation_id'), "
+                            "('servers', 'gpu_launch_reservation_id'), "
+                            "('servers', 'gpu_allocation_group_id'), "
+                            "('instances', 'server_id'), "
+                            "('instances', 'gpu_launch_reservation_id'), "
+                            "('instances', 'gpu_allocation_group_id'), "
+                            "('launch_configs', 'server_id'), "
+                            "('launch_configs', 'gpu_launch_reservation_id'), "
+                            "('nodes', 'gpu_allocation_group_id')) "
+                            "GROUP BY relation.relname, attribute.attname"
                         )
                     )
                 )
@@ -172,14 +185,47 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
             "trg_complete_launch_config_on_job_terminal",
             "trg_launch_terminal_registry_scope",
         } <= triggers
-        assert node_gpu_foreign_keys == {
-            "gpu_launch_reservation_id": (
+        assert lineage_foreign_keys == {
+            ("servers", "launch_reservation_id"): (
                 1,
-                ["fk_nodes_gpu_launch_reservation"],
+                ["fk_servers_launch_reservation"],
+                ["r"],
             ),
-            "gpu_inventory_report_id": (
+            ("servers", "gpu_launch_reservation_id"): (
                 1,
-                ["fk_nodes_gpu_inventory_report"],
+                ["fk_servers_gpu_launch_reservation"],
+                ["r"],
+            ),
+            ("servers", "gpu_allocation_group_id"): (
+                1,
+                ["fk_servers_gpu_allocation_group"],
+                ["r"],
+            ),
+            ("instances", "server_id"): (1, ["fk_instances_server"], ["n"]),
+            ("instances", "gpu_launch_reservation_id"): (
+                1,
+                ["fk_instances_gpu_launch_reservation"],
+                ["r"],
+            ),
+            ("instances", "gpu_allocation_group_id"): (
+                1,
+                ["fk_instances_gpu_allocation_group"],
+                ["r"],
+            ),
+            ("launch_configs", "server_id"): (
+                1,
+                ["fk_launch_configs_server"],
+                ["r"],
+            ),
+            ("launch_configs", "gpu_launch_reservation_id"): (
+                1,
+                ["fk_launch_configs_gpu_launch_reservation"],
+                ["r"],
+            ),
+            ("nodes", "gpu_allocation_group_id"): (
+                1,
+                ["fk_nodes_gpu_allocation_group"],
+                ["r"],
             ),
         }
     finally:

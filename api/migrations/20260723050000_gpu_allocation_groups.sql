@@ -398,13 +398,35 @@ ALTER TABLE gpu_allocation_groups
     ON DELETE RESTRICT;
 
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT
-        REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT;
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT
-        REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT;
+    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT;
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS gpu_allocation_group_generation INTEGER;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_servers_gpu_launch_reservation'
+          AND conrelid = 'servers'::regclass
+    ) THEN
+        ALTER TABLE servers
+            ADD CONSTRAINT fk_servers_gpu_launch_reservation
+            FOREIGN KEY (gpu_launch_reservation_id)
+            REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_servers_gpu_allocation_group'
+          AND conrelid = 'servers'::regclass
+    ) THEN
+        ALTER TABLE servers
+            ADD CONSTRAINT fk_servers_gpu_allocation_group
+            FOREIGN KEY (gpu_allocation_group_id)
+            REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT;
+    END IF;
+END
+$$;
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
 ALTER TABLE servers
@@ -444,10 +466,23 @@ ALTER TABLE servers
     );
 
 ALTER TABLE nodes
-    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT
-        REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT;
+    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT;
 ALTER TABLE nodes
     ADD COLUMN IF NOT EXISTS gpu_allocation_group_generation INTEGER;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_nodes_gpu_allocation_group'
+          AND conrelid = 'nodes'::regclass
+    ) THEN
+        ALTER TABLE nodes
+            ADD CONSTRAINT fk_nodes_gpu_allocation_group
+            FOREIGN KEY (gpu_allocation_group_id)
+            REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT;
+    END IF;
+END
+$$;
 ALTER TABLE nodes
     ADD COLUMN IF NOT EXISTS gpu_retired_at TIMESTAMPTZ;
 ALTER TABLE nodes DROP CONSTRAINT IF EXISTS ck_nodes_gpu_allocation_identity;
