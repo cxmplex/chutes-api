@@ -177,6 +177,16 @@ def test_explicit_trusted_proxy_cidrs_render_unchanged_with_external_policy_ackn
     )
 
 
+def test_api_uvicorn_disables_proxy_header_rewriting():
+    template = (CHART_DIR / "templates" / "api-deployment.yaml").read_text()
+    command = template.split("          command:\n", 1)[1].split("          env:\n", 1)[0]
+
+    assert command.count("            - --no-proxy-headers\n") == 1
+    assert command.index("            - api.main:app\n") < command.index(
+        "            - --no-proxy-headers\n"
+    )
+
+
 def test_explicit_operator_endpoint_cidrs_render_unchanged(helm_binary, tmp_path):
     operator_cidrs = "10.60.0.0/16,2001:db8:60::/64"
     rendered = _render_chart(
@@ -192,6 +202,8 @@ def test_explicit_operator_endpoint_cidrs_render_unchanged(helm_binary, tmp_path
         _environment(_container(deployment, "api"))["OPERATOR_ENDPOINT_CIDRS"]["value"]
         == operator_cidrs
     )
+    assert "--no-proxy-headers" in _container(deployment, "api")["command"]
+
 
 @pytest.mark.parametrize(
     "network_policy_values",

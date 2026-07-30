@@ -7,8 +7,8 @@ snpCrlOutageGraceSeconds: 0
 trustedProxyCidrs: ""
 # Required by production API startup. These CIDRs authorize only the direct socket peers that may
 # call /readyz and /_metrics; forwarded and resolved-client headers are ignored. Include the actual
-# kubelet/CNI probe and monitoring peer ranges for the deployment. Empty remains a fail-closed
-# placeholder that local SKIP_METAGRAPH_CHECK development replaces with loopback defaults.
+# kubelet/CNI probe and monitoring peer ranges for the deployment. Empty is a fail-closed production
+# placeholder; standalone development with this setting unset defaults to loopback.
 operatorEndpointCidrs: ""
 dbSsl: "require"
 

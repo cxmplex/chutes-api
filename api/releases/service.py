@@ -1276,7 +1276,7 @@ async def active_l0_bootstrap(
     channel: str,
     compute_type: str = "cpu",
 ) -> Optional[SignedL0BootstrapManifest]:
-    """Return the newest transactionally admitted bootstrap without mutating state."""
+    """Return the newest active bootstrap publication without mutating state."""
 
     normalized_tee = tee_type.strip().lower()
     publication = (
