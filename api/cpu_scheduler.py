@@ -225,10 +225,7 @@ async def _current_attested_servers(session, servers: list[Server]) -> list[Serv
             func.row_number()
             .over(
                 partition_by=ServerAttestation.server_id,
-                order_by=(
-                    ServerAttestation.created_at.desc(),
-                    ServerAttestation.attestation_id.desc(),
-                ),
+                order_by=ServerAttestation.attempt_sequence.desc(),
             )
             .label("rn"),
         )

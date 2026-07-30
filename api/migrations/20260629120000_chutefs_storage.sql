@@ -91,7 +91,140 @@ CREATE TABLE IF NOT EXISTS storage_objects (
     updated_at  TIMESTAMPTZ,
     UNIQUE (volume_id, object_key)
 );
-CREATE INDEX IF NOT EXISTS idx_storage_objects_volume ON storage_objects (volume_id) WHERE deleted IS false;
+-- Fresh create_all already has the later immutable-generation index with the same name and no
+-- deleted column. Avoid even parsing the legacy predicate unless the exact legacy columns exist;
+-- IF NOT EXISTS does not suppress missing-column parse errors in PostgreSQL.
+DO $$
+DECLARE
+    has_deleted BOOLEAN;
+    has_lifecycle_state BOOLEAN;
+    volume_attnum SMALLINT;
+    object_attnum SMALLINT;
+    volume_index_oid OID;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM pg_attribute
+         WHERE attrelid = 'storage_objects'::regclass
+           AND attname = 'deleted' AND attnum > 0 AND NOT attisdropped
+    ) INTO has_deleted;
+    SELECT EXISTS (
+        SELECT 1 FROM pg_attribute
+         WHERE attrelid = 'storage_objects'::regclass
+           AND attname = 'lifecycle_state' AND attnum > 0 AND NOT attisdropped
+    ) INTO has_lifecycle_state;
+    SELECT attnum INTO STRICT volume_attnum
+      FROM pg_attribute
+     WHERE attrelid = 'storage_objects'::regclass
+       AND attname = 'volume_id' AND attnum > 0 AND NOT attisdropped;
+    SELECT attnum INTO object_attnum
+      FROM pg_attribute
+     WHERE attrelid = 'storage_objects'::regclass
+       AND attname = 'object_id' AND attnum > 0 AND NOT attisdropped;
+    SELECT relation.oid INTO volume_index_oid
+      FROM pg_class AS relation
+      JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+     WHERE namespace.nspname = current_schema()
+       AND relation.relname = 'idx_storage_objects_volume';
+
+    IF has_deleted AND NOT has_lifecycle_state THEN
+        IF NOT EXISTS (
+            SELECT 1
+              FROM pg_attribute AS attribute
+              JOIN pg_attrdef AS attribute_default
+                ON attribute_default.adrelid = attribute.attrelid
+               AND attribute_default.adnum = attribute.attnum
+             WHERE attribute.attrelid = 'storage_objects'::regclass
+               AND attribute.attname = 'deleted'
+               AND format_type(attribute.atttypid, attribute.atttypmod) = 'boolean'
+               AND attribute.attnotnull
+               AND pg_get_expr(attribute_default.adbin, attribute_default.adrelid) = 'false'
+        ) THEN
+            RAISE EXCEPTION 'legacy storage_objects.deleted has invalid definition';
+        END IF;
+        IF volume_index_oid IS NULL THEN
+            EXECUTE
+                'CREATE INDEX idx_storage_objects_volume '
+                'ON storage_objects (volume_id) WHERE deleted IS false';
+            SELECT relation.oid INTO volume_index_oid
+              FROM pg_class AS relation
+              JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+             WHERE namespace.nspname = current_schema()
+               AND relation.relname = 'idx_storage_objects_volume';
+        END IF;
+        IF NOT EXISTS (
+            SELECT 1
+              FROM pg_index AS index_definition
+              JOIN pg_class AS index_relation
+                ON index_relation.oid = index_definition.indexrelid
+              JOIN pg_am AS access_method
+                ON access_method.oid = index_relation.relam
+             WHERE index_definition.indexrelid = volume_index_oid
+               AND index_definition.indrelid = 'storage_objects'::regclass
+               AND index_relation.relkind = 'i'
+               AND access_method.amname = 'btree'
+               AND NOT index_definition.indisunique
+               AND NOT index_definition.indisprimary
+               AND NOT index_definition.indisexclusion
+               AND index_definition.indisvalid
+               AND index_definition.indisready
+               AND index_definition.indislive
+               AND index_definition.indnkeyatts = 1
+               AND index_definition.indnatts = 1
+               AND index_definition.indkey::TEXT = volume_attnum::TEXT
+               AND index_definition.indoption::TEXT = '0'
+               AND index_definition.indexprs IS NULL
+               AND lower(
+                    translate(
+                        regexp_replace(
+                            pg_get_expr(
+                                index_definition.indpred,
+                                index_definition.indrelid,
+                                TRUE
+                            ),
+                            '[[:space:]]+', '', 'g'
+                        ),
+                        '()', ''
+                    )
+               ) = 'deletedisfalse'
+        ) THEN
+            RAISE EXCEPTION 'idx_storage_objects_volume has invalid legacy shape';
+        END IF;
+    ELSIF NOT has_deleted AND has_lifecycle_state THEN
+        IF object_attnum IS NULL OR volume_index_oid IS NULL OR NOT EXISTS (
+            SELECT 1
+              FROM pg_index AS index_definition
+              JOIN pg_class AS index_relation
+                ON index_relation.oid = index_definition.indexrelid
+              JOIN pg_am AS access_method
+                ON access_method.oid = index_relation.relam
+             WHERE index_definition.indexrelid = volume_index_oid
+               AND index_definition.indrelid = 'storage_objects'::regclass
+               AND index_relation.relkind = 'i'
+               AND access_method.amname = 'btree'
+               AND NOT index_definition.indisunique
+               AND NOT index_definition.indisprimary
+               AND NOT index_definition.indisexclusion
+               AND index_definition.indisvalid
+               AND index_definition.indisready
+               AND index_definition.indislive
+               AND index_definition.indnkeyatts = 2
+               AND index_definition.indnatts = 2
+               AND index_definition.indkey::TEXT =
+                   volume_attnum::TEXT || ' ' || object_attnum::TEXT
+               AND index_definition.indoption::TEXT = '0 0'
+               AND index_definition.indexprs IS NULL
+               AND index_definition.indpred IS NULL
+        ) THEN
+            RAISE EXCEPTION 'idx_storage_objects_volume has invalid final shape';
+        END IF;
+    ELSE
+        RAISE EXCEPTION
+            'storage bootstrap requires exact legacy or final object columns; deleted=%, lifecycle_state=%',
+            has_deleted,
+            has_lifecycle_state;
+    END IF;
+END
+$$;
 
 -- Which storage TDs hold a replica of a given object. The validator uses this to (a) satisfy the
 -- volume's replication factor by dispatching replication, (b) answer "who has object X" peer lookups,

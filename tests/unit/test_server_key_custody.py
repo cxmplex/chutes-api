@@ -2,6 +2,7 @@
 
 import base64
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -30,6 +31,7 @@ from api.server.schemas import (
     LuksVolumeInfo,
     LuksVolumeRotation,
     Server,
+    ServerAttestation,
 )
 from api.server.service import (
     issue_boot_attestation_nonce,
@@ -85,6 +87,7 @@ def _capability(*, storage: bool = False) -> LuksCapabilityContext:
         trust_set_fingerprint=measurement_trust_set_fingerprint([measurement]),
         tee_type="tdx",
         storage_role=storage,
+        server_attestation_id="storage-attestation" if storage else None,
         allowed_volumes=["chutefs-data"] if storage else ["storage", "tdx-cache"],
     )
 
@@ -111,9 +114,30 @@ def _measurement(*, storage: bool = False, name: str | None = None) -> TeeMeasur
 def _db_with(server: Server) -> AsyncMock:
     db = AsyncMock(spec=AsyncSession)
     db.get.return_value = server
-    result = Mock()
-    result.scalar_one_or_none.return_value = server
-    db.execute.return_value = result
+    server_result = Mock()
+    server_result.scalar_one_or_none.return_value = server
+    attestation = ServerAttestation(
+        attestation_id="storage-attestation",
+        server_id=server.server_id,
+        verification_error=None,
+        verified_at=datetime.now(timezone.utc),
+        measurement_name=server.measurement_name,
+        measurement_config_fingerprint=server.measurement_config_fingerprint,
+        trust_set_fingerprint=server.trust_set_fingerprint,
+        revocation_status=dict(server.attestation_revocation_status or {}),
+    )
+    attestation_result = Mock()
+    attestation_result.scalar_one_or_none.return_value = attestation
+
+    def execute_result(stmt):
+        entities = {
+            desc.get("entity") for desc in getattr(stmt, "column_descriptions", [])
+        }
+        if ServerAttestation in entities:
+            return attestation_result
+        return server_result
+
+    db.execute.side_effect = execute_result
     db.commit = AsyncMock()
     return db
 
@@ -281,9 +305,20 @@ async def test_storage_registration_signature_binds_identity_cert_and_role():
     membership.scalar.return_value = True
     server_lookup = Mock()
     server_lookup.scalar_one_or_none.return_value = None
+    attempt_lookup = Mock()
+    attempt_lookup.scalar_one_or_none.side_effect = lambda: db.add.call_args.args[0]
     ip_owners = Mock()
     ip_owners.scalars.return_value.all.return_value = []
-    db.execute.side_effect = [membership, server_lookup, ip_owners]
+    # Existing-server allocation, membership, publication Server lock, exact attempt,
+    # sequence-latest CAS, then IP owners.
+    db.execute.side_effect = [
+        server_lookup,
+        membership,
+        server_lookup,
+        attempt_lookup,
+        attempt_lookup,
+        ip_owners,
+    ]
     reservation = SimpleNamespace(
         reservation_id="reservation-1",
         boot_generation=1,
@@ -310,6 +345,10 @@ async def test_storage_registration_signature_binds_identity_cert_and_role():
             return_value=(reservation, claims),
         ),
         patch("api.server.service._verify_td_registration_signature"),
+        patch(
+            "api.server.service._ensure_attestation_subject",
+            new_callable=AsyncMock,
+        ),
         patch(
             "api.server.service._validate_cpu_registration_host",
             new_callable=AsyncMock,
@@ -398,6 +437,35 @@ async def test_luks_attest_rejects_wrong_owner_role_cert_or_volume_without_keys(
             )
 
     assert exc_info.value.status_code == 403
+    build_quote.assert_not_called()
+    rotate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_storage_luks_capability_is_invalid_after_newer_attestation_attempt():
+    server = _server(storage_role=True)
+    db = _db_with(server)
+    capability = _capability(storage=True).model_copy(
+        update={"server_attestation_id": "older-attestation"}
+    )
+    body = LuksAttestRequest(quote="quote", volumes=["chutefs-data"])
+
+    with (
+        patch("api.server.service.build_runtime_quote") as build_quote,
+        patch(
+            "api.server.service.lease_luks_passphrases", new_callable=AsyncMock
+        ) as rotate,
+        pytest.raises(HTTPException, match="Latest attestation attempt"),
+    ):
+        await process_luks_attest_request(
+            db,
+            SERVER_ID,
+            OWNER,
+            body,
+            (QUOTE_NONCE, capability),
+            CERT_HASH,
+        )
+
     build_quote.assert_not_called()
     rotate.assert_not_awaited()
 

@@ -134,6 +134,17 @@ def mock_sqlalchemy_func():
         yield mock_func
 
 
+@pytest.fixture(autouse=True)
+def mock_attestation_subject():
+    """Subject persistence has dedicated protocol tests; isolate broad service tests."""
+
+    with patch(
+        "api.server.service._ensure_attestation_subject",
+        new_callable=AsyncMock,
+    ) as ensure_subject:
+        yield ensure_subject
+
+
 @pytest.fixture
 def mock_db_session():
     """Mock database session."""
@@ -149,6 +160,14 @@ def mock_db_session():
 def _server_lock_result(server):
     result = Mock()
     result.scalar_one.return_value = server
+    return result
+
+
+def _latest_added_attempt_result(session):
+    """Return whichever ServerAttestation this test just durably allocated."""
+
+    result = Mock()
+    result.scalar_one_or_none.side_effect = lambda: session.add.call_args.args[0]
     return result
 
 
@@ -595,7 +614,7 @@ async def test_process_runtime_attestation_success(
     """Test successful runtime attestation processing."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
-    mock_db_session.execute.return_value = _server_lock_result(sample_server)
+    mock_db_session.execute.return_value = _latest_added_attempt_result(mock_db_session)
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         with patch(
@@ -638,9 +657,9 @@ async def test_process_runtime_attestation_success(
             assert "verified_at" in result
 
             mock_db_session.add.assert_called_once()
-            assert mock_db_session.commit.await_count == 2
+            assert mock_db_session.commit.await_count == 3
             mock_db_session.rollback.assert_not_awaited()
-            mock_db_session.execute.assert_awaited_once()
+            assert mock_db_session.execute.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -1086,7 +1105,7 @@ async def test_full_runtime_flow_end_to_end(
     """Test complete runtime attestation flow."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
-    mock_db_session.execute.return_value = _server_lock_result(sample_server)
+    mock_db_session.execute.return_value = _latest_added_attempt_result(mock_db_session)
 
     # Step 1: Create runtime nonce
     mock_settings.redis_client.get.return_value = json.dumps(
@@ -1151,9 +1170,9 @@ async def test_full_runtime_flow_end_to_end(
 
                 assert result["status"] == "verified"
                 assert result["attestation_id"] == "runtime-attest-123"
-                assert mock_db_session.commit.await_count == 2
+                assert mock_db_session.commit.await_count == 3
                 mock_db_session.rollback.assert_not_awaited()
-                mock_db_session.execute.assert_awaited_once()
+                assert mock_db_session.execute.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -1226,25 +1245,33 @@ async def test_boot_attestation_partial_failure_recovery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "verification_error",
+    [
+        InvalidQuoteError("Invalid quote"),
+        InvalidSignatureError("Invalid signature"),
+    ],
+)
 async def test_runtime_attestation_partial_failure_recovery(
     mock_db_session,
     runtime_attestation_args,
     sample_runtime_quote,
     sample_server,
     runtime_nonce_context,
+    verification_error,
 ):
     """Test runtime attestation handles partial failures gracefully."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
-    mock_db_session.execute.return_value = _server_lock_result(sample_server)
+    mock_db_session.execute.return_value = _latest_added_attempt_result(mock_db_session)
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         with patch("api.server.service.build_runtime_quote", return_value=sample_runtime_quote):
             with patch(
                 "api.server.service.verify_quote",
-                side_effect=InvalidQuoteError("Invalid quote"),
+                side_effect=verification_error,
             ):
-                with pytest.raises(InvalidQuoteError):
+                with pytest.raises(type(verification_error)):
                     await process_runtime_attestation(
                         mock_db_session,
                         server_id,
@@ -1258,14 +1285,14 @@ async def test_runtime_attestation_partial_failure_recovery(
 
                 # Should still create failed attestation record
                 mock_db_session.add.assert_called_once()
-                assert mock_db_session.commit.await_count == 2
+                assert mock_db_session.commit.await_count == 3
                 mock_db_session.rollback.assert_awaited_once()
-                mock_db_session.execute.assert_awaited_once()
+                assert mock_db_session.execute.await_count == 4
 
                 # Verify the failed record has correct fields
                 call_args = mock_db_session.add.call_args[0][0]
                 assert isinstance(call_args, ServerAttestation)
-                assert call_args.verification_error == "Invalid quote"
+                assert call_args.verification_error == verification_error.detail
 
 
 # Performance and Concurrency Tests
@@ -1471,7 +1498,7 @@ async def test_runtime_attestation_database_rollback_on_error(
     """Test that runtime attestation database operations handle errors."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
-    mock_db_session.execute.return_value = _server_lock_result(sample_server)
+    mock_db_session.execute.return_value = _latest_added_attempt_result(mock_db_session)
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         with patch("api.server.service.build_runtime_quote", return_value=sample_runtime_quote):
@@ -1505,9 +1532,9 @@ async def test_runtime_attestation_database_rollback_on_error(
                     )
 
                 mock_db_session.add.assert_called_once()
-                assert mock_db_session.commit.await_count == 2
+                assert mock_db_session.commit.await_count == 3
                 mock_db_session.rollback.assert_not_awaited()
-                mock_db_session.execute.assert_awaited_once()
+                assert mock_db_session.execute.await_count == 4
 
 
 # Comprehensive Quote Validation Tests

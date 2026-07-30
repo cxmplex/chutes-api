@@ -1438,16 +1438,18 @@ async def _require_current_attestation_identity(db, server: Server) -> None:
 
     try:
         await runtime_attestation_context_for_server_db(db, server)
-        if server.compute_type == "gpu":
+        if server.compute_type in {"cpu", "gpu"}:
             from api.server.gpu_sessions import (
                 _current_attestation,
+                _current_attestation_identity,
                 _latest_attestation_attempt,
             )
 
-            _current_attestation(
-                server,
-                await _latest_attestation_attempt(db, server.server_id),
-            )
+            latest = await _latest_attestation_attempt(db, server.server_id)
+            if server.compute_type == "gpu":
+                _current_attestation(server, latest)
+            else:
+                _current_attestation_identity(server, latest)
     except MeasurementMismatchError as exc:
         logger.warning(
             f"Rejecting stale CPU-TEE server identity {server.server_id}: {exc}"

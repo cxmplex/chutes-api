@@ -2281,6 +2281,12 @@ class TdLaunchReservation(Base):
             name="uq_td_launch_reservation_boot",
         ),
         UniqueConstraint(
+            "reservation_id",
+            "server_id",
+            "owner_hotkey",
+            name="uq_td_launch_reservation_attribution",
+        ),
+        UniqueConstraint(
             "consumed_attestation_id",
             name="uq_td_launch_reservation_attestation",
         ),

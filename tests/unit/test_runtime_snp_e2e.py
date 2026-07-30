@@ -21,12 +21,14 @@ from api.config import (
     measurement_trust_set_fingerprint,
 )
 from api.constants import NoncePurpose
+from api.host.schemas import TdLaunchReservation
 from api.server import gcp_vtpm, snp_verify
 from api.server.exceptions import MeasurementMismatchError, NonceError
 from api.server.schemas import (
     RuntimeAttestationArgs,
     RuntimeAttestationNonceContext,
     Server,
+    ServerAttestation,
 )
 from api.server.service import (
     create_nonce,
@@ -86,14 +88,26 @@ class _Database:
     def __init__(self, server):
         self.server = server
         self.added = []
+        self.info = {}
         self.commits = 0
         self.rollbacks = 0
 
-    async def execute(self, _statement):
+    async def execute(self, statement, _params=None):
+        descriptions = getattr(statement, "column_descriptions", ())
+        entity = descriptions[0].get("entity") if descriptions else None
+        if entity is ServerAttestation:
+            latest = self.added[-1] if self.added else None
+            return _Result(latest)
+        if entity is TdLaunchReservation:
+            return _Result(None)
         return _Result(self.server)
 
     def add(self, value):
         self.added.append(value)
+
+    async def flush(self):
+        if self.added:
+            self.added[-1].attempt_sequence = len(self.added)
 
     async def commit(self):
         self.commits += 1
@@ -140,7 +154,9 @@ def _server(config, *, gcp):
         self_registered=True,
         compute_type="cpu",
         tee_type="sev-snp",
-        host_id=None if gcp else "l0-synthetic",
+        # This synthetic test exercises bare-metal-direct SNP. Model-B requires an exact
+        # consumed launch reservation and is covered by the authority protocol regressions.
+        host_id=None,
         storage_role=False,
         version=config.version,
         measurement_name=config.name,
@@ -403,7 +419,7 @@ async def test_bare_metal_snp_runtime_nonce_cert_measurement_and_replay(
     assert attestation.revocation_status == {"amd_vcek": "good"}
     assert server.attestation_revocation_status == {"amd_vcek": "good"}
     assert result["revocation_status"] == {"amd_vcek": "good"}
-    assert db.commits == 2
+    assert db.commits == 3  # durable pending row, unlocked preflight, final publication
     assert db.rollbacks == 0
     with pytest.raises(NonceError, match="not found or expired"):
         await validate_and_consume_nonce(nonce, server.ip, NoncePurpose.RUNTIME)
@@ -460,7 +476,7 @@ async def test_gcp_snp_runtime_with_synthetic_vtpm_and_exact_instance_identity(
     }
     assert server.attestation_revocation_status == attestation.revocation_status
     assert result["revocation_status"] == attestation.revocation_status
-    assert db.commits == 2
+    assert db.commits == 3  # durable pending row, unlocked preflight, final publication
     assert db.rollbacks == 0
     with pytest.raises(NonceError, match="not found or expired"):
         await validate_and_consume_nonce(nonce, server.ip, NoncePurpose.RUNTIME)
@@ -489,7 +505,7 @@ async def test_runtime_context_rejects_identity_mutation_after_nonce(monkeypatch
     elif mutation == "compute":
         server.compute_type = "gpu"
     elif mutation == "host":
-        server.host_id = None
+        server.host_id = "unexpected-model-b-host"
 
     with pytest.raises((MeasurementMismatchError, NonceError)):
         await process_runtime_attestation(

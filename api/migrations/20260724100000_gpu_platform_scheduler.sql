@@ -359,7 +359,7 @@ CREATE INDEX IF NOT EXISTS idx_server_attestations_gpu_lineage
     ON server_attestations (
         gpu_launch_reservation_id,
         gpu_allocation_group_id,
-        created_at DESC
+        attempt_sequence DESC
     )
     WHERE gpu_launch_reservation_id IS NOT NULL;
 

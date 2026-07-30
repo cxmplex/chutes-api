@@ -79,12 +79,14 @@ def _revocation_failed(value: Any) -> bool:
     return True
 
 
-def _current_attestation(
+def _current_attestation_identity(
     server: Server,
     attestation: ServerAttestation | None,
     *,
     expected_id: str | None = None,
 ) -> ServerAttestation:
+    """Require the latest CPU or GPU attempt to preserve active server authority."""
+
     cutoff = datetime.now(timezone.utc) - timedelta(
         seconds=settings.release_attestation_max_age_seconds
     )
@@ -95,7 +97,6 @@ def _current_attestation(
         or attestation.verification_error is not None
         or attestation.verified_at is None
         or attestation.verified_at < cutoff
-        or attestation.gpu_retired_at is not None
         or attestation.measurement_name != server.measurement_name
         or attestation.measurement_config_fingerprint
         != server.measurement_config_fingerprint
@@ -103,6 +104,31 @@ def _current_attestation(
         or dict(attestation.revocation_status or {})
         != dict(server.attestation_revocation_status or {})
         or _revocation_failed(attestation.revocation_status)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Latest attestation attempt is not current and successful.",
+        )
+    return attestation
+
+
+def _current_attestation(
+    server: Server,
+    attestation: ServerAttestation | None,
+    *,
+    expected_id: str | None = None,
+) -> ServerAttestation:
+    try:
+        attestation = _current_attestation_identity(
+            server, attestation, expected_id=expected_id
+        )
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Latest GPU attestation attempt is not current and successful.",
+        ) from exc
+    if (
+        attestation.gpu_retired_at is not None
         or attestation.gpu_launch_reservation_id != server.gpu_launch_reservation_id
         or attestation.gpu_allocation_group_id != server.gpu_allocation_group_id
         or attestation.gpu_allocation_group_generation
@@ -129,10 +155,7 @@ async def _latest_attestation_attempt(
     query = (
         select(ServerAttestation)
         .where(ServerAttestation.server_id == server_id)
-        .order_by(
-            ServerAttestation.created_at.desc(),
-            ServerAttestation.attestation_id.desc(),
-        )
+        .order_by(ServerAttestation.attempt_sequence.desc())
         .limit(1)
     )
     if for_update:

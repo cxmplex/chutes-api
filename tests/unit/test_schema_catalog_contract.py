@@ -4,10 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from api.host.schemas import RegistrySession
+from api.host.schemas import RegistrySession, TdLaunchReservation
 from api.instance.schemas import Instance, LaunchConfig
 from api.node.schemas import Node
-from api.server.schemas import Server
+from api.server.schemas import Server, ServerAttestation, ServerAttestationSubject
 
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "api/migrations"
@@ -129,6 +129,144 @@ def test_registry_closure_check_matches_final_manifest_tag_shape():
         "ADD CONSTRAINT ck_registry_session_closure", maxsplit=1
     )[1].split("DROP COLUMN IF EXISTS manifest_tag_digests", maxsplit=1)[0]
     assert "manifest_tag_digests" not in restored
+
+
+def test_attestation_attempt_order_is_database_generated_and_catalog_aligned():
+    column = ServerAttestation.__table__.columns["attempt_sequence"]
+    assert column.nullable is False
+    assert "server_attestation_attempt_sequence" in str(column.server_default.arg)
+    index = next(
+        item
+        for item in ServerAttestation.__table__.indexes
+        if item.name == "idx_server_attestations_attempt_sequence"
+    )
+    assert index.unique is True
+
+    migration = (
+        MIGRATIONS / "20260714070000_release_attestation_identity.sql"
+    ).read_text()
+    up = migration.split("-- migrate:down", maxsplit=1)[0]
+    assert "CREATE SEQUENCE server_attestation_attempt_sequence" in up
+    assert "partial server attestation attempt sequence catalog" in up
+    assert "server_attestation_attempt_sequence has invalid identity" in up
+    assert "idx_server_attestations_attempt_sequence has invalid definition" in up
+    assert "ROW_NUMBER() OVER" in up
+    assert "ORDER BY created_at ASC NULLS LAST, attestation_id ASC" in up
+    assert "SET DEFAULT nextval(''server_attestation_attempt_sequence''::regclass)" in up
+    assert "ON server_attestations (server_id, attempt_sequence DESC)" in up
+
+    release_index = next(
+        item
+        for item in ServerAttestation.__table__.indexes
+        if item.name == "idx_server_attestations_release_identity"
+    )
+    assert release_index.dialect_options["postgresql"]["include"] == [
+        "measurement_name",
+        "measurement_version",
+        "measurement_config_fingerprint",
+        "trust_set_fingerprint",
+        "verification_error",
+        "verified_at",
+    ]
+    trust_migration = (
+        MIGRATIONS / "20260714100000_attestation_trust_fingerprints.sql"
+    ).read_text().split("-- migrate:down", maxsplit=1)[0]
+    release_rebuild = trust_migration.split(
+        "DROP INDEX IF EXISTS idx_server_attestations_release_identity;", maxsplit=1
+    )[1]
+    for included in release_index.dialect_options["postgresql"]["include"]:
+        assert included in release_rebuild
+    assert "ON server_attestations (server_id, attempt_sequence DESC)" in release_rebuild
+
+    gpu_migration = (
+        MIGRATIONS / "20260724100000_gpu_platform_scheduler.sql"
+    ).read_text().split("-- migrate:down", maxsplit=1)[0]
+    gpu_index = gpu_migration.split(
+        "CREATE INDEX IF NOT EXISTS idx_server_attestations_gpu_lineage",
+        maxsplit=1,
+    )[1].split(";", maxsplit=1)[0]
+    assert "attempt_sequence DESC" in gpu_index
+    assert "created_at DESC" not in gpu_index
+
+
+
+def test_attestation_subject_and_model_b_attribution_catalogs_are_fail_closed():
+    subject_fk = next(
+        foreign_key
+        for foreign_key in ServerAttestation.__table__.columns["server_id"].foreign_keys
+        if foreign_key.constraint.name == "fk_server_attestations_subject"
+    )
+    assert subject_fk.constraint.name == "fk_server_attestations_subject"
+    assert subject_fk.target_fullname == "server_attestation_subjects.server_id"
+    assert subject_fk.ondelete == "RESTRICT"
+    assert Server.runtime_attestations.property.viewonly is True
+    assert ServerAttestation.server.property.viewonly is True
+
+    subject_constraints = {
+        constraint.name for constraint in ServerAttestationSubject.__table__.constraints
+    }
+    assert {
+        "uq_server_attestation_subject_owner",
+        "ck_server_attestation_subject_compute_type",
+        "ck_server_attestation_subject_tee_type",
+        "ck_server_attestation_subject_deployment_model",
+    }.issubset(subject_constraints)
+    attestation_constraints = {
+        constraint.name for constraint in ServerAttestation.__table__.constraints
+    }
+    assert {
+        "fk_server_attestations_attribution_owner",
+        "fk_server_attestations_td_reservation_attribution",
+        "ck_server_attestation_attribution",
+    }.issubset(attestation_constraints)
+    reservation_constraints = {
+        constraint.name for constraint in TdLaunchReservation.__table__.constraints
+    }
+    assert "uq_td_launch_reservation_attribution" in reservation_constraints
+
+    identity_migration = (
+        MIGRATIONS / "20260714070000_release_attestation_identity.sql"
+    ).read_text()
+    identity_up, identity_down = identity_migration.split("-- migrate:down", maxsplit=1)
+    for marker in (
+        "CREATE TABLE IF NOT EXISTS server_attestation_subjects",
+        "pg_get_constraintdef(actual.oid, TRUE)",
+        "expected exact legacy or final server attestation FK shape",
+        "ADD CONSTRAINT fk_server_attestations_subject",
+        "ON CONFLICT (server_id) DO NOTHING",
+        "CREATE TRIGGER enforce_server_attestation_subject",
+        "CREATE TRIGGER preserve_server_attestation_audit",
+        "CREATE TRIGGER preserve_server_attestation_subject_identity",
+        "has invalid trigger shape",
+        "NEW.attestation_id IS DISTINCT FROM OLD.attestation_id",
+        "NEW.created_at IS DISTINCT FROM OLD.created_at",
+    ):
+        assert marker in identity_up
+    assert "LEFT JOIN servers AS server_row" in identity_down
+    assert "cannot restore legacy attestation FK" in identity_down
+    assert "ON DELETE CASCADE" in identity_down
+
+    seedless = (
+        MIGRATIONS / "20260720200000_seedless_model_b.sql"
+    ).read_text()
+    seedless_up, seedless_down = seedless.split("-- migrate:down", maxsplit=1)
+    for marker in (
+        "uq_td_launch_reservation_attribution",
+        "ADD COLUMN IF NOT EXISTS attribution_reservation_id VARCHAR",
+        "ADD COLUMN IF NOT EXISTS attribution_owner_hotkey VARCHAR",
+        "pg_get_constraintdef(actual.oid, TRUE)",
+        "server attestation attribution check has an unexpected name",
+        "ADD CONSTRAINT fk_server_attestations_attribution_owner",
+        "ADD CONSTRAINT fk_server_attestations_td_reservation_attribution",
+        "has invalid or duplicate authority",
+    ):
+        assert marker in seedless_up
+    assert (
+        seedless_down.index(
+            "DROP CONSTRAINT IF EXISTS fk_server_attestations_td_reservation_attribution"
+        )
+        < seedless_down.index("DROP TABLE IF EXISTS td_launch_reservations")
+    )
 
 
 def test_default_volume_migration_contains_final_unshipped_authority_shape():

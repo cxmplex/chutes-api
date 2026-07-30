@@ -16,7 +16,7 @@ from sqlalchemy import or_, select
 import api.database.orms  # noqa
 from api.config import settings
 from api.database import get_session
-from api.server.schemas import Host, Server, ServerAttestation
+from api.server.schemas import Host, Server
 from api.host import service as host_service
 from api.host.schemas import (
     HostSocketAuthenticationV1,
@@ -46,6 +46,21 @@ sio.miner_expiry_tasks = {}
 # 1-click CPU TEE agent sessions: server_id -> session_id, and session_id -> {hotkey, server_id}.
 sio.agent_sessions = {}
 sio.agent_meta = {}
+
+
+async def _require_current_server_attestation(session, server: Server):
+    """Require the latest completed attempt for every attested TD control channel."""
+
+    from api.server.gpu_sessions import (
+        _current_attestation,
+        _current_attestation_identity,
+        _latest_attestation_attempt,
+    )
+
+    latest = await _latest_attestation_attempt(session, server.server_id)
+    if server.compute_type == "gpu":
+        return _current_attestation(server, latest)
+    return _current_attestation_identity(server, latest)
 
 
 async def _validate_agent_session(session_id: str) -> bool:
@@ -79,31 +94,15 @@ async def _validate_agent_session(session_id: str) -> bool:
                 valid = readiness.control_channel_eligible
         elif attested_spki:
             server = await session.get(Server, meta["server_id"])
-            latest = (
-                await session.execute(
-                    select(ServerAttestation)
-                    .where(ServerAttestation.server_id == meta["server_id"])
-                    .order_by(
-                        ServerAttestation.created_at.desc(),
-                        ServerAttestation.attestation_id.desc(),
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            cutoff = datetime.now(timezone.utc) - timedelta(
-                seconds=settings.release_attestation_max_age_seconds
-            )
             valid = bool(
                 server is not None
                 and server.attested_cert_pubkey_hash == attested_spki
-                and latest is not None
-                and latest.verification_error is None
-                and latest.verified_at is not None
-                and latest.verified_at >= cutoff
-                and latest.measurement_name == server.measurement_name
-                and latest.measurement_config_fingerprint == server.measurement_config_fingerprint
-                and latest.trust_set_fingerprint == server.trust_set_fingerprint
             )
+            if valid:
+                try:
+                    await _require_current_server_attestation(session, server)
+                except HTTPException:
+                    valid = False
         else:
             valid = True
     if not valid:
@@ -327,6 +326,8 @@ async def agent_authenticate(session_id: str, headers: Dict[str, str]) -> bool:
                     )
                 )
             ).scalar_one_or_none()
+            if server is not None:
+                await _require_current_server_attestation(session, server)
         if server is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -406,20 +407,12 @@ async def td_challenge(session_id: str, data: Dict[str, object]) -> bool:
             ).scalar_one_or_none()
             if server is None or not server.attested_cert or not server.attested_cert_pubkey_hash:
                 raise ValueError("server has no current reservation-attested identity")
+            await _require_current_server_attestation(session, server)
             reservation_identity = {}
             if server.compute_type == "gpu":
-                from api.server.gpu_sessions import (
-                    _current_attestation,
-                    _latest_attestation_attempt,
-                )
-
                 reservation = await session.get(
                     GpuLaunchReservation,
                     server.gpu_launch_reservation_id,
-                )
-                _current_attestation(
-                    server,
-                    await _latest_attestation_attempt(session, server.server_id),
                 )
                 if (
                     reservation is None
@@ -515,6 +508,7 @@ async def td_authenticate(session_id: str, data: Dict[str, object]) -> bool:
             ).scalar_one_or_none()
             if server is None or not server.attested_cert:
                 raise ValueError("TD attested identity is no longer current")
+            await _require_current_server_attestation(session, server)
             reservation_fields = (
                 "launch_reservation_id",
                 "gpu_launch_reservation_id",

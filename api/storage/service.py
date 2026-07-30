@@ -181,7 +181,7 @@ async def _verified_storage_ids(db: AsyncSession, server_ids: Sequence[str]) -> 
             func.row_number()
             .over(
                 partition_by=ServerAttestation.server_id,
-                order_by=ServerAttestation.created_at.desc(),
+                order_by=ServerAttestation.attempt_sequence.desc(),
             )
             .label("rn"),
         )

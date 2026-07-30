@@ -30,7 +30,10 @@ from sqlalchemy import (
     Index,
     ForeignKeyConstraint,
     UniqueConstraint,
+    Sequence,
     case,
+    event,
+    DDL,
 )
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.dialects.postgresql import JSONB
@@ -126,6 +129,11 @@ class RuntimeAttestationNonceContext(BaseModel):
     measurement_version: str
     measurement_config_fingerprint: str
     trust_set_fingerprint: str
+    cpu_launch_reservation_id: Optional[str] = Field(None, min_length=1)
+    cpu_launch_boot_generation: Optional[int] = Field(None, ge=1)
+    cpu_process_incarnation: Optional[str] = Field(None, min_length=1)
+    cpu_claims_sha256: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
+    cpu_registration_attestation_id: Optional[str] = Field(None, min_length=1)
     gpu_launch_reservation_id: Optional[str] = None
     gpu_allocation_group_id: Optional[str] = None
     gpu_allocation_group_generation: Optional[int] = Field(None, ge=1)
@@ -141,7 +149,14 @@ class RuntimeAttestationNonceContext(BaseModel):
     gpu_claims_sha256: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
-    def _exact_gpu_lineage(self) -> "RuntimeAttestationNonceContext":
+    def _exact_reservation_lineage(self) -> "RuntimeAttestationNonceContext":
+        cpu_required = (
+            self.cpu_launch_reservation_id,
+            self.cpu_launch_boot_generation,
+            self.cpu_process_incarnation,
+            self.cpu_claims_sha256,
+            self.cpu_registration_attestation_id,
+        )
         gpu_required = (
             self.gpu_launch_reservation_id,
             self.gpu_allocation_group_id,
@@ -155,7 +170,27 @@ class RuntimeAttestationNonceContext(BaseModel):
             self.gpu_profile_id,
             self.gpu_claims_sha256,
         )
-        if self.compute_type == "gpu":
+        gpu_lineage = (*gpu_required, self.gpu_chute_id, self.gpu_job_id)
+        if self.compute_type == "cpu":
+            if any(value is not None for value in gpu_lineage):
+                raise ValueError("CPU runtime nonce cannot carry GPU reservation lineage")
+            present = [value is not None for value in cpu_required]
+            if self.deployment_model == "bare-metal-model-b":
+                if not all(present):
+                    raise ValueError(
+                        "Model-B CPU runtime nonce requires complete launch reservation lineage"
+                    )
+                if self.provider != "bare-metal" or self.host_id is None:
+                    raise ValueError(
+                        "Model-B CPU runtime nonce requires a bare-metal host identity"
+                    )
+            elif any(present):
+                raise ValueError(
+                    "Model-A or direct CPU runtime nonce cannot carry launch reservation lineage"
+                )
+        else:
+            if any(value is not None for value in cpu_required):
+                raise ValueError("GPU runtime nonce cannot carry CPU reservation lineage")
             present = [value is not None for value in gpu_required]
             if any(present) and not all(present):
                 raise ValueError("GPU runtime nonce requires complete reservation lineage")
@@ -163,10 +198,6 @@ class RuntimeAttestationNonceContext(BaseModel):
                 self.role != "compute" or self.deployment_model != "bare-metal-model-b"
             ):
                 raise ValueError("GPU runtime nonce requires a Model-B compute server")
-        elif any(
-            value is not None for value in (*gpu_required, self.gpu_chute_id, self.gpu_job_id)
-        ):
-            raise ValueError("CPU runtime nonce cannot carry GPU reservation lineage")
         return self
 
 
@@ -214,6 +245,7 @@ class LuksCapabilityContext(BaseModel):
     trust_set_fingerprint: str
     tee_type: str
     storage_role: bool
+    server_attestation_id: Optional[str] = None
     allowed_volumes: List[str]
     issued_volumes: Optional[List[str]] = None
     issued_generations: Optional[Dict[str, int]] = None
@@ -1417,6 +1449,41 @@ class TeeUpgradeWindow(Base):
     )
 
 
+class ServerAttestationSubject(Base):
+    """Immutable attribution identity shared by operational and pre-registration audits."""
+
+    __tablename__ = "server_attestation_subjects"
+
+    server_id = Column(String, primary_key=True)
+    owner_hotkey = Column(String, nullable=False)
+    compute_type = Column(String, nullable=False)
+    tee_type = Column(String, nullable=False)
+    deployment_model = Column(String, nullable=False)
+    first_seen_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "server_id",
+            "owner_hotkey",
+            name="uq_server_attestation_subject_owner",
+        ),
+        CheckConstraint(
+            "compute_type IN ('cpu', 'gpu')",
+            name="ck_server_attestation_subject_compute_type",
+        ),
+        CheckConstraint(
+            "tee_type IN ('tdx', 'sev-snp')",
+            name="ck_server_attestation_subject_tee_type",
+        ),
+        CheckConstraint(
+            "deployment_model IN ('cpu-model-a', 'cpu-model-b', 'gpu')",
+            name="ck_server_attestation_subject_deployment_model",
+        ),
+    )
+
+
 class Server(Base):
     """Main server entity (created after boot via CLI)."""
 
@@ -1620,7 +1687,9 @@ class Server(Base):
     # Relationships
     nodes = relationship("Node", back_populates="server", cascade="all, delete-orphan")
     runtime_attestations = relationship(
-        "ServerAttestation", back_populates="server", cascade="all, delete-orphan"
+        "ServerAttestation",
+        primaryjoin="Server.server_id == foreign(ServerAttestation.server_id)",
+        viewonly=True,
     )
     miner = relationship("MetagraphNode", back_populates="servers")
     pending_upgrade_window = relationship(
@@ -1858,13 +1927,32 @@ class Host(Base):
     )
 
 
+server_attestation_attempt_sequence = Sequence("server_attestation_attempt_sequence")
+
+
 class ServerAttestation(Base):
     """Track runtime attestations (post-registration)."""
 
     __tablename__ = "server_attestations"
 
     attestation_id = Column(String, primary_key=True, default=generate_uuid)
-    server_id = Column(String, ForeignKey("servers.server_id", ondelete="CASCADE"), nullable=False)
+    attempt_sequence = Column(
+        BigInteger,
+        server_attestation_attempt_sequence,
+        server_default=server_attestation_attempt_sequence.next_value(),
+        nullable=False,
+    )
+    server_id = Column(
+        String,
+        ForeignKey(
+            "server_attestation_subjects.server_id",
+            name="fk_server_attestations_subject",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    attribution_reservation_id = Column(String, nullable=True)
+    attribution_owner_hotkey = Column(String, nullable=True)
     quote_data = Column(Text, nullable=True)  # Base64 encoded quote
     verification_error = Column(String, nullable=True)
     measurement_version = Column(
@@ -1904,17 +1992,54 @@ class ServerAttestation(Base):
     gpu_job_id = Column(String, nullable=True)
     gpu_claims_sha256 = Column(String(64), nullable=True)
 
-    server = relationship("Server", back_populates="runtime_attestations")
+    server = relationship(
+        "Server",
+        primaryjoin="foreign(ServerAttestation.server_id) == Server.server_id",
+        viewonly=True,
+    )
 
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["server_id", "attribution_owner_hotkey"],
+            [
+                "server_attestation_subjects.server_id",
+                "server_attestation_subjects.owner_hotkey",
+            ],
+            name="fk_server_attestations_attribution_owner",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "attribution_reservation_id",
+                "server_id",
+                "attribution_owner_hotkey",
+            ],
+            [
+                "td_launch_reservations.reservation_id",
+                "td_launch_reservations.server_id",
+                "td_launch_reservations.owner_hotkey",
+            ],
+            name="fk_server_attestations_td_reservation_attribution",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "(attribution_reservation_id IS NULL AND attribution_owner_hotkey IS NULL) "
+            "OR (attribution_reservation_id IS NOT NULL "
+            "AND attribution_owner_hotkey IS NOT NULL)",
+            name="ck_server_attestation_attribution",
+        ),
         Index("idx_attestation_server", "server_id"),
         Index("idx_attestation_created", "created_at"),
         Index("idx_attestation_verified", "verified_at"),
         Index(
+            "idx_server_attestations_attempt_sequence",
+            attempt_sequence,
+            unique=True,
+        ),
+        Index(
             "idx_server_attestations_release_identity",
             server_id,
-            created_at.desc(),
-            attestation_id.desc(),
+            attempt_sequence.desc(),
             postgresql_include=[
                 "measurement_name",
                 "measurement_version",
@@ -1963,10 +2088,179 @@ class ServerAttestation(Base):
             "idx_server_attestations_gpu_lineage",
             "gpu_launch_reservation_id",
             "gpu_allocation_group_id",
-            created_at.desc(),
+            attempt_sequence.desc(),
             postgresql_where=gpu_launch_reservation_id.isnot(None),
         ),
     )
+
+
+_SERVER_ATTESTATION_SUBJECT_IMMUTABILITY_FUNCTION = DDL(
+    """
+CREATE OR REPLACE FUNCTION preserve_server_attestation_subject_identity()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW IS NOT DISTINCT FROM OLD THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'server attestation subjects are immutable';
+END
+$$
+"""
+).execute_if(dialect="postgresql")
+_SERVER_ATTESTATION_SUBJECT_DROP_TRIGGER = DDL(
+    "DROP TRIGGER IF EXISTS preserve_server_attestation_subject_identity "
+    "ON server_attestation_subjects"
+).execute_if(dialect="postgresql")
+_SERVER_ATTESTATION_SUBJECT_CREATE_TRIGGER = DDL(
+    """
+CREATE TRIGGER preserve_server_attestation_subject_identity
+BEFORE UPDATE OR DELETE ON server_attestation_subjects
+FOR EACH ROW EXECUTE FUNCTION preserve_server_attestation_subject_identity()
+"""
+).execute_if(dialect="postgresql")
+
+_SERVER_ATTESTATION_SUBJECT_FUNCTION = DDL(
+    """
+CREATE OR REPLACE FUNCTION enforce_server_attestation_subject()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    subject_row server_attestation_subjects%%ROWTYPE;
+    live_owner TEXT;
+    live_compute_type TEXT;
+    live_tee_type TEXT;
+    live_deployment_model TEXT;
+    attributed_owner TEXT;
+    attributed_reservation TEXT;
+BEGIN
+    SELECT * INTO subject_row
+      FROM server_attestation_subjects
+     WHERE server_id = NEW.server_id;
+
+    SELECT
+        miner_hotkey,
+        compute_type,
+        tee_type,
+        CASE
+            WHEN compute_type = 'gpu' THEN 'gpu'
+            WHEN (to_jsonb(servers)->>'launch_reservation_id') IS NOT NULL
+                THEN 'cpu-model-b'
+            ELSE 'cpu-model-a'
+        END
+      INTO live_owner, live_compute_type, live_tee_type, live_deployment_model
+      FROM servers
+     WHERE server_id = NEW.server_id;
+
+    IF subject_row.server_id IS NULL THEN
+        IF live_owner IS NULL THEN
+            RAISE EXCEPTION
+                'attestation subject %% must be created from authenticated reservation identity',
+                NEW.server_id;
+        END IF;
+        INSERT INTO server_attestation_subjects (
+            server_id, owner_hotkey, compute_type, tee_type, deployment_model
+        ) VALUES (
+            NEW.server_id,
+            live_owner,
+            live_compute_type,
+            live_tee_type,
+            live_deployment_model
+        )
+        ON CONFLICT (server_id) DO NOTHING;
+        SELECT * INTO subject_row
+          FROM server_attestation_subjects
+         WHERE server_id = NEW.server_id
+           FOR UPDATE;
+    END IF;
+
+    IF live_owner IS NOT NULL THEN
+        IF subject_row.owner_hotkey IS DISTINCT FROM live_owner
+           OR subject_row.compute_type IS DISTINCT FROM live_compute_type
+           OR subject_row.tee_type IS DISTINCT FROM live_tee_type
+           OR subject_row.deployment_model IS DISTINCT FROM live_deployment_model THEN
+            RAISE EXCEPTION 'server %% conflicts with immutable attestation subject', NEW.server_id;
+        END IF;
+    ELSE
+        attributed_owner := to_jsonb(NEW)->>'attribution_owner_hotkey';
+        attributed_reservation := to_jsonb(NEW)->>'attribution_reservation_id';
+        IF attributed_owner IS NULL
+           OR attributed_reservation IS NULL
+           OR attributed_owner IS DISTINCT FROM subject_row.owner_hotkey THEN
+            RAISE EXCEPTION
+                'pre-registration attestation %% lacks exact reservation attribution',
+                NEW.attestation_id;
+        END IF;
+    END IF;
+    RETURN NEW;
+END
+$$
+"""
+).execute_if(dialect="postgresql")
+_SERVER_ATTESTATION_SUBJECT_ENFORCER_DROP_TRIGGER = DDL(
+    "DROP TRIGGER IF EXISTS enforce_server_attestation_subject ON server_attestations"
+).execute_if(dialect="postgresql")
+_SERVER_ATTESTATION_SUBJECT_ENFORCER_CREATE_TRIGGER = DDL(
+    """
+CREATE TRIGGER enforce_server_attestation_subject
+BEFORE INSERT ON server_attestations
+FOR EACH ROW EXECUTE FUNCTION enforce_server_attestation_subject()
+"""
+).execute_if(dialect="postgresql")
+
+_SERVER_ATTESTATION_AUDIT_GUARD_FUNCTION = DDL(
+    """
+CREATE OR REPLACE FUNCTION preserve_server_attestation_audit()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RETURN NULL;
+    END IF;
+    IF NEW.attestation_id IS DISTINCT FROM OLD.attestation_id
+       OR NEW.server_id IS DISTINCT FROM OLD.server_id
+       OR NEW.attempt_sequence IS DISTINCT FROM OLD.attempt_sequence
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+       OR (to_jsonb(NEW)->'attribution_reservation_id')
+            IS DISTINCT FROM (to_jsonb(OLD)->'attribution_reservation_id')
+       OR (to_jsonb(NEW)->'attribution_owner_hotkey')
+            IS DISTINCT FROM (to_jsonb(OLD)->'attribution_owner_hotkey') THEN
+        RAISE EXCEPTION 'server attestation audit identity is immutable';
+    END IF;
+    RETURN NEW;
+END
+$$
+"""
+).execute_if(dialect="postgresql")
+_SERVER_ATTESTATION_AUDIT_GUARD_DROP_TRIGGER = DDL(
+    "DROP TRIGGER IF EXISTS preserve_server_attestation_audit ON server_attestations"
+).execute_if(dialect="postgresql")
+_SERVER_ATTESTATION_AUDIT_GUARD_CREATE_TRIGGER = DDL(
+    """
+CREATE TRIGGER preserve_server_attestation_audit
+BEFORE UPDATE OR DELETE ON server_attestations
+FOR EACH ROW EXECUTE FUNCTION preserve_server_attestation_audit()
+"""
+).execute_if(dialect="postgresql")
+
+for ddl in (
+    _SERVER_ATTESTATION_SUBJECT_IMMUTABILITY_FUNCTION,
+    _SERVER_ATTESTATION_SUBJECT_DROP_TRIGGER,
+    _SERVER_ATTESTATION_SUBJECT_CREATE_TRIGGER,
+):
+    event.listen(ServerAttestationSubject.__table__, "after_create", ddl)
+for ddl in (
+    _SERVER_ATTESTATION_SUBJECT_FUNCTION,
+    _SERVER_ATTESTATION_SUBJECT_ENFORCER_DROP_TRIGGER,
+    _SERVER_ATTESTATION_SUBJECT_ENFORCER_CREATE_TRIGGER,
+    _SERVER_ATTESTATION_AUDIT_GUARD_FUNCTION,
+    _SERVER_ATTESTATION_AUDIT_GUARD_DROP_TRIGGER,
+    _SERVER_ATTESTATION_AUDIT_GUARD_CREATE_TRIGGER,
+):
+    event.listen(ServerAttestation.__table__, "after_create", ddl)
 
 
 class VmCacheConfig(Base):

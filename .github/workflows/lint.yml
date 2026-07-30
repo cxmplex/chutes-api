@@ -37,7 +37,12 @@ jobs:
           uv run pytest -q
           tests/unit/test_cpu_measurements_config.py
           tests/unit/test_runtime_snp_e2e.py
+          tests/unit/test_attestation_authority_protocol.py
           tests/unit/test_attestation_hardening.py
+          tests/unit/test_gpu_runtime_sessions.py
+          tests/unit/test_server_key_custody.py
+          tests/unit/test_agent_channel_socket.py
+          tests/unit/test_schema_catalog_contract.py
           tests/unit/test_snp.py
           tests/unit/test_server_utils.py
           tests/unit/test_server_service.py

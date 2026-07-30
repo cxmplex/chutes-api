@@ -779,7 +779,8 @@ def test_gpu_release_status_policy_tracks_runtime_convergence():
     assert "guest_consumed_at" in source
     assert "gpu_evidence_sha256" in source
     assert "gpu_process_incarnation" in source
-    assert "ServerAttestation.attestation_id.desc()" in source
+    assert "ServerAttestation.attempt_sequence.desc()" in source
+    assert "ServerAttestation.created_at.desc()" not in source
     assert "latest.c.gpu_retired_at.is_(None)" in source
     assert "_revocation_failed" in source
     assert 'GpuLaunchReservation.state == "running"' in source

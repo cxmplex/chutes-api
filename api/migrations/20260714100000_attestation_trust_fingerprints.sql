@@ -76,15 +76,30 @@ CREATE INDEX IF NOT EXISTS idx_servers_active_attestation_identity
 CREATE INDEX IF NOT EXISTS idx_server_attestations_trust_identity
     ON server_attestations (
         server_id,
-        created_at DESC,
+        attempt_sequence DESC,
         measurement_name,
         measurement_config_fingerprint,
         trust_set_fingerprint
+    );
+DROP INDEX IF EXISTS idx_server_attestations_release_identity;
+CREATE INDEX idx_server_attestations_release_identity
+    ON server_attestations (server_id, attempt_sequence DESC)
+    INCLUDE (
+        measurement_name,
+        measurement_version,
+        measurement_config_fingerprint,
+        trust_set_fingerprint,
+        verification_error,
+        verified_at
     );
 
 -- migrate:down
 
 DROP INDEX IF EXISTS idx_server_attestations_trust_identity;
+DROP INDEX IF EXISTS idx_server_attestations_release_identity;
+CREATE INDEX idx_server_attestations_release_identity
+    ON server_attestations (server_id, attempt_sequence DESC)
+    INCLUDE (measurement_name, measurement_version, verification_error, verified_at);
 DROP INDEX IF EXISTS idx_servers_active_attestation_identity;
 ALTER TABLE guest_release_target_token_generations
     DROP CONSTRAINT IF EXISTS ck_guest_release_target_token_consumption;

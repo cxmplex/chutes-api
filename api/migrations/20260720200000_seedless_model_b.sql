@@ -177,13 +177,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_host_pcs_mailbox_active
     WHERE consumed_at IS NULL AND invalidated_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS td_launch_reservations (
-    reservation_id TEXT PRIMARY KEY,
+    reservation_id VARCHAR PRIMARY KEY,
     token_id TEXT NOT NULL UNIQUE,
     token_hash TEXT NOT NULL UNIQUE,
-    owner_hotkey TEXT NOT NULL,
+    owner_hotkey VARCHAR NOT NULL,
     host_id TEXT NOT NULL REFERENCES hosts(host_id) ON DELETE RESTRICT,
     host_key_generation INTEGER NOT NULL,
-    server_id TEXT NOT NULL,
+    server_id VARCHAR NOT NULL,
     role TEXT NOT NULL,
     compute_type TEXT NOT NULL DEFAULT 'cpu',
     tee_type TEXT NOT NULL,
@@ -208,6 +208,8 @@ CREATE TABLE IF NOT EXISTS td_launch_reservations (
     consumed_cert_pubkey_hash TEXT,
     invalidated_at TIMESTAMPTZ,
     CONSTRAINT uq_td_launch_reservation_boot UNIQUE (server_id, boot_generation),
+    CONSTRAINT uq_td_launch_reservation_attribution
+        UNIQUE (reservation_id, server_id, owner_hotkey),
     CONSTRAINT ck_td_reservation_role CHECK (role IN ('chute', 'storage')),
     CONSTRAINT ck_td_reservation_compute_type CHECK (compute_type = 'cpu'),
     CONSTRAINT ck_td_reservation_tee_type CHECK (tee_type IN ('sev-snp', 'tdx')),
@@ -246,9 +248,407 @@ CREATE TABLE IF NOT EXISTS td_launch_reservations (
     )
 );
 
+-- create_all already installs this final composite authority. Production creates it above.
+-- Add only when wholly absent, and reject aliases, duplicate indexes, or same-name wrong shapes.
+DO $$
+DECLARE
+    attribution_key SMALLINT[];
+    matching_constraints INTEGER;
+    matching_unique_indexes INTEGER;
+BEGIN
+    SELECT ARRAY[
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'td_launch_reservations'::regclass
+            AND attname = 'reservation_id' AND attnum > 0 AND NOT attisdropped),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'td_launch_reservations'::regclass
+            AND attname = 'server_id' AND attnum > 0 AND NOT attisdropped),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'td_launch_reservations'::regclass
+            AND attname = 'owner_hotkey' AND attnum > 0 AND NOT attisdropped)
+    ]::SMALLINT[] INTO attribution_key;
+    IF array_position(attribution_key, NULL) IS NOT NULL THEN
+        RAISE EXCEPTION
+            'td_launch_reservations lacks attribution authority columns';
+    END IF;
+
+    SELECT COUNT(*)
+      INTO matching_constraints
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'td_launch_reservations'::regclass
+       AND constraint_row.contype = 'u'
+       AND constraint_row.conkey = attribution_key;
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint AS constraint_row
+         WHERE constraint_row.conrelid = 'td_launch_reservations'::regclass
+           AND constraint_row.conname = 'uq_td_launch_reservation_attribution'
+    ) THEN
+        IF matching_constraints <> 0 THEN
+            RAISE EXCEPTION
+                'td launch reservation attribution uniqueness has an unexpected name';
+        END IF;
+        EXECUTE
+            'ALTER TABLE td_launch_reservations '
+            'ADD CONSTRAINT uq_td_launch_reservation_attribution '
+            'UNIQUE (reservation_id, server_id, owner_hotkey)';
+    END IF;
+
+    SELECT COUNT(*)
+      INTO matching_constraints
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'td_launch_reservations'::regclass
+       AND constraint_row.contype = 'u'
+       AND constraint_row.conkey = attribution_key;
+    SELECT COUNT(*)
+      INTO matching_unique_indexes
+      FROM pg_index AS index_definition
+     WHERE index_definition.indrelid = 'td_launch_reservations'::regclass
+       AND index_definition.indisunique
+       AND index_definition.indnkeyatts = 3
+       AND index_definition.indnatts = 3
+       AND index_definition.indkey::TEXT = array_to_string(attribution_key, ' ')
+       AND index_definition.indexprs IS NULL
+       AND index_definition.indpred IS NULL;
+    IF matching_constraints <> 1
+       OR matching_unique_indexes <> 1
+       OR NOT EXISTS (
+            SELECT 1
+              FROM pg_constraint AS constraint_row
+              JOIN pg_index AS index_definition
+                ON index_definition.indexrelid = constraint_row.conindid
+             WHERE constraint_row.conrelid = 'td_launch_reservations'::regclass
+               AND constraint_row.conname = 'uq_td_launch_reservation_attribution'
+               AND constraint_row.contype = 'u'
+               AND constraint_row.conkey = attribution_key
+               AND NOT constraint_row.condeferrable
+               AND NOT constraint_row.condeferred
+               AND constraint_row.convalidated
+               AND index_definition.indisunique
+               AND index_definition.indisvalid
+               AND index_definition.indisready
+               AND index_definition.indislive
+               AND lower(
+                    regexp_replace(
+                        pg_get_constraintdef(constraint_row.oid, TRUE),
+                        '[[:space:]]+',
+                        '',
+                        'g'
+                    )
+               ) = 'unique(reservation_id,server_id,owner_hotkey)'
+       ) THEN
+        RAISE EXCEPTION
+            'uq_td_launch_reservation_attribution has invalid or duplicate authority';
+    END IF;
+END
+$$;
+
 CREATE INDEX IF NOT EXISTS idx_td_reservation_host_active
     ON td_launch_reservations (host_id, role)
     WHERE consumed_at IS NULL AND invalidated_at IS NULL;
+
+-- Attribute every Model-B attestation, including a failure before Server creation, to the exact
+-- authenticated reservation/server/owner tuple. Non-Model-B attestations keep both columns NULL.
+ALTER TABLE server_attestations
+    ADD COLUMN IF NOT EXISTS attribution_reservation_id VARCHAR;
+ALTER TABLE server_attestations
+    ADD COLUMN IF NOT EXISTS attribution_owner_hotkey VARCHAR;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+          FROM (
+            VALUES
+                ('attribution_reservation_id'),
+                ('attribution_owner_hotkey')
+          ) AS expected(column_name)
+          LEFT JOIN pg_attribute AS attribute
+            ON attribute.attrelid = 'server_attestations'::regclass
+           AND attribute.attname = expected.column_name
+           AND attribute.attnum > 0
+           AND NOT attribute.attisdropped
+          LEFT JOIN pg_attrdef AS attribute_default
+            ON attribute_default.adrelid = attribute.attrelid
+           AND attribute_default.adnum = attribute.attnum
+         WHERE attribute.attname IS NULL
+            OR format_type(attribute.atttypid, attribute.atttypmod) <>
+                'character varying'
+            OR attribute.attnotnull
+            OR attribute_default.oid IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION
+            'server attestation attribution columns have invalid definitions';
+    END IF;
+END
+$$;
+
+CREATE TEMPORARY TABLE expected_server_attestation_attribution_shape (
+    attribution_reservation_id VARCHAR,
+    attribution_owner_hotkey VARCHAR,
+    CONSTRAINT ck_server_attestation_attribution CHECK (
+        (attribution_reservation_id IS NULL AND attribution_owner_hotkey IS NULL)
+        OR
+        (attribution_reservation_id IS NOT NULL AND attribution_owner_hotkey IS NOT NULL)
+    )
+);
+
+DO $$
+DECLARE
+    attribution_columns SMALLINT[];
+    matching_checks INTEGER;
+BEGIN
+    SELECT ARRAY[
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestations'::regclass
+            AND attname = 'attribution_reservation_id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestations'::regclass
+            AND attname = 'attribution_owner_hotkey')
+    ]::SMALLINT[] INTO attribution_columns;
+
+    SELECT COUNT(*)
+      INTO matching_checks
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'server_attestations'::regclass
+       AND constraint_row.contype = 'c'
+       AND cardinality(constraint_row.conkey) = 2
+       AND constraint_row.conkey @> attribution_columns
+       AND attribution_columns @> constraint_row.conkey;
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint AS constraint_row
+         WHERE constraint_row.conrelid = 'server_attestations'::regclass
+           AND constraint_row.conname = 'ck_server_attestation_attribution'
+    ) THEN
+        IF matching_checks <> 0 THEN
+            RAISE EXCEPTION
+                'server attestation attribution check has an unexpected name';
+        END IF;
+        EXECUTE
+            'ALTER TABLE server_attestations '
+            'ADD CONSTRAINT ck_server_attestation_attribution CHECK ('
+            '(attribution_reservation_id IS NULL '
+            'AND attribution_owner_hotkey IS NULL) OR '
+            '(attribution_reservation_id IS NOT NULL '
+            'AND attribution_owner_hotkey IS NOT NULL))';
+    END IF;
+
+    SELECT COUNT(*)
+      INTO matching_checks
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'server_attestations'::regclass
+       AND constraint_row.contype = 'c'
+       AND cardinality(constraint_row.conkey) = 2
+       AND constraint_row.conkey @> attribution_columns
+       AND attribution_columns @> constraint_row.conkey;
+    IF matching_checks <> 1 OR NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint AS actual
+          JOIN pg_constraint AS expected
+            ON expected.conrelid =
+                'expected_server_attestation_attribution_shape'::regclass
+           AND expected.conname = actual.conname
+         WHERE actual.conrelid = 'server_attestations'::regclass
+           AND actual.conname = 'ck_server_attestation_attribution'
+           AND actual.contype = 'c'
+           AND NOT actual.condeferrable
+           AND NOT actual.condeferred
+           AND actual.convalidated
+           AND cardinality(actual.conkey) = 2
+           AND actual.conkey @> attribution_columns
+           AND attribution_columns @> actual.conkey
+           AND lower(
+                regexp_replace(
+                    pg_get_constraintdef(actual.oid, TRUE),
+                    '[[:space:]]+',
+                    '',
+                    'g'
+                )
+           ) = lower(
+                regexp_replace(
+                    pg_get_constraintdef(expected.oid, TRUE),
+                    '[[:space:]]+',
+                    '',
+                    'g'
+                )
+           )
+    ) THEN
+        RAISE EXCEPTION
+            'ck_server_attestation_attribution has invalid or duplicate authority';
+    END IF;
+END
+$$;
+DROP TABLE expected_server_attestation_attribution_shape;
+
+DO $$
+DECLARE
+    owner_source SMALLINT[];
+    owner_target SMALLINT[];
+    reservation_source SMALLINT[];
+    reservation_target SMALLINT[];
+    matching_fks INTEGER;
+BEGIN
+    SELECT ARRAY[
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestations'::regclass
+            AND attname = 'server_id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestations'::regclass
+            AND attname = 'attribution_owner_hotkey')
+    ]::SMALLINT[] INTO owner_source;
+    SELECT ARRAY[
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestation_subjects'::regclass
+            AND attname = 'server_id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestation_subjects'::regclass
+            AND attname = 'owner_hotkey')
+    ]::SMALLINT[] INTO owner_target;
+
+    SELECT COUNT(*)
+      INTO matching_fks
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'server_attestations'::regclass
+       AND constraint_row.contype = 'f'
+       AND constraint_row.conkey = owner_source;
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint AS constraint_row
+         WHERE constraint_row.conrelid = 'server_attestations'::regclass
+           AND constraint_row.conname = 'fk_server_attestations_attribution_owner'
+    ) THEN
+        IF matching_fks <> 0 THEN
+            RAISE EXCEPTION
+                'server attestation owner attribution FK has an unexpected name';
+        END IF;
+        EXECUTE
+            'ALTER TABLE server_attestations '
+            'ADD CONSTRAINT fk_server_attestations_attribution_owner '
+            'FOREIGN KEY (server_id, attribution_owner_hotkey) '
+            'REFERENCES server_attestation_subjects(server_id, owner_hotkey) '
+            'ON DELETE RESTRICT';
+    END IF;
+
+    SELECT COUNT(*)
+      INTO matching_fks
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'server_attestations'::regclass
+       AND constraint_row.contype = 'f'
+       AND constraint_row.conkey = owner_source;
+    IF matching_fks <> 1 OR NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint AS constraint_row
+         WHERE constraint_row.conrelid = 'server_attestations'::regclass
+           AND constraint_row.conname = 'fk_server_attestations_attribution_owner'
+           AND constraint_row.contype = 'f'
+           AND constraint_row.conkey = owner_source
+           AND constraint_row.confrelid = 'server_attestation_subjects'::regclass
+           AND constraint_row.confkey = owner_target
+           AND constraint_row.confdeltype = 'r'
+           AND constraint_row.confupdtype = 'a'
+           AND constraint_row.confmatchtype = 's'
+           AND NOT constraint_row.condeferrable
+           AND NOT constraint_row.condeferred
+           AND constraint_row.convalidated
+           AND lower(
+                regexp_replace(
+                    pg_get_constraintdef(constraint_row.oid, TRUE),
+                    '[[:space:]]+',
+                    '',
+                    'g'
+                )
+           ) = 'foreignkey(server_id,attribution_owner_hotkey)referencesserver_attestation_subjects(server_id,owner_hotkey)ondeleterestrict'
+    ) THEN
+        RAISE EXCEPTION
+            'fk_server_attestations_attribution_owner has invalid or duplicate authority';
+    END IF;
+
+    SELECT ARRAY[
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestations'::regclass
+            AND attname = 'attribution_reservation_id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestations'::regclass
+            AND attname = 'server_id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'server_attestations'::regclass
+            AND attname = 'attribution_owner_hotkey')
+    ]::SMALLINT[] INTO reservation_source;
+    SELECT ARRAY[
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'td_launch_reservations'::regclass
+            AND attname = 'reservation_id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'td_launch_reservations'::regclass
+            AND attname = 'server_id'),
+        (SELECT attnum FROM pg_attribute
+          WHERE attrelid = 'td_launch_reservations'::regclass
+            AND attname = 'owner_hotkey')
+    ]::SMALLINT[] INTO reservation_target;
+
+    SELECT COUNT(*)
+      INTO matching_fks
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'server_attestations'::regclass
+       AND constraint_row.contype = 'f'
+       AND constraint_row.conkey = reservation_source;
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint AS constraint_row
+         WHERE constraint_row.conrelid = 'server_attestations'::regclass
+           AND constraint_row.conname =
+                'fk_server_attestations_td_reservation_attribution'
+    ) THEN
+        IF matching_fks <> 0 THEN
+            RAISE EXCEPTION
+                'server attestation reservation attribution FK has an unexpected name';
+        END IF;
+        EXECUTE
+            'ALTER TABLE server_attestations '
+            'ADD CONSTRAINT fk_server_attestations_td_reservation_attribution '
+            'FOREIGN KEY ('
+            'attribution_reservation_id, server_id, attribution_owner_hotkey) '
+            'REFERENCES td_launch_reservations('
+            'reservation_id, server_id, owner_hotkey) ON DELETE RESTRICT';
+    END IF;
+
+    SELECT COUNT(*)
+      INTO matching_fks
+      FROM pg_constraint AS constraint_row
+     WHERE constraint_row.conrelid = 'server_attestations'::regclass
+       AND constraint_row.contype = 'f'
+       AND constraint_row.conkey = reservation_source;
+    IF matching_fks <> 1 OR NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint AS constraint_row
+         WHERE constraint_row.conrelid = 'server_attestations'::regclass
+           AND constraint_row.conname =
+                'fk_server_attestations_td_reservation_attribution'
+           AND constraint_row.contype = 'f'
+           AND constraint_row.conkey = reservation_source
+           AND constraint_row.confrelid = 'td_launch_reservations'::regclass
+           AND constraint_row.confkey = reservation_target
+           AND constraint_row.confdeltype = 'r'
+           AND constraint_row.confupdtype = 'a'
+           AND constraint_row.confmatchtype = 's'
+           AND NOT constraint_row.condeferrable
+           AND NOT constraint_row.condeferred
+           AND constraint_row.convalidated
+           AND lower(
+                regexp_replace(
+                    pg_get_constraintdef(constraint_row.oid, TRUE),
+                    '[[:space:]]+',
+                    '',
+                    'g'
+                )
+           ) = 'foreignkey(attribution_reservation_id,server_id,attribution_owner_hotkey)referencestd_launch_reservations(reservation_id,server_id,owner_hotkey)ondeleterestrict'
+    ) THEN
+        RAISE EXCEPTION
+            'fk_server_attestations_td_reservation_attribution has invalid or duplicate authority';
+    END IF;
+END
+$$;
 
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS launch_reservation_id TEXT;
@@ -309,6 +709,16 @@ CREATE INDEX IF NOT EXISTS idx_registry_session_server_active
 -- migrate:down
 
 DROP TABLE IF EXISTS registry_sessions;
+ALTER TABLE server_attestations
+    DROP CONSTRAINT IF EXISTS fk_server_attestations_td_reservation_attribution;
+ALTER TABLE server_attestations
+    DROP CONSTRAINT IF EXISTS fk_server_attestations_attribution_owner;
+ALTER TABLE server_attestations
+    DROP CONSTRAINT IF EXISTS ck_server_attestation_attribution;
+ALTER TABLE server_attestations
+    DROP COLUMN IF EXISTS attribution_owner_hotkey;
+ALTER TABLE server_attestations
+    DROP COLUMN IF EXISTS attribution_reservation_id;
 DROP INDEX IF EXISTS uq_servers_launch_reservation;
 ALTER TABLE servers DROP CONSTRAINT IF EXISTS ck_servers_launch_reservation_generation;
 ALTER TABLE servers DROP CONSTRAINT IF EXISTS fk_servers_launch_reservation;

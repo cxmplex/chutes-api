@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from sqlalchemy import and_, delete, exists, or_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -32,6 +33,7 @@ from api.constants import (
     LUKS_STORAGE_VOLUME,
 )
 from api.cpu import validate_cpu_benchmark
+from api.database import generate_uuid
 from api.gpu import SUPPORTED_GPUS
 from api.metagraph import MetagraphNode
 from api.host.reservations import (
@@ -47,6 +49,8 @@ from api.host.schemas import (
     GpuLaunchReservation,
     GpuRegistrationSignatureV1,
     TdLaunchReservation,
+    TdLaunchReservationClaimsV1,
+    TdLaunchReservationClaimsV2,
     TdRegistrationSignatureV1,
     canonical_sha256,
 )
@@ -69,6 +73,7 @@ from api.server.schemas import (
     Host,
     HostRegistrationArgs,
     ServerAttestation,
+    ServerAttestationSubject,
     BootAttestation,
     BootAttestationArgs,
     RuntimeAttestationArgs,
@@ -94,8 +99,8 @@ from api.server.schemas import (
 )
 from api.server.exceptions import (
     AttestationError,
+    AttestationSupersededError,
     GetEvidenceError,
-    GpuEvidenceError,
     InvalidCpuBenchmarkError,
     InvalidGpuEvidenceError,
     InvalidQuoteError,
@@ -637,6 +642,8 @@ def _luks_capability_for_measurement(
     server: Server,
     measurement_config,
     purpose: LuksCapabilityPurpose,
+    *,
+    attestation: Optional[ServerAttestation] = None,
 ) -> LuksCapabilityContext:
     config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(
         measurement_config
@@ -658,6 +665,9 @@ def _luks_capability_for_measurement(
         trust_set_fingerprint=trust_set_fingerprint,
         tee_type=(getattr(measurement_config, "tee_type", None) or "tdx").lower(),
         storage_role=bool(server.storage_role),
+        server_attestation_id=(
+            attestation.attestation_id if attestation is not None else None
+        ),
         allowed_volumes=list(allowed_volumes),
     )
 
@@ -938,11 +948,85 @@ def _expected_gcp_identity(server_id: str) -> Optional[dict]:
     return {"instance_id": int(instance_id)}
 
 
+def _runtime_cpu_claims(server: Server, reservation: TdLaunchReservation):
+    """Validate the exact consumed Model-B CPU launch authority for a runtime nonce."""
+
+    try:
+        claims_type = (
+            TdLaunchReservationClaimsV2
+            if int(reservation.claims_version or 1) == 2
+            else TdLaunchReservationClaimsV1
+        )
+        claims = claims_type.model_validate(reservation.claims)
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise MeasurementMismatchError(
+            "Persisted CPU launch reservation claims are invalid."
+        ) from exc
+    claims_sha256 = canonical_sha256(claims)
+    registered_cert_hash = _registered_cert_hash(server)
+    expected_role = "storage" if server.storage_role else "chute"
+    exact = bool(
+        reservation.reservation_id == claims.reservation_id
+        and reservation.token_id == claims.token_id
+        and reservation.owner_hotkey == claims.owner_hotkey
+        and reservation.host_id == claims.host_id
+        and reservation.host_key_generation == claims.host_key_generation
+        and reservation.server_id == claims.server_id
+        and reservation.role == claims.role
+        and reservation.compute_type == claims.compute_type == "cpu"
+        and reservation.tee_type == claims.tee_type
+        and reservation.process_incarnation == claims.process_incarnation
+        and reservation.boot_generation == claims.boot_generation
+        and reservation.release_id == claims.release_id
+        and reservation.image_sha256 == claims.image_sha256
+        and reservation.image_version == claims.image_version
+        and reservation.profile_id == claims.profile_id
+        and reservation.chute_id == claims.chute_id
+        and reservation.job_id == claims.job_id
+        and reservation.container_repository == claims.container_repository
+        and reservation.container_manifest_digest == claims.container_manifest_digest
+        and reservation.storage_intent_id == claims.storage_intent_id
+        and reservation.storage_intent_generation == claims.storage_intent_generation
+        and reservation.launch_nonce == claims.launch_nonce
+        and reservation.release_target_sha256 == claims.release_target_sha256
+        and int(reservation.claims_version or 1) == claims.version
+        and (reservation.host_compute_type or "cpu")
+        == getattr(claims, "host_compute_type", "cpu")
+        and reservation.gpu_release_id == getattr(claims, "gpu_release_id", None)
+        and reservation.active_cpu_release_id
+        == getattr(claims, "active_cpu_release_id", None)
+        and reservation.claims_sha256 == claims_sha256
+        and reservation.invalidated_at is None
+        and reservation.consumed_at is not None
+        and bool(reservation.consumed_attestation_id)
+        and (reservation.consumed_cert_pubkey_hash or "").lower()
+        == registered_cert_hash
+        and server.server_id == claims.server_id
+        and server.miner_hotkey == claims.owner_hotkey
+        and server.compute_type == "cpu"
+        and server.self_registered is True
+        and server.tee_type == claims.tee_type
+        and server.storage_role == (expected_role == "storage")
+        and claims.role == expected_role
+        and server.host_id == claims.host_id
+        and server.launch_reservation_id == claims.reservation_id
+        and server.launch_boot_generation == claims.boot_generation
+        and server.measurement_name == claims.profile_id
+        and server.version == claims.image_version
+    )
+    if not exact:
+        raise MeasurementMismatchError(
+            "CPU runtime launch reservation is no longer the exact consumed server lineage."
+        )
+    return claims, claims_sha256
+
+
 def runtime_attestation_context_for_server(
     server: Server,
     gpu_reservation=None,
     gpu_group=None,
     gpu_host=None,
+    cpu_reservation=None,
 ) -> RuntimeAttestationNonceContext:
     """Build the one accepted runtime identity from current trust and persisted registration."""
     if not server.is_tee:
@@ -1049,6 +1133,29 @@ def runtime_attestation_context_for_server(
         "measurement_config_fingerprint": config_fingerprint,
         "trust_set_fingerprint": trust_set_fingerprint,
     }
+    if compute_type == "cpu" and deployment_model == "bare-metal-model-b":
+        if cpu_reservation is None:
+            raise MeasurementMismatchError(
+                "Model-B CPU runtime identity requires its consumed launch reservation."
+            )
+        claims, claims_sha256 = _runtime_cpu_claims(server, cpu_reservation)
+        context.update(
+            {
+                "cpu_launch_reservation_id": cpu_reservation.reservation_id,
+                "cpu_launch_boot_generation": cpu_reservation.boot_generation,
+                "cpu_process_incarnation": claims.process_incarnation,
+                "cpu_claims_sha256": claims_sha256,
+                "cpu_registration_attestation_id": cpu_reservation.consumed_attestation_id,
+            }
+        )
+    elif compute_type == "cpu" and (
+        server.launch_reservation_id is not None
+        or server.launch_boot_generation is not None
+    ):
+        raise MeasurementMismatchError(
+            "Non-Model-B CPU runtime identity carries launch reservation state."
+        )
+
     if compute_type == "gpu" and server.gpu_launch_reservation_id:
         if (
             gpu_reservation is None
@@ -1100,25 +1207,52 @@ async def runtime_attestation_context_for_server_db(
     db: AsyncSession,
     server: Server,
 ) -> RuntimeAttestationNonceContext:
-    """Load and lock the durable GPU lineage before issuing or consuming a nonce."""
+    """Load and lock durable Model-B launch lineage before issuing or consuming a nonce."""
 
-    if server.compute_type != "gpu" or not server.gpu_launch_reservation_id:
+    gpu_runtime = server.compute_type == "gpu" and bool(
+        server.gpu_launch_reservation_id
+    )
+    cpu_model_b = server.compute_type == "cpu" and server.host_id is not None
+    if not gpu_runtime and not cpu_model_b:
         return runtime_attestation_context_for_server(server)
     from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
 
     await acquire_gpu_lifecycle_lock(db)
     locked_server = (
         await db.execute(
-            select(Server).where(Server.server_id == server.server_id).with_for_update()
+            select(Server)
+            .where(Server.server_id == server.server_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if locked_server is None:
         raise MeasurementMismatchError(
-            "GPU runtime server disappeared before lineage validation."
+            "Runtime server disappeared before launch-lineage validation."
         )
+    if locked_server.compute_type == "cpu":
+        reservation = (
+            await db.execute(
+                select(TdLaunchReservation)
+                .where(
+                    TdLaunchReservation.reservation_id
+                    == locked_server.launch_reservation_id
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        return runtime_attestation_context_for_server(
+            locked_server,
+            cpu_reservation=reservation,
+        )
+
     host = (
         await db.execute(
-            select(Host).where(Host.host_id == locked_server.host_id).with_for_update()
+            select(Host)
+            .where(Host.host_id == locked_server.host_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     group = (
@@ -1129,6 +1263,7 @@ async def runtime_attestation_context_for_server_db(
                 == locked_server.gpu_allocation_group_id
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     reservation = (
@@ -1139,10 +1274,14 @@ async def runtime_attestation_context_for_server_db(
                 == locked_server.gpu_launch_reservation_id
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     return runtime_attestation_context_for_server(
-        locked_server, reservation, group, host
+        locked_server,
+        gpu_reservation=reservation,
+        gpu_group=group,
+        gpu_host=host,
     )
 
 
@@ -1516,7 +1655,126 @@ def _gpu_attestation_lineage(
     }
 
 
-async def register_cpu_server(
+def _cpu_registration_reservation_identity(reservation, claims) -> tuple[Any, ...]:
+    """Immutable identity rechecked after lock-free CPU quote verification."""
+
+    return (
+        reservation.reservation_id,
+        reservation.boot_generation,
+        claims.owner_hotkey,
+        claims.host_id,
+        claims.server_id,
+        claims.tee_type,
+        claims.role,
+        claims.profile_id,
+        claims.image_sha256,
+        getattr(claims, "process_incarnation", None),
+        getattr(claims, "version", None),
+        getattr(claims, "host_compute_type", None),
+    )
+
+
+def _attestation_deployment_model(
+    compute_type: str,
+    launch_reservation_id: Optional[str],
+) -> str:
+    if compute_type == "gpu":
+        return "gpu"
+    if isinstance(launch_reservation_id, str) and launch_reservation_id:
+        return "cpu-model-b"
+    return "cpu-model-a"
+
+
+async def _ensure_attestation_subject(
+    db: AsyncSession,
+    *,
+    server_id: str,
+    owner_hotkey: str,
+    compute_type: str,
+    tee_type: str,
+    deployment_model: str,
+) -> None:
+    """Create or validate one immutable audit subject without creating a Server row."""
+
+    insert_statement = pg_insert(ServerAttestationSubject).values(
+        server_id=server_id,
+        owner_hotkey=owner_hotkey,
+        compute_type=compute_type,
+        tee_type=tee_type,
+        deployment_model=deployment_model,
+    )
+    exact_identity = and_(
+        ServerAttestationSubject.owner_hotkey == insert_statement.excluded.owner_hotkey,
+        ServerAttestationSubject.compute_type == insert_statement.excluded.compute_type,
+        ServerAttestationSubject.tee_type == insert_statement.excluded.tee_type,
+        ServerAttestationSubject.deployment_model
+        == insert_statement.excluded.deployment_model,
+    )
+    subject_id = (
+        await db.execute(
+            insert_statement.on_conflict_do_update(
+                index_elements=[ServerAttestationSubject.server_id],
+                set_={"server_id": insert_statement.excluded.server_id},
+                where=exact_identity,
+            ).returning(ServerAttestationSubject.server_id)
+        )
+    ).scalar_one_or_none()
+    if subject_id is None:
+        raise ServerRegistrationError(
+            f"Server {server_id} conflicts with immutable attestation attribution."
+        )
+
+
+def _runtime_gpu_claims(reservation):
+    """Normalize malformed durable GPU claims into an attributable attestation failure."""
+
+    from api.host.gpu_allocations import GpuAllocationError, _validate_row_claims
+
+    try:
+        return _validate_row_claims(reservation)
+    except GpuAllocationError as exc:
+        raise MeasurementMismatchError(
+            "Persisted GPU reservation claims are invalid."
+        ) from exc
+
+
+async def _record_attributable_attestation_failure(
+    db: AsyncSession,
+    attempt_id: Optional[str],
+    error: Exception,
+) -> None:
+    """Finalize only one already-durable audit row; never mutate shared authority."""
+
+    if attempt_id is None:
+        return
+    detail = str(getattr(error, "detail", error))
+    try:
+        await db.rollback()
+        attempt = (
+            await db.execute(
+                select(ServerAttestation)
+                .where(ServerAttestation.attestation_id == attempt_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if attempt is not None and attempt.verification_error is not None:
+            attempt.verification_error = detail
+            await db.commit()
+    except Exception:
+        # The pending marker was committed before external work, so a secondary database outage
+        # remains fail-closed. Preserve the original registration exception for its HTTP boundary.
+        logger.exception(
+            f"Failed to finalize attributable CPU registration attempt {attempt_id}"
+        )
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception(
+                f"Failed to roll back CPU registration attempt {attempt_id} finalization"
+            )
+
+
+async def _register_cpu_server_impl(
     db: AsyncSession,
     server_ip: str,
     args: CpuServerRegistrationArgs,
@@ -1525,6 +1783,7 @@ async def register_cpu_server(
     signature: Optional[str],
     expected_cert_hash: str,
     cert_pem: str,
+    attempt_state: dict[str, Optional[str]],
 ) -> Dict[str, Any]:
     """
     Self-registration for a 1-click CPU TEE server (push attestation model).
@@ -1543,6 +1802,9 @@ async def register_cpu_server(
     requested_storage_role = bool(getattr(args, "storage_role", False))
     reservation = None
     reservation_claims = None
+    reservation_identity: Optional[tuple[Any, ...]] = None
+    registration_attempt_id: Optional[str] = None
+    registration_attempt: Optional[ServerAttestation] = None
     commitment = getattr(args, "quote_commitment", None)
     reservation_token = getattr(args, "launch_reservation", None)
     if reservation_token:
@@ -1564,6 +1826,9 @@ async def register_cpu_server(
         miner_hotkey = reservation_claims.owner_hotkey
         host_id = reservation_claims.host_id
         storage_role = reservation_claims.role == "storage"
+        reservation_identity = _cpu_registration_reservation_identity(
+            reservation, reservation_claims
+        )
         signed_registration = TdRegistrationSignatureV1(
             server_id=args.server_id,
             request_nonce=nonce,
@@ -1601,6 +1866,47 @@ async def register_cpu_server(
         except Exception as exc:
             raise ServerRegistrationError(f"Invalid miner signature: {exc}") from exc
 
+    if reservation is not None:
+        # The reservation and in-TD signature make this attempt attributable before an operational
+        # Server exists. Serialize an existing identity when present, create/validate its immutable
+        # audit subject, and commit a fail-closed sequence row before any external verification.
+        existing_server = (
+            await db.execute(
+                select(Server)
+                .where(Server.server_id == args.server_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if existing_server is not None and (
+            existing_server.miner_hotkey != miner_hotkey
+            or existing_server.compute_type != "cpu"
+            or existing_server.tee_type != reservation_claims.tee_type
+        ):
+            raise ServerRegistrationError(
+                f"Server {args.server_id} conflicts with its immutable CPU attribution."
+            )
+        await _ensure_attestation_subject(
+            db,
+            server_id=args.server_id,
+            owner_hotkey=miner_hotkey,
+            compute_type="cpu",
+            tee_type=reservation_claims.tee_type,
+            deployment_model="cpu-model-b",
+        )
+        pending_attempt = ServerAttestation(
+            attestation_id=generate_uuid(),
+            server_id=args.server_id,
+            attribution_reservation_id=reservation.reservation_id,
+            attribution_owner_hotkey=miner_hotkey,
+            quote_data=args.quote,
+            verification_error="CPU registration attestation did not complete.",
+        )
+        registration_attempt_id = pending_attempt.attestation_id
+        attempt_state["attempt_id"] = registration_attempt_id
+        db.add(pending_attempt)
+        await db.flush()
+        await db.commit()
+
     # The owner is derived from the reservation for Model B and from the authenticated Model-A
     # hotkey otherwise. Production subnet membership is checked only after that derivation.
     if settings.skip_metagraph_check:
@@ -1633,6 +1939,11 @@ async def register_cpu_server(
             raise ServerRegistrationError(
                 f"Miner hotkey {miner_hotkey} is not registered on netuid {settings.netuid}"
             )
+
+    if reservation is not None:
+        # Membership checks may start a read transaction after the phase-one commit. Close it
+        # explicitly so quote/DCAP/vTPM work runs without database custody of any kind.
+        await db.commit()
 
     # 2. Verify the runtime attestation (Intel TDX quote or AMD SEV-SNP report) + match a CPU config.
     tee_type = (getattr(args, "tee_type", None) or "tdx").strip().lower()
@@ -1699,7 +2010,30 @@ async def register_cpu_server(
             "A storage-TD measurement may register only with storage_role enabled."
         )
 
-    # Model-B host identity comes only from the locked reservation, never a guest header.
+    if reservation_token:
+        try:
+            refreshed_reservation, refreshed_claims = await resolve_launch_reservation(
+                db,
+                reservation_token,
+                commitment,
+                allow_consumed_for_publication=True,
+            )
+        except LaunchReservationError as exc:
+            raise ServerRegistrationError(str(exc)) from exc
+        if (
+            reservation_identity is None
+            or _cpu_registration_reservation_identity(
+                refreshed_reservation, refreshed_claims
+            )
+            != reservation_identity
+        ):
+            raise ServerRegistrationError(
+                "CPU launch reservation identity changed during attestation verification."
+            )
+        reservation = refreshed_reservation
+        reservation_claims = refreshed_claims
+
+    # Model-B host identity comes only from the freshly re-locked reservation, never a guest header.
     await _validate_cpu_registration_host(
         db,
         host_id,
@@ -1746,6 +2080,47 @@ async def register_cpu_server(
             reservation_claims,
             prior_reservation,
         )
+    if reservation is not None:
+        if registration_attempt_id is None:
+            if server is not None:
+                # This request observed no Server before lock-free verification, so it has no
+                # sequence allocation. A concurrent first registration won and must be retried.
+                raise AttestationSupersededError(
+                    "CPU registration was superseded before attempt allocation."
+                )
+        else:
+            registration_attempt = (
+                await db.execute(
+                    select(ServerAttestation)
+                    .where(
+                        ServerAttestation.attestation_id == registration_attempt_id
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            from api.server.gpu_sessions import _latest_attestation_attempt
+
+            latest = await _latest_attestation_attempt(
+                db, args.server_id, for_update=True
+            )
+            if registration_attempt is None:
+                raise ServerRegistrationError(
+                    "CPU registration attempt audit row disappeared before publication."
+                )
+            if latest is None or latest.attestation_id != registration_attempt_id:
+                config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(
+                    measurement_config
+                )
+                registration_attempt.verification_error = None
+                registration_attempt.verified_at = func.now()
+                registration_attempt.measurement_version = measurement_config.version
+                registration_attempt.measurement_name = measurement_config.name
+                registration_attempt.measurement_config_fingerprint = config_fingerprint
+                registration_attempt.trust_set_fingerprint = trust_set_fingerprint
+                registration_attempt.revocation_status = revocation_status
+                await db.commit()
+                raise AttestationSupersededError()
+
     # Model B: several per-chute TDs run on ONE L0 host and self-register from that host's single
     # public IP -- they are distinguished by their DNAT'd external_ports, not by IP. A co-tenant
     # already registered under the SAME host_id is therefore expected and allowed; only a genuine
@@ -1824,18 +2199,34 @@ async def register_cpu_server(
     if args.endpoints:
         server.tee_endpoints = args.endpoints
 
-    attestation = ServerAttestation(
-        quote_data=args.quote,
-        server_id=args.server_id,
-        created_at=func.now(),
-        verified_at=func.now(),
-        measurement_version=measurement_config.version,
-        measurement_name=measurement_config.name,
-        measurement_config_fingerprint=config_fingerprint,
-        trust_set_fingerprint=trust_set_fingerprint,
-        revocation_status=revocation_status,
-    )
-    db.add(attestation)
+    if registration_attempt is None:
+        # Model A has no reservation-attributed preflight row. Its authenticated miner identity and
+        # fully verified Server are now stable, so create/validate the subject and flush the Server
+        # before inserting the audit row (the DB trigger never invents a subject without authority).
+        await _ensure_attestation_subject(
+            db,
+            server_id=args.server_id,
+            owner_hotkey=miner_hotkey,
+            compute_type="cpu",
+            tee_type=tee_type,
+            deployment_model="cpu-model-a",
+        )
+        await db.flush()
+        attestation = ServerAttestation(
+            quote_data=args.quote,
+            server_id=args.server_id,
+            created_at=func.now(),
+        )
+        db.add(attestation)
+    else:
+        attestation = registration_attempt
+    attestation.verification_error = None
+    attestation.verified_at = func.now()
+    attestation.measurement_version = measurement_config.version
+    attestation.measurement_name = measurement_config.name
+    attestation.measurement_config_fingerprint = config_fingerprint
+    attestation.trust_set_fingerprint = trust_set_fingerprint
+    attestation.revocation_status = revocation_status
     await db.flush()
     if reservation is not None:
         try:
@@ -1857,7 +2248,10 @@ async def register_cpu_server(
     luks_quote_nonce: Optional[str] = None
     if storage_role:
         capability = _luks_capability_for_measurement(
-            server, measurement_config, LuksCapabilityPurpose.STORAGE
+            server,
+            measurement_config,
+            LuksCapabilityPurpose.STORAGE,
+            attestation=attestation,
         )
         luks_quote_nonce = await generate_luks_quote_nonce(capability)
 
@@ -1885,6 +2279,40 @@ async def register_cpu_server(
         "status": "registered",
         "luks_quote_nonce": luks_quote_nonce,
     }
+
+
+async def register_cpu_server(
+    db: AsyncSession,
+    server_ip: str,
+    args: CpuServerRegistrationArgs,
+    miner_hotkey: Optional[str],
+    nonce: str,
+    signature: Optional[str],
+    expected_cert_hash: str,
+    cert_pem: str,
+) -> Dict[str, Any]:
+    """Run CPU registration and finalize its durable attributable failure marker."""
+
+    attempt_state: dict[str, Optional[str]] = {"attempt_id": None}
+    try:
+        return await _register_cpu_server_impl(
+            db,
+            server_ip,
+            args,
+            miner_hotkey,
+            nonce,
+            signature,
+            expected_cert_hash,
+            cert_pem,
+            attempt_state,
+        )
+    except AttestationSupersededError:
+        raise
+    except Exception as exc:
+        await _record_attributable_attestation_failure(
+            db, attempt_state["attempt_id"], exc
+        )
+        raise
 
 
 async def verify_gpu_registration_evidence(
@@ -2159,6 +2587,14 @@ async def register_gpu_server(
         server, measurement_config
     )
     server.attestation_revocation_status = revocation_status
+    await _ensure_attestation_subject(
+        db,
+        server_id=server.server_id,
+        owner_hotkey=server.miner_hotkey,
+        compute_type="gpu",
+        tee_type=server.tee_type,
+        deployment_model="gpu",
+    )
     await db.flush()
 
     existing_nodes = (
@@ -2648,6 +3084,17 @@ async def verify_server(
 
         # Create attestation record (measurement_version for audit trail; server version = latest attestation).
         # Commit here so we have a durable record for this run even if _track_nodes or later steps fail.
+        await _ensure_attestation_subject(
+            db,
+            server_id=server.server_id,
+            owner_hotkey=server.miner_hotkey,
+            compute_type=server.compute_type,
+            tee_type=server.tee_type,
+            deployment_model=_attestation_deployment_model(
+                server.compute_type,
+                getattr(server, "launch_reservation_id", None),
+            ),
+        )
         server_attestation = ServerAttestation(
             quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8"),
             server_id=server.server_id,
@@ -2682,6 +3129,17 @@ async def verify_server(
                 measurement_config.version if measurement_config else None
             )
             measurement_name = measurement_config.name if measurement_config else None
+            await _ensure_attestation_subject(
+                db,
+                server_id=server.server_id,
+                owner_hotkey=server.miner_hotkey,
+                compute_type=server.compute_type,
+                tee_type=server.tee_type,
+                deployment_model=_attestation_deployment_model(
+                    server.compute_type,
+                    getattr(server, "launch_reservation_id", None),
+                ),
+            )
             server_attestation = ServerAttestation(
                 quote_data=base64.b64encode(quote.raw_bytes).decode("utf-8")
                 if quote
@@ -2714,6 +3172,8 @@ async def check_server_ownership(
     server_id: str,
     miner_hotkey: Optional[str],
     expected_cert_hash: Optional[str] = None,
+    *,
+    for_update: bool = False,
 ) -> Server:
     """
     Get a server by ID, ensuring it belongs to the authenticated miner.
@@ -2729,9 +3189,10 @@ async def check_server_ownership(
     Raises:
         ServerNotFoundError: If server not found or doesn't belong to miner
     """
-    server = (
-        await db.execute(select(Server).where(Server.server_id == server_id))
-    ).scalar_one_or_none()
+    query = select(Server).where(Server.server_id == server_id)
+    if for_update:
+        query = query.with_for_update().execution_options(populate_existing=True)
+    server = (await db.execute(query)).scalar_one_or_none()
     if server is None:
         raise ServerNotFoundError(server_id)
     if getattr(server, "launch_reservation_id", None) is not None:
@@ -2872,58 +3333,119 @@ async def process_runtime_attestation(
     """Verify external evidence outside custody, then publish by locked CAS."""
 
     logger.info(f"Processing runtime attestation for server: {server_id}")
-    server = await check_server_ownership(
-        db, server_id, miner_hotkey, expected_cert_hash
-    )
-    if server.ip != actual_ip:
-        logger.warning(
-            f"Runtime attestation IP mismatch: registered={server.ip} request={actual_ip}"
-        )
-        raise MeasurementMismatchError(
-            "Runtime attestation source IP does not match the registered server."
-        )
-    current_context = await runtime_attestation_context_for_server_db(db, server)
-    if nonce_context != current_context:
-        raise NonceError(
-            "Runtime nonce identity no longer matches the exact registered server."
-        )
+    # Authenticate before taking lifecycle locks. The nonce's immutable compute class chooses the
+    # lock order; a class mismatch is recorded without ever touching GPU lineage out of order.
+    await check_server_ownership(db, server_id, miner_hotkey, expected_cert_hash)
     if (
-        expected_cert_hash.lower() != nonce_context.cert_hash
-        or expected_cert_hash.lower() != _registered_cert_hash(server)
+        nonce_context.compute_type == "gpu"
+        or nonce_context.cpu_launch_reservation_id
     ):
-        raise MeasurementMismatchError(
-            "Runtime attestation certificate does not match the registered server."
-        )
+        await acquire_gpu_lifecycle_lock(db)
+    server = await check_server_ownership(
+        db,
+        server_id,
+        miner_hotkey,
+        expected_cert_hash,
+        for_update=True,
+    )
+
+    # Allocate the database sequence while the Server row is locked. CPU re-registration uses the
+    # same row as its publication point, so an older runtime request cannot receive a sequence after
+    # a newer registration has already committed. Commit the incomplete, fail-closed row before any
+    # fallible context or durable-claims parsing, then reacquire the same lock order for preflight.
+    await _ensure_attestation_subject(
+        db,
+        server_id=server.server_id,
+        owner_hotkey=server.miner_hotkey,
+        compute_type=server.compute_type,
+        tee_type=server.tee_type,
+        deployment_model=_attestation_deployment_model(
+            server.compute_type,
+            getattr(server, "launch_reservation_id", None),
+        ),
+    )
+    attestation = ServerAttestation(
+        attestation_id=generate_uuid(),
+        server_id=server_id,
+        quote_data=args.quote,
+        verification_error="Runtime attestation verification did not complete.",
+    )
+    attempt_id = attestation.attestation_id
+    db.add(attestation)
+    await db.flush()
+    await db.commit()
 
     gpu_runtime = nonce_context.gpu_launch_reservation_id is not None
+    lifecycle_runtime = bool(
+        nonce_context.compute_type == "gpu"
+        or nonce_context.cpu_launch_reservation_id
+    )
     claims_snapshot = None
     claims_snapshot_sha256 = None
-    if gpu_runtime:
-        from api.host.gpu_allocations import _validate_row_claims
-
-        reservation_snapshot = (
-            await db.execute(
-                select(GpuLaunchReservation)
-                .where(
-                    GpuLaunchReservation.reservation_id
-                    == nonce_context.gpu_launch_reservation_id
-                )
-                .with_for_update()
-            )
-        ).scalar_one_or_none()
-        if reservation_snapshot is None or reservation_snapshot.state != "running":
-            raise MeasurementMismatchError(
-                "GPU runtime reservation disappeared after nonce issuance."
-            )
-        claims_snapshot = _validate_row_claims(reservation_snapshot)
-        claims_snapshot_sha256 = canonical_sha256(claims_snapshot)
-        if claims_snapshot_sha256 != nonce_context.gpu_claims_sha256:
+    try:
+        if lifecycle_runtime:
+            await acquire_gpu_lifecycle_lock(db)
+        server = await check_server_ownership(
+            db,
+            server_id,
+            miner_hotkey,
+            expected_cert_hash,
+            for_update=True,
+        )
+        if (server.compute_type == "gpu") != (nonce_context.compute_type == "gpu"):
             raise NonceError(
-                "Runtime nonce claims no longer match the reservation bytes."
+                "Runtime nonce compute class no longer matches the registered server."
             )
+        if server.ip != actual_ip:
+            logger.warning(
+                f"Runtime attestation IP mismatch: registered={server.ip} request={actual_ip}"
+            )
+            raise MeasurementMismatchError(
+                "Runtime attestation source IP does not match the registered server."
+            )
+        current_context = await runtime_attestation_context_for_server_db(db, server)
+        if nonce_context != current_context:
+            raise NonceError(
+                "Runtime nonce identity no longer matches the exact registered server."
+            )
+        if (
+            expected_cert_hash.lower() != nonce_context.cert_hash
+            or expected_cert_hash.lower() != _registered_cert_hash(server)
+        ):
+            raise MeasurementMismatchError(
+                "Runtime attestation certificate does not match the registered server."
+            )
+        if gpu_runtime:
+            reservation_snapshot = (
+                await db.execute(
+                    select(GpuLaunchReservation)
+                    .where(
+                        GpuLaunchReservation.reservation_id
+                        == nonce_context.gpu_launch_reservation_id
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if reservation_snapshot is None or reservation_snapshot.state != "running":
+                raise MeasurementMismatchError(
+                    "GPU runtime reservation disappeared after nonce issuance."
+                )
+            claims_snapshot = _runtime_gpu_claims(reservation_snapshot)
+            claims_snapshot_sha256 = canonical_sha256(claims_snapshot)
+            if claims_snapshot_sha256 != nonce_context.gpu_claims_sha256:
+                raise NonceError(
+                    "Runtime nonce claims no longer match the reservation bytes."
+                )
+    except AttestationError as exc:
+        # Authentication identified an existing server, so even a nonce/context/certificate
+        # failure is attributable and must become the latest durable result.
+        attestation.verification_error = str(exc.detail)
+        await db.commit()
+        logger.error(f"Runtime attestation preflight failed: {exc}")
+        raise
 
-    # Release every trust-bearing lock before quote, NVIDIA, or other external
-    # verification. The second phase refetches and compares this exact context.
+    # Release every trust-bearing lock before quote, NVIDIA, or other external verification. The
+    # publication phase reacquires the same order and proves this attempt is still authoritative.
     await db.commit()
 
     runtime_precheck_error: Optional[AttestationError] = None
@@ -3021,10 +3543,16 @@ async def process_runtime_attestation(
                 require_exact=claims_snapshot.management_mode == "platform",
             )
 
-        # Compare-and-set phase: refetch every trust-bearing row after external
-        # work and reject a nonce whose lineage changed in the interim.
+        # Compare-and-set phase: reacquire the same lock order used to allocate attempts. Every
+        # writer serializes on Server, and only the sequence-latest row may mutate shared authority.
+        if lifecycle_runtime:
+            await acquire_gpu_lifecycle_lock(db)
         server = await check_server_ownership(
-            db, server_id, miner_hotkey, expected_cert_hash
+            db,
+            server_id,
+            miner_hotkey,
+            expected_cert_hash,
+            for_update=True,
         )
         if server.ip != actual_ip:
             raise NonceError(
@@ -3035,20 +3563,15 @@ async def process_runtime_attestation(
             raise NonceError(
                 "Runtime reservation lineage changed during evidence verification."
             )
-        server = (
-            await db.execute(
-                select(Server).where(Server.server_id == server_id).with_for_update()
-            )
-        ).scalar_one()
         if expected_cert_hash.lower() != _registered_cert_hash(server):
             raise NonceError(
                 "Runtime certificate lineage changed during evidence verification."
             )
 
+        reservation = None
+        claims = None
         gpu_lineage: dict[str, Any] = {}
         if gpu_runtime:
-            from api.host.gpu_allocations import _validate_row_claims
-
             reservation = (
                 await db.execute(
                     select(GpuLaunchReservation)
@@ -3063,11 +3586,45 @@ async def process_runtime_attestation(
                 raise NonceError(
                     "GPU runtime reservation changed during evidence verification."
                 )
-            claims = _validate_row_claims(reservation)
+            claims = _runtime_gpu_claims(reservation)
             if canonical_sha256(claims) != claims_snapshot_sha256:
                 raise NonceError(
                     "GPU launch claims changed during evidence verification."
                 )
+            gpu_lineage = _gpu_attestation_lineage(
+                reservation,
+                claims,
+                args.gpu_evidence,
+                verified_gpu_evidence,
+            )
+
+        from api.server.gpu_sessions import _latest_attestation_attempt
+
+        latest = await _latest_attestation_attempt(db, server_id, for_update=True)
+        config_fingerprint, trust_set_fingerprint = _measurement_fingerprints(
+            measurement_config
+        )
+        if latest is None or latest.attestation_id != attempt_id:
+            # Preserve this attempt's independently verified audit result, but do not stamp Server,
+            # advance node inventory, issue key authority, or touch lifecycle state.
+            attestation.verification_error = None
+            attestation.measurement_version = measurement_config.version
+            attestation.measurement_name = measurement_config.name
+            attestation.measurement_config_fingerprint = config_fingerprint
+            attestation.trust_set_fingerprint = trust_set_fingerprint
+            attestation.revocation_status = revocation_status
+            attestation.verified_at = func.now()
+            for field, value in gpu_lineage.items():
+                setattr(attestation, field, value)
+            await db.commit()
+            logger.warning(
+                f"Runtime attestation attempt {attempt_id} succeeded after a newer attempt "
+                "became authoritative; retained as audit-only."
+            )
+            raise AttestationSupersededError()
+
+        if gpu_runtime:
+            assert reservation is not None and claims is not None
             selected_uuids = await _validate_runtime_gpu_selection(
                 db, server, reservation, claims, verified_gpu_evidence
             )
@@ -3087,30 +3644,20 @@ async def process_runtime_attestation(
                 raise InvalidGpuEvidenceError(
                     "GPU runtime evidence differs from the immutable registered selection."
                 )
-            gpu_lineage = _gpu_attestation_lineage(
-                reservation,
-                claims,
-                args.gpu_evidence,
-                verified_gpu_evidence,
-            )
 
         config_fingerprint, trust_set_fingerprint = _stamp_server_measurement(
             server, measurement_config
         )
         server.attestation_revocation_status = revocation_status
-        attestation = ServerAttestation(
-            server_id=server_id,
-            quote_data=args.quote,
-            verification_error=None,
-            measurement_version=measurement_config.version,
-            measurement_name=measurement_config.name,
-            measurement_config_fingerprint=config_fingerprint,
-            trust_set_fingerprint=trust_set_fingerprint,
-            revocation_status=revocation_status,
-            verified_at=func.now(),
-            **gpu_lineage,
-        )
-        db.add(attestation)
+        attestation.verification_error = None
+        attestation.measurement_version = measurement_config.version
+        attestation.measurement_name = measurement_config.name
+        attestation.measurement_config_fingerprint = config_fingerprint
+        attestation.trust_set_fingerprint = trust_set_fingerprint
+        attestation.revocation_status = revocation_status
+        attestation.verified_at = func.now()
+        for field, value in gpu_lineage.items():
+            setattr(attestation, field, value)
         await db.commit()
         await db.refresh(attestation)
 
@@ -3121,6 +3668,7 @@ async def process_runtime_attestation(
                 server,
                 measurement_config,
                 LuksCapabilityPurpose.STORAGE,
+                attestation=attestation,
             )
             assert_gpu_external_work_allowed(db, "runtime LUKS nonce issuance")
             luks_quote_nonce = await generate_luks_quote_nonce(capability)
@@ -3135,12 +3683,9 @@ async def process_runtime_attestation(
             ),
         }
 
-    except (
-        InvalidQuoteError,
-        MeasurementMismatchError,
-        InvalidGpuEvidenceError,
-        GpuEvidenceError,
-    ) as e:
+    except AttestationSupersededError:
+        raise
+    except AttestationError as e:
         # A failed external verification is also published only after refetching
         # the nonce-bound lineage. A stale failure cannot quarantine a successor.
         await db.rollback()
@@ -3156,27 +3701,46 @@ async def process_runtime_attestation(
             failed_measurement = get_matching_measurement_config(quote_parsed)
             measurement_version = failed_measurement.version
             measurement_name = failed_measurement.name
-        except (InvalidQuoteError, MeasurementMismatchError):
+        except AttestationError:
             pass
 
+        async def publish_unfenced_failure(detail: str, reason: str) -> None:
+            # The original attempt row is already durable and sequence-ordered. Roll back
+            # any stale lineage reads or node mutations, then retain only its audit verdict.
+            await db.rollback()
+            attestation.verification_error = reason
+            attestation.measurement_version = measurement_version
+            attestation.measurement_name = measurement_name
+            await db.commit()
+            logger.warning(
+                f"Runtime attestation attempt {attempt_id} recorded without a lifecycle fence: "
+                f"{detail}"
+            )
+
+        if lifecycle_runtime:
+            await acquire_gpu_lifecycle_lock(db)
         server = await check_server_ownership(
-            db, server_id, miner_hotkey, expected_cert_hash
+            db,
+            server_id,
+            miner_hotkey,
+            expected_cert_hash,
+            for_update=True,
         )
+        from api.server.gpu_sessions import _latest_attestation_attempt
+
+        latest = await _latest_attestation_attempt(db, server_id, for_update=True)
+        if latest is None or latest.attestation_id != attempt_id:
+            detail = "A newer runtime attestation attempt owns lifecycle authority."
+            await publish_unfenced_failure(detail, str(e.detail))
+            raise AttestationSupersededError() from e
+
         locked_context = await runtime_attestation_context_for_server_db(db, server)
         if locked_context != nonce_context:
-            await db.rollback()
-            raise NonceError(
-                "Runtime lineage changed before failed evidence could be recorded."
-            ) from e
-        server = (
-            await db.execute(
-                select(Server).where(Server.server_id == server_id).with_for_update()
-            )
-        ).scalar_one()
+            detail = "Runtime lineage changed before failed evidence could be recorded."
+            await publish_unfenced_failure(detail, str(e.detail))
+            raise NonceError(detail) from e
         failed_gpu_lineage: dict[str, Any] = {}
         if gpu_runtime and nonce_context.gpu_launch_reservation_id:
-            from api.host.gpu_allocations import _validate_row_claims
-
             reservation = (
                 await db.execute(
                     select(GpuLaunchReservation)
@@ -3188,33 +3752,31 @@ async def process_runtime_attestation(
                 )
             ).scalar_one_or_none()
             if reservation is None or reservation.state != "running":
-                await db.rollback()
-                raise NonceError(
-                    "GPU runtime reservation changed before failure publication."
-                ) from e
-            claims = _validate_row_claims(reservation)
+                detail = "GPU runtime reservation changed before failure publication."
+                await publish_unfenced_failure(detail, str(e.detail))
+                raise NonceError(detail) from e
+            try:
+                claims = _runtime_gpu_claims(reservation)
+            except AttestationError as claims_error:
+                detail = "GPU runtime claims became invalid before failure publication."
+                await publish_unfenced_failure(detail, str(e.detail))
+                raise NonceError(detail) from claims_error
             if canonical_sha256(claims) != claims_snapshot_sha256:
-                await db.rollback()
-                raise NonceError(
-                    "GPU launch claims changed before failure publication."
-                ) from e
+                detail = "GPU launch claims changed before failure publication."
+                await publish_unfenced_failure(detail, str(e.detail))
+                raise NonceError(detail) from e
             failed_gpu_lineage = _gpu_attestation_lineage(
                 reservation,
                 claims,
                 list(args.gpu_evidence or []),
                 None,
             )
-        attestation = ServerAttestation(
-            server_id=server_id,
-            quote_data=args.quote,
-            verification_error=str(e.detail),
-            measurement_version=measurement_version,
-            measurement_name=measurement_name,
-            **failed_gpu_lineage,
-        )
-        db.add(attestation)
+        attestation.verification_error = str(e.detail)
+        attestation.measurement_version = measurement_version
+        attestation.measurement_name = measurement_name
+        for field, value in failed_gpu_lineage.items():
+            setattr(attestation, field, value)
         if gpu_runtime and nonce_context.gpu_launch_reservation_id:
-            await db.flush()
             from api.host.gpu_allocations import request_gpu_lifecycle_fence
 
             await request_gpu_lifecycle_fence(
@@ -3223,7 +3785,7 @@ async def process_runtime_attestation(
                 code="gpu_runtime_attestation_failed",
                 reason=str(e.detail),
                 operation_type="normal_delete",
-                metadata={"attestation_id": attestation.attestation_id},
+                metadata={"attestation_id": attempt_id},
             )
         await db.commit()
         logger.error(f"Runtime attestation failed: {str(e)}")
@@ -3247,16 +3809,11 @@ async def get_server_attestation_status(
     # Verify server ownership
     _ = await check_server_ownership(db, server_id, miner_hotkey)
 
-    # Get latest attestation
-    query = (
-        select(ServerAttestation)
-        .where(ServerAttestation.server_id == server_id)
-        .order_by(ServerAttestation.created_at.desc())
-        .limit(1)
-    )
+    # Failures are attempts too. Use the same database sequence ordering as every
+    # authorization path instead of wall-clock timestamps.
+    from api.server.gpu_sessions import _latest_attestation_attempt
 
-    result = await db.execute(query)
-    latest_attestation = result.scalar_one_or_none()
+    latest_attestation = await _latest_attestation_attempt(db, server_id)
 
     status = {
         "server_id": server_id,
@@ -3494,6 +4051,23 @@ async def _validate_luks_capability_identity(
             detail="Registered server no longer matches the issued LUKS capability.",
         )
     _assert_cert_binding(server, expected_cert_hash, capability.cert_hash)
+    if is_storage:
+        if not capability.server_attestation_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Storage LUKS capability is not bound to an attestation attempt.",
+            )
+        from api.server.gpu_sessions import (
+            _current_attestation_identity,
+            _latest_attestation_attempt,
+        )
+
+        latest = await _latest_attestation_attempt(
+            db, server.server_id, for_update=True
+        )
+        _current_attestation_identity(
+            server, latest, expected_id=capability.server_attestation_id
+        )
     return server
 
 

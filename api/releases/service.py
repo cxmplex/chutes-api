@@ -2560,10 +2560,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         func.row_number()
         .over(
             partition_by=ServerAttestation.server_id,
-            order_by=(
-                ServerAttestation.created_at.desc(),
-                ServerAttestation.attestation_id.desc(),
-            ),
+            order_by=ServerAttestation.attempt_sequence.desc(),
         )
         .label("rn"),
     ).subquery()
@@ -2814,10 +2811,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                     await db.execute(
                         select(ServerAttestation)
                         .where(ServerAttestation.server_id == server.server_id)
-                        .order_by(
-                            ServerAttestation.created_at.desc(),
-                            ServerAttestation.attestation_id.desc(),
-                        )
+                        .order_by(ServerAttestation.attempt_sequence.desc())
                         .limit(1)
                     )
                 ).scalar_one_or_none()

@@ -306,7 +306,26 @@ def _server_row(
         self_registered=self_registered,
         created_at=created_at,
         attested_cert=attested_cert,
+        attested_cert_pubkey_hash=None,
         miner_hotkey="hk-miner",
+        compute_type="cpu",
+        measurement_name="cpu-measurement",
+        measurement_config_fingerprint="2" * 64,
+        trust_set_fingerprint="3" * 64,
+        attestation_revocation_status={},
+    )
+
+
+def _current_cpu_attestation(server, *, failed=False):
+    return SimpleNamespace(
+        attestation_id="cpu-attempt",
+        server_id=server.server_id,
+        verification_error="newer attestation failed" if failed else None,
+        verified_at=None if failed else datetime.now(timezone.utc),
+        measurement_name=server.measurement_name,
+        measurement_config_fingerprint=server.measurement_config_fingerprint,
+        trust_set_fingerprint=server.trust_set_fingerprint,
+        revocation_status=dict(server.attestation_revocation_status),
     )
 
 
@@ -698,10 +717,15 @@ def pass_auth():
         yield factory
 
 
-def _auth_session(server=None, host=None):
+def _auth_session(server=None, host=None, *, attestation=None):
+    if server is not None and attestation is None:
+        attestation = _current_cpu_attestation(server)
     return FakeSession(
         {
             "Server.Server": FakeResult(items=[server] if server else []),
+            "ServerAttestation.ServerAttestation": FakeResult(
+                items=[attestation] if attestation else []
+            ),
             "Host.Host": FakeResult(items=[host] if host else []),
         }
     )
@@ -726,6 +750,30 @@ class TestAgentAuthenticate:
         online.assert_awaited_once_with("srv-1")
         assert clean_sio.emit.await_args.args[0] == "auth_success"
         clean_sio.disconnect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_newer_failed_attestation_rejects_valid_td_channel(
+        self, clean_sio, pass_auth
+    ):
+        key, cert_pem = _attested_keypair_and_cert()
+        headers = dict(AGENT_HEADERS)
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(
+            key, "srv-1:12345:sockets-attest"
+        )
+        server = _server_row(attested_cert=cert_pem)
+        session = _auth_session(
+            server=server,
+            attestation=_current_cpu_attestation(server, failed=True),
+        )
+        online = AsyncMock()
+        with (
+            patch.object(ss, "get_session", _session_ctx(session)),
+            patch.object(ss, "mark_agent_online", online),
+        ):
+            assert await ss.agent_authenticate("sess-1", headers) is False
+        assert ss.sio.agent_sessions == {}
+        online.assert_not_awaited()
+        clean_sio.disconnect.assert_awaited_once_with("sess-1")
 
     @pytest.mark.asyncio
     async def test_self_registered_missing_attested_sig_rejected(self, clean_sio, pass_auth):

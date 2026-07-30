@@ -321,10 +321,7 @@ async def _locked_registry_authority(
     latest_query = (
         select(ServerAttestation)
         .where(ServerAttestation.server_id == server.server_id)
-        .order_by(
-            ServerAttestation.created_at.desc(),
-            ServerAttestation.attestation_id.desc(),
-        )
+        .order_by(ServerAttestation.attempt_sequence.desc())
         .limit(1)
         .with_for_update()
     )

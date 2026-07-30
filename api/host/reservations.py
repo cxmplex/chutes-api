@@ -627,10 +627,7 @@ async def gpu_host_storage_readiness(
         await db.execute(
             select(ServerAttestation)
             .where(ServerAttestation.server_id == intent.server_id)
-            .order_by(
-                ServerAttestation.created_at.desc(),
-                ServerAttestation.attestation_id.desc(),
-            )
+            .order_by(ServerAttestation.attempt_sequence.desc())
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -747,6 +744,8 @@ async def resolve_launch_reservation(
     db: AsyncSession,
     token: str,
     commitment: TdQuoteCommitmentV1,
+    *,
+    allow_consumed_for_publication: bool = False,
 ) -> tuple[TdLaunchReservation, TdLaunchReservationClaimsV1]:
     await acquire_gpu_lifecycle_lock(db)
     reservation_id, token_hash = _parse_token(token)
@@ -791,7 +790,7 @@ async def resolve_launch_reservation(
         row is None
         or not secrets.compare_digest(row.token_hash, token_hash)
         or row.invalidated_at is not None
-        or row.consumed_at is not None
+        or (row.consumed_at is not None and not allow_consumed_for_publication)
         or row.expires_at <= now
     ):
         raise LaunchReservationError(

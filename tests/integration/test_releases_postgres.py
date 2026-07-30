@@ -1390,32 +1390,125 @@ async def test_gpu_v2_enrollment_persists_compute_and_storage_identity(
     assert row.claims["storage_enabled"] is True
 
 
-async def test_seedless_migration_sql_applies_idempotently(postgres_schema):
-    _sessions, schema = postgres_schema
-    migration = (
-        Path(__file__).resolve().parents[2] / "api/migrations/20260720200000_seedless_model_b.sql"
+async def test_attestation_identity_and_seedless_migrations_accept_create_all_and_reentry(
+    postgres_schema,
+):
+    sessions, schema = postgres_schema
+    migrations = (
+        "20260714070000_release_attestation_identity.sql",
+        "20260720200000_seedless_model_b.sql",
     )
-    up_sql = migration.read_text().split("-- migrate:down", 1)[0]
-    parsed = urlsplit(TEST_DATABASE_URL.replace("+asyncpg", ""))
-    connection_url = f"postgresql://{parsed.username}@{parsed.hostname}:{parsed.port}{parsed.path}"
-    environment = {
-        **os.environ,
-        "PGPASSWORD": parsed.password or "",
-        "PGOPTIONS": f"-c search_path={schema}",
-    }
     for _ in range(2):
-        process = await asyncio.create_subprocess_exec(
-            "psql",
-            connection_url,
-            "-v",
-            "ON_ERROR_STOP=1",
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
+        for migration_name in migrations:
+            await _apply_sql_migration(schema, migration_name)
+
+    async with sessions() as session:
+        constraint_counts = dict(
+            (
+                await session.execute(
+                    text(
+                        "SELECT conname, count(*) FROM pg_constraint "
+                        "WHERE conname IN ("
+                        "'fk_server_attestations_subject', "
+                        "'ck_server_attestation_attribution', "
+                        "'fk_server_attestations_attribution_owner', "
+                        "'fk_server_attestations_td_reservation_attribution', "
+                        "'uq_td_launch_reservation_attribution') "
+                        "GROUP BY conname"
+                    )
+                )
+            ).all()
         )
-        stdout, stderr = await process.communicate(up_sql.encode())
-        assert process.returncode == 0, (stdout + stderr).decode(errors="replace")
+        trigger_counts = dict(
+            (
+                await session.execute(
+                    text(
+                        "SELECT tgname, count(*) FROM pg_trigger "
+                        "WHERE NOT tgisinternal AND tgname IN ("
+                        "'preserve_server_attestation_subject_identity', "
+                        "'enforce_server_attestation_subject', "
+                        "'preserve_server_attestation_audit') GROUP BY tgname"
+                    )
+                )
+            ).all()
+        )
+    assert constraint_counts == {
+        "ck_server_attestation_attribution": 1,
+        "fk_server_attestations_attribution_owner": 1,
+        "fk_server_attestations_subject": 1,
+        "fk_server_attestations_td_reservation_attribution": 1,
+        "uq_td_launch_reservation_attribution": 1,
+    }
+    assert trigger_counts == {
+        "enforce_server_attestation_subject": 1,
+        "preserve_server_attestation_audit": 1,
+        "preserve_server_attestation_subject_identity": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation_statements", "migration_name", "expected_error"),
+    [
+        (
+            [
+                "ALTER TABLE server_attestations "
+                "DROP CONSTRAINT fk_server_attestations_subject",
+                "ALTER TABLE server_attestations "
+                "ADD CONSTRAINT fk_server_attestations_subject "
+                "FOREIGN KEY (server_id) "
+                "REFERENCES server_attestation_subjects(server_id) "
+                "ON DELETE CASCADE",
+            ],
+            "20260714070000_release_attestation_identity.sql",
+            "final server attestation subject FK has invalid shape",
+        ),
+        (
+            [
+                "ALTER TABLE server_attestations "
+                "ALTER COLUMN attempt_sequence DROP DEFAULT",
+            ],
+            "20260714070000_release_attestation_identity.sql",
+            "attempt_sequence has invalid type, nullability, or default",
+        ),
+        (
+            [
+                "DROP TRIGGER enforce_server_attestation_subject "
+                "ON server_attestations",
+                "CREATE TRIGGER enforce_server_attestation_subject "
+                "AFTER INSERT ON server_attestations FOR EACH ROW "
+                "EXECUTE FUNCTION enforce_server_attestation_subject()",
+            ],
+            "20260714070000_release_attestation_identity.sql",
+            "enforce_server_attestation_subject has invalid trigger shape",
+        ),
+        (
+            [
+                "ALTER TABLE server_attestations "
+                "DROP CONSTRAINT ck_server_attestation_attribution",
+                "ALTER TABLE server_attestations "
+                "ADD CONSTRAINT ck_server_attestation_attribution "
+                "CHECK (attribution_reservation_id IS NULL)",
+            ],
+            "20260720200000_seedless_model_b.sql",
+            "ck_server_attestation_attribution has invalid or duplicate authority",
+        ),
+    ],
+)
+async def test_attestation_migrations_reject_partial_or_wrong_create_all_catalogs(
+    postgres_schema,
+    mutation_statements,
+    migration_name,
+    expected_error,
+):
+    sessions, schema = postgres_schema
+    async with sessions() as session:
+        for statement in mutation_statements:
+            await session.execute(text(statement))
+        await session.commit()
+
+    with pytest.raises(AssertionError) as error:
+        await _apply_sql_migration(schema, migration_name)
+    assert expected_error in str(error.value)
 
 
 @pytest.mark.parametrize(

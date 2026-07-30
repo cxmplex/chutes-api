@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import asyncpg
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -92,7 +93,10 @@ async def _create_all_then_apply_ordered_migrations(engine) -> None:
         version = path.name.split("_", 1)[0]
         up_sql, _down_sql = _split(path)
         async with engine.begin() as connection:
-            await _execute(connection, up_sql)
+            try:
+                await _execute(connection, up_sql)
+            except Exception as exc:
+                raise RuntimeError(f"ordered migration failed: {path.name}") from exc
             await connection.execute(
                 text(
                     "INSERT INTO schema_migrations(version) VALUES (:version) "
@@ -228,6 +232,88 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
                 ["r"],
             ),
         }
+    finally:
+        await _drop_schema(schema, admin, engine)
+
+
+async def test_storage_object_key_migrations_accept_exact_legacy_and_reject_mixed():
+    schema, admin, engine = await _new_schema()
+    bootstrap_up, _bootstrap_down = _split(
+        MIGRATIONS / "20260629120000_chutefs_storage.sql"
+    )
+    object_key_up, object_key_down = _split(
+        MIGRATIONS / "20260703120000_chutefs_object_key_partial_unique.sql"
+    )
+    try:
+        async with engine.begin() as connection:
+            await _execute(
+                connection,
+                "CREATE TABLE users(user_id VARCHAR PRIMARY KEY);"
+                "CREATE TABLE servers(server_id VARCHAR PRIMARY KEY);"
+                "CREATE TABLE hosts(host_id VARCHAR PRIMARY KEY);",
+            )
+            await _execute(connection, bootstrap_up)
+            await _execute(connection, bootstrap_up)
+
+        # A same-name wrong legacy index is not accepted. The failed transaction rolls the
+        # mutation back, leaving the exact bootstrap catalog available for the next phase.
+        with pytest.raises(asyncpg.PostgresError, match="invalid legacy shape"):
+            async with engine.begin() as connection:
+                await _execute(
+                    connection,
+                    "DROP INDEX idx_storage_objects_volume;"
+                    "CREATE INDEX idx_storage_objects_volume "
+                    "ON storage_objects(object_id);",
+                )
+                await _execute(connection, bootstrap_up)
+
+        async with engine.begin() as connection:
+            await _execute(connection, object_key_up)
+            await _execute(connection, object_key_up)
+            predicate = (
+                await connection.execute(
+                    text(
+                        "SELECT pg_get_expr(index_definition.indpred, "
+                        "index_definition.indrelid, true) "
+                        "FROM pg_index AS index_definition "
+                        "WHERE index_definition.indexrelid = "
+                        "'uq_storage_object_key'::regclass"
+                    )
+                )
+            ).scalar_one()
+            constraint_count = (
+                await connection.execute(
+                    text(
+                        "SELECT count(*) FROM pg_constraint "
+                        "WHERE conrelid = 'storage_objects'::regclass "
+                        "AND contype = 'u' AND conkey = ARRAY[("
+                        "SELECT attnum FROM pg_attribute "
+                        "WHERE attrelid = 'storage_objects'::regclass "
+                        "AND attname = 'volume_id'), ("
+                        "SELECT attnum FROM pg_attribute "
+                        "WHERE attrelid = 'storage_objects'::regclass "
+                        "AND attname = 'object_key')]::smallint[]"
+                    )
+                )
+            ).scalar_one()
+            assert predicate == "deleted IS FALSE"
+            assert constraint_count == 0
+
+            # The exact post-migration legacy catalog is reversible and can transition again.
+            await _execute(connection, object_key_down)
+            await _execute(connection, object_key_up)
+
+        with pytest.raises(
+            asyncpg.PostgresError,
+            match="requires exact legacy or final columns",
+        ):
+            async with engine.begin() as connection:
+                await _execute(
+                    connection,
+                    "ALTER TABLE storage_objects ADD COLUMN lifecycle_state "
+                    "VARCHAR NOT NULL DEFAULT 'pending'",
+                )
+                await _execute(connection, object_key_up)
     finally:
         await _drop_schema(schema, admin, engine)
 

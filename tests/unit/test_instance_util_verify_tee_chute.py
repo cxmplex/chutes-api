@@ -4,8 +4,10 @@ Tests chute attestation flow with e2e_pubkey hash for chutes >= 0.6.0.
 """
 
 import hashlib
-import pytest
+from datetime import datetime, timezone
 from types import SimpleNamespace
+
+import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi import HTTPException
 
@@ -15,9 +17,11 @@ from api.config import (
     measurement_trust_set_fingerprint,
     settings,
 )
+from api.host.schemas import TdLaunchReservation
 from api.instance.util import verify_tee_chute, require_attested_client_cert
 from api.server.exceptions import NoClientCertError
 from api.server.quote import BootTdxQuote
+from api.server.schemas import Server, ServerAttestation
 from tests.fixtures.gpus import TEST_GPU_NONCE
 
 EXPECTED_NONCE = TEST_GPU_NONCE
@@ -242,17 +246,49 @@ def _cpu_tee_instance(server_id: str = "srv-1"):
 
 def _cpu_server(attested_cert: str | None = _ATTESTED_PEM):
     server = MagicMock()
+    server.server_id = "srv-1"
     server.self_registered = True
     server.compute_type = "cpu"
     server.attested_cert = attested_cert
+    server.measurement_name = "cpu-tdx-current"
+    server.measurement_config_fingerprint = "config-fingerprint"
+    server.trust_set_fingerprint = "trust-set-fingerprint"
+    server.attestation_revocation_status = {"dcap": "good"}
     return server
+
+
+def _current_attestation_for(server):
+    return SimpleNamespace(
+        attestation_id="att-current",
+        server_id=server.server_id,
+        verification_error=None,
+        verified_at=datetime.now(timezone.utc),
+        measurement_name=server.measurement_name,
+        measurement_config_fingerprint=server.measurement_config_fingerprint,
+        trust_set_fingerprint=server.trust_set_fingerprint,
+        revocation_status=dict(getattr(server, "attestation_revocation_status", {}) or {}),
+    )
 
 
 def _db_returning(server):
     db = AsyncMock()
-    result = MagicMock()
-    result.scalar_one_or_none.return_value = server
-    db.execute = AsyncMock(return_value=result)
+    db.info = {}
+
+    async def execute(statement, _params=None):
+        descriptions = getattr(statement, "column_descriptions", ())
+        entity = descriptions[0].get("entity") if descriptions else None
+        result = MagicMock()
+        if entity is Server:
+            result.scalar_one_or_none.return_value = server
+        elif entity is ServerAttestation:
+            result.scalar_one_or_none.return_value = _current_attestation_for(server)
+        elif entity is TdLaunchReservation:
+            result.scalar_one_or_none.return_value = None
+        else:
+            result.scalar_one_or_none.return_value = None
+        return result
+
+    db.execute = AsyncMock(side_effect=execute)
     return db
 
 
@@ -261,7 +297,10 @@ async def test_require_attested_client_cert_match_passes():
     """Matching client-cert pubkey hash == pinned attested cert -> allowed."""
     db = _db_returning(_cpu_server())
     with (
-        patch("api.server.service.runtime_attestation_context_for_server"),
+        patch(
+            "api.server.service.runtime_attestation_context_for_server_db",
+            new_callable=AsyncMock,
+        ),
         patch.object(settings, "require_mtls_client_verify", True),
         patch("api.instance.util._get_client_certificate", return_value=MagicMock()),
         patch("api.instance.util.get_public_key_hash", return_value="samehash"),
@@ -275,7 +314,10 @@ async def test_require_attested_client_cert_mismatch_403():
     """A client cert whose pubkey hash != the pinned attested cert is rejected."""
     db = _db_returning(_cpu_server())
     with (
-        patch("api.server.service.runtime_attestation_context_for_server"),
+        patch(
+            "api.server.service.runtime_attestation_context_for_server_db",
+            new_callable=AsyncMock,
+        ),
         patch.object(settings, "require_mtls_client_verify", True),
         patch("api.instance.util._get_client_certificate", return_value=MagicMock()),
         patch(
@@ -294,7 +336,10 @@ async def test_require_attested_client_cert_jwt_only_rejected():
     """JWT-only caller (no verified mTLS client cert) is rejected -- the C-1 secret-exfil block."""
     db = _db_returning(_cpu_server())
     with (
-        patch("api.server.service.runtime_attestation_context_for_server"),
+        patch(
+            "api.server.service.runtime_attestation_context_for_server_db",
+            new_callable=AsyncMock,
+        ),
         patch.object(settings, "require_mtls_client_verify", True),
         patch("api.instance.util._get_client_certificate", side_effect=NoClientCertError()),
     ):
@@ -308,7 +353,10 @@ async def test_require_attested_client_cert_no_attested_cert_403():
     """A CPU-TEE server with no attested cert on record fails closed (cannot bind)."""
     db = _db_returning(_cpu_server(attested_cert=None))
     with (
-        patch("api.server.service.runtime_attestation_context_for_server"),
+        patch(
+            "api.server.service.runtime_attestation_context_for_server_db",
+            new_callable=AsyncMock,
+        ),
         patch.object(settings, "require_mtls_client_verify", True),
     ):
         with pytest.raises(HTTPException) as exc_info:
@@ -334,7 +382,10 @@ async def test_require_attested_client_cert_hard_fails_when_mtls_disabled():
     so CPU-TEE secret endpoints must HARD-FAIL -- never warn-and-skip into unbound secret delivery."""
     db = _db_returning(_cpu_server())
     with (
-        patch("api.server.service.runtime_attestation_context_for_server"),
+        patch(
+            "api.server.service.runtime_attestation_context_for_server_db",
+            new_callable=AsyncMock,
+        ),
         patch.object(settings, "require_mtls_client_verify", False),
     ):
         with pytest.raises(HTTPException) as exc_info:
@@ -373,6 +424,8 @@ def _issued_cpu_server(config):
         compute_type="cpu",
         tee_type="tdx",
         host_id="l0-issued",
+        launch_reservation_id="reservation-issued",
+        launch_boot_generation=1,
         storage_role=False,
         version=config.version,
         measurement_name=config.name,

@@ -60,6 +60,14 @@ class AttestationError(Exception):
         return self.http_status
 
 
+class AttestationSupersededError(AttestationError):
+    """Raised when a newer durable attempt owns publication authority."""
+
+    http_status = status.HTTP_409_CONFLICT
+    code = "attestation_superseded"
+    default_message = "Attestation attempt was superseded by a newer attempt."
+
+
 class NoClientCertError(AttestationError):
     """Raised when attestation is performed without mTLS."""
 

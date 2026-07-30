@@ -15,6 +15,7 @@ from api.server.gpu_sessions import (
     GPU_RUNTIME_SESSION_PURPOSES,
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
     _current_attestation,
+    _current_attestation_identity,
     _revocation_failed,
     _gpu_selection_matches_registration,
     latest_gpu_runtime_session,
@@ -260,14 +261,86 @@ def test_newer_failed_or_mismatched_attempt_invalidates_prior_session(updates):
         _current_attestation(_server(), attempt)
 
 
-def test_latest_attempt_query_does_not_filter_failures():
+def test_latest_attempt_query_does_not_filter_failures_and_uses_db_sequence():
     import inspect
 
     from api.server.gpu_sessions import _latest_attestation_attempt
 
     source = inspect.getsource(_latest_attestation_attempt)
     assert "verification_error.is_" not in source
-    assert "created_at.desc()" in source
+    assert "attempt_sequence.desc()" in source
+    assert "created_at.desc()" not in source
+
+
+def test_all_direct_latest_attempt_consumers_use_database_sequence():
+    import inspect
+
+    from api import cpu_scheduler
+    from api.host import reservations as host_reservations
+    from api.registry import router as registry_router
+    from api.releases import service as releases_service
+    from api.storage import service as storage_service
+
+    consumers = (
+        cpu_scheduler._current_attested_servers,
+        host_reservations.gpu_host_storage_readiness,
+        registry_router._locked_registry_authority,
+        releases_service.release_status,
+        storage_service._verified_storage_ids,
+    )
+    for consumer in consumers:
+        source = inspect.getsource(consumer)
+        assert "ServerAttestation.attempt_sequence" in source, consumer.__qualname__
+        assert "ServerAttestation.created_at.desc()" not in source, consumer.__qualname__
+
+
+def _cpu_server():
+    return SimpleNamespace(
+        server_id="cpu-server",
+        compute_type="cpu",
+        measurement_name="cpu-measurement",
+        measurement_config_fingerprint="2" * 64,
+        trust_set_fingerprint="3" * 64,
+        attestation_revocation_status={},
+    )
+
+
+def _cpu_attestation(*, failed=False):
+    return SimpleNamespace(
+        attestation_id="cpu-attempt",
+        server_id="cpu-server",
+        verification_error="newer quote failed" if failed else None,
+        verified_at=None if failed else datetime.now(timezone.utc),
+        measurement_name="cpu-measurement",
+        measurement_config_fingerprint="2" * 64,
+        trust_set_fingerprint="3" * 64,
+        revocation_status={},
+    )
+
+
+def test_cpu_current_identity_accepts_latest_success_and_rejects_latest_failure():
+    server = _cpu_server()
+    success = _cpu_attestation()
+    assert _current_attestation_identity(server, success) is success
+    with pytest.raises(HTTPException, match="Latest attestation attempt"):
+        _current_attestation_identity(server, _cpu_attestation(failed=True))
+
+
+@pytest.mark.asyncio
+async def test_cpu_model_b_authority_consults_latest_attempt():
+    from api.instance.util import _require_current_attestation_identity
+
+    failed = _cpu_attestation(failed=True)
+    db = AsyncMock()
+    db.execute.return_value = SimpleNamespace(scalar_one_or_none=lambda: failed)
+    with (
+        patch(
+            "api.server.service.runtime_attestation_context_for_server_db",
+            AsyncMock(),
+        ),
+        pytest.raises(HTTPException, match="Latest attestation attempt"),
+    ):
+        await _require_current_attestation_identity(db, _cpu_server())
 
 
 def test_non_revoked_attestation_status_is_not_misclassified():
