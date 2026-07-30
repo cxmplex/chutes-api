@@ -30,7 +30,11 @@ from api.host.schemas import (
     canonical_sha256,
 )
 from api.server.schemas import Server, ServerAttestation
-from api.host.locks import acquire_gpu_lifecycle_lock, assert_gpu_external_work_allowed
+from api.host.locks import (
+    acquire_gpu_lifecycle_lock,
+    acquire_registry_subject_locks,
+    assert_gpu_external_work_allowed,
+)
 from api.instance.schemas import Instance, LaunchConfig
 from api.job.schemas import Job
 from api.server.gpu_sessions import (
@@ -771,6 +775,47 @@ def _registry_request_matches(
     return False
 
 
+def _validated_registry_session_row(
+    row: RegistrySession | None,
+    payload: dict,
+    cert_hash: str,
+    original_method: str,
+    original_uri: str,
+    launch_config_id: str | None,
+) -> RegistrySession:
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registry session does not authorize this certificate/repository/action.",
+        )
+    expected = {
+        "session_id": row.session_id,
+        "jti": row.token_id,
+        "server_id": row.server_id,
+        "scope_id": row.scope_id,
+        "launch_config_id": row.launch_config_id,
+        "attested_cert_sha256": row.attested_cert_pubkey_hash,
+        "repository": row.repository,
+        "actions": row.actions,
+        "manifest_digest": row.manifest_digest,
+        "descriptor_closure_sha256": row.descriptor_closure_sha256,
+    }
+    now = datetime.now(timezone.utc)
+    if (
+        row.revoked_at is not None
+        or row.expires_at <= now
+        or row.attested_cert_pubkey_hash != cert_hash.lower()
+        or row.launch_config_id != launch_config_id
+        or any(payload.get(key) != value for key, value in expected.items())
+        or not _registry_request_matches(row, original_method, original_uri)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Registry session does not authorize this certificate/repository/action.",
+        )
+    return row
+
+
 async def _validate_registry_session(
     db: AsyncSession,
     token: str,
@@ -816,39 +861,50 @@ async def _validate_registry_session(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Registry session purpose is invalid.",
         )
-    await acquire_gpu_lifecycle_lock(db)
+    session_id = payload.get("session_id")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or session_id != session_id.strip()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Registry session identity is invalid.",
+        )
+    preflight = (
+        await db.execute(
+            select(RegistrySession).where(RegistrySession.session_id == session_id)
+        )
+    ).scalar_one_or_none()
+    preflight = _validated_registry_session_row(
+        preflight,
+        payload,
+        cert_hash,
+        original_method,
+        original_uri,
+        launch_config_id,
+    )
+    await acquire_registry_subject_locks(
+        db,
+        server_id=preflight.server_id,
+        launch_config_id=preflight.launch_config_id,
+    )
     row = (
         await db.execute(
             select(RegistrySession)
-            .where(RegistrySession.session_id == payload["session_id"])
+            .where(RegistrySession.session_id == session_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    now = datetime.now(timezone.utc)
-    expected = {
-        "jti": row.token_id if row else None,
-        "server_id": row.server_id if row else None,
-        "scope_id": row.scope_id if row else None,
-        "launch_config_id": row.launch_config_id if row else None,
-        "attested_cert_sha256": row.attested_cert_pubkey_hash if row else None,
-        "repository": row.repository if row else None,
-        "actions": row.actions if row else None,
-        "manifest_digest": row.manifest_digest if row else None,
-        "descriptor_closure_sha256": (row.descriptor_closure_sha256 if row else None),
-    }
-    if (
-        row is None
-        or row.revoked_at is not None
-        or row.expires_at <= now
-        or row.attested_cert_pubkey_hash != cert_hash.lower()
-        or row.launch_config_id != launch_config_id
-        or any(payload.get(key) != value for key, value in expected.items())
-        or not _registry_request_matches(row, original_method, original_uri)
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Registry session does not authorize this certificate/repository/action.",
-        )
+    row = _validated_registry_session_row(
+        row,
+        payload,
+        cert_hash,
+        original_method,
+        original_uri,
+        launch_config_id,
+    )
     server = await _current_attested_registry_server(db, cert_hash)
     if server.server_id != row.server_id:
         raise HTTPException(
@@ -889,7 +945,7 @@ async def _validate_registry_session(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="GPU registry session no longer matches its exact launch scope.",
             )
-    row.last_used_at = now
+    row.last_used_at = datetime.now(timezone.utc)
     await db.commit()
     return row
 
