@@ -19,6 +19,8 @@ def test_settings_importers_share_validator_dev_trust_posture():
     required_environment = {
         "ALLOW_DEBUG_MEASUREMENTS": "true",
         "ALLOW_DEV_ATTESTED_MTLS": "true",
+        "CHUTEFS_ALLOW_INSECURE_DEV_KEY": "true",
+        "GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY": "true",
         "REQUIRE_MTLS_CLIENT_VERIFY": "true",
         "SKIP_METAGRAPH_CHECK": "true",
         "TEE_MEASUREMENT_CONFIG_REQUIRED": "true",

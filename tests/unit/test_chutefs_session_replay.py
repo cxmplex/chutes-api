@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from api.config import settings
+from api.instance import util as instance_util
 from api.server.schemas import (
     ChuteFSLaunchSession,
     ChuteFSTokenKeyEpoch,
@@ -50,9 +51,14 @@ def test_deterministic_tokens_replay_exactly_and_are_purpose_separated(monkeypat
         launch_sessions._REFRESH_PREFIX,
         "refresh",
     )
+    reexchange = launch_sessions._derived_token(
+        row,
+        launch_sessions._REEXCHANGE_PREFIX,
+        "reexchange",
+    )
 
     assert first_access == replayed_access
-    assert first_access != refresh
+    assert len({first_access, refresh, reexchange}) == 3
     assert (
         launch_sessions._session_id_from_token(
             first_access,
@@ -163,12 +169,16 @@ def test_session_model_has_one_active_successor_and_replay_metadata():
         "token_seed",
         "token_key_id",
         "response_replay_until",
+        "revocation_epoch",
+        "reexchange_token_hash",
     }.issubset(columns.keys())
     indexes = {index.name: index for index in ChuteFSLaunchSession.__table__.indexes}
     assert indexes["uq_chutefs_launch_session_active_config"].unique
     assert indexes["uq_chutefs_launch_session_active_instance"].unique
     assert indexes["uq_chutefs_launch_session_successor"].unique
     assert not columns["rotated_from_session_id"].foreign_keys
+    assert columns["revocation_epoch"].default is None
+    assert columns["revocation_epoch"].server_default is None
 
     assert {
         "key_id",
@@ -194,7 +204,10 @@ def test_current_lineage_binds_certificate_and_operational_attestation():
         compute_type="gpu",
         gpu_management_mode="miner",
     )
-    instance = SimpleNamespace(instance_id="instance")
+    instance = SimpleNamespace(
+        instance_id="instance",
+        storage_revocation_epoch=4,
+    )
     binding = SimpleNamespace(binding_id="binding")
     volume = SimpleNamespace(volume_id="volume")
     server = SimpleNamespace(
@@ -213,6 +226,7 @@ def test_current_lineage_binds_certificate_and_operational_attestation():
     )
     assert current["attestation_id"] == "attestation-a"
     assert current["attested_cert_pubkey_hash"] == "a" * 64
+    assert current["revocation_epoch"] == 4
     assert launch_sessions._session_matches_current(SimpleNamespace(**current), current)
 
     server.gpu_runtime_session_attestation_id = "attestation-b"
@@ -222,6 +236,33 @@ def test_current_lineage_binds_certificate_and_operational_attestation():
     assert not launch_sessions._session_matches_current(
         SimpleNamespace(**current), advanced
     )
+
+    instance.storage_revocation_epoch += 1
+    revoked = launch_sessions._current_session_identity(
+        config, instance, binding, volume, server, reservation
+    )
+    assert not launch_sessions._session_matches_current(
+        SimpleNamespace(**advanced), revoked
+    )
+
+
+def test_disable_persists_revocation_epoch_before_redis_fast_path():
+    source = inspect.getsource(instance_util.disable_instance)
+    durable_epoch = source.index("instance.storage_revocation_epoch += 1")
+    durable_commit = source.index("await db.commit()", durable_epoch)
+    redis_publish = source.index("settings.redis_client.client.set", durable_commit)
+    assert durable_epoch < durable_commit < redis_publish
+    assert ".with_for_update()" in source[:durable_epoch]
+    assert "await acquire_gpu_lifecycle_lock(db)" in source[:durable_epoch]
+
+    migration = (
+        Path(__file__).parents[2]
+        / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
+    ).read_text()
+    up = migration.split("-- migrate:down", maxsplit=1)[0]
+    assert "NEW.storage_revocation_epoch < OLD.storage_revocation_epoch" in up
+    assert "NEW.storage_revocation_epoch := OLD.storage_revocation_epoch + 1" in up
+    assert "AFTER UPDATE OF active, verified, storage_revocation_epoch" in up
 
 
 def test_revocation_preflight_and_binding_locks_follow_shared_order():
@@ -326,6 +367,8 @@ def test_rotation_migration_locks_and_guards_only_its_state():
         "generation",
         "access_token_hash",
         "refresh_token_hash",
+        "reexchange_token_hash",
+        "revocation_epoch",
         "access_expires_at",
         "refresh_expires_at",
         "rotated_from_session_id",
@@ -435,11 +478,24 @@ def test_server_revocation_trigger_uses_distinct_identity_changes():
     assert "gpu_runtime_session_attestation_id IS NULL" not in function
 
 
+def test_exact_rotation_replay_precedes_refresh_expiry_rejection():
+    source = inspect.getsource(launch_sessions._rotate_launch_storage_session)
+    assert source.index("if row.revoked_at is not None") < source.index(
+        "if require_refresh_expiry and row.refresh_expires_at <= now"
+    )
+    assert source.index("successor.response_replay_until <= now") < source.index(
+        "if require_refresh_expiry and row.refresh_expires_at <= now"
+    )
+
+
 def test_pruning_requires_all_authority_windows_to_expire_and_is_bounded():
     source = inspect.getsource(launch_sessions._prune_expired_session_lineage)
     assert "access_expires_at <= now" in source
     assert "refresh_expires_at <= now" in source
     assert "response_replay_until <= now" in source
+    assert "replay_successor.rotated_from_session_id" in source
+    assert "replay_successor.revoked_at.is_(None)" in source
+    assert "replay_successor.response_replay_until > now" in source
     assert ".limit(limit)" in source
     assert "limit: int = 128" in source
 
@@ -477,7 +533,9 @@ def test_token_key_retention_ignores_expired_session_key():
     )
 
 
-def test_startup_retains_keys_through_strict_refresh_expiry():
+def test_startup_retains_keys_only_through_finite_response_windows():
     source = inspect.getsource(storage_startup.require_chutefs_token_key_retention)
-    assert '"SELECT token_key_id, MAX(refresh_expires_at) "' in source
-    assert "CASE WHEN revoked_at IS NULL" not in source
+    assert "SELECT token_key_id" in source
+    assert "BOOL_OR(revoked_at IS NULL)" not in source
+    assert "MAX(GREATEST(refresh_expires_at" in source
+    assert "COALESCE(response_replay_until, refresh_expires_at)" in source

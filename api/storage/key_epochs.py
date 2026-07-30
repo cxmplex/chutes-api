@@ -382,7 +382,6 @@ async def retire_token_key_epoch(
                     (
                         (ChuteFSLaunchSession.access_expires_at > now)
                         | (ChuteFSLaunchSession.refresh_expires_at > now)
-                        | (ChuteFSLaunchSession.response_replay_until.is_(None))
                         | (ChuteFSLaunchSession.response_replay_until > now)
                     ),
                 )

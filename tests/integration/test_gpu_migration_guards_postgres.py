@@ -360,6 +360,8 @@ CREATE TABLE chutefs_launch_sessions (
     instance_id VARCHAR NOT NULL,
     access_expires_at TIMESTAMPTZ NOT NULL,
     refresh_expires_at TIMESTAMPTZ NOT NULL,
+    revocation_epoch BIGINT NOT NULL DEFAULT 0,
+    reexchange_token_hash VARCHAR(64) NOT NULL DEFAULT repeat('0', 64),
     revoked_at TIMESTAMPTZ,
     CONSTRAINT chutefs_launch_sessions_config_id_key UNIQUE (config_id),
     CONSTRAINT chutefs_launch_sessions_instance_id_key UNIQUE (instance_id)
@@ -554,13 +556,14 @@ CREATE TABLE chutefs_launch_sessions (
             INSERT INTO chutefs_launch_sessions(
                 session_id, config_id, instance_id, binding_id, user_id,
                 chute_id, compute_type, management_mode, server_id, volume_id,
-                allowed_operations, access_token_hash, refresh_token_hash,
+                allowed_operations, revocation_epoch, access_token_hash,
+                refresh_token_hash, reexchange_token_hash,
                 access_expires_at, refresh_expires_at, attested_cert_pubkey_hash
             ) VALUES (
                 'session', 'config', 'instance', 'binding', 'user', 'chute',
                 'cpu', 'platform', 'server', 'volume',
                 '["put", "get", "list", "delete"]',
-                '{"a" * 64}', '{"b" * 64}',
+                0, '{"a" * 64}', '{"b" * 64}', '{"d" * 64}',
                 NOW() + INTERVAL '5 minutes', NOW() + INTERVAL '10 minutes',
                 '{"c" * 64}'
             );

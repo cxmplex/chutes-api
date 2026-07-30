@@ -2457,8 +2457,10 @@ class ChuteFSLaunchSession(Base):
     attested_cert_pubkey_hash = Column(String, nullable=True)
     allowed_operations = Column(JSONB, nullable=False)
     generation = Column(Integer, nullable=False, default=1, server_default="1")
+    revocation_epoch = Column(BigInteger, nullable=False)
     access_token_hash = Column(String(64), nullable=False, unique=True)
     refresh_token_hash = Column(String(64), nullable=False, unique=True)
+    reexchange_token_hash = Column(String(64), nullable=False, unique=True)
     access_expires_at = Column(DateTime(timezone=True), nullable=False)
     refresh_expires_at = Column(DateTime(timezone=True), nullable=False)
     rotation_request_sha256 = Column(String(64), nullable=True)
@@ -2512,6 +2514,7 @@ class ChuteFSLaunchSession(Base):
             "AND jsonb_typeof(allowed_operations) = 'array' "
             'AND allowed_operations = \'["put", "get", "list", "delete"]\'::jsonb '
             "AND generation > 0 "
+            "AND revocation_epoch >= 0 "
             "AND access_expires_at <= refresh_expires_at "
             "AND attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$' "
             "AND ((compute_type = 'cpu' AND management_mode = 'platform' "
@@ -2529,6 +2532,10 @@ class ChuteFSLaunchSession(Base):
         CheckConstraint(
             "refresh_token_hash ~ '^[0-9a-f]{64}$'",
             name="ck_chutefs_launch_session_refresh_hash",
+        ),
+        CheckConstraint(
+            "reexchange_token_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_chutefs_launch_session_reexchange_hash",
         ),
         CheckConstraint(
             "((token_seed IS NULL AND token_key_id IS NULL "

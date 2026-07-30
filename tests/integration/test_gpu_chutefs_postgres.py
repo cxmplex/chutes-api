@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 from urllib.parse import quote
@@ -27,6 +28,7 @@ from starlette.requests import Request
 from api.chute.schemas import Chute
 from api.config import settings
 from api.image.schemas import Image
+from api.instance import util as instance_util
 from api.instance.schemas import Instance, LaunchConfig
 from api.instance.util import create_launch_jwt_v2
 from api.job.schemas import Job
@@ -78,6 +80,51 @@ def storage_crypto(monkeypatch):
 @pytest.fixture(autouse=True)
 def nv_attest():
     yield
+
+
+class _DisablePipeline:
+    def zremrangebyscore(self, *_args):
+        return self
+
+    def zadd(self, *_args):
+        return self
+
+    def zcard(self, *_args):
+        return self
+
+    def expire(self, *_args):
+        return self
+
+    async def execute(self):
+        return [0, 1, 1, 1]
+
+
+class _DisableRedis:
+    def __init__(self, values):
+        self.values = values
+        self.client = self
+
+    async def get(self, key):
+        return self.values.get(key)
+
+    async def getdel(self, key):
+        return self.values.pop(key, None)
+
+    async def set(self, key, value, *, nx=False, ex=None):
+        del ex
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    async def delete(self, key):
+        return int(self.values.pop(key, None) is not None)
+
+    async def expire(self, key, _ttl):
+        return int(key in self.values)
+
+    def pipeline(self):
+        return _DisablePipeline()
 
 
 async def _user(db: AsyncSession, user_id: str) -> User:
@@ -525,6 +572,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     )
     assert rotated.access_token != issued.access_token
     assert rotated.refresh_token != issued.refresh_token
+    assert rotated.reexchange_token != issued.reexchange_token
     assert rotated.generation == issued.generation + 1
     assert (
         await service.verify_grant(
@@ -618,8 +666,11 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
 
     current_instance = await db.get(Instance, instance_id)
     assert current_instance is not None
+    prior_revocation_epoch = current_instance.storage_revocation_epoch
     current_instance.active = False
     await db.commit()
+    await db.refresh(current_instance)
+    assert current_instance.storage_revocation_epoch == prior_revocation_epoch + 1
     with pytest.raises(HTTPException, match="inactive"):
         await launch_sessions.authorize_default_volume(
             db,
@@ -638,6 +689,265 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         is None
     )
     await db.commit()
+
+
+async def test_disable_between_preflight_and_lifecycle_lock_fences_authority(
+    pg_session,
+    monkeypatch,
+):
+    db, redis = pg_session
+    await _ensure_test_token_key_epoch(db)
+    chute = await _chute(db, storage_pg.USER_ID, f"disable-race-{uuid.uuid4().hex}")
+    _, cert = _identity("disable-race")
+    config, instance = await _cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"disable-race-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(settings, "require_mtls_client_verify", True)
+    request = _mtls_request(cert)
+    _, issued = await launch_sessions.issue_launch_storage_session(
+        db,
+        config.config_id,
+        request,
+    )
+    grant = (
+        await issue_default_volume_grant(
+            DefaultGrantRequest(op="put"),
+            request,
+            db,
+            f"Bearer {issued.access_token}",
+        )
+    ).grant
+    await db.commit()
+    prior_epoch = instance.storage_revocation_epoch
+
+    sessions = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+
+    @asynccontextmanager
+    async def dedicated_session(*_args, **_kwargs):
+        async with sessions() as candidate:
+            yield candidate
+
+    monkeypatch.setattr(instance_util, "get_session", dedicated_session)
+    monkeypatch.setattr(settings, "_redis_client", _DisableRedis(redis.values))
+    passed_redis_preflight = asyncio.Event()
+    release_refresh = asyncio.Event()
+    original_preflight = launch_sessions._require_not_disabled
+
+    async def pause_after_redis_preflight(candidate, instance_id):
+        await original_preflight(candidate, instance_id)
+        passed_redis_preflight.set()
+        await release_refresh.wait()
+
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_not_disabled",
+        pause_after_redis_preflight,
+    )
+
+    async def refresh_in_separate_transaction():
+        async with sessions() as candidate:
+            return await launch_sessions.refresh_launch_storage_session(
+                candidate,
+                f"Bearer {issued.refresh_token}",
+                request,
+            )
+
+    refresh_task = asyncio.create_task(refresh_in_separate_transaction())
+    await asyncio.wait_for(passed_redis_preflight.wait(), timeout=10)
+    try:
+        assert await instance_util.disable_instance(
+            instance.instance_id,
+            chute.chute_id,
+            storage_pg.MINER,
+        )
+    finally:
+        release_refresh.set()
+
+    with pytest.raises(HTTPException) as rejected:
+        await asyncio.wait_for(refresh_task, timeout=10)
+    assert rejected.value.status_code == 401
+
+    # Expire the transient Redis fast-path before checking the grant so this
+    # assertion exercises only the durable epoch/session revocation boundary.
+    redis.values.pop(f"instance_disabled:{instance.instance_id}", None)
+    async with sessions() as verifier:
+        durable_instance = await verifier.get(Instance, instance.instance_id)
+        durable_session = await verifier.scalar(
+            select(ChuteFSLaunchSession).where(
+                ChuteFSLaunchSession.access_token_hash
+                == launch_sessions._token_hash(issued.access_token)
+            )
+        )
+        assert durable_instance.storage_revocation_epoch == prior_epoch + 1
+        assert durable_session.revoked_at is not None
+        assert (
+            await service.verify_grant(
+                grant,
+                config.default_volume_id,
+                "put",
+                db=verifier,
+            )
+            is None
+        )
+        await verifier.commit()
+
+
+async def test_refresh_lost_response_replays_after_predecessor_expiry(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    await _ensure_test_token_key_epoch(db)
+    chute = await _chute(db, storage_pg.USER_ID, f"refresh-boundary-{uuid.uuid4().hex}")
+    _, cert = _identity("refresh-boundary")
+    config, _instance = await _cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"refresh-boundary-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(settings, "require_mtls_client_verify", True)
+    request = _mtls_request(cert)
+    _, issued = await launch_sessions.issue_launch_storage_session(
+        db,
+        config.config_id,
+        request,
+    )
+    refresh_expiry = datetime.fromisoformat(issued.refresh_expires_at)
+
+    with monkeypatch.context() as clock:
+        clock.setattr(
+            launch_sessions,
+            "_now",
+            lambda: refresh_expiry - timedelta(seconds=1),
+        )
+        _, rotated = await launch_sessions.refresh_launch_storage_session(
+            db,
+            f"Bearer {issued.refresh_token}",
+            request,
+        )
+        clock.setattr(
+            launch_sessions,
+            "_now",
+            lambda: refresh_expiry + timedelta(seconds=1),
+        )
+        _, replayed = await launch_sessions.refresh_launch_storage_session(
+            db,
+            f"Bearer {issued.refresh_token}",
+            request,
+        )
+    assert replayed.model_dump(mode="json") == rotated.model_dump(mode="json")
+
+
+async def test_reexchange_rotates_after_refresh_expiry_with_exact_replay(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    await _ensure_test_token_key_epoch(db)
+    chute = await _chute(db, storage_pg.USER_ID, f"reexchange-{uuid.uuid4().hex}")
+    _, cert = _identity("launch-reexchange")
+    config, instance = await _cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"reexchange-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(settings, "require_mtls_client_verify", True)
+    request = _mtls_request(cert)
+    _, issued = await launch_sessions.issue_launch_storage_session(
+        db,
+        config.config_id,
+        request,
+    )
+    after_refresh_expiry = datetime.fromisoformat(
+        issued.refresh_expires_at
+    ) + timedelta(seconds=1)
+
+    with monkeypatch.context() as future:
+        future.setattr(
+            launch_sessions,
+            "_now",
+            lambda: after_refresh_expiry,
+        )
+        _, recovered = await launch_sessions.exchange_launch_token(
+            db,
+            config.config_id,
+            issued.reexchange_token,
+            request,
+        )
+        assert recovered.generation == issued.generation + 1
+        assert recovered.access_token != issued.access_token
+        assert recovered.refresh_token != issued.refresh_token
+        assert recovered.reexchange_token != issued.reexchange_token
+
+        _, replayed = await launch_sessions.exchange_launch_token(
+            db,
+            config.config_id,
+            issued.reexchange_token,
+            request,
+        )
+        assert replayed.model_dump(mode="json") == recovered.model_dump(mode="json")
+
+        with pytest.raises(HTTPException, match="invalid, expired"):
+            await launch_sessions.refresh_launch_storage_session(
+                db,
+                f"Bearer {issued.refresh_token}",
+                request,
+            )
+        await db.rollback()
+        with pytest.raises(HTTPException, match="invalid"):
+            await launch_sessions.authorize_default_volume(
+                db,
+                f"Bearer {issued.access_token}",
+                request,
+                "get",
+            )
+        await db.rollback()
+        authorized = await launch_sessions.authorize_default_volume(
+            db,
+            f"Bearer {recovered.access_token}",
+            request,
+            "get",
+        )
+        assert authorized.instance.instance_id == instance.instance_id
+        await db.commit()
+
+    rows = list(
+        (
+            await db.execute(
+                select(ChuteFSLaunchSession)
+                .where(ChuteFSLaunchSession.config_id == config.config_id)
+                .order_by(ChuteFSLaunchSession.generation)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [row.generation for row in rows] == [1, 2]
+    assert rows[0].revoked_at is not None
+    assert rows[1].revoked_at is None
 
 
 async def test_delayed_launch_exchange_cannot_replace_refreshed_session(
@@ -1199,6 +1509,7 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
         "attestation_id": None,
         "attested_cert_pubkey_hash": server.attested_cert_pubkey_hash,
         "allowed_operations": list(launch_sessions.ALLOWED_OPERATIONS),
+        "revocation_epoch": instance.storage_revocation_epoch,
         "token_key_id": key_id,
     }
     history_ids = [f"history-{index:03d}-{uuid.uuid4().hex}" for index in range(129)]
@@ -1211,6 +1522,7 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
                 generation=index,
                 access_token_hash=digest(f"access-{session_id}"),
                 refresh_token_hash=digest(f"refresh-{session_id}"),
+                reexchange_token_hash=digest(f"reexchange-{session_id}"),
                 access_expires_at=now - timedelta(hours=2),
                 refresh_expires_at=now - timedelta(hours=1),
                 rotation_request_sha256=digest(f"rotate-{session_id}"),
@@ -1230,6 +1542,7 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
             generation=130,
             access_token_hash=digest(f"access-{active_id}"),
             refresh_token_hash=digest(f"refresh-{active_id}"),
+            reexchange_token_hash=digest(f"reexchange-{active_id}"),
             access_expires_at=now + timedelta(minutes=15),
             refresh_expires_at=now + timedelta(hours=24),
             rotation_request_sha256=digest(f"rotate-{active_id}"),
@@ -1255,7 +1568,7 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
         )
         == 2
     )
-    assert await db.get(ChuteFSLaunchSession, history_ids[0]) is None
+    assert await db.get(ChuteFSLaunchSession, history_ids[0]) is not None
     active = await db.get(ChuteFSLaunchSession, active_id)
     assert active.rotated_from_session_id == history_ids[0]
     assert active.rotated_from_session_sha256 == digest(history_ids[0])
@@ -1264,8 +1577,25 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
         db,
         config.config_id,
         now=now,
+    ) == 0
+    await db.commit()
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(ChuteFSLaunchSession)
+            .where(ChuteFSLaunchSession.config_id == config.config_id)
+        )
+        == 2
+    )
+
+    after_replay = active.response_replay_until + timedelta(seconds=1)
+    assert await launch_sessions._prune_expired_session_lineage(
+        db,
+        config.config_id,
+        now=after_replay,
     ) == 1
     await db.commit()
+    assert await db.get(ChuteFSLaunchSession, history_ids[0]) is None
     assert (
         await db.scalar(
             select(func.count())

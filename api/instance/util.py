@@ -331,6 +331,22 @@ async def disable_instance(
     disabled_key = f"instance_disabled:{instance_id}"
     count_key = f"instance_disable_zset:{instance_id}"
 
+    # Persist revocation before publishing the temporary Redis fast-path. The
+    # monotonically increasing epoch is part of every launch-storage session,
+    # so an expired Redis key can never resurrect prior authority.
+    async with get_session() as db:
+        await acquire_gpu_lifecycle_lock(db)
+        instance = (
+            await db.execute(
+                select(Instance)
+                .where(Instance.instance_id == instance_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if instance is not None:
+            instance.storage_revocation_epoch += 1
+            await db.commit()
+
     # Use the raw redis client to ensure we don't silently discard.
     acquired = await settings.redis_client.client.set(
         disabled_key, b"1", nx=True, ex=INSTANCE_DISABLE_BASE_TIMEOUT

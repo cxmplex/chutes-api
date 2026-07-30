@@ -8,10 +8,10 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from api.config import settings
-from api.server.exceptions import NoClientCertError
 from api.server.router import (
     _gpu_registration_live_cert_hash,
     _gpu_registration_live_cert_pem,
@@ -84,12 +84,14 @@ async def test_forwarded_certificate_without_live_handshake_cannot_register_or_r
         "/gpu/registration/attempts/attempt-id",
     ):
         request = _request(cert_pem, None, path)
-        with pytest.raises(NoClientCertError):
+        with pytest.raises(HTTPException) as rejected:
             await _gpu_registration_live_cert_hash(request)
-    with pytest.raises(NoClientCertError):
+        assert rejected.value.status_code == 401
+    with pytest.raises(HTTPException) as rejected:
         await _gpu_registration_live_cert_pem(
             _request(cert_pem, None, "/gpu/registration/attempts")
         )
+    assert rejected.value.status_code == 401
 
 
 @pytest.mark.asyncio

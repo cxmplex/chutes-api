@@ -74,8 +74,9 @@ def _configure(
     replica_id: str,
     new_secret: str = "n" * 32,
     keys: dict[str, str] | None = None,
+    active_key_id: str = "old-key",
 ) -> None:
-    monkeypatch.setattr(settings, "chutefs_token_key_id", "old-key")
+    monkeypatch.setattr(settings, "chutefs_token_key_id", active_key_id)
     monkeypatch.setattr(
         settings,
         "chutefs_token_keys_json",
@@ -376,8 +377,10 @@ async def test_retirement_requires_access_refresh_and_response_replay_expiry(
             attested_cert_pubkey_hash=server.attested_cert_pubkey_hash,
             allowed_operations=list(ALLOWED_OPERATIONS),
             generation=1,
+            revocation_epoch=instance.storage_revocation_epoch,
             access_token_hash=uuid.uuid4().hex * 2,
             refresh_token_hash=uuid.uuid4().hex * 2,
+            reexchange_token_hash=uuid.uuid4().hex * 2,
             access_expires_at=now - timedelta(minutes=1),
             refresh_expires_at=now + timedelta(hours=24),
             rotation_request_sha256=uuid.uuid4().hex * 2,
@@ -424,6 +427,142 @@ async def test_retirement_requires_access_refresh_and_response_replay_expiry(
         await db.commit()
     await db.rollback()
     assert (await db.get(ChuteFSTokenKeyEpoch, "old-key")).state == "retiring"
+
+
+async def test_expired_active_session_reexchanges_after_old_key_removal(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    await _install_rotation_migration(db)
+    monkeypatch.setattr(storage_startup, "engine", db.bind)
+
+    _configure(
+        monkeypatch,
+        replica_id="bootstrap-pod",
+        keys={"old-key": "o" * 32},
+    )
+    await storage_startup.require_chutefs_token_key_retention()
+
+    chute = await chutefs_pg._chute(
+        db,
+        storage_pg.USER_ID,
+        f"expired-active-key-{uuid.uuid4().hex}",
+    )
+    _, cert = chutefs_pg._identity("expired-active-key")
+    config, instance = await chutefs_pg._cpu_launch(
+        db,
+        user_id=storage_pg.USER_ID,
+        chute=chute,
+        server_id=f"expired-active-key-server-{uuid.uuid4().hex}",
+        cert=cert,
+    )
+    binding = await db.scalar(
+        select(DefaultChuteFSVolumeBinding).where(
+            DefaultChuteFSVolumeBinding.user_id == storage_pg.USER_ID,
+            DefaultChuteFSVolumeBinding.chute_id == chute.chute_id,
+            DefaultChuteFSVolumeBinding.lifecycle_state == "active",
+        )
+    )
+    server = await db.get(Server, config.server_id)
+    assert binding is not None
+    assert server is not None
+    now = datetime.now(timezone.utc)
+    expired = ChuteFSLaunchSession(
+        session_id=f"expired-active-{uuid.uuid4().hex}",
+        config_id=config.config_id,
+        instance_id=instance.instance_id,
+        binding_id=binding.binding_id,
+        user_id=storage_pg.USER_ID,
+        chute_id=chute.chute_id,
+        job_id=None,
+        compute_type="cpu",
+        management_mode="platform",
+        server_id=server.server_id,
+        volume_id=binding.volume_id,
+        reservation_id=None,
+        allocation_group_id=None,
+        allocation_group_generation=None,
+        process_incarnation=None,
+        attestation_id=None,
+        attested_cert_pubkey_hash=server.attested_cert_pubkey_hash,
+        allowed_operations=list(ALLOWED_OPERATIONS),
+        generation=1,
+        revocation_epoch=instance.storage_revocation_epoch,
+        access_token_hash=uuid.uuid4().hex * 2,
+        refresh_token_hash=uuid.uuid4().hex * 2,
+        reexchange_token_hash="0" * 64,
+        access_expires_at=now - timedelta(hours=2),
+        refresh_expires_at=now - timedelta(hours=1),
+        rotation_request_sha256=uuid.uuid4().hex * 2,
+        token_seed=uuid.uuid4().hex * 2,
+        token_key_id="old-key",
+        response_replay_until=now - timedelta(minutes=90),
+        revoked_at=None,
+    )
+    reexchange_token = launch_sessions._derived_token(
+        expired,
+        launch_sessions._REEXCHANGE_PREFIX,
+        "reexchange",
+    )
+    expired.reexchange_token_hash = launch_sessions._token_hash(reexchange_token)
+    db.add(expired)
+    await db.commit()
+
+    _configure(monkeypatch, replica_id="pod-a")
+    await storage_startup.require_chutefs_token_key_retention()
+    await key_epochs.stage_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="new-key",
+        required_replica_ids=["pod-a"],
+    )
+    await storage_startup.require_chutefs_token_key_retention()
+    await key_epochs.activate_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="new-key",
+    )
+    retired = await key_epochs.retire_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="old-key",
+    )
+    assert retired["key_id"] == "old-key"
+
+    _configure(
+        monkeypatch,
+        replica_id="pod-a",
+        keys={"new-key": "n" * 32},
+        active_key_id="new-key",
+    )
+    await storage_startup.require_chutefs_token_key_retention()
+    monkeypatch.setattr(
+        launch_sessions,
+        "_require_current_attestation_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(settings, "require_mtls_client_verify", True)
+    _, successor = await launch_sessions.exchange_launch_token(
+        db,
+        config.config_id,
+        reexchange_token,
+        chutefs_pg._mtls_request(cert),
+    )
+    successor_row = await db.scalar(
+        select(ChuteFSLaunchSession).where(
+            ChuteFSLaunchSession.access_token_hash
+            == launch_sessions._token_hash(successor.access_token)
+        )
+    )
+    await db.refresh(expired)
+    assert expired.revoked_at is not None
+    assert successor_row is not None
+    assert successor_row.token_key_id == "new-key"
+    assert successor_row.generation == expired.generation + 1
 
 
 async def test_paused_mint_fences_activation_retirement_and_stale_direct_insert(
@@ -549,7 +688,8 @@ async def test_paused_mint_fences_activation_retirement_and_stale_direct_insert(
                         allocation_group_id, allocation_group_generation,
                         process_incarnation, attestation_id,
                         attested_cert_pubkey_hash, allowed_operations, generation,
-                        access_token_hash, refresh_token_hash, access_expires_at,
+                        revocation_epoch, access_token_hash, refresh_token_hash,
+                        reexchange_token_hash, access_expires_at,
                         refresh_expires_at, rotation_request_sha256, token_seed,
                         token_key_id, response_replay_until, created_at,
                         rotated_at, revoked_at
@@ -560,8 +700,9 @@ async def test_paused_mint_fences_activation_retirement_and_stale_direct_insert(
                            reservation_id, allocation_group_id,
                            allocation_group_generation, process_incarnation,
                            attestation_id, attested_cert_pubkey_hash,
-                           allowed_operations, generation, :access_hash,
-                           :refresh_hash, access_expires_at, refresh_expires_at,
+                           allowed_operations, generation, revocation_epoch,
+                           :access_hash, :refresh_hash, :reexchange_hash,
+                           access_expires_at, refresh_expires_at,
                            :request_hash, :token_seed, 'old-key',
                            response_replay_until, NOW(), NOW(), NOW()
                       FROM chutefs_launch_sessions
@@ -573,6 +714,7 @@ async def test_paused_mint_fences_activation_retirement_and_stale_direct_insert(
                     "source_session_id": minted_session_id,
                     "access_hash": "1" * 64,
                     "refresh_hash": "2" * 64,
+                    "reexchange_hash": "5" * 64,
                     "request_hash": "3" * 64,
                     "token_seed": "4" * 64,
                 },

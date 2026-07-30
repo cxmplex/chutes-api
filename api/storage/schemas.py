@@ -295,6 +295,7 @@ class LaunchStorageSessionResponse(BaseModel):
     access_expires_at: str
     refresh_token: str
     refresh_expires_at: str
+    reexchange_token: str
     allowed_operations: List[Literal["put", "get", "list", "delete"]]
     generation: int = Field(..., ge=1)
 

@@ -239,6 +239,7 @@ def test_default_authority_snapshot_binds_current_attestation():
         attested_cert_pubkey_hash="a" * 64,
         allowed_operations=["put", "get"],
         generation=2,
+        revocation_epoch=4,
         access_token_hash="b" * 64,
         access_expires_at=now,
     )

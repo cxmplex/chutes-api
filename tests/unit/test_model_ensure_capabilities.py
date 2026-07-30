@@ -143,6 +143,7 @@ def _launch_identity_db(*, server_id=None):
         config_id="config",
         user_id="user",
         chute_id="chute",
+        miner_hotkey="miner",
         job_id=None,
         compute_type="gpu" if server_id is None else "cpu",
         default_volume_id="volume",

@@ -243,6 +243,40 @@ AFTER UPDATE OF failed_at, completed_at, verification_error, registry_scope_acti
 ON launch_configs
 FOR EACH ROW EXECUTE FUNCTION revoke_registry_scope_on_launch_terminal();
 
+-- A durable monotonic epoch is the database authority for instance-level
+-- storage revocation. The BEFORE trigger auto-advances terminal transitions
+-- while also permitting callers to advance the epoch explicitly under lock.
+ALTER TABLE instances
+    ADD COLUMN IF NOT EXISTS storage_revocation_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE instances
+    DROP CONSTRAINT IF EXISTS ck_instances_storage_revocation_epoch;
+ALTER TABLE instances
+    ADD CONSTRAINT ck_instances_storage_revocation_epoch
+        CHECK (storage_revocation_epoch >= 0);
+
+CREATE OR REPLACE FUNCTION enforce_instance_storage_revocation_epoch()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.storage_revocation_epoch < OLD.storage_revocation_epoch THEN
+        RAISE EXCEPTION 'instance storage revocation epoch cannot decrease';
+    END IF;
+    IF ((OLD.active AND NOT NEW.active)
+        OR (OLD.verified AND NOT NEW.verified))
+       AND NEW.storage_revocation_epoch = OLD.storage_revocation_epoch
+    THEN
+        NEW.storage_revocation_epoch := OLD.storage_revocation_epoch + 1;
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+DROP TRIGGER IF EXISTS trg_instance_storage_revocation_epoch ON instances;
+CREATE TRIGGER trg_instance_storage_revocation_epoch
+BEFORE UPDATE OF active, verified, storage_revocation_epoch ON instances
+FOR EACH ROW EXECUTE FUNCTION enforce_instance_storage_revocation_epoch();
+
 -- Opaque, rotating launch-bound sessions.  Tokens are stored only as SHA-256 digests.  Snapshot
 -- columns are immutable and revalidated against all current launch/server/reservation rows on every
 -- exchange, refresh, tracker operation, and grant.
@@ -271,8 +305,10 @@ CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (
     attested_cert_pubkey_hash      VARCHAR,
     allowed_operations             JSONB NOT NULL,
     generation                     INTEGER NOT NULL DEFAULT 1,
+    revocation_epoch               BIGINT NOT NULL,
     access_token_hash              VARCHAR(64) NOT NULL UNIQUE,
     refresh_token_hash             VARCHAR(64) NOT NULL UNIQUE,
+    reexchange_token_hash          VARCHAR(64) NOT NULL UNIQUE,
     access_expires_at              TIMESTAMPTZ NOT NULL,
     refresh_expires_at             TIMESTAMPTZ NOT NULL,
     created_at                     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -284,6 +320,7 @@ CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (
         AND jsonb_typeof(allowed_operations) = 'array'
         AND allowed_operations = '["put", "get", "list", "delete"]'::jsonb
         AND generation > 0
+        AND revocation_epoch >= 0
         AND access_expires_at <= refresh_expires_at
         AND attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$'
         AND (
@@ -309,7 +346,9 @@ CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (
     CONSTRAINT ck_chutefs_launch_session_access_hash
         CHECK (access_token_hash ~ '^[0-9a-f]{64}$'),
     CONSTRAINT ck_chutefs_launch_session_refresh_hash
-        CHECK (refresh_token_hash ~ '^[0-9a-f]{64}$')
+        CHECK (refresh_token_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT ck_chutefs_launch_session_reexchange_hash
+        CHECK (reexchange_token_hash ~ '^[0-9a-f]{64}$')
 );
 
 CREATE INDEX IF NOT EXISTS idx_chutefs_launch_sessions_expiry
@@ -344,8 +383,10 @@ BEGIN
         OR NEW.attested_cert_pubkey_hash IS DISTINCT FROM OLD.attested_cert_pubkey_hash
         OR NEW.allowed_operations IS DISTINCT FROM OLD.allowed_operations
         OR NEW.generation IS DISTINCT FROM OLD.generation
+        OR NEW.revocation_epoch IS DISTINCT FROM OLD.revocation_epoch
         OR NEW.access_token_hash IS DISTINCT FROM OLD.access_token_hash
         OR NEW.refresh_token_hash IS DISTINCT FROM OLD.refresh_token_hash
+        OR NEW.reexchange_token_hash IS DISTINCT FROM OLD.reexchange_token_hash
         OR NEW.access_expires_at IS DISTINCT FROM OLD.access_expires_at
         OR NEW.refresh_expires_at IS DISTINCT FROM OLD.refresh_expires_at
         OR NEW.created_at IS DISTINCT FROM OLD.created_at
@@ -369,6 +410,7 @@ AS $$
 BEGIN
     IF (OLD.active AND NOT NEW.active)
        OR (OLD.verified AND NOT NEW.verified)
+       OR NEW.storage_revocation_epoch IS DISTINCT FROM OLD.storage_revocation_epoch
     THEN
         UPDATE chutefs_launch_sessions
            SET revoked_at = COALESCE(revoked_at, NOW())
@@ -381,7 +423,7 @@ $$;
 
 DROP TRIGGER IF EXISTS trg_revoke_chutefs_session_on_instance_disable ON instances;
 CREATE TRIGGER trg_revoke_chutefs_session_on_instance_disable
-AFTER UPDATE OF active, verified ON instances
+AFTER UPDATE OF active, verified, storage_revocation_epoch ON instances
 FOR EACH ROW EXECUTE FUNCTION revoke_chutefs_session_on_instance_disable();
 
 CREATE OR REPLACE FUNCTION revoke_chutefs_session_on_config_failure()
@@ -623,6 +665,11 @@ DROP FUNCTION IF EXISTS revoke_chutefs_session_on_instance_disable();
 DROP TRIGGER IF EXISTS trg_chutefs_launch_session_identity ON chutefs_launch_sessions;
 DROP FUNCTION IF EXISTS enforce_chutefs_launch_session_identity();
 DROP TABLE IF EXISTS chutefs_launch_sessions;
+DROP TRIGGER IF EXISTS trg_instance_storage_revocation_epoch ON instances;
+DROP FUNCTION IF EXISTS enforce_instance_storage_revocation_epoch();
+ALTER TABLE instances
+    DROP CONSTRAINT IF EXISTS ck_instances_storage_revocation_epoch;
+ALTER TABLE instances DROP COLUMN IF EXISTS storage_revocation_epoch;
 DROP TRIGGER IF EXISTS trg_launch_storage_identity_immutable ON launch_configs;
 DROP FUNCTION IF EXISTS enforce_launch_storage_identity_immutable();
 CREATE OR REPLACE FUNCTION revoke_registry_scope_on_launch_terminal()

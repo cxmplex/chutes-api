@@ -85,8 +85,10 @@ BEGIN
         OR NEW.attested_cert_pubkey_hash IS DISTINCT FROM OLD.attested_cert_pubkey_hash
         OR NEW.allowed_operations IS DISTINCT FROM OLD.allowed_operations
         OR NEW.generation IS DISTINCT FROM OLD.generation
+        OR NEW.revocation_epoch IS DISTINCT FROM OLD.revocation_epoch
         OR NEW.access_token_hash IS DISTINCT FROM OLD.access_token_hash
         OR NEW.refresh_token_hash IS DISTINCT FROM OLD.refresh_token_hash
+        OR NEW.reexchange_token_hash IS DISTINCT FROM OLD.reexchange_token_hash
         OR NEW.access_expires_at IS DISTINCT FROM OLD.access_expires_at
         OR NEW.refresh_expires_at IS DISTINCT FROM OLD.refresh_expires_at
         OR NEW.rotated_from_session_id IS DISTINCT FROM OLD.rotated_from_session_id
@@ -264,10 +266,7 @@ BEGIN
            AND (
                session.access_expires_at > NOW()
                OR session.refresh_expires_at > NOW()
-               OR COALESCE(
-                   session.response_replay_until,
-                   session.refresh_expires_at
-               ) > NOW()
+               OR session.response_replay_until > NOW()
            )
     ) THEN
         RAISE EXCEPTION 'ChuteFS token key is still referenced by replayable sessions';
@@ -434,8 +433,10 @@ BEGIN
         OR NEW.attested_cert_pubkey_hash IS DISTINCT FROM OLD.attested_cert_pubkey_hash
         OR NEW.allowed_operations IS DISTINCT FROM OLD.allowed_operations
         OR NEW.generation IS DISTINCT FROM OLD.generation
+        OR NEW.revocation_epoch IS DISTINCT FROM OLD.revocation_epoch
         OR NEW.access_token_hash IS DISTINCT FROM OLD.access_token_hash
         OR NEW.refresh_token_hash IS DISTINCT FROM OLD.refresh_token_hash
+        OR NEW.reexchange_token_hash IS DISTINCT FROM OLD.reexchange_token_hash
         OR NEW.access_expires_at IS DISTINCT FROM OLD.access_expires_at
         OR NEW.refresh_expires_at IS DISTINCT FROM OLD.refresh_expires_at
         OR NEW.created_at IS DISTINCT FROM OLD.created_at

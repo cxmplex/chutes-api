@@ -21,6 +21,7 @@ from sqlalchemy import (
     Double,
     UniqueConstraint,
     CheckConstraint,
+    BigInteger,
     DDL,
     event,
     text,
@@ -176,6 +177,16 @@ class Instance(Base):
     )
     gpu_allocation_group_generation = Column(Integer, nullable=True)
     gpu_process_incarnation = Column(String, nullable=True)
+    # Durable authority generation for launch-bound storage. Every disable or
+    # verification revocation advances this epoch under the instance row lock;
+    # sessions and grants snapshot it and therefore cannot regain authority
+    # merely because a temporary Redis marker expires.
+    storage_revocation_epoch = Column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
     cacert = Column(String, nullable=True)
     port_mappings = Column(JSONB, nullable=True)
     inspecto = Column(String, nullable=True)
@@ -235,6 +246,10 @@ class Instance(Base):
             "AND gpu_process_incarnation IS NOT NULL "
             "AND server_id IS NOT NULL)",
             name="ck_instances_gpu_manager",
+        ),
+        CheckConstraint(
+            "storage_revocation_epoch >= 0",
+            name="ck_instances_storage_revocation_epoch",
         ),
     )
 

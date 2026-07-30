@@ -301,6 +301,7 @@ def test_launch_storage_exchange_is_exact_producer_to_consumer_bytes():
         access_expires_at="2026-07-25T00:15:00+00:00",
         refresh_token="refresh-token",
         refresh_expires_at="2026-07-26T00:00:00+00:00",
+        reexchange_token="reexchange-token",
         allowed_operations=["put", "get", "list", "delete"],
         generation=1,
     )
@@ -327,6 +328,7 @@ def test_launch_storage_exchange_is_exact_producer_to_consumer_bytes():
         "access_expires_at",
         "refresh_token",
         "refresh_expires_at",
+        "reexchange_token",
         "allowed_operations",
         "generation",
     ]

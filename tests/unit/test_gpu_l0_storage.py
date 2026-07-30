@@ -32,10 +32,20 @@ class _Result:
     def scalar_one_or_none(self):
         return self.value
 
+    def scalars(self):
+        return SimpleNamespace(all=lambda: self.value)
+
 
 class _ReadinessDb:
     def __init__(self, *, intent, reservation, server, attestation, releases):
-        self.results = iter((_Result(intent), _Result(reservation), _Result(attestation)))
+        self.results = iter(
+            (
+                _Result(intent),
+                _Result(reservation),
+                _Result(attestation),
+                _Result([intent.server_id]),
+            )
+        )
         self.server = server
         self.releases = releases
 

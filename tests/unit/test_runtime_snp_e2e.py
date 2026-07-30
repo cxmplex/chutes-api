@@ -75,6 +75,9 @@ class _Result:
     def __init__(self, value):
         self.value = value
 
+    def scalar_one(self):
+        return self.value
+
     def scalar_one_or_none(self):
         return self.value
 
@@ -84,6 +87,7 @@ class _Database:
         self.server = server
         self.added = []
         self.commits = 0
+        self.rollbacks = 0
 
     async def execute(self, _statement):
         return _Result(self.server)
@@ -93,6 +97,9 @@ class _Database:
 
     async def commit(self):
         self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
 
     async def refresh(self, value):
         value.attestation_id = f"runtime-{self.commits}"
@@ -396,6 +403,8 @@ async def test_bare_metal_snp_runtime_nonce_cert_measurement_and_replay(
     assert attestation.revocation_status == {"amd_vcek": "good"}
     assert server.attestation_revocation_status == {"amd_vcek": "good"}
     assert result["revocation_status"] == {"amd_vcek": "good"}
+    assert db.commits == 2
+    assert db.rollbacks == 0
     with pytest.raises(NonceError, match="not found or expired"):
         await validate_and_consume_nonce(nonce, server.ip, NoncePurpose.RUNTIME)
 
@@ -451,6 +460,8 @@ async def test_gcp_snp_runtime_with_synthetic_vtpm_and_exact_instance_identity(
     }
     assert server.attestation_revocation_status == attestation.revocation_status
     assert result["revocation_status"] == attestation.revocation_status
+    assert db.commits == 2
+    assert db.rollbacks == 0
     with pytest.raises(NonceError, match="not found or expired"):
         await validate_and_consume_nonce(nonce, server.ip, NoncePurpose.RUNTIME)
 

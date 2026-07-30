@@ -23,7 +23,7 @@ def missing_retained_token_keys(
     *,
     now: datetime,
 ) -> list[str]:
-    """Return unconfigured keys still needed by any refresh replay window."""
+    """Return unconfigured keys needed by an unexpired response window."""
 
     return sorted(
         key_id
@@ -197,7 +197,9 @@ async def require_chutefs_token_key_retention() -> None:
         rows = (
             await connection.execute(
                 text(
-                    "SELECT token_key_id, MAX(refresh_expires_at) "
+                    "SELECT token_key_id, "
+                    "MAX(GREATEST(refresh_expires_at, "
+                    "COALESCE(response_replay_until, refresh_expires_at))) "
                     "FROM chutefs_launch_sessions "
                     "WHERE token_key_id IS NOT NULL "
                     "GROUP BY token_key_id"

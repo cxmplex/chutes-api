@@ -120,8 +120,10 @@ async def test_every_chutefs_authority_and_replay_field_is_sql_immutable(
             attested_cert_pubkey_hash=server.attested_cert_pubkey_hash,
             allowed_operations=["put", "get", "list", "delete"],
             generation=1,
+            revocation_epoch=instance.storage_revocation_epoch,
             access_token_hash="1" * 64,
             refresh_token_hash="2" * 64,
+            reexchange_token_hash="5" * 64,
             access_expires_at=now + timedelta(minutes=10),
             refresh_expires_at=now + timedelta(hours=1),
             rotation_request_sha256="3" * 64,
@@ -136,8 +138,10 @@ async def test_every_chutefs_authority_and_replay_field_is_sql_immutable(
 
     assignments = (
         "generation = generation + 1",
+        "revocation_epoch = revocation_epoch + 1",
         "access_token_hash = repeat('a', 64)",
         "refresh_token_hash = repeat('b', 64)",
+        "reexchange_token_hash = repeat('g', 64)",
         "access_expires_at = access_expires_at + INTERVAL '1 second'",
         "refresh_expires_at = refresh_expires_at + INTERVAL '1 second'",
         "rotated_from_session_id = 'predecessor-session'",

@@ -90,6 +90,12 @@ async def test_legacy_gpu_start_waits_for_exact_async_command_ack():
     )
 
     class Result:
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
+
         def scalar_one_or_none(self):
             return migration
 

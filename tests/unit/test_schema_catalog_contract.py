@@ -136,6 +136,11 @@ def test_default_volume_migration_contains_final_unshipped_authority_shape():
         MIGRATIONS / "20260724234500_gpu_chutefs_default_volume.sql"
     ).read_text()
     up = migration.split("-- migrate:down", maxsplit=1)[0]
+    session_table = up.split(
+        "CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (", maxsplit=1
+    )[1].split(");", maxsplit=1)[0]
+    assert "revocation_epoch               BIGINT NOT NULL," in session_table
+    assert "revocation_epoch               BIGINT NOT NULL DEFAULT" not in session_table
     scope = up.split(
         "CONSTRAINT ck_chutefs_launch_session_scope CHECK (", maxsplit=1
     )[1].split("CONSTRAINT ck_chutefs_launch_session_access_hash", maxsplit=1)[0]
@@ -147,8 +152,10 @@ def test_default_volume_migration_contains_final_unshipped_authority_shape():
     for field in (
         "attestation_id",
         "generation",
+        "revocation_epoch",
         "access_token_hash",
         "refresh_token_hash",
+        "reexchange_token_hash",
         "access_expires_at",
         "refresh_expires_at",
         "rotated_at",

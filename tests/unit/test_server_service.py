@@ -146,6 +146,12 @@ def mock_db_session():
     return session
 
 
+def _server_lock_result(server):
+    result = Mock()
+    result.scalar_one.return_value = server
+    return result
+
+
 # Test data fixtures
 
 
@@ -589,6 +595,7 @@ async def test_process_runtime_attestation_success(
     """Test successful runtime attestation processing."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
+    mock_db_session.execute.return_value = _server_lock_result(sample_server)
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         with patch(
@@ -631,7 +638,9 @@ async def test_process_runtime_attestation_success(
             assert "verified_at" in result
 
             mock_db_session.add.assert_called_once()
-            mock_db_session.commit.assert_called_once()
+            assert mock_db_session.commit.await_count == 2
+            mock_db_session.rollback.assert_not_awaited()
+            mock_db_session.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1077,6 +1086,7 @@ async def test_full_runtime_flow_end_to_end(
     """Test complete runtime attestation flow."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
+    mock_db_session.execute.return_value = _server_lock_result(sample_server)
 
     # Step 1: Create runtime nonce
     mock_settings.redis_client.get.return_value = json.dumps(
@@ -1141,6 +1151,9 @@ async def test_full_runtime_flow_end_to_end(
 
                 assert result["status"] == "verified"
                 assert result["attestation_id"] == "runtime-attest-123"
+                assert mock_db_session.commit.await_count == 2
+                mock_db_session.rollback.assert_not_awaited()
+                mock_db_session.execute.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1223,6 +1236,7 @@ async def test_runtime_attestation_partial_failure_recovery(
     """Test runtime attestation handles partial failures gracefully."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
+    mock_db_session.execute.return_value = _server_lock_result(sample_server)
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         with patch("api.server.service.build_runtime_quote", return_value=sample_runtime_quote):
@@ -1244,7 +1258,9 @@ async def test_runtime_attestation_partial_failure_recovery(
 
                 # Should still create failed attestation record
                 mock_db_session.add.assert_called_once()
-                mock_db_session.commit.assert_called_once()
+                assert mock_db_session.commit.await_count == 2
+                mock_db_session.rollback.assert_awaited_once()
+                mock_db_session.execute.assert_awaited_once()
 
                 # Verify the failed record has correct fields
                 call_args = mock_db_session.add.call_args[0][0]
@@ -1455,6 +1471,7 @@ async def test_runtime_attestation_database_rollback_on_error(
     """Test that runtime attestation database operations handle errors."""
     server_id = "test-server-123"
     miner_hotkey = "5FTestHotkey123"
+    mock_db_session.execute.return_value = _server_lock_result(sample_server)
 
     with patch("api.server.service.check_server_ownership", return_value=sample_server):
         with patch("api.server.service.build_runtime_quote", return_value=sample_runtime_quote):
@@ -1488,7 +1505,9 @@ async def test_runtime_attestation_database_rollback_on_error(
                     )
 
                 mock_db_session.add.assert_called_once()
-                mock_db_session.commit.assert_called_once()
+                assert mock_db_session.commit.await_count == 2
+                mock_db_session.rollback.assert_not_awaited()
+                mock_db_session.execute.assert_awaited_once()
 
 
 # Comprehensive Quote Validation Tests
