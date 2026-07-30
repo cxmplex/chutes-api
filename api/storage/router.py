@@ -879,13 +879,18 @@ async def commit_default_object(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, "put")
+    authorized, observed_live_storage_ids = (
+        await _authorize_default_volume_with_storage_observation(
+            db, authorization, request, "put"
+        )
+    )
     obj, replicas_confirmed = await service.commit_object(
         db,
         authorized.volume,
         body.object_id,
         body.key,
         salt=body.salt,
+        observed_live_storage_ids=observed_live_storage_ids,
     )
     return CommitObjectResponse(
         object_id=obj.object_id,

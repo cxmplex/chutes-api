@@ -954,6 +954,7 @@ def test_debug_measurement_opt_in_rejected_outside_dev_posture():
         Settings(
             allow_debug_measurements=True,
             skip_metagraph_check=False,
+            operator_endpoint_cidrs=["127.0.0.0/8"],
             require_mtls_client_verify=True,
         )
 

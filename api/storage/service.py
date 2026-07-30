@@ -2279,6 +2279,8 @@ async def commit_object(
     object_id: str,
     key: str,
     salt: str,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> tuple[StorageObject, int]:
     """Atomically CAS using immutable receipts from current attested storage targets."""
     try:
@@ -2330,7 +2332,12 @@ async def commit_object(
     if obj.lifecycle_state == OBJECT_COMMITTED:
         # A lost commit response is safe to retry.  Recompute current live durability, but never
         # reapply accounting or lifecycle transitions.
-        confirmed = await _refresh_object_durability(db, obj, volume=locked_volume)
+        live_ids = await _live_attested_server_ids(
+            db, observed_live_storage_ids=observed_live_storage_ids
+        )
+        confirmed = await _refresh_object_durability(
+            db, obj, volume=locked_volume, live_ids=live_ids
+        )
         await db.commit()
         await db.refresh(obj)
         await db.refresh(volume)
@@ -2413,7 +2420,9 @@ async def commit_object(
     )
     servers = await _storage_servers_by_id(db, [placement.server_id for placement in placements])
     server_by_id = {server.server_id: server for server in servers}
-    live_ids = await _live_attested_server_ids(db)
+    live_ids = await _live_attested_server_ids(
+        db, observed_live_storage_ids=observed_live_storage_ids
+    )
     now = datetime.now(timezone.utc)
 
     proven: List[ReplicaPlacement] = []

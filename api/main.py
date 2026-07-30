@@ -7,11 +7,12 @@ import os
 import re
 import gc
 import asyncio
+import ipaddress
 
 # import fickling
 import hashlib
 from loguru import logger
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, Request, APIRouter, HTTPException, status, Response
 from fastapi.responses import ORJSONResponse
 from sqlalchemy import text
@@ -59,9 +60,11 @@ from api.metrics.util import keep_gauges_fresh
 from api.instance.util import start_instance_invalidation_listener
 from api.log import install_asyncio_exception_handler
 from api.client_ip import resolve_client_ip
-from api.storage.startup import require_chutefs_token_key_retention
-from api.gpu_registration_keys import (
-    require_gpu_registration_recovery_key_retention,
+from api.key_authority_health import (
+    initialize_key_authorities,
+    key_authorities_ready,
+    key_authority_ack_refresh_loop,
+    key_authority_health,
 )
 
 
@@ -125,7 +128,7 @@ async def lifespan(_: FastAPI):
         )
 
     await run_database_migrations()
-    await require_chutefs_token_key_retention()
+    await initialize_key_authorities()
 
     loop = asyncio.get_event_loop()
     executor = ThreadPoolExecutor(max_workers=64)
@@ -133,6 +136,10 @@ async def lifespan(_: FastAPI):
 
     asyncio.create_task(loop_lag_monitor())
     asyncio.create_task(keep_gauges_fresh())
+    authority_refresh_task = asyncio.create_task(
+        key_authority_ack_refresh_loop(),
+        name="key-authority-ack-refresh",
+    )
     asyncio.create_task(start_instance_invalidation_listener())
 
     # Prom multi-proc dir.
@@ -144,7 +151,12 @@ async def lifespan(_: FastAPI):
 
     asyncio.create_task(storage_reconcile_loop())
 
-    yield
+    try:
+        yield
+    finally:
+        authority_refresh_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await authority_refresh_task
 
 
 app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
@@ -201,22 +213,38 @@ async def ping():
         )
 
 
+def _require_operator_peer(request: Request) -> None:
+    """Authorize operator surfaces from the direct socket peer only."""
+
+    peer = request.client.host if request.client is not None else None
+    try:
+        peer_ip = ipaddress.ip_address(peer) if peer is not None else None
+    except ValueError:
+        peer_ip = None
+    if peer_ip is None or not any(
+        peer_ip in ipaddress.ip_network(cidr, strict=False)
+        for cidr in settings.operator_endpoint_cidrs
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
 async def ready(request: Request):
-    """Internal readiness surface: database plus complete TEE trust-set health."""
-    if request.state.has_resolved_ip:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    """Read-only readiness surface for direct operator peers."""
+
+    _require_operator_peer(request)
     trust_health = settings.tee_measurement_health()
     if not trust_health["ready"]:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"tee_measurements": trust_health},
         )
+    authority_health = key_authority_health()
+    if not key_authorities_ready(authority_health):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"key_authorities": authority_health},
+        )
     try:
-        # Kubernetes calls readiness periodically on every serving pod. This is
-        # also the bounded per-replica acknowledgement path for epochs staged
-        # after a rolling key distribution, so activation never needs a restart.
-        await require_chutefs_token_key_retention()
-        await require_gpu_registration_recovery_key_retention()
         async with get_session() as session:
             await session.execute(text("SELECT 1"))
         async with get_session(readonly=True) as session:
@@ -226,7 +254,11 @@ async def ready(request: Request):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=f"Database connectivity problems: {exc}",
         ) from exc
-    return {"status": "ready", "tee_measurements": trust_health}
+    return {
+        "status": "ready",
+        "tee_measurements": trust_health,
+        "key_authorities": authority_health,
+    }
 
 
 def _tee_trust_metrics(health: dict) -> bytes:
@@ -258,14 +290,41 @@ def _tee_trust_metrics(health: dict) -> bytes:
     ).encode()
 
 
+def _key_authority_metrics(health: dict[str, dict[str, object]]) -> bytes:
+    """Render fixed-cardinality process-local authority health."""
+
+    lines = [
+        "# HELP chutes_key_authority_ready Whether the local key authority ACK is current.",
+        "# TYPE chutes_key_authority_ready gauge",
+        "# HELP chutes_key_authority_ack_age_seconds Age of the last successful authority ACK.",
+        "# TYPE chutes_key_authority_ack_age_seconds gauge",
+    ]
+    for authority in sorted(health):
+        entry = health[authority]
+        lines.append(
+            f'chutes_key_authority_ready{{authority="{authority}"}} '
+            f'{1 if entry.get("ready") else 0}'
+        )
+        age = entry.get("ack_age_seconds")
+        if isinstance(age, (int, float)):
+            lines.append(
+                f'chutes_key_authority_ack_age_seconds{{authority="{authority}"}} {age}'
+            )
+    return ("\n".join(lines) + "\n").encode()
+
+
 # Prometheus metrics endpoint.
 async def get_latest_metrics(request: Request):
-    if request.state.has_resolved_ip:
-        raise HTTPException(status_code=403, detail="Forbidden")
+    _require_operator_peer(request)
     trust_health = settings.tee_measurement_health()
+    authority_health = key_authority_health()
     registry = CollectorRegistry()
     multiprocess.MultiProcessCollector(registry)
-    data = generate_latest(registry) + _tee_trust_metrics(trust_health)
+    data = (
+        generate_latest(registry)
+        + _tee_trust_metrics(trust_health)
+        + _key_authority_metrics(authority_health)
+    )
     return Response(data, media_type=CONTENT_TYPE_LATEST)
 
 

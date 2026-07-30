@@ -130,6 +130,64 @@ async def test_default_storage_observation_runs_between_exact_authorizations(mon
 
 
 @pytest.mark.asyncio
+async def test_default_object_commit_uses_only_preobserved_storage_liveness(monkeypatch):
+    db = _BoundaryDb()
+    volume = SimpleNamespace(
+        used_bytes=7,
+        quota_bytes=100,
+        replication_factor=2,
+    )
+    authorized = SimpleNamespace(volume=volume)
+    observed = {"storage-1"}
+
+    async def _authorize(current_db, authorization, request, operation):
+        assert current_db is db
+        assert authorization == "Bearer launch-session"
+        assert operation == "put"
+        return authorized, observed
+
+    async def _commit(
+        current_db, current_volume, object_id, key, *, salt, observed_live_storage_ids
+    ):
+        assert current_db is db
+        assert current_volume is volume
+        assert (object_id, key, salt) == ("object-1", "model.bin", "salt-1")
+        assert observed_live_storage_ids is observed
+        return (
+            SimpleNamespace(
+                object_id=object_id,
+                lifecycle_state="committed",
+                size_bytes=7,
+                durability_state="healthy",
+            ),
+            2,
+        )
+
+    monkeypatch.setattr(
+        storage_router, "_authorize_default_volume_with_storage_observation", _authorize
+    )
+    monkeypatch.setattr(storage_service, "commit_object", _commit)
+
+    response = await storage_router.commit_default_object(
+        storage_router.CommitObjectRequest(
+            object_id="object-1", key="model.bin", salt="salt-1"
+        ),
+        SimpleNamespace(),
+        db,
+        "Bearer launch-session",
+    )
+
+    assert response.object_id == "object-1"
+    assert response.replicas_confirmed == 2
+    assert not response.under_replicated
+
+
+def test_default_object_commit_threads_liveness_through_all_service_paths():
+    source = inspect.getsource(storage_service.commit_object)
+    assert source.count("observed_live_storage_ids=observed_live_storage_ids") == 2
+
+
+@pytest.mark.asyncio
 async def test_default_storage_observation_rejects_authority_change(monkeypatch):
     db = _BoundaryDb()
     results = iter((SimpleNamespace(snapshot="first"), SimpleNamespace(snapshot="second")))

@@ -1,4 +1,6 @@
+import ast
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -17,6 +19,7 @@ from api.server.gpu_sessions import (
     _gpu_selection_matches_registration,
     latest_gpu_runtime_session,
     mint_gpu_runtime_session,
+    require_completed_gpu_registration,
     validate_gpu_runtime_session,
 )
 from api import socket_server
@@ -74,6 +77,20 @@ def _attestation(mode="miner"):
         gpu_evidence_sha256="f" * 64,
         gpu_evidence_certificate_sha256s=["1" * 64],
     )
+
+
+@pytest.mark.asyncio
+async def test_completed_registration_requires_operational_attestation_before_db_access():
+    db = AsyncMock()
+    with pytest.raises(HTTPException, match="operational attestation is required") as exc_info:
+        await require_completed_gpu_registration(
+            db,
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(),
+        )
+    assert exc_info.value.status_code == 403
+    db.execute.assert_not_awaited()
 
 
 def test_miner_registration_mints_short_scoped_attested_session():
@@ -382,3 +399,35 @@ def test_four_device_mode_selection_binds_the_same_registered_two_devices():
         registered_certificates=registered_certificates,
         operational_certificates=list(registered_certificates),
     )
+
+
+def test_api_callers_never_pass_none_to_completed_registration_check():
+    api_root = Path(__file__).parents[2] / "api"
+    violations = []
+
+    for path in api_root.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            name = (
+                function.id
+                if isinstance(function, ast.Name)
+                else function.attr if isinstance(function, ast.Attribute) else None
+            )
+            if name != "require_completed_gpu_registration":
+                continue
+            candidates = list(node.args[2:3])
+            candidates.extend(
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg == "operational_attestation"
+            )
+            if any(
+                isinstance(value, ast.Constant) and value.value is None
+                for value in candidates
+            ):
+                violations.append((str(path.relative_to(api_root)), node.lineno))
+
+    assert not violations, f"Missing operational attestation at API call sites: {violations}"

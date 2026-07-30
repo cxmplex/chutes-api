@@ -756,11 +756,27 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context) -> None:
         """Validate configuration after initialization."""
-        for cidr in self.trusted_proxy_cidrs:
-            try:
-                ipaddress.ip_network(cidr, strict=False)
-            except ValueError as exc:
-                raise ValueError(f"Invalid TRUSTED_PROXY_CIDRS entry {cidr!r}") from exc
+        if self.operator_endpoint_cidrs is None:
+            if not self.skip_metagraph_check:
+                raise ValueError(
+                    "OPERATOR_ENDPOINT_CIDRS must contain at least one direct-peer CIDR "
+                    "in the production posture."
+                )
+            self.operator_endpoint_cidrs = ["127.0.0.0/8", "::1/128"]
+        for setting_name, cidrs in (
+            ("TRUSTED_PROXY_CIDRS", self.trusted_proxy_cidrs),
+            ("OPERATOR_ENDPOINT_CIDRS", self.operator_endpoint_cidrs),
+        ):
+            for cidr in cidrs:
+                try:
+                    ipaddress.ip_network(cidr, strict=False)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid {setting_name} entry {cidr!r}") from exc
+        if not self.skip_metagraph_check and not self.operator_endpoint_cidrs:
+            raise ValueError(
+                "OPERATOR_ENDPOINT_CIDRS must contain at least one direct-peer CIDR "
+                "in the production posture."
+            )
         # ALLOW_DEBUG_MEASUREMENTS is not a production escape hatch. The metagraph bypass is the
         # validator's explicit dev marker (including the dev-attested-mTLS posture); without that
         # marker, reject the opt-in itself before loading any debug pins.
@@ -1061,9 +1077,18 @@ class Settings(BaseSettings):
         default_factory=lambda: ["127.0.0.0/8", "::1/128"]
     )
 
-    @field_validator("trusted_proxy_cidrs", mode="before")
+    # Operator-only endpoints authorize the directly connected socket peer and deliberately ignore
+    # all forwarding headers. Local development defaults to loopback; production has no implicit
+    # network trust and must configure OPERATOR_ENDPOINT_CIDRS explicitly.
+    operator_endpoint_cidrs: Annotated[Optional[List[str]], NoDecode] = None
+
+    @field_validator(
+        "trusted_proxy_cidrs",
+        "operator_endpoint_cidrs",
+        mode="before",
+    )
     @classmethod
-    def _parse_trusted_proxy_cidrs(cls, value):
+    def _parse_cidr_list(cls, value):
         if isinstance(value, str):
             return [cidr.strip() for cidr in value.split(",") if cidr.strip()]
         return value

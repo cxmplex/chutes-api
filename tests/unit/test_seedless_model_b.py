@@ -292,7 +292,7 @@ async def test_release_activation_gate_persists_verified_l0_audit(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_verified_draft_bootstrap_is_available_before_activation(tmp_path):
+async def test_newer_staged_bootstrap_does_not_shadow_active_generation(tmp_path):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     private_key = Ed25519PrivateKey.generate()
     registry = _publisher_registry(tmp_path, private_key, now)
@@ -307,7 +307,12 @@ async def test_verified_draft_bootstrap_is_available_before_activation(tmp_path)
         l0_version="1.10.0",
         squashfs_sha256="4" * 64,
         signed_manifest=signed.model_dump(mode="json", exclude_none=True),
+        admission_status="active",
         source_release_id="draft-bootstrap",
+    )
+    staged = L0BootstrapPublication(
+        generation=2,
+        admission_status="staged",
     )
     result = Mock()
     result.scalar_one_or_none.return_value = publication
@@ -326,9 +331,50 @@ async def test_verified_draft_bootstrap_is_available_before_activation(tmp_path)
         returned = await release_service.active_l0_bootstrap(db, "tdx", "stable")
 
     assert returned == signed
+    query = db.execute.await_args.args[0]
+    assert "active" in query.compile().params.values()
+    assert staged.generation > publication.generation
     db.add.assert_not_called()
     db.flush.assert_not_awaited()
     db.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_staged_only_bootstrap_is_not_served():
+    result = Mock()
+    result.scalar_one_or_none.return_value = None
+    db = AsyncMock()
+    db.execute.return_value = result
+
+    returned = await release_service.active_l0_bootstrap(db, "tdx", "stable")
+
+    assert returned is None
+    query = db.execute.await_args.args[0]
+    assert "active" in query.compile().params.values()
+
+
+@pytest.mark.asyncio
+async def test_activation_switches_the_visible_l0_generation():
+    release = GuestRelease(
+        release_id="release-2",
+        tee_type="tdx",
+        channel="stable",
+    )
+    publication = L0BootstrapPublication(
+        tee_type="tdx",
+        channel="stable",
+        compute_type="cpu",
+        generation=2,
+        admission_status="staged",
+    )
+    db = AsyncMock()
+    await release_service._mark_l0_publication_active(db, release, publication)
+
+    statement = db.execute.await_args.args[0]
+    params = statement.compile().params
+    assert {"active", "staged"} <= set(params.values())
+    assert publication.admission_status == "active"
+    assert publication.activated_at is not None
 
 
 @pytest.mark.asyncio
@@ -433,7 +479,7 @@ async def test_l0_publication_rejects_equivocation_and_backward_key_epoch(tmp_pa
             await release_service._admit_l0_bootstrap(db, release)
 
 
-def test_real_asgi_bootstrap_response_verifies_in_miner_cli(tmp_path, monkeypatch):
+def test_real_asgi_staged_only_404_then_active_response_verifies_in_miner_cli(tmp_path, monkeypatch):
     miner_cli_source = repository_root("miner", start=Path(__file__)) / "src" / "chutes-miner-cli"
     now = datetime.now(timezone.utc).replace(microsecond=0)
     private_key = Ed25519PrivateKey.generate()
@@ -454,14 +500,19 @@ def test_real_asgi_bootstrap_response_verifies_in_miner_cli(tmp_path, monkeypatc
         patch.object(
             release_service,
             "active_l0_bootstrap",
-            AsyncMock(return_value=signed),
+            AsyncMock(side_effect=[None, signed]),
         ),
         TestClient(app) as client,
     ):
+        staged_only = client.get(
+            "/releases/l0-bootstrap?tee_type=tdx&channel=stable",
+            headers={HOTKEY_HEADER: "owner"},
+        )
         response = client.get(
             "/releases/l0-bootstrap?tee_type=tdx&channel=stable",
             headers={HOTKEY_HEADER: "owner"},
         )
+    assert staged_only.status_code == 404
     assert response.status_code == 200
     assert "release_id" not in response.json()["manifest"]
 

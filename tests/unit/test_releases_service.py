@@ -270,6 +270,19 @@ def test_partial_release_materializes_omitted_active_image_slots():
     assert merged["storage"] == candidate.images["storage"]
 
 
+def test_inherited_l0_marker_cannot_replace_the_current_active_l0():
+    current = _release(l0={"version": "l0-current"})
+    current.release_id = "current"
+    current.status = RELEASE_STATUS_ACTIVE
+    candidate = _release(l0={"version": "l0-stale", "_inherited": True})
+    candidate.release_id = "candidate"
+
+    merged = rsvc._merged_release_images(candidate, current)
+
+    assert merged["l0"]["version"] == "l0-current"
+    assert merged["l0"]["_inherited"] is True
+
+
 @pytest.mark.asyncio
 async def test_idempotent_partial_activation_preserves_inherited_role_marker():
     release = _release(

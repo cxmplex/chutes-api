@@ -100,6 +100,10 @@ class OAuthTokenWrapper:
         """
         from api.idp.schemas import check_scope_access
 
+        # Authorization routers use this sentinel for unmapped or separately authenticated routes.
+        # It must deny even a token carrying the broad admin scope.
+        if action == "__deny__":
+            return False
         if self.admin:
             return True
 

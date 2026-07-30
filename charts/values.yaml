@@ -5,6 +5,11 @@ snpCrlOutageGraceSeconds: 0
 # Trust only sanitizing final hops controlled by this deployment. Do not trust third-party proxy
 # images until their header behavior is verified.
 trustedProxyCidrs: ""
+# Required by production API startup. These CIDRs authorize only the direct socket peers that may
+# call /readyz and /_metrics; forwarded and resolved-client headers are ignored. Include the actual
+# kubelet/CNI probe and monitoring peer ranges for the deployment. Empty remains a fail-closed
+# placeholder that local SKIP_METAGRAPH_CHECK development replaces with loopback defaults.
+operatorEndpointCidrs: ""
 dbSsl: "require"
 
 provenance:

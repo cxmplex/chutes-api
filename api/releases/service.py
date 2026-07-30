@@ -266,7 +266,7 @@ def _merged_release_images(release: GuestRelease, current_active: Optional[Guest
     for role, image in (release.images or {}).items():
         replacement = dict(image) if isinstance(image, dict) else image
         if (
-            role in {"chute", "storage", "gpu"}
+            role in {"chute", "storage", "gpu", "l0"}
             and isinstance(replacement, dict)
             and replacement.get("_inherited")
         ):
@@ -1286,6 +1286,7 @@ async def active_l0_bootstrap(
                 L0BootstrapPublication.tee_type == normalized_tee,
                 L0BootstrapPublication.channel == channel,
                 L0BootstrapPublication.compute_type == compute_type,
+                L0BootstrapPublication.admission_status == "active",
             )
             .order_by(L0BootstrapPublication.generation.desc())
             .limit(1)

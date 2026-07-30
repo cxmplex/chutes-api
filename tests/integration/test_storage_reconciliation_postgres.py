@@ -47,8 +47,8 @@ from api.server.schemas import (
     StorageVolumeKey,
 )
 from api.server.util import get_public_key_hash
+from api.storage import reconcile as storage_reconcile
 from api.storage import service
-from api.storage.reconcile import _RECONCILE_LOCK_KEY
 from api.storage.router import require_fresh_storage_caller
 from api.user.schemas import User
 
@@ -4729,36 +4729,52 @@ async def test_administrative_erase_retirement_is_explicit_and_overdue_only(
     assert task.retired_by_user_id == "administrator"
 
 
-async def test_reconcile_advisory_lock_survives_long_overlap(pg_session):
+async def test_reconcile_advisory_lock_survives_work_commits(pg_session, monkeypatch):
     db, _redis = pg_session
-    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
-    async with factory() as leader, factory() as contender:
-        leader_won = (
-            await leader.execute(
-                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": _RECONCILE_LOCK_KEY},
-            )
-        ).scalar_one()
-        assert leader_won
+    lock_engine = create_async_engine(TEST_DATABASE_URL, pool_size=2, max_overflow=0)
+    factory = sessionmaker(lock_engine, class_=AsyncSession, expire_on_commit=False)
+    contender_results = []
+
+    async def reconcile_with_overlap(work_session):
+        # The bounded work pass can commit freely without owning the leadership connection.
+        assert work_session is not db
+        await work_session.execute(text("SELECT 1"))
+        await work_session.commit()
         await asyncio.sleep(0.05)
-        contender_won = (
-            await contender.execute(
-                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": _RECONCILE_LOCK_KEY},
+        async with factory() as contender:
+            contender_results.append(
+                (
+                    await contender.execute(
+                        text(
+                            "SELECT pg_try_advisory_lock("
+                            "hashtextextended(:lock_key, 0))"
+                        ),
+                        {"lock_key": storage_reconcile._RECONCILE_LOCK_KEY},
+                    )
+                ).scalar_one()
             )
-        ).scalar_one()
-        assert not contender_won
-        await leader.execute(
-            text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": _RECONCILE_LOCK_KEY},
-        )
-        assert (
-            await contender.execute(
-                text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": _RECONCILE_LOCK_KEY},
-            )
-        ).scalar_one()
-        await contender.execute(
-            text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": _RECONCILE_LOCK_KEY},
-        )
+
+    monkeypatch.setattr(storage_reconcile, "engine", lock_engine)
+    monkeypatch.setattr(storage_reconcile, "get_session", lambda: factory())
+    monkeypatch.setattr(storage_reconcile, "reconcile_storage", reconcile_with_overlap)
+
+    try:
+        assert await storage_reconcile.reconcile_storage_once()
+        assert contender_results == [False]
+
+        # The production function asserted its unlock; a new session can immediately become leader.
+        async with factory() as contender:
+            assert (
+                await contender.execute(
+                    text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": storage_reconcile._RECONCILE_LOCK_KEY},
+                )
+            ).scalar_one()
+            assert (
+                await contender.execute(
+                    text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                    {"lock_key": storage_reconcile._RECONCILE_LOCK_KEY},
+                )
+            ).scalar_one()
+    finally:
+        await lock_engine.dispose()

@@ -11,8 +11,9 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from api.client_ip import resolve_client_ip
+from api.config import Settings
 from api.graval_server import resolved_ip_middleware as graval_resolved_ip_middleware
-from api.main import host_router_middleware
+from api.main import _require_operator_peer, host_router_middleware
 from api.user.service import _RESTRICTED_HOTKEY, _enforce_restricted_hotkey_ip
 
 
@@ -50,6 +51,47 @@ def _request(peer: str, headers: dict[str, str] | None = None) -> Request:
             "server": ("api", 8000),
         }
     )
+
+
+def test_operator_endpoint_dev_default_is_loopback(monkeypatch):
+    monkeypatch.setenv("SKIP_METAGRAPH_CHECK", "true")
+    monkeypatch.delenv("OPERATOR_ENDPOINT_CIDRS", raising=False)
+
+    configured = Settings()
+
+    assert configured.operator_endpoint_cidrs == ["127.0.0.0/8", "::1/128"]
+
+
+def test_operator_endpoint_production_requires_explicit_allowlist(monkeypatch):
+    monkeypatch.setenv("SKIP_METAGRAPH_CHECK", "false")
+    monkeypatch.delenv("OPERATOR_ENDPOINT_CIDRS", raising=False)
+
+    with pytest.raises(ValueError, match="OPERATOR_ENDPOINT_CIDRS"):
+        Settings()
+
+
+def test_operator_endpoint_cidr_environment_parser():
+    configured = Settings(operator_endpoint_cidrs="10.42.0.0/16,2001:db8:42::/64")
+    assert configured.operator_endpoint_cidrs == ["10.42.0.0/16", "2001:db8:42::/64"]
+
+
+def test_operator_endpoint_uses_direct_peer_and_ignores_forwarding_headers(monkeypatch):
+    monkeypatch.setattr(
+        "api.main.settings.operator_endpoint_cidrs",
+        ["10.0.0.0/8"],
+    )
+
+    _require_operator_peer(
+        _request("10.20.30.40", {"X-Resolved-IP": "198.51.100.20"})
+    )
+
+    denied = _request(
+        "198.51.100.20",
+        {"X-Resolved-IP": "10.20.30.40", "X-Forwarded-For": "10.20.30.40"},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        _require_operator_peer(denied)
+    assert exc_info.value.status_code == 403
 
 
 def test_untrusted_peer_cannot_spoof_resolved_or_forwarded_ip(monkeypatch):

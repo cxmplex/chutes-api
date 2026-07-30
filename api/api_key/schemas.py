@@ -169,6 +169,10 @@ class APIKey(Base):
         """
         Check if the user's API key has access to the specified thing.
         """
+        # Authorization routers use this sentinel for unmapped or separately authenticated routes.
+        # It must deny even an otherwise unrestricted administrative API key.
+        if action == "__deny__":
+            return False
         if self.admin:
             return True
         for scope in self.scopes:

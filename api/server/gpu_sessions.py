@@ -203,13 +203,13 @@ def _gpu_inventory_report_matches_group(
     )
 
 
-async def require_completed_gpu_registration(
+async def _completed_gpu_registration_authority(
     db: AsyncSession,
     reservation: GpuLaunchReservation,
     operational_attestation: ServerAttestation | None,
     server: Server,
 ) -> CompletedGpuRegistrationAuthority:
-    """Require the exact completed Registration V2 publication authority."""
+    """Validate completed Registration V2 authority and optional operational evidence."""
 
     await acquire_gpu_lifecycle_lock(db)
     attempts = list(
@@ -589,6 +589,42 @@ async def require_completed_gpu_registration(
         gpu_uuids=tuple(selection_uuids),
         gpu_identifiers=tuple(stable_identifiers),
         gpu_certificate_sha256s=tuple(expected_evidence_certificates),
+    )
+
+
+async def build_completed_gpu_registration_authority(
+    db: AsyncSession,
+    reservation: GpuLaunchReservation,
+    server: Server,
+) -> CompletedGpuRegistrationAuthority:
+    """Build immutable completed-registration authority without operational evidence."""
+
+    return await _completed_gpu_registration_authority(
+        db,
+        reservation,
+        None,
+        server,
+    )
+
+
+async def require_completed_gpu_registration(
+    db: AsyncSession,
+    reservation: GpuLaunchReservation,
+    operational_attestation: ServerAttestation,
+    server: Server,
+) -> CompletedGpuRegistrationAuthority:
+    """Require completed registration plus a current exact operational attestation."""
+
+    if operational_attestation is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="GPU operational attestation is required.",
+        )
+    return await _completed_gpu_registration_authority(
+        db,
+        reservation,
+        operational_attestation,
+        server,
     )
 
 

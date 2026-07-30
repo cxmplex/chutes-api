@@ -146,6 +146,7 @@ def test_chart_defaults_to_no_trusted_proxies(helm_binary, tmp_path, values):
     deployment = _document(documents, "Deployment", "api")
 
     assert _environment(_container(deployment, "api"))["TRUSTED_PROXY_CIDRS"]["value"] == ""
+    assert _environment(_container(deployment, "api"))["OPERATOR_ENDPOINT_CIDRS"]["value"] == ""
     assert not any(
         document["kind"] == "NetworkPolicy" and document["metadata"]["name"] == "api-ingress-netpol"
         for document in documents
@@ -175,6 +176,22 @@ def test_explicit_trusted_proxy_cidrs_render_unchanged_with_external_policy_ackn
         _environment(_container(deployment, "api"))["TRUSTED_PROXY_CIDRS"]["value"] == trusted_cidrs
     )
 
+
+def test_explicit_operator_endpoint_cidrs_render_unchanged(helm_binary, tmp_path):
+    operator_cidrs = "10.60.0.0/16,2001:db8:60::/64"
+    rendered = _render_chart(
+        helm_binary,
+        tmp_path,
+        values={"operatorEndpointCidrs": operator_cidrs},
+        show_only="api-deployment.yaml",
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    deployment = _document(_documents(rendered), "Deployment", "api")
+
+    assert (
+        _environment(_container(deployment, "api"))["OPERATOR_ENDPOINT_CIDRS"]["value"]
+        == operator_cidrs
+    )
 
 @pytest.mark.parametrize(
     "network_policy_values",

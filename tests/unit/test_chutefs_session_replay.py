@@ -356,7 +356,7 @@ def test_key_epoch_bootstrap_orders_stage_ack_then_activation():
     assert "active key fingerprint" in source
 
 
-def test_key_epoch_ack_is_readiness_only_and_liveness_stays_independent():
+def test_key_epoch_ack_is_background_only_and_probes_are_read_only():
     source = (Path(__file__).parents[2] / "api/main.py").read_text()
     ping = source.split("async def ping():", maxsplit=1)[1].split(
         "async def ready(", maxsplit=1
@@ -364,11 +364,16 @@ def test_key_epoch_ack_is_readiness_only_and_liveness_stays_independent():
     ready = source.split("async def ready(", maxsplit=1)[1].split(
         "def _tee_trust_metrics", maxsplit=1
     )[0]
+    lifespan = source.split("async def lifespan(", maxsplit=1)[1].split(
+        "app = FastAPI", maxsplit=1
+    )[0]
 
     assert "require_chutefs_token_key_retention" not in ping
-    assert "require_chutefs_token_key_retention" in ready
+    assert "require_chutefs_token_key_retention" not in ready
     assert "require_gpu_registration_recovery_key_retention" not in ping
-    assert "require_gpu_registration_recovery_key_retention" in ready
+    assert "require_gpu_registration_recovery_key_retention" not in ready
+    assert "initialize_key_authorities" in lifespan
+    assert "key_authority_ack_refresh_loop" in lifespan
 
 
 def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
