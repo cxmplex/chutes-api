@@ -3079,15 +3079,15 @@ async def register_host(
 async def request_host_image_upgrade(
     db: AsyncSession, host_id: str, miner_hotkey: str
 ) -> Dict[str, Any]:
-    """Model B: tell an online L0 host to refresh its chute guest image (control-channel upgrade_image).
+    """Tell an online L0 host to converge to its exact active release manifest.
 
     Authentication (signature over "{hotkey}:{nonce}:host_upgrade", same scheme as registration)
-    is enforced by the router's `get_current_user` dependency; this service owns ownership +
-    online checks and the dispatch. The host re-fetches the published guest image and tears down
-    its running per-chute TDs so the scheduler re-places their chutes onto fresh TDs from the new image.
-    Remember to pin the new image's measurement on the validator in lockstep, or the new TDs fail attest.
+    is enforced by the router's `get_current_user` dependency; this service owns ownership,
+    desired-state resolution, online checks, and dispatch. Never send a manifest-less command:
+    those lack the storage/GPU reservation context needed for a safe rollout.
     """
     from api.agent_channel import is_agent_online, send_agent_command
+    from api.releases.service import ReleaseError, active_manifest_for_host
 
     if not miner_hotkey:
         raise ServerRegistrationError("Missing miner hotkey for host upgrade")
@@ -3097,6 +3097,29 @@ async def request_host_image_upgrade(
         raise ServerRegistrationError(f"Host {host_id} is not registered")
     if host.miner_hotkey != miner_hotkey:
         raise ServerRegistrationError(f"Host {host_id} belongs to a different miner")
+    try:
+        manifest = await active_manifest_for_host(
+            db,
+            host.tee_type,
+            host.release_channel,
+            host.compute_type,
+            host_id=host.host_id,
+            miner_hotkey=miner_hotkey,
+        )
+    except ReleaseError as exc:
+        raise ServerRegistrationError(
+            f"Host {host_id} has no valid active release: {exc}"
+        ) from exc
+    if manifest is None:
+        raise ServerRegistrationError(
+            f"Host {host_id} has no active release to upgrade to"
+        )
+    payload = {
+        "manifest": manifest.model_dump(mode="json", exclude_none=True),
+    }
+    # Active-manifest composition can repair a validator-owned storage intent. Commit all
+    # database custody before consulting Redis liveness or dispatching the command.
+    await db.commit()
     assert_gpu_external_work_allowed(db, "host image upgrade liveness lookup")
     if not await is_agent_online(host_id, db=db):
         raise ServerRegistrationError(
@@ -3104,7 +3127,12 @@ async def request_host_image_upgrade(
         )
 
     assert_gpu_external_work_allowed(db, "host image upgrade command dispatch")
-    command_id = await send_agent_command(host_id, "upgrade_image", {}, db=db)
+    command_id = await send_agent_command(
+        host_id,
+        "upgrade_image",
+        payload,
+        db=db,
+    )
     logger.success(
         f"Dispatched upgrade_image to host {host_id} (command_id={command_id})"
     )

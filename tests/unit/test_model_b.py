@@ -89,6 +89,88 @@ def test_host_routes_use_scoped_or_miner_auth_as_designed(path, method, dependen
 
 
 @pytest.mark.asyncio
+async def test_host_image_upgrade_dispatches_exact_active_manifest():
+    host = _host()
+    db = AsyncMock()
+    db.info = {}
+    db.get = AsyncMock(return_value=host)
+    db.commit = AsyncMock()
+    payload = {
+        "schema": "chutes.release-manifest",
+        "schema_version": 1,
+        "release_id": "release-1",
+        "compute_type": "cpu",
+        "tee_type": "sev-snp",
+        "channel": "stable",
+        "chute": {"sha256": "a" * 64},
+    }
+    manifest = SimpleNamespace(model_dump=Mock(return_value=payload))
+
+    with (
+        patch(
+            "api.releases.service.active_manifest_for_host",
+            AsyncMock(return_value=manifest),
+        ) as active_manifest,
+        patch(
+            "api.agent_channel.is_agent_online",
+            AsyncMock(return_value=True),
+        ) as is_online,
+        patch(
+            "api.agent_channel.send_agent_command",
+            AsyncMock(return_value="command-1"),
+        ) as send_command,
+    ):
+        result = await svc.request_host_image_upgrade(db, host.host_id, HOTKEY)
+
+    active_manifest.assert_awaited_once_with(
+        db,
+        host.tee_type,
+        host.release_channel,
+        host.compute_type,
+        host_id=host.host_id,
+        miner_hotkey=HOTKEY,
+    )
+    manifest.model_dump.assert_called_once_with(mode="json", exclude_none=True)
+    db.commit.assert_awaited_once_with()
+    is_online.assert_awaited_once_with(host.host_id, db=db)
+    send_command.assert_awaited_once_with(
+        host.host_id,
+        "upgrade_image",
+        {"manifest": payload},
+        db=db,
+    )
+    assert result == {
+        "host_id": host.host_id,
+        "command_id": "command-1",
+        "status": "dispatched",
+    }
+
+
+@pytest.mark.asyncio
+async def test_host_image_upgrade_without_active_manifest_fails_before_redis():
+    host = _host()
+    db = AsyncMock()
+    db.info = {}
+    db.get = AsyncMock(return_value=host)
+    db.commit = AsyncMock()
+
+    with (
+        patch(
+            "api.releases.service.active_manifest_for_host",
+            AsyncMock(return_value=None),
+        ),
+        patch("api.agent_channel.is_agent_online", AsyncMock()) as is_online,
+        patch("api.agent_channel.send_agent_command", AsyncMock()) as send_command,
+        pytest.raises(ServerRegistrationError, match="no active release"),
+    ):
+        await svc.request_host_image_upgrade(db, host.host_id, HOTKEY)
+
+    db.commit.assert_not_awaited()
+    is_online.assert_not_awaited()
+    send_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_register_host_valid_updates_telemetry_only():
     with patch.object(svc.settings, "skip_metagraph_check", True):
         # No active release -> registration explicitly attaches release=None.
