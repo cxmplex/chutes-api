@@ -97,7 +97,7 @@ ALTER TABLE gpu_infra_custodies
             AND decommissioned_at IS NULL AND k3s_encryption_key IS NOT NULL)
     );
 
-CREATE TABLE gpu_server_decommissions (
+CREATE TABLE IF NOT EXISTS gpu_server_decommissions (
     server_id VARCHAR PRIMARY KEY
         REFERENCES servers(server_id) ON DELETE RESTRICT,
     request_id VARCHAR NOT NULL UNIQUE,
@@ -121,7 +121,7 @@ CREATE TABLE gpu_server_decommissions (
             OR (allocation_group_id IS NOT NULL AND allocation_group_generation > 0))
     )
 );
-CREATE INDEX idx_gpu_server_decommissions_owner
+CREATE INDEX IF NOT EXISTS idx_gpu_server_decommissions_owner
     ON gpu_server_decommissions(owner_hotkey, decommissioned_at);
 
 CREATE OR REPLACE FUNCTION preserve_gpu_server_decommission_audit()
@@ -135,6 +135,8 @@ BEGIN
     RAISE EXCEPTION 'gpu server decommission audit rows are immutable';
 END
 $$;
+DROP TRIGGER IF EXISTS preserve_gpu_server_decommission_audit
+    ON gpu_server_decommissions;
 CREATE TRIGGER preserve_gpu_server_decommission_audit
 BEFORE UPDATE OR DELETE ON gpu_server_decommissions
 FOR EACH ROW EXECUTE FUNCTION preserve_gpu_server_decommission_audit();
@@ -226,6 +228,11 @@ BEGIN
     RETURN NEW;
 END
 $$;
+DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_server ON servers;
+DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_custody
+    ON gpu_infra_custodies;
+DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_migration
+    ON gpu_legacy_migrations;
 CREATE TRIGGER preserve_gpu_decommissioned_server
 BEFORE UPDATE OR DELETE ON servers
 FOR EACH ROW EXECUTE FUNCTION preserve_gpu_decommission_terminal();
