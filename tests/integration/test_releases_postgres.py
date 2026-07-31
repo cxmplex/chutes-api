@@ -564,10 +564,15 @@ async def test_launch_reservation_concurrent_replay_allows_one_consumer(
                     session, token, commitment
                 )
                 await asyncio.sleep(0.05)
+                response_bytes = '{"status":"registered"}'
                 consume_launch_reservation(
                     row,
                     attestation_id=attestation_id,
                     cert_pubkey_hash="3" * 64,
+                    registration_response_bytes=response_bytes,
+                    registration_response_sha256=hashlib.sha256(
+                        response_bytes.encode("ascii")
+                    ).hexdigest(),
                 )
                 await session.commit()
                 return "consumed"
@@ -581,6 +586,112 @@ async def test_launch_reservation_concurrent_replay_allows_one_consumer(
         row = await check.get(TdLaunchReservation, claims["reservation_id"])
         assert row.consumed_at is not None
         assert row.consumed_attestation_id in {"attestation-a", "attestation-b"}
+
+async def test_consumed_reservation_force_refreshes_and_replays_after_authority_advances(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    async with sessions() as setup:
+        setup.add(
+            MetagraphNode(
+                hotkey="owner",
+                netuid=64,
+                checksum="checksum",
+                coldkey="coldkey",
+            )
+        )
+        host = _host("host-response-replay")
+        release = _release("release-response-replay")
+        setup.add(host)
+        setup.add(release)
+        await setup.flush()
+        setup.add(_host_key(host.host_id))
+        reservation, token = await create_launch_reservation(
+            setup,
+            host,
+            role="chute",
+            server_id="chute-response-replay",
+            process_incarnation="response-replay-process",
+            profile_id="cpu-baremetal-tdx-1.10.0-2vcpu-8g",
+            chute_id="chute-response-replay",
+            container_repository="owner/replay-image",
+            container_manifest_digest=f"sha256:{'c' * 64}",
+        )
+        claims_document = reservation.claims
+        await setup.commit()
+
+    commitment = TdQuoteCommitmentV1(
+        reservation_sha256=canonical_sha256(claims_document),
+        launch_nonce=claims_document["launch_nonce"],
+        attested_spki_sha256="3" * 64,
+        release_target_sha256=claims_document["release_target_sha256"],
+        boot_generation=claims_document["boot_generation"],
+    )
+    response_bytes = '{"status":"registered"}'
+    response_sha256 = hashlib.sha256(response_bytes.encode("ascii")).hexdigest()
+
+    async with sessions() as retry_session:
+        stale_row, _claims = await resolve_launch_reservation(
+            retry_session,
+            token,
+            commitment,
+        )
+        assert stale_row.consumed_at is None
+        await retry_session.commit()
+
+        async with sessions() as winner:
+            winner_row, _winner_claims = await resolve_launch_reservation(
+                winner,
+                token,
+                commitment,
+            )
+            consume_launch_reservation(
+                winner_row,
+                attestation_id="response-replay-winner",
+                cert_pubkey_hash="3" * 64,
+                registration_response_bytes=response_bytes,
+                registration_response_sha256=response_sha256,
+            )
+            await winner.commit()
+
+        async with sessions() as advance:
+            advanced_release = await advance.get(GuestRelease, release.release_id)
+            advanced_key = await advance.get(HostKeyGeneration, (host.host_id, 1))
+            advanced_release.status = "superseded"
+            advanced_key.revoked_at = datetime.now(timezone.utc)
+            await advance.commit()
+
+        replayed, _replayed_claims = await resolve_launch_reservation(
+            retry_session,
+            token,
+            commitment,
+            allow_consumed_for_publication=True,
+        )
+        assert replayed is stale_row
+        assert replayed.consumed_attestation_id == "response-replay-winner"
+        assert replayed.registration_response_bytes == response_bytes
+        assert replayed.registration_response_sha256 == response_sha256
+        await retry_session.commit()
+
+        async with sessions() as invalidate:
+            invalidated = await invalidate.get(
+                TdLaunchReservation,
+                claims_document["reservation_id"],
+            )
+            invalidated.invalidated_at = datetime.now(timezone.utc)
+            await invalidate.commit()
+
+        replayed_after_invalidation, _claims = await resolve_launch_reservation(
+            retry_session,
+            token,
+            commitment,
+            allow_consumed_for_publication=True,
+        )
+        assert replayed_after_invalidation.consumed_attestation_id == (
+            "response-replay-winner"
+        )
+        await retry_session.rollback()
+
 
 
 async def test_storage_intent_claim_is_server_selected_scoped_and_replay_safe(

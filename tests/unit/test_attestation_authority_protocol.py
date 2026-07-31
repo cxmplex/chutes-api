@@ -1,6 +1,7 @@
 """Behavioral regressions for monotonic attestation publication authority."""
 
 import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -13,6 +14,7 @@ from api.host.gpu_allocations import GpuAllocationError
 from api.host.schemas import (
     TdLaunchReservationClaimsV1,
     TdQuoteCommitmentV1,
+    canonical_json_bytes,
     canonical_sha256,
 )
 from api.server.exceptions import (
@@ -20,6 +22,7 @@ from api.server.exceptions import (
     AttestationVerifierUnavailableError,
     MeasurementMismatchError,
     NonceError,
+    ServerRegistrationError,
 )
 from api.server.router import register_cpu_server_endpoint
 from api.server.schemas import (
@@ -29,6 +32,7 @@ from api.server.schemas import (
     ServerAttestation,
 )
 from api.server.service import (
+    _replay_cpu_registration_response,
     process_runtime_attestation,
     register_cpu_server,
     runtime_attestation_context_for_server,
@@ -709,10 +713,106 @@ def _model_b_reservation():
         role="chute",
         profile_id="cpu-runtime",
         image_sha256="3" * 64,
+        image_version="1.0.0",
         process_incarnation="cpu-process-authority-test",
         host_compute_type="cpu",
     )
     return reservation, claims
+
+
+def _persist_exact_cpu_registration_response(reservation, document=None):
+    document = document or {
+        "server_id": SERVER_ID,
+        "owner_hotkey": OWNER,
+        "measurement_version": "1.0.0",
+        "measurement_name": "cpu-runtime",
+        "measurement_config_fingerprint": CONFIG_FINGERPRINT,
+        "trust_set_fingerprint": TRUST_FINGERPRINT,
+        "revocation_status": {"authority": "verified"},
+        "benchmark_score": 1.0,
+        "verified_at": "2026-07-30T12:00:00+00:00",
+        "status": "registered",
+        "luks_quote_nonce": None,
+    }
+    response_bytes = canonical_json_bytes(document)
+    reservation.consumed_at = object()
+    reservation.consumed_attestation_id = "completed-registration"
+    reservation.consumed_cert_pubkey_hash = CERT_HASH
+    reservation.registration_response_bytes = response_bytes.decode("ascii")
+    reservation.registration_response_sha256 = hashlib.sha256(
+        response_bytes
+    ).hexdigest()
+    return document, response_bytes
+
+
+@pytest.mark.asyncio
+async def test_consumed_model_b_registration_replays_exact_bytes_without_reverification():
+    db = _async_db()
+    args = _model_b_registration_args()
+    reservation, claims = _model_b_reservation()
+    document, response_bytes = _persist_exact_cpu_registration_response(reservation)
+
+    with (
+        patch(
+            "api.server.service.resolve_launch_reservation",
+            new_callable=AsyncMock,
+            return_value=(reservation, claims),
+        ) as resolve,
+        patch("api.server.service._verify_td_registration_signature") as verify_signature,
+        patch(
+            "api.server.service.verify_quote",
+            new_callable=AsyncMock,
+        ) as verify_quote,
+    ):
+        result = await register_cpu_server(
+            db,
+            SERVER_IP,
+            args,
+            None,
+            NONCE,
+            None,
+            CERT_HASH,
+            "attested-certificate",
+        )
+
+    assert dict(result) == document
+    assert result.response_bytes == response_bytes
+    resolve.assert_awaited_once()
+    assert resolve.await_args.kwargs == {"allow_consumed_for_publication": True}
+    verify_signature.assert_called_once()
+    verify_quote.assert_not_awaited()
+    db.flush.assert_not_awaited()
+    db.commit.assert_awaited_once()
+
+
+def test_consumed_cpu_response_replay_rejects_noncanonical_bytes():
+    reservation, claims = _model_b_reservation()
+    _document, response_bytes = _persist_exact_cpu_registration_response(reservation)
+    altered = b" " + response_bytes
+    reservation.registration_response_bytes = altered.decode("ascii")
+    reservation.registration_response_sha256 = hashlib.sha256(altered).hexdigest()
+
+    with pytest.raises(ServerRegistrationError, match="bytes are not canonical"):
+        _replay_cpu_registration_response(reservation, claims, CERT_HASH)
+
+
+def test_consumed_cpu_response_replay_rejects_integrity_tamper():
+    reservation, claims = _model_b_reservation()
+    _persist_exact_cpu_registration_response(reservation)
+    reservation.registration_response_sha256 = "0" * 64
+
+    with pytest.raises(ServerRegistrationError, match="no valid exact response replay"):
+        _replay_cpu_registration_response(reservation, claims, CERT_HASH)
+
+
+def test_consumed_cpu_response_replay_rejects_reservation_identity_drift():
+    reservation, claims = _model_b_reservation()
+    document, _response_bytes = _persist_exact_cpu_registration_response(reservation)
+    document = {**document, "measurement_name": "different-profile"}
+    _persist_exact_cpu_registration_response(reservation, document)
+
+    with pytest.raises(ServerRegistrationError, match="differs from reservation identity"):
+        _replay_cpu_registration_response(reservation, claims, CERT_HASH)
 
 
 @pytest.mark.asyncio
@@ -893,12 +993,12 @@ async def test_model_b_first_registration_failure_persists_attributed_attempt_wi
 
 
 @pytest.mark.asyncio
-async def test_older_model_b_success_reaches_sequence_cas_after_newer_consumption():
+async def test_older_model_b_attempt_replays_newer_response_after_verification():
     db = _async_db()
     args = _model_b_registration_args()
     reservation, claims = _model_b_reservation()
-    reservation.consumed_at = object()
-    reservation.consumed_attestation_id = "newer-success"
+    reservation.consumed_at = None
+    reservation.consumed_attestation_id = None
     reservation.invalidated_at = None
     current_server = SimpleNamespace(
         server_id=SERVER_ID,
@@ -921,7 +1021,6 @@ async def test_older_model_b_success_reaches_sequence_cas_after_newer_consumptio
         _scalar_result(None),
         _scalar_result(SERVER_ID),
         _membership_result(),
-        _scalar_result(current_server),
         attempt_result,
     ]
     measurement = SimpleNamespace(
@@ -934,12 +1033,27 @@ async def test_older_model_b_success_reaches_sequence_cas_after_newer_consumptio
     )
     latest = SimpleNamespace(attestation_id="newer-success", verification_error=None)
 
+    winner = {}
+    resolve_calls = 0
+
+    async def resolve_for_race(*_args, **_kwargs):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        if resolve_calls == 2:
+            document, response_bytes = _persist_exact_cpu_registration_response(
+                reservation
+            )
+            reservation.consumed_attestation_id = "newer-success"
+            winner["document"] = document
+            winner["response_bytes"] = response_bytes
+        return reservation, claims
+
     with (
         patch("api.server.service.settings", SimpleNamespace(skip_metagraph_check=False, netuid=64)),
         patch(
             "api.server.service.resolve_launch_reservation",
             new_callable=AsyncMock,
-            side_effect=[(reservation, claims), (reservation, claims)],
+            side_effect=resolve_for_race,
         ) as resolve,
         patch("api.server.service._verify_td_registration_signature"),
         patch("api.server.service.generate_uuid", return_value="older-success"),
@@ -974,26 +1088,99 @@ async def test_older_model_b_success_reaches_sequence_cas_after_newer_consumptio
             return_value=latest,
         ),
     ):
-        with pytest.raises(AttestationSupersededError):
-            await register_cpu_server(
-                db,
-                SERVER_IP,
-                args,
-                None,
-                NONCE,
-                None,
-                CERT_HASH,
-                "attested-certificate",
-            )
+        result = await register_cpu_server(
+            db,
+            SERVER_IP,
+            args,
+            None,
+            NONCE,
+            None,
+            CERT_HASH,
+            "attested-certificate",
+        )
 
     pending = attempts[0]
+    assert dict(result) == winner["document"]
+    assert result.response_bytes == winner["response_bytes"]
     assert isinstance(pending, ServerAttestation)
     assert pending.attestation_id == "older-success"
-    assert pending.verification_error is None
-    assert pending.verified_at is not None
+    assert pending.verification_error == (
+        "CPU registration was superseded by a concurrently committed response."
+    )
+    assert pending.verified_at is None
     assert authority_before == vars(current_server)
     assert len(resolve.await_args_list) == 2
-    assert resolve.await_args_list[1].kwargs == {"allow_consumed_for_publication": True}
+    assert all(
+        call.kwargs == {"allow_consumed_for_publication": True}
+        for call in resolve.await_args_list
+    )
+
+
+class _ExactCpuRegistrationResult(dict):
+    response_bytes: bytes
+
+
+@pytest.mark.asyncio
+async def test_cpu_registration_route_emits_the_exact_committed_response_bytes():
+    args = _model_b_registration_args()
+    request = SimpleNamespace(state=SimpleNamespace(client_ip=SERVER_IP))
+    db = _async_db()
+    reservation, _claims = _model_b_reservation()
+    document, response_bytes = _persist_exact_cpu_registration_response(reservation)
+    result = _ExactCpuRegistrationResult(document)
+    result.response_bytes = response_bytes
+
+    with patch(
+        "api.server.router.register_cpu_server",
+        new_callable=AsyncMock,
+        return_value=result,
+    ):
+        response = await register_cpu_server_endpoint(
+            request,
+            args,
+            db,
+            NONCE,
+            CERT_HASH,
+            "attested-certificate",
+            None,
+            None,
+        )
+
+    assert response.body == response_bytes
+    assert response.headers["content-type"] == "application/json"
+
+
+@pytest.mark.asyncio
+async def test_cpu_registration_route_rejects_service_byte_divergence():
+    args = _model_b_registration_args()
+    request = SimpleNamespace(state=SimpleNamespace(client_ip=SERVER_IP))
+    db = _async_db()
+    reservation, _claims = _model_b_reservation()
+    document, response_bytes = _persist_exact_cpu_registration_response(reservation)
+    result = _ExactCpuRegistrationResult(document)
+    result.response_bytes = response_bytes + b" "
+
+    with (
+        patch(
+            "api.server.router.register_cpu_server",
+            new_callable=AsyncMock,
+            return_value=result,
+        ),
+        pytest.raises(
+            ServerRegistrationError,
+            match="response bytes differ from the validated document",
+        ),
+    ):
+        await register_cpu_server_endpoint(
+            request,
+            args,
+            db,
+            NONCE,
+            CERT_HASH,
+            "attested-certificate",
+            None,
+            None,
+        )
 
 
 @pytest.mark.asyncio

@@ -206,6 +206,8 @@ CREATE TABLE IF NOT EXISTS td_launch_reservations (
     consumed_at TIMESTAMPTZ,
     consumed_attestation_id TEXT UNIQUE,
     consumed_cert_pubkey_hash TEXT,
+    registration_response_bytes TEXT,
+    registration_response_sha256 VARCHAR(64),
     invalidated_at TIMESTAMPTZ,
     CONSTRAINT uq_td_launch_reservation_boot UNIQUE (server_id, boot_generation),
     CONSTRAINT uq_td_launch_reservation_attribution
@@ -238,12 +240,16 @@ CREATE TABLE IF NOT EXISTS td_launch_reservations (
             consumed_at IS NULL
             AND consumed_attestation_id IS NULL
             AND consumed_cert_pubkey_hash IS NULL
+            AND registration_response_bytes IS NULL
+            AND registration_response_sha256 IS NULL
         )
         OR
         (
             consumed_at IS NOT NULL
             AND consumed_attestation_id IS NOT NULL
             AND consumed_cert_pubkey_hash ~ '^[0-9a-f]{64}$'
+            AND octet_length(registration_response_bytes) > 0
+            AND registration_response_sha256 ~ '^[0-9a-f]{64}$'
         )
     )
 );

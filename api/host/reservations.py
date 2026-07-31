@@ -782,16 +782,21 @@ async def resolve_launch_reservation(
         await db.execute(
             select(TdLaunchReservation)
             .where(TdLaunchReservation.reservation_id == reservation_id)
+            .execution_options(populate_existing=True)
             .with_for_update()
         )
     ).scalar_one_or_none()
     now = _utcnow()
-    if (
-        row is None
-        or not secrets.compare_digest(row.token_hash, token_hash)
-        or row.invalidated_at is not None
-        or (row.consumed_at is not None and not allow_consumed_for_publication)
-        or row.expires_at <= now
+    if row is None or not secrets.compare_digest(row.token_hash, token_hash):
+        raise LaunchReservationError(
+            "Launch reservation is unknown, expired, invalidated, or consumed."
+        )
+    if row.consumed_at is not None and not allow_consumed_for_publication:
+        raise LaunchReservationError(
+            "Launch reservation is unknown, expired, invalidated, or consumed."
+        )
+    if row.consumed_at is None and (
+        row.invalidated_at is not None or row.expires_at <= now
     ):
         raise LaunchReservationError(
             "Launch reservation is unknown, expired, invalidated, or consumed."
@@ -828,6 +833,21 @@ async def resolve_launch_reservation(
         raise LaunchReservationError(
             "Launch reservation durable row does not match its canonical claims."
         )
+    expected = {
+        "reservation_sha256": row.claims_sha256,
+        "launch_nonce": claims.launch_nonce,
+        "release_target_sha256": claims.release_target_sha256,
+        "boot_generation": claims.boot_generation,
+    }
+    if any(getattr(commitment, name) != value for name, value in expected.items()):
+        raise LaunchReservationError(
+            "TD quote commitment does not match the launch reservation."
+        )
+    if row.consumed_at is not None:
+        # Exact committed response replay authenticates immutable reservation/token/commitment
+        # identity above. Later release, host-key, intent, expiry, or revocation transitions must
+        # not strand a registration whose success transaction already committed.
+        return row, claims
     if claims.storage_intent_id is not None:
         if (
             intent is None
@@ -944,14 +964,6 @@ async def resolve_launch_reservation(
         or key.revoked_at is not None
     ):
         raise LaunchReservationError("Launch reservation host-key generation is no longer active.")
-    expected = {
-        "reservation_sha256": row.claims_sha256,
-        "launch_nonce": claims.launch_nonce,
-        "release_target_sha256": claims.release_target_sha256,
-        "boot_generation": claims.boot_generation,
-    }
-    if any(getattr(commitment, name) != value for name, value in expected.items()):
-        raise LaunchReservationError("TD quote commitment does not match the launch reservation.")
     return row, claims
 
 
@@ -970,9 +982,30 @@ def consume_launch_reservation(
     *,
     attestation_id: str,
     cert_pubkey_hash: str,
+    registration_response_bytes: str,
+    registration_response_sha256: str,
 ) -> None:
     if reservation.consumed_at is not None or reservation.invalidated_at is not None:
         raise LaunchReservationError("Launch reservation is no longer consumable.")
+    try:
+        encoded_response = registration_response_bytes.encode("ascii")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise LaunchReservationError(
+            "CPU registration response bytes are not canonical ASCII."
+        ) from exc
+    if (
+        not encoded_response
+        or not re.fullmatch(r"[0-9a-f]{64}", registration_response_sha256 or "")
+        or not secrets.compare_digest(
+            hashlib.sha256(encoded_response).hexdigest(),
+            registration_response_sha256,
+        )
+    ):
+        raise LaunchReservationError(
+            "CPU registration response bytes failed their integrity commitment."
+        )
     reservation.consumed_at = _utcnow()
     reservation.consumed_attestation_id = attestation_id
     reservation.consumed_cert_pubkey_hash = cert_pubkey_hash.lower()
+    reservation.registration_response_bytes = registration_response_bytes
+    reservation.registration_response_sha256 = registration_response_sha256

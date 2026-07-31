@@ -52,6 +52,7 @@ from api.host.schemas import (
     TdLaunchReservationClaimsV1,
     TdLaunchReservationClaimsV2,
     TdRegistrationSignatureV1,
+    canonical_json_bytes,
     canonical_sha256,
 )
 from api.host.locks import (
@@ -80,6 +81,7 @@ from api.server.schemas import (
     RuntimeAttestationNonceContext,
     ServerArgs,
     CpuServerRegistrationArgs,
+    CpuServerRegistrationResponse,
     TeeUpgradeWindow,
     MaintenanceReason,
     SoleSurvivorBlock,
@@ -143,6 +145,72 @@ from api.util import get_signing_message, nonce_is_valid_v2, semcomp
 BOOT_LUKS_ALLOWED_VOLUMES = ("storage", "tdx-cache")
 STORAGE_LUKS_ALLOWED_VOLUMES = (CHUTEFS_DATA_VOLUME,)
 BOOT_NONCE_SIGNATURE_PURPOSE = "boot_luks_nonce"
+
+
+class CpuRegistrationResult(dict):
+    """Validated response document paired with the exact canonical wire bytes."""
+
+    def __init__(self, document: Dict[str, Any], response_bytes: bytes):
+        super().__init__(document)
+        self.response_bytes = response_bytes
+
+
+def _cpu_registration_result(document: Dict[str, Any]) -> CpuRegistrationResult:
+    validated = CpuServerRegistrationResponse.model_validate(document)
+    canonical_document = validated.model_dump(mode="json")
+    return CpuRegistrationResult(
+        canonical_document,
+        canonical_json_bytes(canonical_document),
+    )
+
+
+def _replay_cpu_registration_response(
+    reservation: TdLaunchReservation,
+    claims: TdLaunchReservationClaimsV1 | TdLaunchReservationClaimsV2,
+    expected_cert_hash: str,
+) -> CpuRegistrationResult:
+    stored = reservation.registration_response_bytes
+    stored_sha256 = reservation.registration_response_sha256
+    try:
+        stored_bytes = stored.encode("ascii") if isinstance(stored, str) else b""
+    except UnicodeEncodeError as exc:
+        raise ServerRegistrationError(
+            "Consumed CPU registration response is not canonical ASCII."
+        ) from exc
+    if (
+        not stored_bytes
+        or not isinstance(stored_sha256, str)
+        or not secrets.compare_digest(
+            hashlib.sha256(stored_bytes).hexdigest(), stored_sha256
+        )
+        or not secrets.compare_digest(
+            reservation.consumed_cert_pubkey_hash or "", expected_cert_hash.lower()
+        )
+    ):
+        raise ServerRegistrationError(
+            "Consumed CPU registration has no valid exact response replay."
+        )
+    try:
+        result = _cpu_registration_result(json.loads(stored))
+    except (TypeError, ValueError, UnicodeError, ValidationError) as exc:
+        raise ServerRegistrationError(
+            "Consumed CPU registration response is not canonical."
+        ) from exc
+    if result.response_bytes != stored_bytes:
+        raise ServerRegistrationError(
+            "Consumed CPU registration response bytes are not canonical."
+        )
+    if (
+        result["server_id"] != claims.server_id
+        or result["owner_hotkey"] != claims.owner_hotkey
+        or result["measurement_name"] != claims.profile_id
+        or result["measurement_version"] != claims.image_version
+        or bool(result["luks_quote_nonce"]) != (claims.role == "storage")
+    ):
+        raise ServerRegistrationError(
+            "Consumed CPU registration response differs from reservation identity."
+        )
+    return result
 
 
 def _measurement_fingerprints(measurement_config) -> tuple[str, str]:
@@ -1810,7 +1878,10 @@ async def _register_cpu_server_impl(
     if reservation_token:
         try:
             reservation, reservation_claims = await resolve_launch_reservation(
-                db, reservation_token, commitment
+                db,
+                reservation_token,
+                commitment,
+                allow_consumed_for_publication=True,
             )
         except LaunchReservationError as exc:
             raise ServerRegistrationError(str(exc)) from exc
@@ -1839,6 +1910,17 @@ async def _register_cpu_server_impl(
         _verify_td_registration_signature(
             cert_pem, signed_registration, args.td_signature
         )
+        if getattr(reservation, "consumed_at", None) is not None:
+            result = _replay_cpu_registration_response(
+                reservation,
+                reservation_claims,
+                expected_cert_hash,
+            )
+            await db.commit()
+            logger.info(
+                f"Replayed exact CPU registration response for {args.server_id}."
+            )
+            return result
     else:
         # Model A retains its miner-signature architecture until that separate design changes.
         if not miner_hotkey or not signature:
@@ -2032,6 +2114,34 @@ async def _register_cpu_server_impl(
             )
         reservation = refreshed_reservation
         reservation_claims = refreshed_claims
+        if getattr(reservation, "consumed_at", None) is not None:
+            # Another exact attempt may have committed while this request verified the quote
+            # without database locks. Return that winner's immutable response instead of a fatal
+            # 409, and leave this attributable attempt as an explicit superseded audit row.
+            result = _replay_cpu_registration_response(
+                reservation,
+                reservation_claims,
+                expected_cert_hash,
+            )
+            if registration_attempt_id is not None:
+                replay_attempt = (
+                    await db.execute(
+                        select(ServerAttestation)
+                        .where(
+                            ServerAttestation.attestation_id
+                            == registration_attempt_id
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if replay_attempt is not None and replay_attempt.verification_error == (
+                    "CPU registration attestation did not complete."
+                ):
+                    replay_attempt.verification_error = (
+                        "CPU registration was superseded by a concurrently committed response."
+                    )
+            await db.commit()
+            return result
 
     # Model-B host identity comes only from the freshly re-locked reservation, never a guest header.
     await _validate_cpu_registration_host(
@@ -2220,31 +2330,23 @@ async def _register_cpu_server_impl(
         db.add(attestation)
     else:
         attestation = registration_attempt
+    verified_at = datetime.now(timezone.utc)
     attestation.verification_error = None
-    attestation.verified_at = func.now()
+    attestation.verified_at = verified_at
     attestation.measurement_version = measurement_config.version
     attestation.measurement_name = measurement_config.name
     attestation.measurement_config_fingerprint = config_fingerprint
     attestation.trust_set_fingerprint = trust_set_fingerprint
     attestation.revocation_status = revocation_status
     await db.flush()
-    if reservation is not None:
-        try:
-            consume_launch_reservation(
-                reservation,
-                attestation_id=attestation.attestation_id,
-                cert_pubkey_hash=expected_cert_hash,
-            )
-        except LaunchReservationError as exc:
-            raise ServerRegistrationError(str(exc)) from exc
-    await db.commit()
-    await db.refresh(attestation)
 
     # ChuteFS: a storage TD then calls POST /{server_id}/luks/attest to obtain its persistent
     # data-volume passphrase. That endpoint is gated on a single-use luks_quote_nonce which, for the
     # validator-dialed GPU flow, is minted in boot attestation. The self-registering storage TD has
     # no boot-attestation step, so its already signature-authorized registration mints a separate
-    # storage-only capability after owner, quote, measurement role, and cert persistence all succeed.
+    # storage-only capability after owner, quote, and measurement role validation. Mint before the
+    # final transaction commit: an orphaned Redis nonce is harmless, while committing first would
+    # make a lost response strand the one-use launch reservation.
     luks_quote_nonce: Optional[str] = None
     if storage_role:
         capability = _luks_capability_for_measurement(
@@ -2255,30 +2357,44 @@ async def _register_cpu_server_impl(
         )
         luks_quote_nonce = await generate_luks_quote_nonce(capability)
 
+    result = _cpu_registration_result(
+        {
+            "server_id": args.server_id,
+            "owner_hotkey": miner_hotkey,
+            "measurement_version": measurement_config.version,
+            "measurement_name": measurement_config.name,
+            "measurement_config_fingerprint": config_fingerprint,
+            "trust_set_fingerprint": trust_set_fingerprint,
+            "revocation_status": revocation_status,
+            "benchmark_score": float(server.benchmark_score),
+            "verified_at": verified_at.isoformat(),
+            "status": "registered",
+            "luks_quote_nonce": luks_quote_nonce,
+        }
+    )
+    if reservation is not None:
+        try:
+            consume_launch_reservation(
+                reservation,
+                attestation_id=attestation.attestation_id,
+                cert_pubkey_hash=expected_cert_hash,
+                registration_response_bytes=result.response_bytes.decode("ascii"),
+                registration_response_sha256=hashlib.sha256(
+                    result.response_bytes
+                ).hexdigest(),
+            )
+        except LaunchReservationError as exc:
+            raise ServerRegistrationError(str(exc)) from exc
+    # Server, attestation, reservation consumption, and exact replay bytes become visible together.
+    await db.commit()
+
     logger.success(
         f"CPU server self-registered: server_id={args.server_id} ip={server_ip} "
         f"miner={miner_hotkey} score={server.benchmark_score} version={measurement_config.version}"
         + (f" host_id={server.host_id}" if server.host_id else "")
         + (" storage_role=True" if storage_role else "")
     )
-    verified_at = attestation.verified_at
-    return {
-        "server_id": args.server_id,
-        "owner_hotkey": miner_hotkey,
-        "measurement_version": measurement_config.version,
-        "measurement_name": measurement_config.name,
-        "measurement_config_fingerprint": config_fingerprint,
-        "trust_set_fingerprint": trust_set_fingerprint,
-        "revocation_status": revocation_status,
-        "benchmark_score": float(server.benchmark_score),
-        "verified_at": (
-            verified_at.isoformat()
-            if hasattr(verified_at, "isoformat")
-            else datetime.now(timezone.utc).isoformat()
-        ),
-        "status": "registered",
-        "luks_quote_nonce": luks_quote_nonce,
-    }
+    return result
 
 
 async def register_cpu_server(

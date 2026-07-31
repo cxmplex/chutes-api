@@ -2340,6 +2340,8 @@ class TdLaunchReservation(Base):
     consumed_at = Column(DateTime(timezone=True), nullable=True)
     consumed_attestation_id = Column(String, nullable=True)
     consumed_cert_pubkey_hash = Column(String(64), nullable=True)
+    registration_response_bytes = Column(Text, nullable=True)
+    registration_response_sha256 = Column(String(64), nullable=True)
     invalidated_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -2396,9 +2398,13 @@ class TdLaunchReservation(Base):
         CheckConstraint("expires_at > issued_at", name="ck_td_reservation_expiry"),
         CheckConstraint(
             "(consumed_at IS NULL AND consumed_attestation_id IS NULL "
-            "AND consumed_cert_pubkey_hash IS NULL) OR "
+            "AND consumed_cert_pubkey_hash IS NULL "
+            "AND registration_response_bytes IS NULL "
+            "AND registration_response_sha256 IS NULL) OR "
             "(consumed_at IS NOT NULL AND consumed_attestation_id IS NOT NULL "
-            "AND consumed_cert_pubkey_hash ~ '^[0-9a-f]{64}$')",
+            "AND consumed_cert_pubkey_hash ~ '^[0-9a-f]{64}$' "
+            "AND octet_length(registration_response_bytes) > 0 "
+            "AND registration_response_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_td_reservation_consumption",
         ),
         Index(

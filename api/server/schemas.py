@@ -1049,20 +1049,40 @@ class CpuServerRegistrationArgs(BaseModel):
 class CpuServerRegistrationResponse(BaseModel):
     """Response for a successful CPU TEE server self-registration."""
 
-    server_id: str
-    owner_hotkey: str
-    measurement_version: Optional[str] = None
-    measurement_name: str
-    measurement_config_fingerprint: str
-    trust_set_fingerprint: str
+    model_config = ConfigDict(extra="forbid")
+
+    server_id: str = Field(..., min_length=1)
+    owner_hotkey: str = Field(..., min_length=1)
+    measurement_version: str = Field(..., min_length=1)
+    measurement_name: str = Field(..., min_length=1)
+    measurement_config_fingerprint: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    trust_set_fingerprint: str = Field(..., pattern=r"^[0-9a-f]{64}$")
     revocation_status: Dict[str, str]
-    benchmark_score: float
+    benchmark_score: float = Field(..., ge=0, allow_inf_nan=False)
     verified_at: str
-    status: str = "registered"
+    status: Literal["registered"] = "registered"
     # ChuteFS: the single-use nonce a self-registering storage TD must embed in its next quote to
     # call POST /{server_id}/luks/attest for its persistent data-volume key. Minted (and returned) only
     # for storage_role registrations.
-    luks_quote_nonce: Optional[str] = None
+    luks_quote_nonce: Optional[str] = Field(None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("verified_at")
+    @classmethod
+    def validate_verified_at(cls, value: str) -> str:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("verified_at must be an ISO-8601 timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("verified_at must include a timezone")
+        return value
+
+    @field_validator("revocation_status")
+    @classmethod
+    def validate_revocation_status(cls, value: Dict[str, str]) -> Dict[str, str]:
+        if any(not key for key in value):
+            raise ValueError("revocation status keys must be non-empty")
+        return value
 
 
 class GpuRuntimeSessionResponse(BaseModel):

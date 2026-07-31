@@ -18,7 +18,7 @@ from api.config import (
 )
 from api.node.util import check_node_inventory
 from api.host.locks import assert_gpu_external_work_allowed
-from api.host.schemas import canonical_sha256
+from api.host.schemas import canonical_json_bytes, canonical_sha256
 from api.user.schemas import User
 from api.user.service import get_current_user
 from api.constants import (
@@ -342,7 +342,7 @@ async def register_cpu_server_endpoint(
             if reason:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=reason)
         server_ip = request.state.client_ip
-        return await register_cpu_server(
+        result = await register_cpu_server(
             db,
             server_ip,
             args,
@@ -351,6 +351,18 @@ async def register_cpu_server_endpoint(
             signature,
             expected_cert_hash,
             expected_cert_pem,
+        )
+        validated = CpuServerRegistrationResponse.model_validate(result)
+        expected_bytes = canonical_json_bytes(validated.model_dump(mode="json"))
+        response_bytes = getattr(result, "response_bytes", expected_bytes)
+        if response_bytes != expected_bytes:
+            raise ServerRegistrationError(
+                "CPU registration response bytes differ from the validated document."
+            )
+        return Response(
+            content=response_bytes,
+            media_type="application/json",
+            status_code=status.HTTP_200_OK,
         )
     except AttestationError as e:
         logger.warning(
