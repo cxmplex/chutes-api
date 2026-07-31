@@ -6,7 +6,15 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from api.host.schemas import (
     FrozenWireModel,
@@ -18,6 +26,7 @@ from api.host.schemas import (
 )
 
 _HEX = r"^[0-9a-f]{64}$"
+_LUKS_UUID = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 LifecycleOperationType = Literal[
     "pre_slot_claim_quarantine",
     "launch_rollback",
@@ -627,33 +636,71 @@ class GpuHotplugCommandV1(FrozenWireModel):
         return self
 
 
-class GpuHotplugObjectStateV1(FrozenWireModel):
-    namespace: Literal["storage", "tdx-cache"]
-    block_node_name: str
-    device_id: str
-    serial: str
-    source_path_sha256: str = Field(..., pattern=_HEX)
-    block_node_present: bool
-    device_present: bool
-    device_bound: bool
-
-
-class GpuHotplugCommandAckV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-hotplug-command-ack.v1"] = (
-        "chutes.gpu-hotplug-command-ack.v1"
+class _StrictGpuHotplugWireModel(FrozenWireModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        str_strip_whitespace=False,
     )
-    version: Literal[1] = 1
-    command_id: str
-    payload_sha256: str = Field(..., pattern=_HEX)
+
+
+class GpuHotplugSourceIdentityV1(_StrictGpuHotplugWireModel):
+    schema: Literal["chutes.gpu-hotplug-source-identity.v1"] = Field(...)
+    version: Literal[1] = Field(...)
+    filesystem_uuid: StrictStr = Field(..., pattern=_LUKS_UUID)
+    inode: StrictInt = Field(..., ge=1)
+    size_bytes: StrictInt = Field(..., ge=1)
+    luks_uuid: StrictStr = Field(..., pattern=_LUKS_UUID)
+
+
+class GpuHotplugObjectStateV1(_StrictGpuHotplugWireModel):
+    namespace: Literal["storage", "tdx-cache"]
+    block_node_name: StrictStr
+    device_id: StrictStr
+    serial: StrictStr
+    source_identity: GpuHotplugSourceIdentityV1
+    block_node_present: StrictBool
+    device_present: StrictBool
+    device_bound: StrictBool
+
+
+class GpuHotplugCommandAckV1(_StrictGpuHotplugWireModel):
+    schema: Literal["chutes.gpu-hotplug-command-ack.v1"] = Field(...)
+    version: Literal[1] = Field(...)
+    command_id: StrictStr
+    payload_sha256: StrictStr = Field(..., pattern=_HEX)
     state: Literal["acked", "failed"]
     objects: List[GpuHotplugObjectStateV1]
-    ack_sha256: str = Field(..., pattern=_HEX)
-    failure_code: Optional[str] = None
-    failure_reason: Optional[str] = None
+    ack_sha256: StrictStr = Field(..., pattern=_HEX)
+    failure_code: Optional[StrictStr] = None
+    failure_reason: Optional[StrictStr] = None
 
     @model_validator(mode="after")
     def _ack_shape(self) -> "GpuHotplugCommandAckV1":
         namespaces = [item.namespace for item in self.objects]
+        expected_bindings = [
+            (
+                "storage",
+                "gpu-legacy-storage-node",
+                "gpu-legacy-storage-device",
+                "gpu-legacy-storage",
+            ),
+            (
+                "tdx-cache",
+                "gpu-legacy-cache-node",
+                "gpu-legacy-cache-device",
+                "gpu-legacy-cache",
+            ),
+        ]
+        observed_bindings = [
+            (item.namespace, item.block_node_name, item.device_id, item.serial)
+            for item in self.objects
+        ]
+        if observed_bindings != expected_bindings:
+            raise ValueError("GPU hotplug ACK namespace binding tuple differs")
+        if self.objects[0].source_identity == self.objects[1].source_identity:
+            raise ValueError("GPU hotplug ACK source identities must be distinct")
         exact = bool(
             namespaces == ["storage", "tdx-cache"]
             and all(

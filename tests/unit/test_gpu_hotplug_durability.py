@@ -60,10 +60,33 @@ def _failed_ack(row):
         "objects": [
             {
                 "namespace": namespace,
-                "block_node_name": f"block-{namespace}",
-                "device_id": f"device-{namespace}",
-                "serial": f"serial-{namespace}",
-                "source_path_sha256": "b" * 64,
+                "block_node_name": (
+                    "gpu-legacy-storage-node"
+                    if namespace == "storage"
+                    else "gpu-legacy-cache-node"
+                ),
+                "device_id": (
+                    "gpu-legacy-storage-device"
+                    if namespace == "storage"
+                    else "gpu-legacy-cache-device"
+                ),
+                "serial": (
+                    "gpu-legacy-storage"
+                    if namespace == "storage"
+                    else "gpu-legacy-cache"
+                ),
+                "source_identity": {
+                    "schema": "chutes.gpu-hotplug-source-identity.v1",
+                    "version": 1,
+                    "luks_uuid": (
+                        "11111111-1111-1111-1111-111111111111"
+                        if namespace == "storage"
+                        else "22222222-2222-2222-2222-222222222222"
+                    ),
+                    "filesystem_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    "inode": 1001 if namespace == "storage" else 1002,
+                    "size_bytes": 1073741824,
+                },
                 "block_node_present": False,
                 "device_present": False,
                 "device_bound": False,
@@ -136,6 +159,8 @@ async def test_exact_failed_hotplug_ack_terminalizes_after_custody_ended(ended_b
         host_id=row.host_id,
         target_server_id=row.stable_server_id,
         migration_id=row.migration_id,
+        storage_luks_uuid="11111111-1111-1111-1111-111111111111",
+        cache_luks_uuid="22222222-2222-2222-2222-222222222222",
         state="ready",
     )
     db = _Db([row, locked_host, reservation, group, migration])
@@ -183,6 +208,8 @@ async def test_failed_hotplug_ack_creates_normal_delete_intent_before_release():
         host_id=row.host_id,
         target_server_id=row.stable_server_id,
         migration_id=row.migration_id,
+        storage_luks_uuid="11111111-1111-1111-1111-111111111111",
+        cache_luks_uuid="22222222-2222-2222-2222-222222222222",
         state="ready",
     )
     db = _Db([row, locked_host, reservation, group, migration])
@@ -396,3 +423,43 @@ def test_hotplug_retry_alert_is_persisted_and_emitted_once():
     bound.error.assert_called_once_with(
         "Durable GPU hotplug command exceeded the retry alert threshold."
     )
+
+
+@pytest.mark.asyncio
+async def test_hotplug_ack_rejects_luks_identity_mismatch_before_commit():
+    row = _command_row()
+    current_host = SimpleNamespace(
+        host_id=row.host_id,
+        active_key_generation=row.host_key_generation,
+        boot_generation=row.host_boot_generation,
+    )
+    locked_host = SimpleNamespace(
+        host_id=row.host_id,
+        active_key_generation=row.host_key_generation,
+        boot_generation=row.host_boot_generation,
+        provisioning_state="ready",
+    )
+    reservation = _runtime_reservation(row)
+    group = _runtime_group(row)
+    migration = SimpleNamespace(
+        host_id=row.host_id,
+        target_server_id=row.stable_server_id,
+        migration_id=row.migration_id,
+        storage_luks_uuid="99999999-9999-9999-9999-999999999999",
+        cache_luks_uuid="22222222-2222-2222-2222-222222222222",
+        state="ready",
+    )
+    db = _Db([row, locked_host, reservation, group, migration])
+
+    with patch(
+        "api.gpu_hotplug_service.acquire_gpu_lifecycle_lock",
+        AsyncMock(return_value=None),
+    ):
+        with pytest.raises(GpuHotplugError, match="source identity differs"):
+            await record_gpu_hotplug_ack(
+                db, current_host, row.command_id, _failed_ack(row)
+            )
+
+    assert row.ack is None
+    assert row.ack_sha256 is None
+    db.flush.assert_not_awaited()

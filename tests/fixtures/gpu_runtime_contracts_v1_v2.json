@@ -207,7 +207,7 @@
       "version": 1
     },
     "hotplug_acked": {
-      "ack_sha256": "8116ba52be61d6aadb18e2a6e799ee754d91759e58ebeb76953a46da63adae5d",
+      "ack_sha256": "b0b767a28d59bf6bdbe91f6339f3d4b57aa5d08bea0f074c2b572f512a34b176",
       "command_id": "gpu-hotplug-2dd5548a4ef9f84a17bd97dfb6ad7658fb906e7644776c8298799239ba526e8e",
       "objects": [
         {
@@ -218,7 +218,14 @@
           "device_present": true,
           "namespace": "storage",
           "serial": "gpu-legacy-storage",
-          "source_path_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          "source_identity": {
+            "filesystem_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "inode": 1001,
+            "luks_uuid": "11111111-1111-1111-1111-111111111111",
+            "schema": "chutes.gpu-hotplug-source-identity.v1",
+            "size_bytes": 1073741824,
+            "version": 1
+          }
         },
         {
           "block_node_name": "gpu-legacy-cache-node",
@@ -228,7 +235,14 @@
           "device_present": true,
           "namespace": "tdx-cache",
           "serial": "gpu-legacy-cache",
-          "source_path_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          "source_identity": {
+            "filesystem_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "inode": 1002,
+            "luks_uuid": "22222222-2222-2222-2222-222222222222",
+            "schema": "chutes.gpu-hotplug-source-identity.v1",
+            "size_bytes": 1073741824,
+            "version": 1
+          }
         }
       ],
       "payload_sha256": "b8df4773bc42f45cd58c4856f50b944fa9b50345567ac1ddf44c8c8ef26f8ddc",
@@ -261,7 +275,7 @@
       "version": 1
     },
     "hotplug_failed": {
-      "ack_sha256": "c28e6f815ccc0d2b735a29776fc0ba5c1358020b39d992bce1a5159f0d83578f",
+      "ack_sha256": "146d8353313b83ab71ecd8bcceaefa47503fba7ce5c4eeae04841569be84c2ca",
       "command_id": "gpu-hotplug-2dd5548a4ef9f84a17bd97dfb6ad7658fb906e7644776c8298799239ba526e8e",
       "failure_code": "frontend_missing",
       "failure_reason": "block backend exists but frontend device is absent",
@@ -274,7 +288,14 @@
           "device_present": true,
           "namespace": "storage",
           "serial": "gpu-legacy-storage",
-          "source_path_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          "source_identity": {
+            "filesystem_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "inode": 1001,
+            "luks_uuid": "11111111-1111-1111-1111-111111111111",
+            "schema": "chutes.gpu-hotplug-source-identity.v1",
+            "size_bytes": 1073741824,
+            "version": 1
+          }
         },
         {
           "block_node_name": "gpu-legacy-cache-node",
@@ -284,7 +305,14 @@
           "device_present": false,
           "namespace": "tdx-cache",
           "serial": "gpu-legacy-cache",
-          "source_path_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+          "source_identity": {
+            "filesystem_uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "inode": 1002,
+            "luks_uuid": "22222222-2222-2222-2222-222222222222",
+            "schema": "chutes.gpu-hotplug-source-identity.v1",
+            "size_bytes": 1073741824,
+            "version": 1
+          }
         }
       ],
       "payload_sha256": "b8df4773bc42f45cd58c4856f50b944fa9b50345567ac1ddf44c8c8ef26f8ddc",
@@ -781,7 +809,7 @@
     },
     "failed_response": {
       "attempt_id": "fixture-registration-attempt-2",
-      "failure_code": "quote_invalid",
+      "failure_code": "gpu_registration_verification_failed",
       "failure_detail": "fixture quote validation failed",
       "schema": "chutes.gpu-registration-response.v2",
       "state": "failed",

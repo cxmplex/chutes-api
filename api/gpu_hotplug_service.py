@@ -715,6 +715,21 @@ async def record_gpu_hotplug_ack(
     )
     if not custody_current and ack.state != "failed":
         raise GpuHotplugError("GPU hotplug custody changed before acknowledgement.")
+    if migration is None:
+        raise GpuHotplugError(
+            "GPU hotplug ACK source identity has no authoritative migration."
+        )
+    ack_luks_uuids = {
+        item.namespace: item.source_identity.luks_uuid for item in ack.objects
+    }
+    expected_luks_uuids = {
+        "storage": migration.storage_luks_uuid,
+        "tdx-cache": migration.cache_luks_uuid,
+    }
+    if ack_luks_uuids != expected_luks_uuids:
+        raise GpuHotplugError(
+            "GPU hotplug ACK source identity differs from migration custody."
+        )
     now = _now()
     row.ack = ack.model_dump(mode="json", exclude_none=True)
     row.ack_sha256 = ack.ack_sha256
