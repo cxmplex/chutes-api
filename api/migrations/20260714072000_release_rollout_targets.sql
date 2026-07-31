@@ -4,6 +4,8 @@
 ALTER TABLE hosts
     ADD COLUMN IF NOT EXISTS storage_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE hosts
+    ADD COLUMN IF NOT EXISTS storage_requested BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE hosts
     ADD COLUMN IF NOT EXISTS release_channel TEXT NOT NULL DEFAULT 'stable';
 
 -- Existing storage TD registrations identify hosts that were already enrolled before this column.
@@ -15,6 +17,38 @@ WHERE EXISTS (
     WHERE server.host_id = host.host_id
       AND server.storage_role IS TRUE
 );
+
+-- Intent survives a temporary TD failure and identity/key reenrollment. Runtime capability is
+-- refreshed independently by signed registration and heartbeat telemetry.
+UPDATE hosts SET storage_requested = storage_enabled WHERE storage_enabled IS TRUE;
+
+-- A migrated-but-feature-disabled deployment must continue accepting the production binary,
+-- whose INSERT/UPDATE column list knows only storage_enabled. Promote that legacy capability
+-- write to durable intent before the new invariant is checked. New API payloads can distinguish
+-- omission from explicit false and reject false+enabled at the wire boundary.
+CREATE OR REPLACE FUNCTION sync_host_storage_requested_from_capability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.storage_enabled IS TRUE THEN
+        NEW.storage_requested := TRUE;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_hosts_storage_capability_implies_intent ON hosts;
+CREATE TRIGGER trg_hosts_storage_capability_implies_intent
+    BEFORE INSERT OR UPDATE ON hosts
+    FOR EACH ROW EXECUTE FUNCTION sync_host_storage_requested_from_capability();
+
+-- Replace any disposable-dev/WIP copy that referenced runtime capability instead of intent.
+ALTER TABLE hosts DROP CONSTRAINT IF EXISTS ck_hosts_zero_capacity_storage_only;
+ALTER TABLE hosts DROP CONSTRAINT IF EXISTS ck_hosts_storage_capability_requires_intent;
+ALTER TABLE hosts
+    ADD CONSTRAINT ck_hosts_storage_capability_requires_intent
+    CHECK (storage_enabled IS FALSE OR storage_requested IS TRUE);
 
 DO $$
 BEGIN
@@ -29,7 +63,7 @@ BEGIN
     ) THEN
         ALTER TABLE hosts
             ADD CONSTRAINT ck_hosts_zero_capacity_storage_only
-            CHECK (capacity > 0 OR storage_enabled IS TRUE);
+            CHECK (capacity > 0 OR storage_requested IS TRUE);
     END IF;
 END
 $$;
@@ -141,7 +175,11 @@ DROP TABLE IF EXISTS guest_release_target_token_generations;
 DROP TABLE IF EXISTS guest_release_targets;
 ALTER TABLE guest_releases DROP COLUMN IF EXISTS targets_captured_at;
 DROP INDEX IF EXISTS idx_hosts_release_targeting;
+DROP TRIGGER IF EXISTS trg_hosts_storage_capability_implies_intent ON hosts;
+DROP FUNCTION IF EXISTS sync_host_storage_requested_from_capability();
 ALTER TABLE hosts DROP CONSTRAINT IF EXISTS ck_hosts_zero_capacity_storage_only;
+ALTER TABLE hosts DROP CONSTRAINT IF EXISTS ck_hosts_storage_capability_requires_intent;
 ALTER TABLE hosts DROP CONSTRAINT IF EXISTS ck_hosts_capacity_nonnegative;
 ALTER TABLE hosts DROP COLUMN IF EXISTS release_channel;
 ALTER TABLE hosts DROP COLUMN IF EXISTS storage_enabled;
+ALTER TABLE hosts DROP COLUMN IF EXISTS storage_requested;

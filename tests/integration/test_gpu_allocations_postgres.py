@@ -520,6 +520,7 @@ async def _seed(sessions):
         compute_type="gpu",
         capacity=0,
         reported_capacity=1,
+        storage_requested=True,
         storage_enabled=True,
         storage_td_vcpus=2,
         storage_td_mem="8G",

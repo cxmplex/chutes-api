@@ -1127,13 +1127,20 @@ class HostRegistrationArgs(BaseModel):
         ge=0,
         le=64,
         description=(
-            "Max concurrent per-chute TDs. Zero is valid only when storage_enabled reserves the "
+            "Max concurrent per-chute TDs. Zero is valid only when storage_requested reserves the "
             "host's sole TD slot."
+        ),
+    )
+    storage_requested: Optional[bool] = Field(
+        None,
+        description=(
+            "Durable operator/release intent to run the dedicated ChuteFS storage TD. Omitted "
+            "legacy payloads inherit storage_enabled for wire compatibility."
         ),
     )
     storage_enabled: bool = Field(
         False,
-        description="Whether this enrolled L0 runs the dedicated ChuteFS storage TD.",
+        description="Whether the dedicated ChuteFS storage TD is currently healthy.",
     )
     storage_td_vcpus: Optional[int] = Field(
         None,
@@ -1234,10 +1241,19 @@ class HostRegistrationArgs(BaseModel):
 
     @model_validator(mode="after")
     def _validate_zero_capacity_storage_enrollment(self):
+        storage_requested = (
+            self.storage_enabled
+            if self.storage_requested is None
+            else self.storage_requested
+        )
         if self.compute_type == "gpu" and (
-            self.tee_type != "tdx" or self.storage_enabled is not True
+            self.tee_type != "tdx"
+            or storage_requested is not True
+            or self.storage_enabled is not True
         ):
-            raise ValueError("GPU hosts require TDX and storage_enabled=true")
+            raise ValueError(
+                "GPU hosts require TDX and storage_requested/storage_enabled=true"
+            )
         if self.compute_type == "cpu" and (
             self.untrusted_gpu_inventory is not None
             or self.untrusted_gpu_inventory_ready is not None
@@ -1251,8 +1267,18 @@ class HostRegistrationArgs(BaseModel):
             raise ValueError("GPU hosts must report explicit inventory readiness and host_boot_id")
         if self.compute_type == "cpu" and self.host_boot_id is not None:
             raise ValueError("CPU host registration must preserve the V1 boot contract")
-        if self.capacity == 0 and not self.storage_enabled:
-            raise ValueError("capacity=0 is valid only for an enrolled ChuteFS storage host")
+        if self.capacity == 0 and not storage_requested:
+            raise ValueError("capacity=0 is valid only for a storage-requested host")
+        if self.storage_enabled and not storage_requested:
+            raise ValueError("storage capability requires durable storage intent")
+        if self.compute_type == "cpu" and self.storage_enabled and (
+            self.disk_total_gb is None or self.disk_free_gb is None
+        ):
+            raise ValueError("CPU storage capability requires current disk capacity")
+        if self.compute_type == "cpu" and not self.storage_enabled and (
+            self.disk_total_gb is not None or self.disk_free_gb is not None
+        ):
+            raise ValueError("CPU disk capacity cannot be advertised while storage is unhealthy")
         if (self.storage_td_vcpus is None) != (self.storage_td_mem is None):
             raise ValueError("storage_td_vcpus and storage_td_mem must be supplied together")
         if self.default_mem:
@@ -1846,9 +1872,12 @@ class Host(Base):
     # Raw host-requested capacity. GPU capacity remains validator-clamped to zero until the exact
     # CPU/storage sibling reservation, attestation, incarnation, and liveness are current.
     reported_capacity = Column(Integer, nullable=False, default=1, server_default="1")
-    # Signed L0 enrollment state. Allows a one-slot storage appliance to advertise zero schedulable
-    # chute slots without letting ordinary compute hosts misuse capacity=0 registration.
+    # Current signed launcher telemetry. CPU hosts set this only while the storage TD is healthy;
+    # GPU hosts retain their mandatory-storage enrollment posture and use the attested readiness gate.
     storage_enabled = Column(Boolean, nullable=False, default=False, server_default="false")
+    # Durable operator/release intent. This survives TD failure and logical-host key reenrollment so
+    # an unhealthy or image-less storage host remains eligible to receive its recovery release/token.
+    storage_requested = Column(Boolean, nullable=False, default=False, server_default="false")
     storage_td_vcpus = Column(Integer, nullable=True)
     storage_td_mem = Column(String, nullable=True)
     # Desired-state channel followed by this logical L0 target. Release activation snapshots only
@@ -1910,8 +1939,12 @@ class Host(Base):
             name="ck_hosts_reported_capacity",
         ),
         CheckConstraint(
-            "capacity > 0 OR storage_enabled IS TRUE",
+            "capacity > 0 OR storage_requested IS TRUE",
             name="ck_hosts_zero_capacity_storage_only",
+        ),
+        CheckConstraint(
+            "storage_enabled IS FALSE OR storage_requested IS TRUE",
+            name="ck_hosts_storage_capability_requires_intent",
         ),
         CheckConstraint(
             "(storage_td_vcpus IS NULL AND storage_td_mem IS NULL) OR "

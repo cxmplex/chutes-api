@@ -110,7 +110,7 @@ WITH eligible_targets AS (
      AND host.tee_type = active.tee_type
      AND host.release_channel = active.channel
     WHERE target.role = 'storage'
-      AND host.storage_enabled IS TRUE
+      AND host.storage_requested IS TRUE
       AND host.provisioning_state = 'ready'
       AND (
           COALESCE(

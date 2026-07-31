@@ -48,6 +48,13 @@ def test_host_enrollment_openapi_preserves_v1_and_exposes_gpu_v2():
     assert schemas["EnrollmentVoucherClaimsV2"]["properties"]["compute_type"]["const"] == "gpu"
     assert schemas["EnrollmentVoucherClaimsV2"]["properties"]["storage_enabled"]["const"] is True
     assert schemas["HostEnrollmentStatusV2"]["properties"]["compute_type"]["const"] == "gpu"
+    registration = schemas["HostRegistrationArgs"]
+    storage_requested = registration["properties"]["storage_requested"]
+    assert "storage_requested" not in registration.get("required", [])
+    assert {item["type"] for item in storage_requested["anyOf"]} == {
+        "boolean",
+        "null",
+    }
 
 
 def _mock_db(existing_host=None, existing_node=object()):
@@ -95,11 +102,142 @@ async def test_register_host_valid_updates_telemetry_only():
         assert res == {
             "host_id": "l0-unit-1",
             "capacity": 4,
+            "storage_requested": False,
+            "storage_enabled": False,
             "status": "registered",
             "release": None,
         }
         assert not db.add.called
         assert host.capacity == 4
+
+
+@pytest.mark.asyncio
+async def test_legacy_cpu_storage_payload_opts_in_without_double_reserving_capacity():
+    host = _host()
+    args = HostRegistrationArgs(
+        host_id=host.host_id,
+        capacity=3,
+        tee_type="sev-snp",
+        storage_enabled=True,
+        disk_total_gb=100,
+        disk_free_gb=60,
+    )
+    assert args.storage_requested is None
+    db = _mock_db()
+    with (
+        patch.object(svc.settings, "skip_metagraph_check", True),
+        patch(
+            "api.releases.service.active_manifest_for_host",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        result = await svc.register_host(db, args, host)
+
+    assert result["capacity"] == 3
+    assert result["storage_requested"] is True
+    assert result["storage_enabled"] is True
+    assert host.reported_capacity == 3
+    assert host.capacity == 3
+    assert host.storage_requested is True
+    assert host.disk_total_gb == 100
+    assert host.disk_free_gb == 60
+
+
+@pytest.mark.asyncio
+async def test_legacy_gpu_storage_payload_omission_reaches_registration_service():
+    host = _host("gpu-legacy-storage")
+    host.tee_type = "tdx"
+    host.compute_type = "gpu"
+    host.storage_requested = True
+    host.storage_enabled = True
+    host.boot_generation = 1
+    args = HostRegistrationArgs(
+        host_id=host.host_id,
+        capacity=1,
+        tee_type="tdx",
+        compute_type="gpu",
+        release_channel="stable",
+        storage_enabled=True,
+        host_boot_id="11111111-1111-1111-1111-111111111111",
+        untrusted_gpu_inventory={
+            "configured_profile": "b200-8gpu",
+            "devices": [],
+            "observed_count": 0,
+            "expected_count": 8,
+            "profile_match": False,
+        },
+        untrusted_gpu_inventory_ready=True,
+    )
+    assert args.storage_requested is None
+    readiness = SimpleNamespace(
+        trusted_storage_ready=True,
+        control_channel_eligible=True,
+        trusted_schedulable=True,
+        reason="ready",
+    )
+    observe = AsyncMock(return_value={"storage-server"})
+    advance_boot = AsyncMock()
+    db = _mock_db()
+    with (
+        patch.object(svc.settings, "skip_metagraph_check", True),
+        patch(
+            "api.host.reservations.observe_gpu_storage_liveness",
+            observe,
+        ),
+        patch(
+            "api.host.gpu_allocations.advance_gpu_host_boot",
+            advance_boot,
+        ),
+        patch(
+            "api.releases.service.active_manifest_for_host",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            svc,
+            "gpu_host_storage_readiness",
+            AsyncMock(return_value=readiness),
+        ),
+    ):
+        result = await svc.register_host(db, args, host)
+
+    assert result["capacity"] == 1
+    assert result["storage_requested"] is True
+    assert result["storage_enabled"] is True
+    observe.assert_awaited_once_with(db, host.host_id)
+    advance_boot.assert_awaited_once_with(db, host, str(args.host_boot_id))
+
+
+@pytest.mark.asyncio
+async def test_registration_cannot_erase_reenrolled_storage_intent_or_restore_capacity():
+    host = _host()
+    host.storage_requested = True
+    host.storage_enabled = False
+    args = HostRegistrationArgs(
+        host_id=host.host_id,
+        capacity=4,
+        tee_type="sev-snp",
+        storage_requested=False,
+        storage_enabled=False,
+    )
+
+    for _ in range(2):
+        db = _mock_db()
+        with (
+            patch.object(svc.settings, "skip_metagraph_check", True),
+            patch(
+                "api.releases.service.active_manifest_for_host",
+                AsyncMock(return_value=None),
+            ),
+        ):
+            result = await svc.register_host(db, args, host)
+
+        assert result["capacity"] == 3
+        assert result["storage_requested"] is True
+        assert result["storage_enabled"] is False
+        assert host.reported_capacity == 4
+        assert host.capacity == 3
+        assert host.disk_total_gb is None
+        assert host.disk_free_gb is None
 
 
 @pytest.mark.asyncio
@@ -343,14 +481,63 @@ def test_host_registration_schema_accepts_zero_only_as_nonnegative_input():
         HostRegistrationArgs(
             host_id="storage-only",
             capacity=0,
-            storage_enabled=True,
+            storage_requested=True,
         ).capacity
         == 0
     )
     with pytest.raises(ValidationError, match="greater than or equal"):
-        HostRegistrationArgs(host_id="negative", capacity=-1, storage_enabled=True)
-    with pytest.raises(ValidationError, match="enrolled ChuteFS storage"):
+        HostRegistrationArgs(host_id="negative", capacity=-1, storage_requested=True)
+    with pytest.raises(ValidationError, match="storage-requested"):
         HostRegistrationArgs(host_id="zero-compute", capacity=0)
+
+
+
+def test_legacy_cpu_storage_payload_and_explicit_false_are_distinct():
+    legacy = HostRegistrationArgs(
+        host_id="legacy-cpu-storage",
+        capacity=0,
+        storage_enabled=True,
+        disk_total_gb=100,
+        disk_free_gb=50,
+    )
+    assert legacy.storage_requested is None
+    assert legacy.storage_enabled is True
+
+    with pytest.raises(ValidationError, match="durable storage intent"):
+        HostRegistrationArgs(
+            host_id="explicitly-disabled-cpu-storage",
+            storage_requested=False,
+            storage_enabled=True,
+            disk_total_gb=100,
+            disk_free_gb=50,
+        )
+
+def test_cpu_storage_capability_requires_current_disk_health():
+    with pytest.raises(ValidationError, match="current disk capacity"):
+        HostRegistrationArgs(
+            host_id="cpu-storage-no-capacity",
+            storage_requested=True,
+            storage_enabled=True,
+        )
+
+    valid = HostRegistrationArgs(
+        host_id="cpu-storage-healthy",
+        storage_requested=True,
+        storage_enabled=True,
+        disk_total_gb=100,
+        disk_free_gb=60,
+    )
+    assert valid.storage_enabled is True
+    assert valid.disk_free_gb == 60
+
+    with pytest.raises(ValidationError, match="while storage is unhealthy"):
+        HostRegistrationArgs(
+            host_id="cpu-storage-withdrawn",
+            storage_requested=True,
+            storage_enabled=False,
+            disk_total_gb=100,
+            disk_free_gb=60,
+        )
 
 
 def test_gpu_host_registration_requires_tdx_and_storage_posture():
@@ -371,11 +558,13 @@ def test_gpu_host_registration_requires_tdx_and_storage_posture():
         untrusted_gpu_inventory_ready=True,
     )
     assert gpu.compute_type == "gpu"
+    assert gpu.storage_requested is None
     with pytest.raises(ValidationError, match="GPU hosts require TDX"):
         HostRegistrationArgs(
             host_id="gpu-snp",
             tee_type="sev-snp",
             compute_type="gpu",
+            storage_requested=True,
             storage_enabled=True,
             host_boot_id="11111111-1111-1111-1111-111111111111",
             untrusted_gpu_inventory={
@@ -387,11 +576,29 @@ def test_gpu_host_registration_requires_tdx_and_storage_posture():
             },
             untrusted_gpu_inventory_ready=False,
         )
+    with pytest.raises(ValidationError, match="storage_requested/storage_enabled"):
+        HostRegistrationArgs(
+            host_id="gpu-explicit-storage-false",
+            tee_type="tdx",
+            compute_type="gpu",
+            storage_requested=False,
+            storage_enabled=True,
+            host_boot_id="11111111-1111-1111-1111-111111111111",
+            untrusted_gpu_inventory={
+                "configured_profile": "b200-8gpu",
+                "devices": [],
+                "observed_count": 0,
+                "expected_count": 8,
+                "profile_match": False,
+            },
+            untrusted_gpu_inventory_ready=True,
+        )
     with pytest.raises(ValidationError, match="storage_enabled"):
         HostRegistrationArgs(
             host_id="gpu-no-storage",
             tee_type="tdx",
             compute_type="gpu",
+            storage_requested=True,
             storage_enabled=False,
             host_boot_id="11111111-1111-1111-1111-111111111111",
             untrusted_gpu_inventory={
@@ -439,13 +646,15 @@ async def test_register_host_accepts_zero_capacity_storage_enrollment():
             HostRegistrationArgs(
                 host_id="storage-only",
                 capacity=0,
-                storage_enabled=True,
+                storage_requested=True,
                 tee_type="sev-snp",
             ),
             _host("storage-only"),
         )
     assert not db.add.called
     assert result["capacity"] == 0
+    assert result["storage_requested"] is True
+    assert result["storage_enabled"] is False
 
 
 @pytest.mark.asyncio

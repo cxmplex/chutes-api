@@ -472,22 +472,28 @@ async def handle_agent_status(server_id: str, data) -> None:
     try:
         if "slots" in data:
             await _reconcile_host_slots(server_id, data.get("slots") or [])
-            # Fleet releases: record the guest-image digests + running L0 version the host reports
-            # (for the release convergence status). Best-effort; never let it break the reconcile.
-            if "staged_images" in data or "l0_version" in data:
-                await _persist_host_staged_images(
-                    server_id, data.get("staged_images"), data.get("l0_version")
-                )
         elif "containers" in data:
             await _reconcile_server_containers(server_id, data.get("containers") or [])
+        if any(
+            key in data
+            for key in (
+                "staged_images",
+                "l0_version",
+                "storage_enabled",
+                "disk_total_gb",
+                "disk_free_gb",
+            )
+        ):
+            # Persist signed launcher telemetry even when slot collection failed and was omitted.
+            # CPU storage capability is current health, not durable release intent.
+            await _persist_host_telemetry(server_id, data)
     except Exception as exc:
         logger.error(f"Heartbeat reconcile failed for {server_id}: {exc}")
 
 
-async def _persist_host_staged_images(host_id: str, staged, l0_version=None) -> None:
-    """Persist the host's reported staged guest-image digests + running L0 version (release status)."""
-    if not isinstance(staged, dict) and not l0_version:
-        return
+async def _persist_host_telemetry(host_id: str, data: dict) -> None:
+    """Persist signed host health/release telemetry, failing CPU storage capability closed."""
+
     from api.database import get_session
     from api.server.schemas import Host
 
@@ -496,12 +502,38 @@ async def _persist_host_staged_images(host_id: str, staged, l0_version=None) -> 
         if host is None:
             return
         changed = False
+        staged = data.get("staged_images")
+        l0_version = data.get("l0_version")
         if isinstance(staged, dict) and host.staged_images != staged:
             host.staged_images = staged
             changed = True
         if l0_version and host.l0_version != l0_version:
             host.l0_version = l0_version
             changed = True
+        if host.compute_type == "cpu" and "storage_enabled" in data:
+            enabled = data.get("storage_enabled") is True and bool(host.storage_requested)
+            total = data.get("disk_total_gb")
+            free = data.get("disk_free_gb")
+            valid_capacity = (
+                isinstance(total, int)
+                and not isinstance(total, bool)
+                and 0 <= total <= 8_589_934_591
+                and isinstance(free, int)
+                and not isinstance(free, bool)
+                and 0 <= free <= total
+            )
+            enabled = enabled and valid_capacity
+            next_total = total if enabled else None
+            next_free = free if enabled else None
+            if host.storage_enabled is not enabled:
+                host.storage_enabled = enabled
+                changed = True
+            if host.disk_total_gb != next_total:
+                host.disk_total_gb = next_total
+                changed = True
+            if host.disk_free_gb != next_free:
+                host.disk_free_gb = next_free
+                changed = True
         if changed:
             await session.commit()
 

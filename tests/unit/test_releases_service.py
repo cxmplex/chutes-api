@@ -305,7 +305,7 @@ async def test_idempotent_partial_activation_preserves_inherited_role_marker():
 
     assert activated.images["chute"]["_inherited"] is True
     assert rsvc.release_manifest(activated).chute is not None
-    assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_enabled=True)) == [
+    assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_requested=True)) == [
         "storage"
     ]
     assert db.commit.called
@@ -340,7 +340,7 @@ async def test_rollback_partial_activation_inherits_current_role_without_promoti
     assert activated.images["storage"]["sha256"] == "c" * 64
     assert "_inherited" not in activated.images["storage"]
     assert rsvc.release_manifest(activated).chute is not None
-    assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_enabled=True)) == [
+    assert rsvc._target_roles_for_host(activated, Host(capacity=2, storage_requested=True)) == [
         "storage"
     ]
     assert db.commit.called
@@ -371,7 +371,7 @@ async def test_storage_only_activation_preserves_active_chute_for_scheduler():
         "chute",
         "storage",
     }
-    host = Host(capacity=2, storage_enabled=True)
+    host = Host(capacity=2, storage_requested=True)
     assert rsvc._target_roles_for_host(activated, host) == ["storage"]
     manifest = rsvc.release_manifest(activated)
     assert manifest.chute is not None
@@ -622,11 +622,12 @@ def test_release_manifest_omits_provenance_from_host_payload():
 
 def test_storage_release_auto_opts_in_before_role_target_snapshot():
     release = _release(chute=_image(), storage=_image("storage"))
-    compute = Host(capacity=1, storage_enabled=False)
-    storage_only = Host(capacity=0, storage_enabled=True)
-    combined = Host(capacity=2, storage_enabled=True)
+    compute = Host(capacity=1, storage_requested=False, storage_enabled=False)
+    storage_only = Host(capacity=0, storage_requested=True, storage_enabled=False)
+    combined = Host(capacity=2, storage_requested=True, storage_enabled=False)
     rsvc._apply_storage_auto_opt_in(release, compute)
-    assert compute.storage_enabled is True
+    assert compute.storage_requested is True
+    assert compute.storage_enabled is False
     assert compute.capacity == 0
     assert rsvc._target_roles_for_host(release, compute) == ["storage"]
     assert rsvc._target_roles_for_host(release, storage_only) == ["storage"]
@@ -635,7 +636,7 @@ def test_storage_release_auto_opts_in_before_role_target_snapshot():
 
 def test_storage_auto_opt_in_reserves_exactly_once():
     release = _release(chute=_image(), storage=_image("storage"))
-    host = Host(capacity=2, storage_enabled=False)
+    host = Host(capacity=2, storage_requested=False, storage_enabled=False)
     rsvc._apply_storage_auto_opt_in(release, host)
     rsvc._apply_storage_auto_opt_in(release, host)
     assert host.capacity == 1
@@ -835,6 +836,7 @@ async def test_gpu_storage_desired_state_keeps_exact_cpu_release_identity_withou
         compute_type="gpu",
         release_channel="stable",
         storage_enabled=True,
+        storage_requested=True,
         storage_td_vcpus=2,
         storage_td_mem="8G",
     )
@@ -911,6 +913,7 @@ async def test_gpu_storage_intent_is_host_scoped_restart_idempotent_and_has_no_c
         compute_type="gpu",
         release_channel="stable",
         storage_enabled=True,
+        storage_requested=True,
         provisioning_state="ready",
         identity_durable_at=datetime.now(timezone.utc),
     )

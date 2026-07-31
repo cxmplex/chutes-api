@@ -349,6 +349,7 @@ def test_aggregate_resource_budget_includes_storage_and_l0_reserves():
         miner_hotkey="owner",
         tee_type="tdx",
         compute_type="gpu",
+        storage_requested=True,
         storage_enabled=True,
         storage_td_vcpus=2,
         storage_td_mem="8G",

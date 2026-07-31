@@ -277,7 +277,7 @@ async def claim_storage_launch_intent(
     if (
         host.provisioning_state != "ready"
         or host.identity_durable_at is None
-        or not host.storage_enabled
+        or not host.storage_requested
         or host.active_key_generation is None
         or host.compute_type not in {"cpu", "gpu"}
         or (host.compute_type == "gpu" and host.tee_type != "tdx")

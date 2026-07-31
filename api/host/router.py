@@ -1482,6 +1482,7 @@ async def list_hosts(
                 "ram_gb": h.ram_gb,
                 "specs": h.specs,
                 "storage_enabled": h.storage_enabled,
+                "storage_requested": h.storage_requested,
                 "trusted_storage_ready": (
                     readiness.trusted_storage_ready if readiness is not None else None
                 ),

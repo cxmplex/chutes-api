@@ -221,6 +221,7 @@ def _readiness_state(*, consumed=True, announced=True):
         tee_type="tdx",
         compute_type="gpu",
         release_channel="stable",
+        storage_requested=True,
         storage_enabled=True,
         capacity=0,
         reported_capacity=1,

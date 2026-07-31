@@ -1354,7 +1354,7 @@ def _target_roles_for_host(release: GuestRelease, host: Host) -> List[str]:
     storage = images.get("storage") or {}
     if chute and not chute.get("_inherited") and int(host.capacity or 0) > 0:
         roles.append("chute")
-    if storage and not storage.get("_inherited") and bool(getattr(host, "storage_enabled", False)):
+    if storage and not storage.get("_inherited") and bool(getattr(host, "storage_requested", False)):
         roles.append("storage")
     return roles
 
@@ -1372,10 +1372,10 @@ def _apply_storage_auto_opt_in(release: GuestRelease, host: Host) -> None:
     storage = (release.images or {}).get("storage") or {}
     if not storage or storage.get("_inherited"):
         return
-    if bool(getattr(host, "storage_enabled", False)):
+    if bool(getattr(host, "storage_requested", False)):
         return
     current = int(host.capacity or 0)
-    host.storage_enabled = True
+    host.storage_requested = True
     host.capacity = max(0, current - 1)
 
 
@@ -1578,7 +1578,7 @@ async def _gpu_storage_sibling_for_host(
         or gpu_release.tee_type != "tdx"
         or host.compute_type != "gpu"
         or host.tee_type != "tdx"
-        or not host.storage_enabled
+        or not host.storage_requested
     ):
         raise ReleaseError(
             "GPU storage sibling composition requires a storage-enabled TDX GPU host."
@@ -1679,7 +1679,7 @@ async def _ensure_gpu_storage_launch_intent_for_host(
         or host.release_channel != gpu_release.channel
         or host.provisioning_state != "ready"
         or host.identity_durable_at is None
-        or not host.storage_enabled
+        or not host.storage_requested
     ):
         raise ReleaseError(
             f"GPU storage-sibling host {host.host_id} is not launch-intent eligible."
@@ -1861,7 +1861,7 @@ async def _ensure_storage_launch_intents(
             or host.release_channel != release.channel
             or host.provisioning_state != "ready"
             or host.identity_durable_at is None
-            or not host.storage_enabled
+            or not host.storage_requested
         ):
             raise ReleaseError(
                 f"Storage target {target.host_id} is no longer eligible for launch intent."
@@ -1911,7 +1911,7 @@ async def _ensure_storage_launch_intent_for_host(
         or host.release_channel != release.channel
         or host.provisioning_state != "ready"
         or host.identity_durable_at is None
-        or not host.storage_enabled
+        or not host.storage_requested
     ):
         raise ReleaseError(f"Storage host {host.host_id} is not eligible for launch-intent repair.")
     active = (

@@ -512,9 +512,73 @@ class TestHandleAgentStatusRouting:
         srv_rec.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_storage_failure_without_slot_inventory_still_persists(self, mock_settings):
+        persist = AsyncMock()
+        with patch.object(ac, "_persist_host_telemetry", persist):
+            await ac.handle_agent_status(
+                "host-1",
+                {
+                    "storage_enabled": False,
+                    "disk_total_gb": None,
+                    "disk_free_gb": None,
+                },
+            )
+
+        persist.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_reconcile_errors_swallowed(self, mock_settings):
         with patch.object(ac, "_reconcile_host_slots", AsyncMock(side_effect=RuntimeError("boom"))):
             await ac.handle_agent_status("host-1", {"slots": []})
+
+
+@pytest.mark.asyncio
+async def test_cpu_storage_heartbeat_withdraws_and_requires_valid_capacity():
+    host = SimpleNamespace(
+        compute_type="cpu",
+        storage_requested=True,
+        storage_enabled=True,
+        disk_total_gb=100,
+        disk_free_gb=50,
+        staged_images=None,
+        l0_version=None,
+    )
+    session = AsyncMock()
+    session.get = AsyncMock(return_value=host)
+
+    class SessionContext:
+        async def __aenter__(self):
+            return session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    with patch("api.database.get_session", side_effect=lambda: SessionContext()):
+        await ac._persist_host_telemetry(
+            "host-1",
+            {
+                "storage_enabled": False,
+                "disk_total_gb": None,
+                "disk_free_gb": None,
+            },
+        )
+        assert host.storage_enabled is False
+        assert host.disk_total_gb is None
+        assert host.disk_free_gb is None
+
+        # A claimed healthy TD without exact capacity remains withdrawn.
+        await ac._persist_host_telemetry("host-1", {"storage_enabled": True})
+        assert host.storage_enabled is False
+
+        await ac._persist_host_telemetry(
+            "host-1",
+            {"storage_enabled": True, "disk_total_gb": 200, "disk_free_gb": 125},
+        )
+
+    assert host.storage_enabled is True
+    assert host.disk_total_gb == 200
+    assert host.disk_free_gb == 125
+    assert session.commit.await_count == 2
 
 
 def _instance_row(instance_id="inst-1", config_id="cfg-1", created_at=OLD, server_id="srv-1"):

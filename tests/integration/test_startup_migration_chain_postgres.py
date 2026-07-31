@@ -182,11 +182,56 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
                     )
                 )
             }
+            # Exact old-binary gate: its SQL column list has storage_enabled but does not know the
+            # additive storage_requested column. Both INSERT and UPDATE must remain valid after the
+            # schema migration, and the compatibility trigger must preserve the new invariant.
+            await connection.execute(
+                text(
+                    "INSERT INTO metagraph_nodes (hotkey, netuid, checksum, coldkey) "
+                    "VALUES ('legacy-storage-owner', 64, 'legacy-storage', 'coldkey')"
+                )
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO hosts "
+                    "(host_id, name, miner_hotkey, netuid, tee_type, capacity, storage_enabled) "
+                    "VALUES ('legacy-storage-insert', 'legacy-storage-insert', "
+                    "'legacy-storage-owner', 64, 'tdx', 0, TRUE), "
+                    "('legacy-storage-update', 'legacy-storage-update', "
+                    "'legacy-storage-owner', 64, 'tdx', 4, FALSE)"
+                )
+            )
+            await connection.execute(
+                text(
+                    "UPDATE hosts SET capacity = 0, storage_enabled = TRUE "
+                    "WHERE host_id = 'legacy-storage-update'"
+                )
+            )
+            legacy_storage_rows = {
+                row.host_id: (
+                    row.storage_requested,
+                    row.storage_enabled,
+                    row.capacity,
+                )
+                for row in (
+                    await connection.execute(
+                        text(
+                            "SELECT host_id, storage_requested, storage_enabled, capacity "
+                            "FROM hosts WHERE host_id LIKE 'legacy-storage-%'"
+                        )
+                    )
+                )
+            }
+        assert legacy_storage_rows == {
+            "legacy-storage-insert": (True, True, 0),
+            "legacy-storage-update": (True, True, 0),
+        }
         assert {path.name.split("_", 1)[0] for path in _migration_paths()} <= versions
         assert {
             "trg_prevent_user_delete_before_chutefs_erasure",
             "trg_complete_launch_config_on_job_terminal",
             "trg_launch_terminal_registry_scope",
+            "trg_hosts_storage_capability_implies_intent",
         } <= triggers
         assert lineage_foreign_keys == {
             ("servers", "launch_reservation_id"): (

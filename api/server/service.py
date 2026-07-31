@@ -2772,15 +2772,25 @@ async def register_host(
         raise ServerRegistrationError(
             "Host telemetry cannot change the enrolled TEE, compute type, or release channel."
         )
-    if (authenticated_host.compute_type or "cpu") == "gpu" and not args.storage_enabled:
-        raise ServerRegistrationError("GPU hosts must remain storage-enabled.")
+    reported_storage_requested = (
+        bool(args.storage_enabled)
+        if args.storage_requested is None
+        else bool(args.storage_requested)
+    )
+    if (authenticated_host.compute_type or "cpu") == "gpu" and (
+        not reported_storage_requested or not args.storage_enabled
+    ):
+        raise ServerRegistrationError("GPU hosts must remain storage-requested and enabled.")
     capacity = int(args.capacity)
-    storage_enabled = bool(getattr(args, "storage_enabled", False))
+    # Registration is untrusted telemetry: it may opt in, but it cannot erase durable
+    # operator/release intent that must survive key reenrollment and image recovery.
+    storage_requested = bool(authenticated_host.storage_requested) or reported_storage_requested
+    storage_enabled = bool(getattr(args, "storage_enabled", False)) and storage_requested
     if capacity < 0 or capacity > 64:
         raise ServerRegistrationError("Host capacity must be in 0..64.")
-    if capacity == 0 and not storage_enabled:
+    if capacity == 0 and not storage_requested:
         raise ServerRegistrationError(
-            "capacity=0 is valid only for an enrolled ChuteFS storage host."
+            "capacity=0 is valid only for a storage-requested host."
         )
     observed_live_storage_ids = None
     if authenticated_host.compute_type == "gpu":
@@ -2817,10 +2827,17 @@ async def register_host(
     host = authenticated_host
     host.name = args.name or args.host_id
     host.reported_capacity = capacity
-    host.capacity = capacity
+    # Current agents reserve the storage slot before reporting capacity. A legacy/recovered agent
+    # that has not yet rediscovered durable intent reports raw compute capacity, so reserve it here.
+    host.capacity = (
+        capacity
+        if reported_storage_requested or not storage_requested
+        else max(0, capacity - 1)
+    )
     host.storage_enabled = storage_enabled
     host.storage_td_vcpus = args.storage_td_vcpus
     host.storage_td_mem = args.storage_td_mem
+    host.storage_requested = storage_requested
     host.default_mem = args.default_mem
     host.default_vcpus = args.default_vcpus
     host.external_host = args.external_host or None
@@ -2839,8 +2856,16 @@ async def register_host(
     host.ram_gb = mem.get("total_gb")
     # ChuteFS: physical disk inventory so the validator knows how much durable storage this host can
     # back. Reported explicitly by the agent (preferred) or denormalized from the specs disk list.
-    host.disk_total_gb = args.disk_total_gb or _sum_disk_gb(specs.get("disks"))
-    host.disk_free_gb = args.disk_free_gb
+    if storage_enabled:
+        host.disk_total_gb = (
+            args.disk_total_gb
+            if args.disk_total_gb is not None
+            else _sum_disk_gb(specs.get("disks"))
+        )
+        host.disk_free_gb = args.disk_free_gb
+    else:
+        host.disk_total_gb = None
+        host.disk_free_gb = None
     # L0 image identity (re-netboot update tracking); tolerate older agents that don't report it.
     if getattr(args, "l0_version", None):
         host.l0_version = args.l0_version
@@ -2870,9 +2895,9 @@ async def register_host(
     if (
         manifest is not None
         and manifest.storage is not None
-        and not host.storage_enabled
+        and not host.storage_requested
     ):
-        host.storage_enabled = True
+        host.storage_requested = True
         host.capacity = max(0, int(host.capacity or 0) - 1)
     if manifest is not None:
         active_release = (
@@ -2914,6 +2939,8 @@ async def register_host(
     response = {
         "host_id": host.host_id,
         "capacity": host.capacity,
+        "storage_requested": host.storage_requested,
+        "storage_enabled": host.storage_enabled,
         "status": "registered",
         "release": release,
     }

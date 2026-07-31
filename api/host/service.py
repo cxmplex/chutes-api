@@ -477,8 +477,9 @@ async def redeem_enrollment_voucher(
         )
     # GPU enrollment always carries storage. CPU storage is an explicit operator opt-in and must
     # survive identity/key rotation rather than being derived from compute type on every redeem.
-    storage_enabled_after_enrollment = request_compute == "gpu" or bool(
-        host is not None and host.storage_enabled
+    storage_requested_after_enrollment = request_compute == "gpu" or bool(
+        host is not None
+        and (host.storage_requested or host.storage_enabled)
     )
     if host is None:
         host = Host(
@@ -490,7 +491,8 @@ async def redeem_enrollment_voucher(
             compute_type=request_compute,
             release_channel=voucher.channel,
             capacity=1,
-            storage_enabled=storage_enabled_after_enrollment,
+            storage_requested=storage_requested_after_enrollment,
+            storage_enabled=request_compute == "gpu",
         )
         db.add(host)
         await db.flush()
@@ -539,7 +541,13 @@ async def redeem_enrollment_voucher(
     host.miner_hotkey = voucher.owner_hotkey
     host.tee_type = voucher.tee_type
     host.compute_type = request_compute
-    host.storage_enabled = storage_enabled_after_enrollment
+    host.storage_requested = storage_requested_after_enrollment
+    # A rotated CPU launcher must prove its currently healthy storage TD again through signed
+    # registration/heartbeat telemetry. Intent remains durable so it can obtain the recovery image.
+    host.storage_enabled = request_compute == "gpu"
+    if request_compute != "gpu":
+        host.disk_total_gb = None
+        host.disk_free_gb = None
     host.release_channel = voucher.channel
     host.enrollment_generation = voucher.enrollment_generation
     host.active_key_generation = next_key_generation
