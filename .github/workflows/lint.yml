@@ -42,7 +42,6 @@ jobs:
           tests/unit/test_gpu_runtime_sessions.py
           tests/unit/test_server_key_custody.py
           tests/unit/test_agent_channel_socket.py
-          tests/unit/test_schema_catalog_contract.py
           tests/unit/test_snp.py
           tests/unit/test_server_utils.py
           tests/unit/test_server_service.py
@@ -104,6 +103,20 @@ jobs:
           cosign version
       - name: Install test dependencies
         run: uv sync --extra dev
+      - name: Run required schema and migration foundation unit tests
+        run: >-
+          uv run pytest -q
+          tests/unit/test_storage_startup.py
+          tests/unit/test_cpu_scheduler.py
+          tests/unit/test_schema_catalog_contract.py
+          --junitxml=schema-migration-foundation.xml
+      - name: Reject skipped schema and migration foundation tests
+        run: >-
+          uv run python -c
+          "import xml.etree.ElementTree as E;
+          root=E.parse('schema-migration-foundation.xml').getroot();
+          skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
+          assert skipped == 0, f'{skipped} schema and migration foundation tests skipped'"
       - name: Run mandatory release unit tests
         run: >-
           uv run pytest -q
