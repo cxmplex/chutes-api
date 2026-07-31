@@ -1,6 +1,5 @@
 """Focused regressions for GPU lifecycle external-work boundaries."""
 
-import asyncio
 import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -59,14 +58,7 @@ async def test_job_port_failure_commits_before_deletion_publish(monkeypatch):
     async def _notify(_instance):
         events.append("notify")
 
-    def _create_task(coro):
-        assert events[-1] == "commit"
-        coro.close()
-        events.append("scheduled")
-        return SimpleNamespace()
-
     monkeypatch.setattr(instance_router, "notify_deleted", _notify)
-    monkeypatch.setattr(asyncio, "create_task", _create_task)
 
     with pytest.raises(HTTPException) as exc:
         await instance_router._verify_job_ports(
@@ -76,7 +68,7 @@ async def test_job_port_failure_commits_before_deletion_publish(monkeypatch):
         )
 
     assert exc.value.status_code == 403
-    assert events == ["execute", "commit", "scheduled"]
+    assert events == ["execute", "commit", "notify"]
 
 
 def test_verified_at_is_applied_only_after_port_cas():
