@@ -64,6 +64,7 @@ from api.bounty.util import (
     bounty_lifetime_for,
 )
 from api.instance.locking import prepare_instance_terminal_writes
+from api.host.locks import acquire_gpu_lifecycle_lock
 from api.instance.schemas import Instance
 from api.instance.util import get_chute_target_manager, cleanup_instance_conn_tracking
 from api.user.schemas import User, PriceOverride
@@ -357,7 +358,11 @@ async def unshare_chute(
         text(
             "delete from chute_shares where shared_by = :cuser_id and shared_to = :user_id and chute_id = :chute_id"
         ),
-        {"cuser_id": current_user.user_id, "user_id": user.user_id, "chute_id": chute.chute_id},
+        {
+            "cuser_id": current_user.user_id,
+            "user_id": user.user_id,
+            "chute_id": chute.chute_id,
+        },
     )
     await db.commit()
     return {
@@ -612,7 +617,12 @@ async def make_public(
             existing_public.shutdown_after_seconds = None
             existing_public.updated_at = func.now()
             notifications.append(
-                ("chute_updated", existing_public.chute_id, new_version, not existing_public.cords)
+                (
+                    "chute_updated",
+                    existing_public.chute_id,
+                    new_version,
+                    not existing_public.cords,
+                )
             )
             results.append(
                 {
@@ -1643,7 +1653,10 @@ async def _deploy_chute(
             detail="Chute cannot be public when image is not public!",
         )
     version = str(
-        uuid.uuid5(uuid.NAMESPACE_OID, f"{image.image_id}:{image.patch_version}:{chute_args.code}")
+        uuid.uuid5(
+            uuid.NAMESPACE_OID,
+            f"{image.image_id}:{image.patch_version}:{chute_args.code}",
+        )
     )
     chute = (
         (
@@ -1967,7 +1980,8 @@ async def _deploy_chute(
             chute = Chute(
                 chute_id=str(
                     uuid.uuid5(
-                        uuid.NAMESPACE_OID, f"{current_user.username}::chute::{chute_args.name}"
+                        uuid.NAMESPACE_OID,
+                        f"{current_user.username}::chute::{chute_args.name}",
                     )
                 ),
                 image_id=image.image_id,
@@ -2633,19 +2647,30 @@ async def update_common_attributes(
 
     # Handle disabled field
     deleted_instances = []
+    delete_disabled_bounty = False
     if args.disabled is not None:
+        # Chute disable is launch-authority revocation. Serialize it with model/session
+        # authorization before taking the Chute row lock so a public chute cannot race a
+        # capability consume while its instances intentionally remain present.
+        await acquire_gpu_lifecycle_lock(db)
+        chute = (
+            (
+                await db.execute(
+                    select(Chute)
+                    .where(Chute.chute_id == chute.chute_id)
+                    .options(selectinload(Chute.instances))
+                    .with_for_update(of=Chute)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .unique()
+            .scalar_one()
+        )
         chute.disabled = args.disabled
-
-        # Set the lightweight disabled flag in Redis for fast checks
-        await set_chute_disabled(chute.chute_id, args.disabled)
-
-        # Invalidate caches immediately so other processes see the updated state
-        await invalidate_chute_cache(chute.chute_id, chute.name)
 
         # If disabling a private chute, terminate all instances with valid_termination=true
         if args.disabled and not chute.public:
-            # Delete any active bounty to prevent new instances from spinning up
-            await delete_bounty(chute.chute_id)
+            delete_disabled_bounty = True
 
             instance_ids = [inst.instance_id for inst in chute.instances]
             if instance_ids:
@@ -2670,6 +2695,12 @@ async def update_common_attributes(
                     await db.delete(inst)
 
     await db.commit()
+    if args.disabled is not None:
+        # External cache/bounty work runs only after durable revocation released lifecycle custody.
+        await set_chute_disabled(chute.chute_id, args.disabled)
+        await invalidate_chute_cache(chute.chute_id, chute.name)
+        if delete_disabled_bounty:
+            await delete_bounty(chute.chute_id)
     for instance in deleted_instances:
         await notify_deleted(instance, "chute disabled")
     await db.refresh(chute)

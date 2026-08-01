@@ -691,9 +691,7 @@ class GpuDecommissionRequestV1(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema: Literal["chutes.gpu-decommission-request"] = (
-        "chutes.gpu-decommission-request"
-    )
+    schema: Literal["chutes.gpu-decommission-request"] = "chutes.gpu-decommission-request"
     version: Literal[1] = 1
     request_id: str
     reason: str = Field(..., min_length=1, max_length=2000)
@@ -1262,18 +1260,14 @@ class HostRegistrationArgs(BaseModel):
     @model_validator(mode="after")
     def _validate_zero_capacity_storage_enrollment(self):
         storage_requested = (
-            self.storage_enabled
-            if self.storage_requested is None
-            else self.storage_requested
+            self.storage_enabled if self.storage_requested is None else self.storage_requested
         )
         if self.compute_type == "gpu" and (
             self.tee_type != "tdx"
             or storage_requested is not True
             or self.storage_enabled is not True
         ):
-            raise ValueError(
-                "GPU hosts require TDX and storage_requested/storage_enabled=true"
-            )
+            raise ValueError("GPU hosts require TDX and storage_requested/storage_enabled=true")
         if self.compute_type == "cpu" and (
             self.untrusted_gpu_inventory is not None
             or self.untrusted_gpu_inventory_ready is not None
@@ -1291,12 +1285,16 @@ class HostRegistrationArgs(BaseModel):
             raise ValueError("capacity=0 is valid only for a storage-requested host")
         if self.storage_enabled and not storage_requested:
             raise ValueError("storage capability requires durable storage intent")
-        if self.compute_type == "cpu" and self.storage_enabled and (
-            self.disk_total_gb is None or self.disk_free_gb is None
+        if (
+            self.compute_type == "cpu"
+            and self.storage_enabled
+            and (self.disk_total_gb is None or self.disk_free_gb is None)
         ):
             raise ValueError("CPU storage capability requires current disk capacity")
-        if self.compute_type == "cpu" and not self.storage_enabled and (
-            self.disk_total_gb is not None or self.disk_free_gb is not None
+        if (
+            self.compute_type == "cpu"
+            and not self.storage_enabled
+            and (self.disk_total_gb is not None or self.disk_free_gb is not None)
         ):
             raise ValueError("CPU disk capacity cannot be advertised while storage is unhealthy")
         if (self.storage_td_vcpus is None) != (self.storage_td_mem is None):
@@ -1545,9 +1543,7 @@ class ServerAttestationSubject(Base):
     compute_type = Column(String, nullable=False)
     tee_type = Column(String, nullable=False)
     deployment_model = Column(String, nullable=False)
-    first_seen_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    first_seen_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
         UniqueConstraint(
@@ -1669,7 +1665,7 @@ class Server(Base):
 
     # True for 1-click CPU servers that self-registered via POST /servers/cpu/register
     # (the server attested + checked in itself), vs servers advertised by a miner control plane.
-    self_registered = Column(Boolean, default=False, server_default="false")
+    self_registered = Column(Boolean, nullable=False, default=False, server_default="false")
 
     # Attestation-bound TLS serving cert (PEM) for self-registered CPU TEE servers. The cert's
     # public-key hash is bound into the registration TDX quote report_data (verify_quote), so it is
@@ -2837,17 +2833,21 @@ BEGIN
             RAISE EXCEPTION 'decommissioned GPU server rows are immutable';
         END IF;
     ELSIF TG_OP = 'INSERT' THEN
-        IF TG_TABLE_NAME = 'gpu_infra_custodies' AND EXISTS (
-            SELECT 1 FROM gpu_server_decommissions
-             WHERE server_id = NEW.server_id
-        ) THEN
-            RAISE EXCEPTION 'decommissioned GPU custody cannot be recreated';
-        ELSIF TG_TABLE_NAME = 'gpu_legacy_migrations' AND EXISTS (
-            SELECT 1 FROM gpu_server_decommissions
-             WHERE server_id = NEW.legacy_server_id
-                OR server_id = NEW.target_server_id
-        ) THEN
-            RAISE EXCEPTION 'decommissioned GPU migration lineage cannot be recreated';
+        IF TG_TABLE_NAME = 'gpu_infra_custodies' THEN
+            IF EXISTS (
+                SELECT 1 FROM gpu_server_decommissions
+                 WHERE server_id = NEW.server_id
+            ) THEN
+                RAISE EXCEPTION 'decommissioned GPU custody cannot be recreated';
+            END IF;
+        ELSIF TG_TABLE_NAME = 'gpu_legacy_migrations' THEN
+            IF EXISTS (
+                SELECT 1 FROM gpu_server_decommissions
+                 WHERE server_id = NEW.legacy_server_id
+                    OR server_id = NEW.target_server_id
+            ) THEN
+                RAISE EXCEPTION 'decommissioned GPU migration lineage cannot be recreated';
+            END IF;
         END IF;
         RETURN NEW;
     ELSIF (to_jsonb(OLD)->>'state') = 'decommissioned' THEN
@@ -2868,12 +2868,10 @@ _GPU_DECOMMISSION_TERMINAL_DROP_SERVER = DDL(
     "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_server ON servers"
 ).execute_if(dialect="postgresql")
 _GPU_DECOMMISSION_TERMINAL_DROP_CUSTODY = DDL(
-    "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_custody "
-    "ON gpu_infra_custodies"
+    "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_custody ON gpu_infra_custodies"
 ).execute_if(dialect="postgresql")
 _GPU_DECOMMISSION_TERMINAL_DROP_MIGRATION = DDL(
-    "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_migration "
-    "ON gpu_legacy_migrations"
+    "DROP TRIGGER IF EXISTS preserve_gpu_decommissioned_migration ON gpu_legacy_migrations"
 ).execute_if(dialect="postgresql")
 _GPU_DECOMMISSION_TERMINAL_CREATE_SERVER = DDL(
     "CREATE TRIGGER preserve_gpu_decommissioned_server "

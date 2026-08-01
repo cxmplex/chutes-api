@@ -12,6 +12,7 @@ from sqlalchemy.exc import DBAPIError
 from api.chute.schemas import Chute
 from api.gpu_models import GpuLifecycleOperation
 from api.host.gpu_allocations import _retire_gpu_runtime_lineage
+from api.host.locks import acquire_gpu_lifecycle_lock
 from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
 from api.instance.schemas import Instance
 from api.user.schemas import User
@@ -166,9 +167,7 @@ async def test_lifecycle_create_all_and_migration_catalogs_match(postgres_schema
         assert create_all_catalog.returncode == 0, create_all_catalog.stderr.decode()
         assert migrated_catalog.returncode == 0, migrated_catalog.stderr.decode()
         assert create_all_catalog.stdout == migrated_catalog.stdout
-        assert b"idx_gpu_registration_attempt_reservation|true" in (
-            migrated_catalog.stdout
-        )
+        assert b"idx_gpu_registration_attempt_reservation|true" in (migrated_catalog.stdout)
     finally:
         migration_pg._drop_schema(migrated_schema)
 
@@ -273,9 +272,7 @@ async def test_gpu_runtime_billing_cutoff_is_first_write_wins(postgres_schema):
             gpu_management_mode="miner",
             gpu_launch_reservation_id=response.claims.reservation_id,
             gpu_allocation_group_id=response.claims.allocation_group_id,
-            gpu_allocation_group_generation=(
-                response.claims.allocation_group_generation
-            ),
+            gpu_allocation_group_generation=(response.claims.allocation_group_generation),
             gpu_process_incarnation=response.claims.process_incarnation,
         )
         session.add(instance)
@@ -285,6 +282,7 @@ async def test_gpu_runtime_billing_cutoff_is_first_write_wins(postgres_schema):
             GpuLaunchReservation,
             response.claims.reservation_id,
         )
+        await acquire_gpu_lifecycle_lock(session)
         await _retire_gpu_runtime_lineage(
             session,
             reservation,
@@ -299,6 +297,7 @@ async def test_gpu_runtime_billing_cutoff_is_first_write_wins(postgres_schema):
             GpuLaunchReservation,
             response.claims.reservation_id,
         )
+        await acquire_gpu_lifecycle_lock(session)
         await _retire_gpu_runtime_lineage(
             session,
             reservation,

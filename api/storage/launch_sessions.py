@@ -38,7 +38,7 @@ from api.server.schemas import (
     Server,
     StorageVolume,
 )
-from api.server.util import _get_client_certificate, get_public_key_hash
+from api.server.util import require_live_attested_client_cert
 from api.storage import startup as storage_startup
 from api.storage.schemas import LaunchStorageContext, LaunchStorageSessionResponse
 from api.storage.key_epochs import lock_token_key_epoch_for_session
@@ -119,16 +119,11 @@ async def lock_launch_storage_configurations(
     # transitions take the matching exclusive advisory lock first, so neither
     # can invert the User/config/session lock hierarchy.
     await db.execute(
-        text(
-            "SELECT pg_advisory_xact_lock_shared("
-            "hashtextextended(:lock_name, 0))"
-        ),
+        text("SELECT pg_advisory_xact_lock_shared(hashtextextended(:lock_name, 0))"),
         {"lock_name": _SCHEMA_FENCE_ADVISORY_LOCK},
     )
     await lock_token_key_epoch_for_session(db)
-    user_ids = sorted(
-        {user_id for _config_id, user_id in hints} | set(additional_user_ids)
-    )
+    user_ids = sorted({user_id for _config_id, user_id in hints} | set(additional_user_ids))
     locked_users = list(
         (
             await db.execute(
@@ -168,12 +163,8 @@ async def lock_launch_storage_configurations(
         .scalars()
         .all()
     )
-    expected_config_owners = sorted(
-        (config_id, user_id) for config_id, user_id in hints
-    )
-    actual_config_owners = sorted(
-        (config.config_id, config.user_id) for config in locked_configs
-    )
+    expected_config_owners = sorted((config_id, user_id) for config_id, user_id in hints)
+    actual_config_owners = sorted((config.config_id, config.user_id) for config in locked_configs)
     if actual_config_owners != expected_config_owners:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -260,10 +251,7 @@ def _canonical_digest(value: str) -> str:
 
 def _token_key(key_id: str) -> bytes:
     key = settings.chutefs_token_keys.get(key_id)
-    if (
-        key is None
-        or not storage_startup.token_key_material_is_validated(key_id, key)
-    ):
+    if key is None or not storage_startup.token_key_material_is_validated(key_id, key):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="The ChuteFS session token key is unavailable.",
@@ -304,9 +292,7 @@ def _rotation_request_digest(
 ) -> str:
     if purpose not in {"refresh", "reexchange"}:
         raise ValueError("Unsupported ChuteFS session rotation purpose.")
-    return _canonical_digest(
-        f"chutes.chutefs-session-{purpose}.v1\0{session_id}\0{token_hash}"
-    )
+    return _canonical_digest(f"chutes.chutefs-session-{purpose}.v1\0{session_id}\0{token_hash}")
 
 
 def _issue_request_digest(config_id: str, instance_id: str) -> str:
@@ -325,11 +311,7 @@ async def _active_token_key_id(db: AsyncSession) -> str:
             )
         ).scalars()
     )
-    key = (
-        settings.chutefs_token_keys.get(key_ids[0])
-        if len(key_ids) == 1
-        else None
-    )
+    key = settings.chutefs_token_keys.get(key_ids[0]) if len(key_ids) == 1 else None
     if (
         len(key_ids) != 1
         or key is None
@@ -374,14 +356,10 @@ def _current_session_identity(
             reservation.process_incarnation if reservation is not None else None
         ),
         "attestation_id": (
-            server.gpu_runtime_session_attestation_id
-            if config.compute_type == "gpu"
-            else None
+            server.gpu_runtime_session_attestation_id if config.compute_type == "gpu" else None
         ),
         "attested_cert_pubkey_hash": (
-            server.attested_cert_pubkey_hash.lower()
-            if server.attested_cert_pubkey_hash
-            else None
+            server.attested_cert_pubkey_hash.lower() if server.attested_cert_pubkey_hash else None
         ),
         "revocation_epoch": instance.storage_revocation_epoch,
     }
@@ -417,8 +395,7 @@ async def _prune_expired_session_lineage(
                     ChuteFSLaunchSession.response_replay_until <= now,
                     ~select(replay_successor.session_id)
                     .where(
-                        replay_successor.rotated_from_session_id
-                        == ChuteFSLaunchSession.session_id,
+                        replay_successor.rotated_from_session_id == ChuteFSLaunchSession.session_id,
                         replay_successor.revoked_at.is_(None),
                         replay_successor.response_replay_until > now,
                     )
@@ -435,9 +412,7 @@ async def _prune_expired_session_lineage(
     )
     if session_ids:
         await db.execute(
-            delete(ChuteFSLaunchSession).where(
-                ChuteFSLaunchSession.session_id.in_(session_ids)
-            )
+            delete(ChuteFSLaunchSession).where(ChuteFSLaunchSession.session_id.in_(session_ids))
         )
     return len(session_ids)
 
@@ -488,30 +463,7 @@ async def _require_presented_attested_cert(
     request: Request,
     server: Server,
 ) -> str:
-    if not settings.require_mtls_client_verify:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Launch-bound platform storage requires a verifying mTLS terminator.",
-        )
-    try:
-        cert_hash = get_public_key_hash(
-            _get_client_certificate(request, require_proxy_verified=True)
-        ).lower()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Current attested mTLS possession could not be verified.",
-        ) from exc
-    if not server.attested_cert_pubkey_hash or not hmac.compare_digest(
-        server.attested_cert_pubkey_hash.lower(), cert_hash
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Presented mTLS identity is not the launch server's attested identity.",
-        )
-    return cert_hash
+    return require_live_attested_client_cert(request, server)
 
 
 async def _load_current_lineage(
@@ -649,10 +601,7 @@ async def _load_current_lineage(
         reservation = (
             await db.execute(
                 select(GpuLaunchReservation)
-                .where(
-                    GpuLaunchReservation.reservation_id
-                    == config.gpu_launch_reservation_id
-                )
+                .where(GpuLaunchReservation.reservation_id == config.gpu_launch_reservation_id)
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
@@ -662,8 +611,7 @@ async def _load_current_lineage(
                 await db.execute(
                     select(GpuAllocationGroup)
                     .where(
-                        GpuAllocationGroup.allocation_group_id
-                        == reservation.allocation_group_id
+                        GpuAllocationGroup.allocation_group_id == reservation.allocation_group_id
                     )
                     .with_for_update()
                     .execution_options(populate_existing=True)
@@ -736,7 +684,7 @@ async def _load_current_lineage(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="GPU launch reservation or allocation identity is no longer current.",
             )
-        if mode == "platform" and require_client_mtls:
+        if require_client_mtls:
             if request is None:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -1172,9 +1120,7 @@ async def _rotate_launch_storage_session(
             )
         )
     ).scalar_one_or_none()
-    if config_id is None or (
-        expected_config_id is not None and config_id != expected_config_id
-    ):
+    if config_id is None or (expected_config_id is not None and config_id != expected_config_id):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=failure_detail,
@@ -1219,8 +1165,7 @@ async def _rotate_launch_storage_session(
             or successor.revoked_at is not None
             or successor.response_replay_until is None
             or successor.response_replay_until <= now
-            or successor.rotated_from_session_sha256
-            != _canonical_digest(row.session_id)
+            or successor.rotated_from_session_sha256 != _canonical_digest(row.session_id)
         ):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

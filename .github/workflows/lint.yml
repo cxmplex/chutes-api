@@ -146,8 +146,23 @@ jobs:
 
   cross-repository-contracts:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: chutes
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d chutes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     env:
       CHUTES_CROSS_REPO_ROOT: ${{ github.workspace }}/cohort
+      TEST_DATABASE_URL: postgresql+asyncpg://user:password@127.0.0.1:5432/chutes
     steps:
       - name: Check out API under the cohort root
         uses: actions/checkout@v4
@@ -183,6 +198,7 @@ jobs:
         run: >-
           uv run pytest -q
           tests/unit/test_gpu_cross_worktree_contracts.py
+          tests/integration/test_gpu_registration_agent_cross_repo.py
           --junitxml=cross-repository-contracts.xml
       - name: Reject skipped cross-repository fixtures
         working-directory: cohort/chutes-api

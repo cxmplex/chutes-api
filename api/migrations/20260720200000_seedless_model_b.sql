@@ -657,7 +657,7 @@ END
 $$;
 
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS launch_reservation_id TEXT;
+    ADD COLUMN IF NOT EXISTS launch_reservation_id VARCHAR;
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS launch_boot_generation INTEGER;
 

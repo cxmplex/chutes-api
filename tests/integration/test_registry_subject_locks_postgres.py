@@ -27,6 +27,13 @@ pytestmark = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def nv_attest():
+    """Do not gate pure PostgreSQL lock tests on the optional GPU verifier CLI."""
+
+    yield
+
+
 @pytest_asyncio.fixture
 async def postgres_sessions():
     engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)

@@ -7,6 +7,7 @@ import base64
 import hashlib
 import os
 import uuid
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -161,10 +162,17 @@ PRE_MIGRATION_DDL = """
     DROP INDEX IF EXISTS idx_storage_objects_pending;
     DROP INDEX IF EXISTS idx_storage_objects_current;
     DROP INDEX IF EXISTS uq_storage_object_current;
+    DROP INDEX IF EXISTS idx_storage_objects_volume;
     DROP INDEX IF EXISTS idx_storage_objects_reconcile;
     ALTER TABLE storage_objects DROP CONSTRAINT IF EXISTS ck_storage_object_lifecycle_state;
     ALTER TABLE storage_objects DROP CONSTRAINT IF EXISTS fk_storage_object_expected_predecessor;
+    ALTER TABLE storage_objects DROP CONSTRAINT IF EXISTS uq_storage_object_key;
+    ALTER TABLE storage_objects
+        DROP CONSTRAINT IF EXISTS storage_objects_volume_id_object_key_key;
     ALTER TABLE storage_objects ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE storage_objects
+        ADD CONSTRAINT storage_objects_volume_id_object_key_key
+        UNIQUE (volume_id, object_key);
     ALTER TABLE storage_objects DROP COLUMN IF EXISTS tombstoned_at;
     ALTER TABLE storage_objects DROP COLUMN IF EXISTS superseded_at;
     ALTER TABLE storage_objects DROP COLUMN IF EXISTS committed_at;
@@ -969,6 +977,124 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
         await admin.dispose()
 
 
+async def test_legacy_adoption_revalidates_server_identity_after_rotation_lock(
+    pg_session, monkeypatch
+):
+    db, redis = pg_session
+    server = await _server(db, redis, "legacy-race-holder", "legacy-race-host")
+    server_id = server.server_id
+    old_incarnation = server.storage_incarnation
+    old_cert_hash = server.attested_cert_pubkey_hash
+    volume = await _volume(db, 1)
+    object_id = "legacy-race-object"
+    placement_id = "legacy-race-placement"
+    # This row represents a production object created before the enforced generation trigger.
+    # Suppress triggers only while loading the fixture, then restore enforcement before the race.
+    await db.execute(text("SET LOCAL session_replication_role = replica"))
+    await db.execute(
+        StorageObject.__table__.insert().values(
+            object_id=object_id,
+            volume_id=volume.volume_id,
+            object_key="legacy-race-key",
+            lifecycle_state="committed",
+            size_bytes=32,
+            projected_size_bytes=32,
+            ciphertext_size_bytes=None,
+            sha256="7" * 64,
+            salt=base64.b64encode(hashlib.sha256(object_id.encode()).digest()).decode(),
+            durability_state="irrecoverable",
+            durable_replica_count=0,
+            committed_at=NOW,
+        )
+    )
+    await db.execute(
+        ReplicaPlacement.__table__.insert().values(
+            placement_id=placement_id,
+            object_id=object_id,
+            server_id=server_id,
+            status="evicted",
+            storage_incarnation=None,
+            target_cert_pubkey_hash=None,
+            attempt_count=0,
+            last_error="legacy_adoption_required",
+        )
+    )
+    await db.execute(text("SET LOCAL session_replication_role = origin"))
+    await db.commit()
+    submission = {
+        "object_id": object_id,
+        "result": "verified",
+        "ciphertext_sha256": "7" * 64,
+        "ciphertext_size_bytes": 48,
+        "plaintext_size_bytes": 32,
+        "plaintext_sha256": "8" * 64,
+    }
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as locker, factory() as adopter:
+        locked_revalidation_entered = asyncio.Event()
+        original_require_server = service._require_legacy_adoption_server
+
+        async def observed_require_server(*args, **kwargs):
+            if kwargs.get("lock") is True:
+                locked_revalidation_entered.set()
+            return await original_require_server(*args, **kwargs)
+
+        monkeypatch.setattr(
+            service,
+            "_require_legacy_adoption_server",
+            observed_require_server,
+        )
+        # Match production: require_attested_caller and the service share this identity map.
+        adopter_caller = await adopter.get(Server, server_id)
+        rotating_server = (
+            await locker.execute(
+                select(Server).where(Server.server_id == server_id).with_for_update()
+            )
+        ).scalar_one()
+        rotating_server.attested_cert_pubkey_hash = "9" * 64
+        await locker.flush()
+
+        adoption = asyncio.create_task(
+            service.adopt_legacy_replicas(
+                adopter,
+                adopter_caller,
+                old_incarnation,
+                [submission],
+            )
+        )
+        try:
+            await asyncio.wait_for(locked_revalidation_entered.wait(), timeout=5)
+            assert not adoption.done()
+            await locker.commit()
+            with pytest.raises(HTTPException) as stale_identity:
+                await asyncio.wait_for(adoption, timeout=5)
+            assert stale_identity.value.status_code == 403
+        finally:
+            if locker.in_transaction():
+                await locker.rollback()
+            if not adoption.done():
+                adoption.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await adoption
+
+    db.expire_all()
+    obj = await db.get(StorageObject, object_id)
+    placement = await db.get(ReplicaPlacement, placement_id)
+    assert obj.ciphertext_size_bytes is None
+    assert obj.legacy_adopted_at is None
+    assert obj.legacy_adoption_placement_id is None
+    assert obj.legacy_adoption_server_id is None
+    assert obj.legacy_adoption_cert_pubkey_hash is None
+    assert obj.legacy_adoption_storage_incarnation is None
+    assert placement.status == "evicted"
+    assert placement.proof_at is None
+    assert placement.proof_mode is None
+    assert placement.storage_incarnation is None
+    assert placement.target_cert_pubkey_hash is None
+    assert old_cert_hash != "9" * 64
+
+
 async def test_secure_replication_migration_down_up_round_trip(pg_session):
     db, redis = pg_session
     legacy_server = await _server(db, redis, "migration-storage", "migration-host")
@@ -1213,6 +1339,7 @@ async def test_orm_bootstrap_cannot_skip_secure_replication_quarantine():
                     SELECT 1
                     FROM pg_trigger
                     WHERE tgname = 'trg_storage_hygiene_object'
+                      AND tgrelid = 'storage_objects'::regclass
                       AND NOT tgisinternal
                 )
                 """
@@ -1545,15 +1672,13 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
             versions = set(
                 (
                     await connection.execute(
-                        text("SELECT version FROM schema_migrations WHERE version >= :cutoff"),
-                        {"cutoff": database_migrations.TRACKED_MIGRATION_BASELINE},
+                        text("SELECT version FROM schema_migrations"),
                     )
                 ).scalars()
             )
             expected_versions = {
                 path.name.split("_", 1)[0]
                 for path in (Path(__file__).resolve().parents[2] / "api/migrations").glob("*.sql")
-                if path.name.split("_", 1)[0] >= database_migrations.TRACKED_MIGRATION_BASELINE
             }
             assert versions == expected_versions
             server_health_shape = (
@@ -1615,6 +1740,7 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
                         SELECT EXISTS (
                             SELECT 1 FROM pg_trigger
                             WHERE tgname = 'trg_storage_hygiene_object'
+                              AND tgrelid = 'storage_objects'::regclass
                               AND NOT tgisinternal
                         )
                         """
@@ -2294,6 +2420,122 @@ async def test_one_use_capability_drives_initial_copy_and_repair(pg_session):
             ciphertext_size,
         )
     assert stale_idempotent_receipt.value.status_code == 409
+
+
+async def test_replication_receipt_rechecks_deadline_after_authority_lock_wait(
+    pg_session, monkeypatch
+):
+    db, redis = pg_session
+    source_identity = _attested_identity("receipt-lock-source")
+    source = await _server(
+        db,
+        redis,
+        "receipt-lock-source",
+        "receipt-lock-source-host",
+        attested_identity=source_identity,
+    )
+    target = await _server(db, redis, "receipt-lock-target", "receipt-lock-target-host")
+    volume = await _volume(db, 2)
+    obj = await _object(db, volume, "receipt-lock-object", size_bytes=32)
+    await _placement(db, obj, source, status="pending")
+    target_placement = await _placement(db, obj, target, status="pending")
+    target_placement_id = target_placement.placement_id
+    digest = "e" * 64
+    ciphertext_size = 80
+    assert (
+        await service.announce_replicas(
+            db,
+            MINER,
+            source.server_id,
+            source.server_id,
+            source.storage_incarnation,
+            [
+                {
+                    "object_id": obj.object_id,
+                    "status": "stored",
+                    "ciphertext_sha256": digest,
+                    "ciphertext_size_bytes": ciphertext_size,
+                    "plaintext_size_bytes": 32,
+                    "plaintext_sha256": "f" * 64,
+                }
+            ],
+        )
+        == 1
+    )
+    lease = await service.issue_replication_capability(
+        db,
+        source,
+        obj.object_id,
+        target.server_id,
+        digest,
+        ciphertext_size,
+    )
+    await service.consume_replication_capability(
+        db,
+        target,
+        lease["capability"],
+        _sign_capability(source_identity, lease["capability"]),
+    )
+
+    capability = await db.get(StorageReplicationCapability, lease["capability_id"])
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=2)
+    capability.expires_at = deadline
+    capability.transfer_deadline = deadline
+    target_placement.pending_deadline = deadline
+    await db.commit()
+
+    lock_wait_entered = asyncio.Event()
+    original_locked_servers = service._locked_replication_servers
+
+    async def delayed_locked_servers(*args, **kwargs):
+        lock_wait_entered.set()
+        return await original_locked_servers(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_locked_replication_servers", delayed_locked_servers)
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as locker, factory() as contender:
+        await locker.execute(
+            select(Server).where(Server.server_id == target.server_id).with_for_update()
+        )
+        contender_target = await contender.get(Server, target.server_id)
+        completion = asyncio.create_task(
+            service.complete_replication_capability(
+                contender,
+                contender_target,
+                lease["capability"],
+                digest,
+                ciphertext_size,
+            )
+        )
+        try:
+            await asyncio.wait_for(lock_wait_entered.wait(), timeout=5)
+
+            async def wait_until_expired():
+                while datetime.now(timezone.utc) <= deadline:
+                    await asyncio.sleep(0.02)
+
+            await asyncio.wait_for(wait_until_expired(), timeout=5)
+            await locker.commit()
+
+            with pytest.raises(HTTPException) as expired:
+                await asyncio.wait_for(completion, timeout=5)
+            assert expired.value.status_code == 409
+        finally:
+            if locker.in_transaction():
+                await locker.rollback()
+            if not completion.done():
+                completion.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await completion
+
+    db.expire_all()
+    capability = await db.get(StorageReplicationCapability, lease["capability_id"])
+    target_placement = await db.get(ReplicaPlacement, target_placement_id)
+    assert capability.completed_at is None
+    assert target_placement.proof_at is None
+    assert target_placement.proof_capability_id is None
+    assert target_placement.confirmed_at is None
+    assert target_placement.status == "pending"
 
 
 async def test_capability_rejects_wrong_object_hash_size_expiry_and_incarnation(
@@ -3254,6 +3496,7 @@ async def test_delete_object_uses_bounded_fence_pages(pg_session, monkeypatch):
 async def test_overwrite_quota_reserves_positive_delta_and_releases_expiry(pg_session):
     db, redis = pg_session
     server = await _server(db, redis, "quota-delta-target", "quota-delta-host")
+    server_id = server.server_id
     user = await db.get(User, USER_ID)
     user.storage_volume_quota_bytes = 10
     user.storage_aggregate_quota_bytes = 100
@@ -3281,9 +3524,7 @@ async def test_overwrite_quota_reserves_positive_delta_and_releases_expiry(pg_se
         )
         placement = (
             await db.execute(
-                select(ReplicaPlacement).where(
-                    ReplicaPlacement.object_id == generation.object_id
-                )
+                select(ReplicaPlacement).where(ReplicaPlacement.object_id == generation.object_id)
             )
         ).scalar_one()
         placement.pending_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -3302,6 +3543,8 @@ async def test_overwrite_quota_reserves_positive_delta_and_releases_expiry(pg_se
     assert volume_limit.value.status_code == 413
     assert "Volume quota exceeded" in volume_limit.value.detail
     await db.rollback()
+    server = await db.get(Server, server_id)
+    assert server is not None
 
     # Exercise aggregate accounting separately: 16 committed bytes plus a 2-byte overwrite delta
     # exactly fits; a 3-byte delta does not. Expired reservations from the first volume stay free.
@@ -3323,9 +3566,7 @@ async def test_overwrite_quota_reserves_positive_delta_and_releases_expiry(pg_se
     aggregate_volume.used_bytes = 8
     await db.commit()
 
-    replacement = await reserve_then_expire(
-        aggregate_volume, aggregate_predecessor.object_key, 10
-    )
+    replacement = await reserve_then_expire(aggregate_volume, aggregate_predecessor.object_key, 10)
     assert replacement.expected_predecessor_id == aggregate_predecessor.object_id
     with pytest.raises(HTTPException) as aggregate_limit:
         await service.plan_object_placement(
@@ -3813,6 +4054,75 @@ async def test_inventory_cutoff_preserves_new_and_proven_during_scan_placements(
     assert new_placement.status == "present"
 
 
+async def test_later_serialized_inventory_sighting_uses_database_wall_clock(pg_session):
+    db, redis = pg_session
+    holder = await _server(db, redis, "inventory-order-holder", "inventory-order-host")
+    holder_id = holder.server_id
+    holder_incarnation = holder.storage_incarnation
+    volume = await _volume(db, 1)
+    obj = await _object(
+        db,
+        volume,
+        "inventory-order-object",
+        sha256="5" * 64,
+        size_bytes=17,
+    )
+    placement = await _placement(db, obj, holder, status="present")
+    placement_id = placement.placement_id
+    empty_snapshot_id = str(uuid.uuid4())
+    sighting_snapshot_id = str(uuid.uuid4())
+    entry = {
+        "volume_id": volume.volume_id,
+        "object_id": obj.object_id,
+        "ciphertext_sha256": obj.sha256,
+        "ciphertext_size_bytes": obj.ciphertext_size_bytes,
+    }
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as earlier_transaction, factory() as later_transaction:
+        # Anchor this transaction before the empty snapshot, but publish its sighting afterward.
+        anchored_at = await earlier_transaction.scalar(select(func.now()))
+        assert anchored_at is not None
+        await asyncio.sleep(0.05)
+
+        later_holder = await later_transaction.get(Server, holder_id)
+        await service.record_inventory_page(
+            later_transaction,
+            later_holder,
+            empty_snapshot_id,
+            holder_incarnation,
+            [],
+            True,
+        )
+        earlier_holder = await earlier_transaction.get(Server, holder_id)
+        await service.record_inventory_page(
+            earlier_transaction,
+            earlier_holder,
+            sighting_snapshot_id,
+            holder_incarnation,
+            [entry],
+            True,
+        )
+
+    db.expire_all()
+    empty_snapshot = await db.get(StorageInventorySnapshot, empty_snapshot_id)
+    sighting_snapshot = await db.get(StorageInventorySnapshot, sighting_snapshot_id)
+    empty_cutoff = empty_snapshot.eligibility_cutoff_at
+    assert empty_snapshot.completed_at < sighting_snapshot.completed_at
+    assert sighting_snapshot.completed_at > anchored_at
+    assert await service._reconcile_inventory_omissions(
+        db,
+        max_snapshots=2,
+        max_placements=10,
+    ) == (0, 2)
+
+    db.expire_all()
+    placement = await db.get(ReplicaPlacement, placement_id)
+    assert placement.status == "present"
+    assert placement.last_inventory_snapshot_id == sighting_snapshot_id
+    assert placement.last_inventory_seen_at > empty_cutoff
+
+
 async def test_attested_receipt_drives_exact_accounting_and_aggregate_quota(pg_session):
     db, redis = pg_session
     user = await db.get(User, USER_ID)
@@ -4020,7 +4330,8 @@ async def test_model_inventory_heartbeat_bridges_reconcile_cadence_jitter(pg_ses
     assert await service.model_peers(db, "org/authoritative", "a" * 40) == []
 
     scanning_snapshot_id = str(uuid.uuid4())
-    heartbeat_started_at = datetime.now(timezone.utc)
+    heartbeat_started_at = await db.scalar(select(func.now()))
+    assert heartbeat_started_at is not None
     assert await service.announce_model_holdings(
         db,
         MINER,
@@ -4150,7 +4461,8 @@ async def test_more_than_ten_active_model_streams_keep_waiting_marker_fresh(
         await db.commit()
         assert await service.model_peers(db, "org/authoritative-10", f"{10:040x}") == []
 
-        heartbeat_started_at = datetime.now(timezone.utc)
+        heartbeat_started_at = await db.scalar(select(func.now()))
+        assert heartbeat_started_at is not None
         await service.announce_model_holdings(
             db,
             MINER,
@@ -4497,6 +4809,94 @@ async def test_newest_completed_model_snapshot_wins_when_reconciliation_overlaps
     ]
 
 
+async def test_later_serialized_model_snapshot_uses_database_wall_clock(pg_session):
+    db, redis = pg_session
+    holder = await _server(db, redis, "model-order-holder", "model-order-host")
+    holder_id = holder.server_id
+    holder_incarnation = holder.storage_incarnation
+    empty_snapshot_id = str(uuid.uuid4())
+    authoritative_snapshot_id = str(uuid.uuid4())
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as earlier_transaction, factory() as later_transaction:
+        # PostgreSQL now() is fixed at transaction start; this transaction publishes second.
+        anchored_at = await earlier_transaction.scalar(select(func.now()))
+        assert anchored_at is not None
+        await asyncio.sleep(0.05)
+
+        later_holder = await later_transaction.get(Server, holder_id)
+        await service.announce_model_holdings(
+            later_transaction,
+            MINER,
+            holder_id,
+            later_holder.server_id,
+            empty_snapshot_id,
+            0,
+            holder_incarnation,
+            100,
+            [],
+            True,
+        )
+        earlier_holder = await earlier_transaction.get(Server, holder_id)
+        await service.announce_model_holdings(
+            earlier_transaction,
+            MINER,
+            holder_id,
+            earlier_holder.server_id,
+            authoritative_snapshot_id,
+            0,
+            holder_incarnation,
+            100,
+            [{"repo_id": "org/transaction-order", "revision": "6" * 40, "bytes": 23}],
+            True,
+        )
+
+    db.expire_all()
+    empty_snapshot = await db.get(StorageModelInventorySnapshot, empty_snapshot_id)
+    authoritative_snapshot = await db.get(StorageModelInventorySnapshot, authoritative_snapshot_id)
+    assert empty_snapshot.started_at < authoritative_snapshot.started_at
+    assert authoritative_snapshot.started_at > anchored_at
+
+    for _ in range(4):
+        await service._reconcile_model_inventory_snapshots(
+            db,
+            max_snapshots=2,
+            max_entries=100,
+        )
+        db.expire_all()
+        states = dict(
+            (
+                await db.execute(
+                    select(
+                        StorageModelInventorySnapshot.snapshot_id,
+                        StorageModelInventorySnapshot.state,
+                    ).where(
+                        StorageModelInventorySnapshot.snapshot_id.in_(
+                            [empty_snapshot_id, authoritative_snapshot_id]
+                        )
+                    )
+                )
+            ).all()
+        )
+        if states == {
+            empty_snapshot_id: "reconciled",
+            authoritative_snapshot_id: "reconciled",
+        }:
+            break
+    else:
+        pytest.fail("serialized model inventory snapshots did not reconcile")
+
+    holdings = list(
+        (await db.execute(select(ContentHolding).where(ContentHolding.server_id == holder_id)))
+        .scalars()
+        .all()
+    )
+    assert [
+        (holding.repo_id, holding.revision, holding.bytes, holding.last_snapshot_id)
+        for holding in holdings
+    ] == [("org/transaction-order", "6" * 40, 23, authoritative_snapshot_id)]
+
+
 async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_arriving(
     pg_session,
 ):
@@ -4618,7 +5018,17 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
 
     assert active_snapshot.applied_entries == 1001
     assert len(waiting_snapshot_ids) > 1
-    newest_waiting_id = waiting_snapshot_ids[-1]
+    newest_waiting_id = await db.scalar(
+        select(StorageModelInventorySnapshot.snapshot_id)
+        .where(StorageModelInventorySnapshot.snapshot_id.in_(waiting_snapshot_ids))
+        .order_by(
+            StorageModelInventorySnapshot.started_at.desc(),
+            StorageModelInventorySnapshot.snapshot_id.desc(),
+        )
+        .limit(1)
+    )
+    assert newest_waiting_id is not None
+    newest_waiting_version = waiting_snapshot_ids.index(newest_waiting_id)
     for _ in range(20):
         await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=250)
         db.expire_all()
@@ -4629,7 +5039,9 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
         pytest.fail("newest waiting model snapshot did not reconcile")
 
     assert newest_waiting.application_started_at is not None
-    for superseded_id in waiting_snapshot_ids[:-1]:
+    for superseded_id in (
+        snapshot_id for snapshot_id in waiting_snapshot_ids if snapshot_id != newest_waiting_id
+    ):
         superseded = await db.get(StorageModelInventorySnapshot, superseded_id)
         assert superseded.state == "reconciled"
         assert superseded.application_started_at is None
@@ -4640,7 +5052,7 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
     )
     assert [
         (holding.repo_id, holding.bytes, holding.last_snapshot_id) for holding in final_holdings
-    ] == [("org/winner", len(waiting_snapshot_ids) - 1, newest_waiting_id)]
+    ] == [("org/winner", newest_waiting_version, newest_waiting_id)]
 
 
 async def test_newer_snapshot_omits_late_applied_older_rows_but_not_future_rows(
@@ -4839,10 +5251,7 @@ async def test_reconcile_advisory_lock_survives_work_commits(pg_session, monkeyp
             contender_results.append(
                 (
                     await contender.execute(
-                        text(
-                            "SELECT pg_try_advisory_lock("
-                            "hashtextextended(:lock_key, 0))"
-                        ),
+                        text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
                         {"lock_key": storage_reconcile._RECONCILE_LOCK_KEY},
                     )
                 ).scalar_one()

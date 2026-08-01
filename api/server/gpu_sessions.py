@@ -44,6 +44,11 @@ GPU_RUNTIME_SESSION_PURPOSES = (
 )
 GPU_PLATFORM_RUNTIME_SESSION_PURPOSES = ("registry",)
 GPU_RUNTIME_SESSION_LIFETIME_SECONDS = 900
+GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS = 5
+
+
+def _runtime_session_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -98,8 +103,7 @@ def _current_attestation_identity(
         or attestation.verified_at is None
         or attestation.verified_at < cutoff
         or attestation.measurement_name != server.measurement_name
-        or attestation.measurement_config_fingerprint
-        != server.measurement_config_fingerprint
+        or attestation.measurement_config_fingerprint != server.measurement_config_fingerprint
         or attestation.trust_set_fingerprint != server.trust_set_fingerprint
         or dict(attestation.revocation_status or {})
         != dict(server.attestation_revocation_status or {})
@@ -119,9 +123,7 @@ def _current_attestation(
     expected_id: str | None = None,
 ) -> ServerAttestation:
     try:
-        attestation = _current_attestation_identity(
-            server, attestation, expected_id=expected_id
-        )
+        attestation = _current_attestation_identity(server, attestation, expected_id=expected_id)
     except HTTPException as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -131,8 +133,7 @@ def _current_attestation(
         attestation.gpu_retired_at is not None
         or attestation.gpu_launch_reservation_id != server.gpu_launch_reservation_id
         or attestation.gpu_allocation_group_id != server.gpu_allocation_group_id
-        or attestation.gpu_allocation_group_generation
-        != server.gpu_allocation_group_generation
+        or attestation.gpu_allocation_group_generation != server.gpu_allocation_group_generation
         or attestation.gpu_management_mode != server.gpu_management_mode
         or attestation.gpu_process_incarnation != server.gpu_process_incarnation
         or attestation.gpu_topology_fingerprint != server.gpu_topology_fingerprint
@@ -187,8 +188,7 @@ def _gpu_inventory_report_matches_group(
         if item.topology_fingerprint == group.topology_fingerprint
         and [device.bdf for device in item.devices] == list(group.gpu_bdfs)
         and [device.uuid for device in item.devices] == list(group.gpu_uuids)
-        and [device.gpu_identifier for device in item.devices]
-        == list(group.gpu_identifiers)
+        and [device.gpu_identifier for device in item.devices] == list(group.gpu_identifiers)
         and [device.attestation_certificate_sha256 for device in item.devices]
         == list(group.gpu_attestation_certificate_sha256s)
     ]
@@ -199,9 +199,7 @@ def _gpu_inventory_report_matches_group(
         and report.report_id == claims.report_id
         and report.report_generation == claims.report_generation
         and report.host_id == claims.host_id == host.host_id == group.host_id
-        and report.host_key_generation
-        == claims.host_key_generation
-        == expected_host_key_generation
+        and report.host_key_generation == claims.host_key_generation == expected_host_key_generation
         and report.host_boot_generation
         == claims.host_boot_generation
         == expected_host_boot_generation
@@ -211,10 +209,7 @@ def _gpu_inventory_report_matches_group(
         == claims.profile_contract_sha256
         == group.profile_contract_sha256
         and report.topology_fingerprint == group.topology_fingerprint
-        and (
-            not require_group_report_link
-            or group.last_report_id == report.report_id
-        )
+        and (not require_group_report_link or group.last_report_id == report.report_id)
         and (
             not require_host_latest
             or (
@@ -235,36 +230,28 @@ async def _completed_gpu_registration_authority(
     """Validate completed Registration V2 authority and optional operational evidence."""
 
     await acquire_gpu_lifecycle_lock(db)
-    attempts = list(
-        (
-            await db.execute(
-                select(GpuRegistrationAttempt)
-                .where(
-                    GpuRegistrationAttempt.reservation_id == reservation.reservation_id,
-                    GpuRegistrationAttempt.state == "completed",
-                )
-                .order_by(
-                    GpuRegistrationAttempt.completed_at,
-                    GpuRegistrationAttempt.attempt_id,
-                )
-                .with_for_update()
+    attempt = (
+        await db.execute(
+            select(GpuRegistrationAttempt)
+            .where(
+                GpuRegistrationAttempt.reservation_id == reservation.reservation_id,
+                GpuRegistrationAttempt.registration_generation
+                == reservation.registration_generation,
+                GpuRegistrationAttempt.state == "completed",
             )
-        ).scalars()
-    )
-    if len(attempts) != 1:
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if attempt is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="GPU registration attempt is not durably completed.",
         )
-    attempt = attempts[0]
     registration_attestation = (
         (
             await db.execute(
                 select(ServerAttestation)
-                .where(
-                    ServerAttestation.attestation_id
-                    == reservation.registration_attestation_id
-                )
+                .where(ServerAttestation.attestation_id == reservation.registration_attestation_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -274,19 +261,12 @@ async def _completed_gpu_registration_authority(
     group = (
         await db.execute(
             select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.allocation_group_id
-                == reservation.allocation_group_id
-            )
+            .where(GpuAllocationGroup.allocation_group_id == reservation.allocation_group_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
     host = (
-        await db.execute(
-            select(Host)
-            .where(Host.host_id == reservation.host_id)
-            .with_for_update()
-        )
+        await db.execute(select(Host).where(Host.host_id == reservation.host_id).with_for_update())
     ).scalar_one_or_none()
     stable = dict(attempt.stable_response or {})
     expected_stable_keys = {
@@ -336,8 +316,7 @@ async def _completed_gpu_registration_authority(
             and stable_uuids == sorted(set(stable_uuids))
             and isinstance(stable_identifiers, list)
             and len(stable_identifiers) == len(stable_uuids)
-            and stable_identifiers
-            == [inventory_by_uuid[gpu_uuid] for gpu_uuid in stable_uuids]
+            and stable_identifiers == [inventory_by_uuid[gpu_uuid] for gpu_uuid in stable_uuids]
             and registration_attestation is not None
             and registration_attestation.gpu_evidence_certificate_sha256s
             == expected_evidence_certificates
@@ -368,14 +347,10 @@ async def _completed_gpu_registration_authority(
     )
     nodes_by_uuid = {node.uuid: node for node in nodes}
     registration_report_ids = {
-        node.gpu_inventory_report_id
-        for node in nodes
-        if node.gpu_inventory_report_id is not None
+        node.gpu_inventory_report_id for node in nodes if node.gpu_inventory_report_id is not None
     }
     registration_report_id = (
-        next(iter(registration_report_ids))
-        if len(registration_report_ids) == 1
-        else None
+        next(iter(registration_report_ids)) if len(registration_report_ids) == 1 else None
     )
     registration_report = (
         (
@@ -428,8 +403,7 @@ async def _completed_gpu_registration_authority(
             and node.miner_hotkey == server.miner_hotkey
             and node.gpu_identifier == stable_identifiers[index]
             and node.gpu_allocation_group_id == reservation.allocation_group_id
-            and node.gpu_allocation_group_generation
-            == reservation.allocation_group_generation
+            and node.gpu_allocation_group_generation == reservation.allocation_group_generation
             and node.gpu_launch_reservation_id == reservation.reservation_id
             and node.gpu_process_incarnation == reservation.process_incarnation
             and node.gpu_inventory_report_id == registration_report_id
@@ -445,66 +419,53 @@ async def _completed_gpu_registration_authority(
     registration_exact = bool(
         set(stable) == expected_stable_keys
         and selected_matches
+        and attempt.registration_generation == reservation.registration_generation
         and attempt.attestation_id
         == registration_attestation.attestation_id
         == reservation.registration_attestation_id
         and attempt.registration_id is not None
         and attempt.stable_response_sha256 is not None
-        and secrets.compare_digest(
-            attempt.stable_response_sha256, canonical_sha256(stable)
-        )
+        and secrets.compare_digest(attempt.stable_response_sha256, canonical_sha256(stable))
         and stable.get("registration_id") == attempt.registration_id
         and stable.get("attestation_id") == attempt.attestation_id
         and stable.get("server_id") == reservation.server_id
         and stable.get("reservation_id") == reservation.reservation_id
         and stable.get("claims_sha256") == reservation.claims_sha256
         and stable.get("allocation_group_id") == reservation.allocation_group_id
-        and stable.get("allocation_group_generation")
-        == reservation.allocation_group_generation
+        and stable.get("allocation_group_generation") == reservation.allocation_group_generation
         and stable.get("process_incarnation") == reservation.process_incarnation
         and stable.get("management_mode") == reservation.management_mode
         and stable.get("owner_hotkey") == reservation.owner_hotkey
-        and stable.get("measurement_version")
-        == registration_attestation.measurement_version
+        and stable.get("measurement_version") == registration_attestation.measurement_version
         and stable.get("measurement_name") == registration_attestation.measurement_name
         and stable.get("measurement_config_fingerprint")
         == registration_attestation.measurement_config_fingerprint
-        and stable.get("trust_set_fingerprint")
-        == registration_attestation.trust_set_fingerprint
-        and stable.get("verified_at")
-        == registration_attestation.verified_at.isoformat()
+        and stable.get("trust_set_fingerprint") == registration_attestation.trust_set_fingerprint
+        and stable.get("verified_at") == registration_attestation.verified_at.isoformat()
         and stable.get("status") == "registered"
-        and server.server_id
-        == reservation.server_id
-        == registration_attestation.server_id
+        and server.server_id == reservation.server_id == registration_attestation.server_id
         and server.gpu_launch_reservation_id == reservation.reservation_id
         and server.gpu_allocation_group_id == reservation.allocation_group_id
-        and server.gpu_allocation_group_generation
-        == reservation.allocation_group_generation
+        and server.gpu_allocation_group_generation == reservation.allocation_group_generation
         and server.gpu_process_incarnation == reservation.process_incarnation
         and server.gpu_management_mode == reservation.management_mode
         and registration_attestation.verification_error is None
         and registration_attestation.verified_at is not None
         and registration_attestation.gpu_retired_at is None
-        and registration_attestation.gpu_host_boot_generation
-        == reservation.host_boot_generation
+        and registration_attestation.gpu_host_boot_generation == reservation.host_boot_generation
         and registration_attestation.gpu_reservation_generation
         == reservation.reservation_generation
         and registration_attestation.gpu_management_mode == reservation.management_mode
-        and registration_attestation.gpu_topology_fingerprint
-        == reservation.topology_fingerprint
+        and registration_attestation.gpu_topology_fingerprint == reservation.topology_fingerprint
         and registration_attestation.gpu_release_id == reservation.gpu_release_id
         and registration_attestation.gpu_profile_id == reservation.profile_id
         and registration_attestation.gpu_chute_id == reservation.chute_id
         and registration_attestation.gpu_job_id == reservation.job_id
-        and registration_attestation.gpu_launch_reservation_id
-        == reservation.reservation_id
-        and registration_attestation.gpu_allocation_group_id
-        == reservation.allocation_group_id
+        and registration_attestation.gpu_launch_reservation_id == reservation.reservation_id
+        and registration_attestation.gpu_allocation_group_id == reservation.allocation_group_id
         and registration_attestation.gpu_allocation_group_generation
         == reservation.allocation_group_generation
-        and registration_attestation.gpu_process_incarnation
-        == reservation.process_incarnation
+        and registration_attestation.gpu_process_incarnation == reservation.process_incarnation
         and registration_attestation.gpu_claims_sha256 == reservation.claims_sha256
         and server.attested_cert is not None
         and server.attested_cert == attempt.peer_certificate_pem
@@ -515,9 +476,7 @@ async def _completed_gpu_registration_authority(
         and attempt.peer_spki_sha256 == attempt.peer_spki_sha256.lower()
         and secrets.compare_digest(attempt.peer_certificate_sha256, certificate_sha256)
         and server.attested_cert_pubkey_hash is not None
-        and secrets.compare_digest(
-            attempt.peer_spki_sha256, server.attested_cert_pubkey_hash
-        )
+        and secrets.compare_digest(attempt.peer_spki_sha256, server.attested_cert_pubkey_hash)
     )
     if not registration_exact:
         raise HTTPException(
@@ -566,22 +525,16 @@ async def _completed_gpu_registration_authority(
         operational_attestation is None
         or (
             operational_attestation.server_id == server.server_id
-            and operational_attestation.gpu_launch_reservation_id
-            == reservation.reservation_id
-            and operational_attestation.gpu_allocation_group_id
-            == reservation.allocation_group_id
+            and operational_attestation.gpu_launch_reservation_id == reservation.reservation_id
+            and operational_attestation.gpu_allocation_group_id == reservation.allocation_group_id
             and operational_attestation.gpu_allocation_group_generation
             == reservation.allocation_group_generation
-            and operational_attestation.gpu_host_boot_generation
-            == reservation.host_boot_generation
+            and operational_attestation.gpu_host_boot_generation == reservation.host_boot_generation
             and operational_attestation.gpu_reservation_generation
             == reservation.reservation_generation
-            and operational_attestation.gpu_management_mode
-            == reservation.management_mode
-            and operational_attestation.gpu_process_incarnation
-            == reservation.process_incarnation
-            and operational_attestation.gpu_topology_fingerprint
-            == reservation.topology_fingerprint
+            and operational_attestation.gpu_management_mode == reservation.management_mode
+            and operational_attestation.gpu_process_incarnation == reservation.process_incarnation
+            and operational_attestation.gpu_topology_fingerprint == reservation.topology_fingerprint
             and operational_attestation.gpu_release_id == reservation.gpu_release_id
             and operational_attestation.gpu_profile_id == reservation.profile_id
             and operational_attestation.gpu_chute_id == reservation.chute_id
@@ -668,7 +621,7 @@ def mint_gpu_runtime_session(
             "GPU runtime sessions require a current attested server and exact mode scope"
         )
     _current_attestation(server, attestation)
-    now = datetime.now(timezone.utc)
+    now = _runtime_session_now()
     expires_at = now + timedelta(seconds=GPU_RUNTIME_SESSION_LIFETIME_SECONDS)
     payload = {
         "schema": "chutes.gpu-runtime-session",
@@ -703,19 +656,36 @@ async def validate_gpu_runtime_session(
     required_purpose: str | None,
     allow_resetting: bool = False,
 ) -> tuple[Server, dict[str, Any]]:
+    validation_now = _runtime_session_now()
     try:
         payload = jwt.decode(
             token,
             settings.launch_config_key,
             algorithms=["HS256"],
             issuer="chutes",
-            options={"require": ["exp", "iat", "iss", "jti"]},
+            options={
+                "require": ["exp", "iat", "iss", "jti"],
+                "verify_exp": False,
+                "verify_iat": False,
+            },
         )
     except jwt.PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="GPU runtime session is invalid or expired.",
         ) from exc
+    iat = payload.get("iat") if isinstance(payload, dict) else None
+    exp = payload.get("exp") if isinstance(payload, dict) else None
+    if (
+        type(iat) is not int
+        or type(exp) is not int
+        or exp <= int(validation_now.timestamp())
+        or iat > int(validation_now.timestamp()) + GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GPU runtime session is invalid or expired.",
+        )
     required_keys = {
         "schema",
         "version",
@@ -758,9 +728,7 @@ async def validate_gpu_runtime_session(
     attestation = await db.get(ServerAttestation, payload["attestation_id"])
     reservation = await db.get(GpuLaunchReservation, payload["reservation_id"])
     latest_attestation = (
-        await _latest_attestation_attempt(db, server.server_id)
-        if server is not None
-        else None
+        await _latest_attestation_attempt(db, server.server_id) if server is not None else None
     )
     if (
         server is None
@@ -775,7 +743,7 @@ async def validate_gpu_runtime_session(
         or server.attested_cert_pubkey_hash != payload["attested_spki_sha256"]
         or server.gpu_runtime_session_attestation_id != payload["attestation_id"]
         or server.gpu_runtime_session_expires_at is None
-        or server.gpu_runtime_session_expires_at <= datetime.now(timezone.utc)
+        or server.gpu_runtime_session_expires_at <= validation_now
         or reservation.state
         not in (
             {"running", "resetting"}
@@ -786,8 +754,7 @@ async def validate_gpu_runtime_session(
         or reservation.server_id != server.server_id
         or reservation.management_mode != server.gpu_management_mode
         or reservation.allocation_group_id != server.gpu_allocation_group_id
-        or reservation.allocation_group_generation
-        != server.gpu_allocation_group_generation
+        or reservation.allocation_group_generation != server.gpu_allocation_group_generation
         or reservation.process_incarnation != server.gpu_process_incarnation
         or reservation.topology_fingerprint != server.gpu_topology_fingerprint
         or attestation.gpu_claims_sha256 != reservation.claims_sha256
@@ -843,10 +810,7 @@ async def latest_gpu_runtime_session(
         (
             await db.execute(
                 select(GpuLaunchReservation)
-                .where(
-                    GpuLaunchReservation.reservation_id
-                    == server.gpu_launch_reservation_id
-                )
+                .where(GpuLaunchReservation.reservation_id == server.gpu_launch_reservation_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -906,7 +870,6 @@ def _gpu_selection_matches_registration(
     return bool(
         mode_selection
         and (
-            operational_certificates is None
-            or operational_certificates == registered_certificates
+            operational_certificates is None or operational_certificates == registered_certificates
         )
     )

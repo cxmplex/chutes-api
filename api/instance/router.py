@@ -193,22 +193,14 @@ async def _maybe_start_log_capture(instance, config_id: str):
     try:
         async with get_session(readonly=True) as session:
             chute = (
-                (
-                    await session.execute(
-                        select(Chute).where(Chute.chute_id == instance.chute_id)
-                    )
-                )
+                (await session.execute(select(Chute).where(Chute.chute_id == instance.chute_id)))
                 .unique()
                 .scalar_one_or_none()
             )
             if not chute or chute.public:
                 return
             user = (
-                (
-                    await session.execute(
-                        select(User).where(User.user_id == chute.user_id)
-                    )
-                )
+                (await session.execute(select(User).where(User.user_id == chute.user_id)))
                 .unique()
                 .scalar_one_or_none()
             )
@@ -218,9 +210,9 @@ async def _maybe_start_log_capture(instance, config_id: str):
         if not instance.port_mappings:
             return
         try:
-            log_port = next(
-                p for p in instance.port_mappings if p["internal_port"] == 8001
-            )["external_port"]
+            log_port = next(p for p in instance.port_mappings if p["internal_port"] == 8001)[
+                "external_port"
+            ]
         except (StopIteration, TypeError, KeyError):
             return
         asyncio.create_task(
@@ -245,18 +237,14 @@ INSPECTO = load_shared_object("chutes", "chutes-inspecto.so")
 INSPECTO.verify_hash.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
 INSPECTO.verify_hash.restype = ctypes.c_char_p
 
-NETNANNY = ctypes.CDLL(
-    os.getenv("CHUTES_NNVERIFY_PATH", "/usr/local/lib/chutes-nnverify.so")
-)
+NETNANNY = ctypes.CDLL(os.getenv("CHUTES_NNVERIFY_PATH", "/usr/local/lib/chutes-nnverify.so"))
 NETNANNY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 NETNANNY.verify.restype = ctypes.c_int
 
 # Aegis v4 verification library is required.
 import chutes as _chutes_pkg  # noqa: E402
 
-_aegis_verify_path = os.path.join(
-    os.path.dirname(_chutes_pkg.__file__), "chutes-aegis-verify.so"
-)
+_aegis_verify_path = os.path.join(os.path.dirname(_chutes_pkg.__file__), "chutes-aegis-verify.so")
 AEGIS_VERIFY = ctypes.CDLL(_aegis_verify_path)
 AEGIS_VERIFY.verify.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint8]
 AEGIS_VERIFY.verify.restype = ctypes.c_int
@@ -290,9 +278,7 @@ def _verify_rint_commitment_v4(commitment_hex: str) -> bool:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
         if len(commitment_hex) != 292:
-            logger.error(
-                f"RUNINT v4: commitment length mismatch: {len(commitment_hex)} != 292"
-            )
+            logger.error(f"RUNINT v4: commitment length mismatch: {len(commitment_hex)} != 292")
             return False
 
         commitment_bytes = bytes.fromhex(commitment_hex)
@@ -346,9 +332,7 @@ def _verify_rint_commitment(commitment_hex: str, expected_nonce: str) -> bool:
         import hashlib
 
         if len(commitment_hex) != 324:
-            logger.error(
-                f"RUNINT: commitment length mismatch: {len(commitment_hex)} != 324"
-            )
+            logger.error(f"RUNINT: commitment length mismatch: {len(commitment_hex)} != 324")
             return False
 
         commitment_bytes = bytes.fromhex(commitment_hex)
@@ -429,9 +413,7 @@ def _verify_e2e_pubkey_sig(
         elif isinstance(pub, rsa.RSAPublicKey):
             pub.verify(sig, data, padding.PKCS1v15(), hashes.SHA256())
         else:
-            logger.error(
-                f"e2e_pubkey sig: unsupported attested cert key type {type(pub).__name__}"
-            )
+            logger.error(f"e2e_pubkey sig: unsupported attested cert key type {type(pub).__name__}")
             return False
         return True
     except InvalidSignature:
@@ -492,15 +474,11 @@ def _validate_tls_cert(
                 else:
                     cert_nonce = raw.decode()  # fallback for raw OCTET STRING
                 if cert_nonce != nonce:
-                    logger.error(
-                        f"TLS cert nonce mismatch: cert={cert_nonce} expected={nonce}"
-                    )
+                    logger.error(f"TLS cert nonce mismatch: cert={cert_nonce} expected={nonce}")
                     return False
             except x509.ExtensionNotFound:
                 # Legacy cert without nonce extension — allow if sig verified.
-                logger.warning(
-                    "TLS cert has no nonce extension, skipping nonce embedding check"
-                )
+                logger.warning("TLS cert has no nonce extension, skipping nonce embedding check")
 
         logger.info("TLS cert signature validation successful")
         return True
@@ -509,9 +487,7 @@ def _validate_tls_cert(
         return False
 
 
-async def _verify_instance_tls_live(
-    host: str, port: int, expected_cert_pem: str
-) -> bool:
+async def _verify_instance_tls_live(host: str, port: int, expected_cert_pem: str) -> bool:
     """Connect to the instance's logging port and verify the served cert matches expected."""
     import ssl
     from cryptography import x509
@@ -596,9 +572,7 @@ async def _get_instance_counts_and_target(
         WHERE chute_id = :chute_id
     """)
     count_result = (
-        (await db.execute(query, {"chute_id": chute_id, "hotkey": hotkey}))
-        .mappings()
-        .first()
+        (await db.execute(query, {"chute_id": chute_id, "hotkey": hotkey})).mappings().first()
     )
     current_count = count_result["total_count"]
     active_count = count_result["active_count"]
@@ -626,9 +600,7 @@ async def _get_instance_counts_and_target(
         capacity_row = capacity_result.first()
         if capacity_row and capacity_row.target_count is not None:
             target_count = capacity_row.target_count
-            logger.info(
-                f"Retrieved target_count from CapacityLog for {chute_id}: {target_count}"
-            )
+            logger.info(f"Retrieved target_count from CapacityLog for {chute_id}: {target_count}")
         else:
             target_count = current_count
             logger.warning(
@@ -828,9 +800,7 @@ async def _check_scalable_private(
               AND ia.activated_at <= NOW() - INTERVAL '3 days'
          """)
         public_result = (
-            (await db.execute(public_history_query, {"hotkey": miner.hotkey}))
-            .mappings()
-            .first()
+            (await db.execute(public_history_query, {"hotkey": miner.hotkey})).mappings().first()
         )
         if not public_result or public_result["public_count"] == 0:
             logger.warning(
@@ -856,9 +826,7 @@ async def _check_scalable_private(
               AND i.billed_to IS NULL
         """)
         active_public_result = (
-            (await db.execute(active_public_query, {"hotkey": miner.hotkey}))
-            .mappings()
-            .first()
+            (await db.execute(active_public_query, {"hotkey": miner.hotkey})).mappings().first()
         )
         instance_count = (
             active_public_result["active_instance_count"] if active_public_result else 0
@@ -883,9 +851,7 @@ async def _check_scalable_private(
         # Try cached value first, fall back to a single-miner DB query on cache miss.
         if inventory_history is _EXTERNAL_VALUE_UNSET:
             inventory_history = None
-            assert_gpu_external_work_allowed(
-                db, "private instance inventory telemetry lookup"
-            )
+            assert_gpu_external_work_allowed(db, "private instance inventory telemetry lookup")
             inventory_raw = await settings.redis_client.get(f"uqhist:{miner.hotkey}")
             if inventory_raw:
                 inventory_history = json.loads(inventory_raw)
@@ -935,9 +901,7 @@ async def _check_scalable_private(
             )
             rows = miner_inventory_result.mappings().all()
             if rows:
-                inventory_history = [
-                    {"total_count": int(r["total_count"])} for r in rows
-                ]
+                inventory_history = [{"total_count": int(r["total_count"])} for r in rows]
         if not inventory_history:
             logger.warning(
                 f"PRIVATE_GATE: miner {miner.hotkey} denied private chute {chute_id}: no inventory history found"
@@ -946,9 +910,9 @@ async def _check_scalable_private(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="No inventory history found; you must have an average of at least 16 GPUs over the 7-day scoring period to deploy private chutes.",
             )
-        avg_gpus = sum(
-            entry.get("total_count", 0) for entry in inventory_history
-        ) / len(inventory_history)
+        avg_gpus = sum(entry.get("total_count", 0) for entry in inventory_history) / len(
+            inventory_history
+        )
         if avg_gpus < 16:
             logger.warning(
                 f"PRIVATE_GATE: miner {miner.hotkey} denied private chute {chute_id}: "
@@ -1080,9 +1044,7 @@ async def _validate_nodes(
 
     # The hostname used in verifying the node must match the hostname of the instance.
     if len(node_hosts) > 1 or list(node_hosts)[0].lower() != host.lower():
-        logger.warning(
-            "INSTANCEFAIL: Instance hostname mismatch: {node_hosts=} {host=}"
-        )
+        logger.warning("INSTANCEFAIL: Instance hostname mismatch: {node_hosts=} {host=}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Instance hostname does not match the node verification hostname: {host=} vs {node_hosts=}",
@@ -1094,9 +1056,7 @@ async def _validate_host_port(db, host, port):
     existing = (
         (
             await db.execute(
-                select(Instance)
-                .where(Instance.host == host, Instance.port == port)
-                .limit(1)
+                select(Instance).where(Instance.host == host, Instance.port == port).limit(1)
             )
         )
         .unique()
@@ -1139,9 +1099,7 @@ async def get_instance_reconciliation_csv(
     return Response(
         content=output.getvalue(),
         media_type="text/csv",
-        headers={
-            "Content-Disposition": 'attachment; filename="audit-reconciliation.csv"'
-        },
+        headers={"Content-Disposition": 'attachment; filename="audit-reconciliation.csv"'},
     )
 
 
@@ -1191,11 +1149,7 @@ def _require_non_cpu_tee_claim_fields(
     )
     if cpu_tee:
         return
-    fields = (
-        ("gpus",)
-        if launch_config.gpu_management_mode == "platform"
-        else ("gpus", "env")
-    )
+    fields = ("gpus",) if launch_config.gpu_management_mode == "platform" else ("gpus", "env")
     missing = [field for field in fields if getattr(args, field) is None]
     if missing:
         raise HTTPException(
@@ -1219,9 +1173,7 @@ async def _validate_launch_config_env(
     # is nothing to decrypt -- their integrity is anchored by TD attestation + cosign image verification.
     if "ENVDUMP_UNLOCK" in os.environ and args.env:
         try:
-            dump = await asyncio.to_thread(
-                DUMPER.decrypt, launch_config.env_key, args.env
-            )
+            dump = await asyncio.to_thread(DUMPER.decrypt, launch_config.env_key, args.env)
         except Exception as exc:
             logger.error(
                 f"Attempt to claim {launch_config.config_id=} failed, invalid envdump payload received: {exc}"
@@ -1322,9 +1274,7 @@ async def _validate_launch_config_inspecto(
         if not args.inspecto:
             logger.error(f"{log_prefix} no inspecto hash provided")
             launch_config.failed_at = func.now()
-            launch_config.verification_error = (
-                "Failed inspecto environment/lib verification."
-            )
+            launch_config.verification_error = "Failed inspecto environment/lib verification."
             await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1340,9 +1290,7 @@ async def _validate_launch_config_inspecto(
                 assert_gpu_external_work_allowed(db, "launch Inspecto hash lookup")
                 inspecto_hash = await get_inspecto_hash(chute.image_id)
             if not inspecto_hash:
-                logger.info(
-                    f"INSPECTO: image_id={chute.image_id} has no inspecto hash; allowing."
-                )
+                logger.info(f"INSPECTO: image_id={chute.image_id} has no inspecto hash; allowing.")
                 inspecto_valid = True
             else:
                 if not args.inspecto:
@@ -1375,13 +1323,9 @@ async def _validate_launch_config_inspecto(
                                 fail_reason = f"inspecto verification failed: {payload}"
         if not inspecto_valid:
             if enforce_inspecto:
-                logger.error(
-                    f"{log_prefix} has invalid inspecto verification: {fail_reason}"
-                )
+                logger.error(f"{log_prefix} has invalid inspecto verification: {fail_reason}")
                 launch_config.failed_at = func.now()
-                launch_config.verification_error = (
-                    "Failed inspecto environment/lib verification."
-                )
+                launch_config.verification_error = "Failed inspecto environment/lib verification."
                 await db.commit()
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -1479,9 +1423,7 @@ def _launch_external_input_document(
         "job": job_document,
         "node_selector": node_selector.model_dump(mode="json"),
         # Do not retain request secrets in the snapshot; the digest still binds every byte.
-        "request_sha256": canonical_sha256(
-            args.model_dump(mode="json", exclude_none=False)
-        ),
+        "request_sha256": canonical_sha256(args.model_dump(mode="json", exclude_none=False)),
         "private_launch": is_private,
     }
 
@@ -1530,9 +1472,7 @@ async def _collect_launch_external_work(
         )
         if is_private:
             if not chute.tee:
-                assert_gpu_external_work_allowed(
-                    db, "private launch inventory telemetry lookup"
-                )
+                assert_gpu_external_work_allowed(db, "private launch inventory telemetry lookup")
                 inventory_raw = await settings.redis_client.get(
                     f"uqhist:{launch_config.miner_hotkey}"
                 )
@@ -1541,11 +1481,7 @@ async def _collect_launch_external_work(
             bounty_exists = await check_bounty_exists(chute.chute_id)
 
     filesystem_hash = None
-    if (
-        not managed_tee
-        and semcomp(chute.chutes_version, "0.3.1") >= 0
-        and "CFSV_OP" in os.environ
-    ):
+    if not managed_tee and semcomp(chute.chutes_version, "0.3.1") >= 0 and "CFSV_OP" in os.environ:
         assert_gpu_external_work_allowed(db, "launch filesystem hash dispatch")
         task = await generate_fs_hash.kiq(
             chute.image_id,
@@ -1738,17 +1674,14 @@ async def _validate_launch_config_instance(
             await db.execute(
                 select(GpuLaunchReservation)
                 .where(
-                    GpuLaunchReservation.reservation_id
-                    == launch_config.gpu_launch_reservation_id
+                    GpuLaunchReservation.reservation_id == launch_config.gpu_launch_reservation_id
                 )
                 .with_for_update()
             )
         ).scalar_one_or_none()
         platform_server = (
             await db.execute(
-                select(Server)
-                .where(Server.server_id == launch_config.server_id)
-                .with_for_update()
+                select(Server).where(Server.server_id == launch_config.server_id).with_for_update()
             )
         ).scalar_one_or_none()
         if (
@@ -1757,23 +1690,19 @@ async def _validate_launch_config_instance(
             or platform_reservation.state != "running"
             or platform_reservation.management_mode != "platform"
             or platform_reservation.server_id != platform_server.server_id
-            or platform_reservation.reservation_id
-            != platform_server.gpu_launch_reservation_id
+            or platform_reservation.reservation_id != platform_server.gpu_launch_reservation_id
             or platform_reservation.chute_id != launch_config.chute_id
             or platform_reservation.job_id != launch_config.job_id
-            or platform_reservation.container_repository
-            != launch_config.container_repository
+            or platform_reservation.container_repository != launch_config.container_repository
             or platform_reservation.container_manifest_digest
             != launch_config.container_manifest_digest
             or platform_server.gpu_management_mode != "platform"
             or platform_server.gpu_retired_at is not None
             or platform_server.in_maintenance
-            or platform_server.gpu_allocation_group_id
-            != platform_reservation.allocation_group_id
+            or platform_server.gpu_allocation_group_id != platform_reservation.allocation_group_id
             or platform_server.gpu_allocation_group_generation
             != platform_reservation.allocation_group_generation
-            or platform_server.gpu_process_incarnation
-            != platform_reservation.process_incarnation
+            or platform_server.gpu_process_incarnation != platform_reservation.process_incarnation
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1795,17 +1724,14 @@ async def _validate_launch_config_instance(
             await db.execute(
                 select(GpuLaunchReservation)
                 .where(
-                    GpuLaunchReservation.reservation_id
-                    == launch_config.gpu_launch_reservation_id
+                    GpuLaunchReservation.reservation_id == launch_config.gpu_launch_reservation_id
                 )
                 .with_for_update()
             )
         ).scalar_one_or_none()
         miner_server = (
             await db.execute(
-                select(Server)
-                .where(Server.server_id == launch_config.server_id)
-                .with_for_update()
+                select(Server).where(Server.server_id == launch_config.server_id).with_for_update()
             )
         ).scalar_one_or_none()
         if (
@@ -1815,16 +1741,13 @@ async def _validate_launch_config_instance(
             or gpu_lineage_reservation.management_mode != "miner"
             or gpu_lineage_reservation.server_id != launch_config.server_id
             or miner_server.gpu_management_mode != "miner"
-            or miner_server.gpu_launch_reservation_id
-            != gpu_lineage_reservation.reservation_id
+            or miner_server.gpu_launch_reservation_id != gpu_lineage_reservation.reservation_id
             or miner_server.gpu_retired_at is not None
             or miner_server.in_maintenance
-            or miner_server.gpu_allocation_group_id
-            != gpu_lineage_reservation.allocation_group_id
+            or miner_server.gpu_allocation_group_id != gpu_lineage_reservation.allocation_group_id
             or miner_server.gpu_allocation_group_generation
             != gpu_lineage_reservation.allocation_group_generation
-            or miner_server.gpu_process_incarnation
-            != gpu_lineage_reservation.process_incarnation
+            or miner_server.gpu_process_incarnation != gpu_lineage_reservation.process_incarnation
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -1834,8 +1757,7 @@ async def _validate_launch_config_instance(
         expected_mode = launch_config.gpu_management_mode
         if expected_mode in {"platform", "miner"} and (
             launch_job.gpu_management_mode != expected_mode
-            or launch_job.gpu_launch_reservation_id
-            != launch_config.gpu_launch_reservation_id
+            or launch_job.gpu_launch_reservation_id != launch_config.gpu_launch_reservation_id
         ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1900,9 +1822,7 @@ async def _validate_launch_config_instance(
             .scalar_one_or_none()
         )
         existing_instance = await db.scalar(
-            select(Instance.instance_id).where(
-                Instance.config_id == launch_config.config_id
-            )
+            select(Instance.instance_id).where(Instance.config_id == launch_config.config_id)
         )
         if (
             current_config is None
@@ -1963,9 +1883,7 @@ async def _validate_launch_config_instance(
         except HTTPException as exc:
             launch_config.failed_at = func.now()
             detail = exc.detail
-            launch_config.verification_error = (
-                detail if isinstance(detail, str) else str(detail)
-            )
+            launch_config.verification_error = detail if isinstance(detail, str) else str(detail)
             await db.commit()
             raise
 
@@ -2099,9 +2017,7 @@ async def _validate_launch_config_instance(
             if not args.rint_commitment:
                 logger.error(f"{log_prefix} missing runint commitment")
                 launch_config.failed_at = func.now()
-                launch_config.verification_error = (
-                    "Missing runtime integrity commitment"
-                )
+                launch_config.verification_error = "Missing runtime integrity commitment"
                 await db.commit()
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -2110,9 +2026,7 @@ async def _validate_launch_config_instance(
             if not _verify_rint_commitment(args.rint_commitment, launch_config.nonce):
                 logger.error(f"{log_prefix} invalid runint commitment")
                 launch_config.failed_at = func.now()
-                launch_config.verification_error = (
-                    "Invalid runtime integrity commitment"
-                )
+                launch_config.verification_error = "Invalid runtime integrity commitment"
                 await db.commit()
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
@@ -2139,8 +2053,7 @@ async def _validate_launch_config_instance(
             job_claim_conditions.extend(
                 [
                     Job.gpu_management_mode == launch_config.gpu_management_mode,
-                    Job.gpu_launch_reservation_id
-                    == launch_config.gpu_launch_reservation_id,
+                    Job.gpu_launch_reservation_id == launch_config.gpu_launch_reservation_id,
                 ]
             )
         else:
@@ -2167,9 +2080,7 @@ async def _validate_launch_config_instance(
                 f"claimed when miner {launch_config.miner_hotkey=} tried to claim it."
             )
             launch_config.failed_at = func.now()
-            launch_config.verification_error = (
-                "Job was already claimed by another miner"
-            )
+            launch_config.verification_error = "Job was already claimed by another miner"
             await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -2189,9 +2100,7 @@ async def _validate_launch_config_instance(
                 f"{log_prefix} v4 instance (>= 0.5.5) must provide v4 (04-prefix) rint_commitment"
             )
             launch_config.failed_at = func.now()
-            launch_config.verification_error = (
-                "v4 instance must provide v4 rint_commitment"
-            )
+            launch_config.verification_error = "v4 instance must provide v4 rint_commitment"
             await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2200,22 +2109,16 @@ async def _validate_launch_config_instance(
         if not tls_cert or not tls_cert_sig:
             logger.error(f"{log_prefix} v4 instance missing tls_cert or tls_cert_sig")
             launch_config.failed_at = func.now()
-            launch_config.verification_error = (
-                "v4 instance must provide TLS certificate"
-            )
+            launch_config.verification_error = "v4 instance must provide TLS certificate"
             await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="v4 instances must provide a TLS certificate and signature",
             )
-        if not _validate_tls_cert(
-            tls_cert, tls_cert_sig, rint_commitment, launch_config.nonce
-        ):
+        if not _validate_tls_cert(tls_cert, tls_cert_sig, rint_commitment, launch_config.nonce):
             logger.error(f"{log_prefix} TLS cert signature validation failed")
             launch_config.failed_at = func.now()
-            launch_config.verification_error = (
-                "TLS certificate signature validation failed"
-            )
+            launch_config.verification_error = "TLS certificate signature validation failed"
             await db.commit()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -2232,9 +2135,7 @@ async def _validate_launch_config_instance(
         server_row = None
         if getattr(launch_config, "server_id", None):
             server_row = (
-                await db.execute(
-                    select(Server).where(Server.server_id == launch_config.server_id)
-                )
+                await db.execute(select(Server).where(Server.server_id == launch_config.server_id))
             ).scalar_one_or_none()
         attested_cert = getattr(server_row, "attested_cert", None)
         if server_row is not None and server_row.in_maintenance:
@@ -2274,9 +2175,7 @@ async def _validate_launch_config_instance(
                 cpu_e2e_pubkey_sig,
                 launch_config.config_id,
             ):
-                logger.error(
-                    f"{log_prefix} CPU-TEE e2e_pubkey attestation-binding failed"
-                )
+                logger.error(f"{log_prefix} CPU-TEE e2e_pubkey attestation-binding failed")
                 launch_config.failed_at = func.now()
                 launch_config.verification_error = (
                     "CPU-TEE e2e_pubkey is not attestation-bound (missing or invalid signature by the "
@@ -2329,9 +2228,7 @@ async def _validate_launch_config_instance(
         server_id=launch_config.server_id,
         gpu_management_mode=launch_config.gpu_management_mode,
         gpu_launch_reservation_id=(
-            gpu_lineage_reservation.reservation_id
-            if gpu_lineage_reservation is not None
-            else None
+            gpu_lineage_reservation.reservation_id if gpu_lineage_reservation is not None else None
         ),
         gpu_allocation_group_id=(
             gpu_lineage_reservation.allocation_group_id
@@ -2378,9 +2275,7 @@ async def _validate_launch_config_instance(
             f"Adding private instance bonus value {bonus=} to {instance.instance_id} "
             f"for total {instance.compute_multiplier=} for {chute.name=} {chute.chute_id=} {integrated=}"
         )
-        instance.billed_to = (
-            launch_job.user_id if launch_job is not None else chute.user_id
-        )
+        instance.billed_to = launch_job.user_id if launch_job is not None else chute.user_id
 
     # Track the warmup (base) multiplier separately — this is node_selector + private/tee bonus
     # + manual boost + TEE bonus, but WITHOUT urgency (chute.boost) or bounty.
@@ -2519,12 +2414,9 @@ async def _validate_launch_config_instance(
             matching_inventory_groups = [
                 item
                 for item in (
-                    lineage_report_claims.groups
-                    if lineage_report_claims is not None
-                    else []
+                    lineage_report_claims.groups if lineage_report_claims is not None else []
                 )
-                if item.topology_fingerprint
-                == gpu_lineage_reservation.topology_fingerprint
+                if item.topology_fingerprint == gpu_lineage_reservation.topology_fingerprint
                 and [device.bdf for device in item.devices]
                 == list(gpu_lineage_reservation.gpu_bdfs)
                 and [device.uuid for device in item.devices]
@@ -2536,42 +2428,32 @@ async def _validate_launch_config_instance(
                 or lineage_report_claims is None
                 or len(matching_inventory_groups) != 1
                 or lineage_group.state != "running"
-                or lineage_group.reservation_id
-                != gpu_lineage_reservation.reservation_id
-                or lineage_group.generation
-                != gpu_lineage_reservation.allocation_group_generation
+                or lineage_group.reservation_id != gpu_lineage_reservation.reservation_id
+                or lineage_group.generation != gpu_lineage_reservation.allocation_group_generation
                 or lineage_group.reservation_generation
                 != gpu_lineage_reservation.reservation_generation
-                or lineage_group.process_incarnation
-                != gpu_lineage_reservation.process_incarnation
+                or lineage_group.process_incarnation != gpu_lineage_reservation.process_incarnation
                 or lineage_report.reconciliation_status != "accepted"
                 or lineage_report.host_id != gpu_lineage_reservation.host_id
-                or lineage_report.host_key_generation
-                != gpu_lineage_reservation.host_key_generation
+                or lineage_report.host_key_generation != gpu_lineage_reservation.host_key_generation
                 or lineage_report.host_boot_generation
                 != gpu_lineage_reservation.host_boot_generation
-                or lineage_report.claims_sha256
-                != canonical_sha256(lineage_report_claims)
+                or lineage_report.claims_sha256 != canonical_sha256(lineage_report_claims)
             ):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="GPU workload inventory lineage is no longer current.",
                 )
-            inventory_by_uuid = {
-                item.uuid: item for item in matching_inventory_groups[0].devices
-            }
+            inventory_by_uuid = {item.uuid: item for item in matching_inventory_groups[0].devices}
             selected_uuids = {node.uuid for node in nodes}
             reserved_uuids = set(gpu_lineage_reservation.gpu_uuids)
             mismatched_lineage = any(
                 node.server_id != launch_config.server_id
-                or node.gpu_allocation_group_id
-                != gpu_lineage_reservation.allocation_group_id
+                or node.gpu_allocation_group_id != gpu_lineage_reservation.allocation_group_id
                 or node.gpu_allocation_group_generation
                 != gpu_lineage_reservation.allocation_group_generation
-                or node.gpu_launch_reservation_id
-                != gpu_lineage_reservation.reservation_id
-                or node.gpu_process_incarnation
-                != gpu_lineage_reservation.process_incarnation
+                or node.gpu_launch_reservation_id != gpu_lineage_reservation.reservation_id
+                or node.gpu_process_incarnation != gpu_lineage_reservation.process_incarnation
                 or node.gpu_inventory_report_id != lineage_report.report_id
                 or node.gpu_retired_at is not None
                 or node.uuid not in inventory_by_uuid
@@ -2614,9 +2496,7 @@ async def _validate_launch_config_instance(
             await error_session.commit()
         # Raw SQL bypasses the LaunchConfig verification_error listener, so account for
         # this failure explicitly using the pre-rollback chute identity.
-        track_launch_config_failure(
-            chute_id, "invalid GPU/nodes configuration provided"
-        )
+        track_launch_config_failure(chute_id, "invalid GPU/nodes configuration provided")
         raise
 
     if not is_cpu:
@@ -2723,13 +2603,9 @@ async def _validate_launch_config_instance(
                         **instance.extra,
                         "cllmv_session_key": cllmv_session_key,
                     }
-                    logger.info(
-                        f"CLLMV V2 session key decrypted for {instance.instance_id}"
-                    )
+                    logger.info(f"CLLMV V2 session key decrypted for {instance.instance_id}")
             except Exception as exc:
-                logger.warning(
-                    f"CLLMV V2 session key decryption error (pre-0.5.5): {exc}"
-                )
+                logger.warning(f"CLLMV V2 session key decryption error (pre-0.5.5): {exc}")
 
     # Instance resolve point shared by TEE and non-TEE launch flows: bind the full
     # identity set so downstream attestation failures remain correlatable.
@@ -2814,9 +2690,7 @@ async def _validate_tee_launch_config_instance(
 
     # Deny launches on servers in TEE maintenance mode before creating any instance/node records.
     # CPU (GPU-less) chutes have no GPU nodes, so the server is resolved by host + miner_hotkey.
-    is_cpu = (
-        str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
-    )
+    is_cpu = str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "cpu"
     if is_cpu or launch_config.gpu_management_mode == "platform":
         server = await get_cpu_server_for_host(
             db, args.host, launch_config.miner_hotkey, server_id=launch_config.server_id
@@ -2854,9 +2728,7 @@ async def _validate_tee_launch_config_instance(
         server = None
         if getattr(instance, "server_id", None):
             server = (
-                await db.execute(
-                    select(Server).where(Server.server_id == instance.server_id)
-                )
+                await db.execute(select(Server).where(Server.server_id == instance.server_id))
             ).scalar_one_or_none()
         if server is not None and getattr(server, "self_registered", False):
             measurement_version = server.version
@@ -2868,9 +2740,7 @@ async def _validate_tee_launch_config_instance(
                 .limit(1)
             )
             latest_boot = (await db.execute(stmt)).scalar_one_or_none()
-            measurement_version = (
-                latest_boot.measurement_version if latest_boot else None
-            )
+            measurement_version = latest_boot.measurement_version if latest_boot else None
         if measurement_version is None or semcomp(measurement_version, "0.2.0") < 0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -2883,18 +2753,12 @@ async def _validate_tee_launch_config_instance(
     return launch_config, nodes, instance, validator_pubkey
 
 
-async def _verify_tee_version_support(
-    db: AsyncSession, chute: Chute, hotkey: str | None
-) -> None:
+async def _verify_tee_version_support(db: AsyncSession, chute: Chute, hotkey: str | None) -> None:
     """
     Reject launch config for TEE chutes (>= 0.6.0) when miner has legacy TEE servers (< 0.2.1).
     Raises HTTPException with server names if any TEE servers need upgrading.
     """
-    if (
-        not chute.tee
-        or not hotkey
-        or semcomp(chute.chutes_version or "0.0.0", "0.6.0") < 0
-    ):
+    if not chute.tee or not hotkey or semcomp(chute.chutes_version or "0.0.0", "0.6.0") < 0:
         return
 
     latest_boot = (
@@ -2991,9 +2855,7 @@ async def _collect_launch_demand_external_work(
         )
         if is_private:
             if not chute.tee:
-                assert_gpu_external_work_allowed(
-                    db, "launch demand inventory telemetry lookup"
-                )
+                assert_gpu_external_work_allowed(db, "launch demand inventory telemetry lookup")
                 inventory_raw = await settings.redis_client.get(f"uqhist:{hotkey}")
                 inventory_history = json.loads(inventory_raw) if inventory_raw else None
             assert_gpu_external_work_allowed(db, "launch demand bounty lookup")
@@ -3248,14 +3110,10 @@ def _miner_launch_request_document(
             "gpu_management_mode": config.gpu_management_mode,
             "gpu_launch_reservation_id": config.gpu_launch_reservation_id,
             "default_volume_id": config.default_volume_id,
-            "storage_session_exchange_allowed": bool(
-                config.storage_session_exchange_allowed
-            ),
+            "storage_session_exchange_allowed": bool(config.storage_session_exchange_allowed),
             "env_type": config.env_type,
             "env_key_sha256": _miner_launch_secret_sha256("env-key", config.env_key),
-            "runtime_nonce_sha256": _miner_launch_secret_sha256(
-                "runtime-nonce", config.nonce
-            ),
+            "runtime_nonce_sha256": _miner_launch_secret_sha256("runtime-nonce", config.nonce),
         },
         "jwt_policy": policy,
         "demand_posture": demand_posture,
@@ -3271,9 +3129,7 @@ async def _lock_current_miner_launch_custody(
     reservation = (
         await db.execute(
             select(GpuLaunchReservation)
-            .where(
-                GpuLaunchReservation.reservation_id == server.gpu_launch_reservation_id
-            )
+            .where(GpuLaunchReservation.reservation_id == server.gpu_launch_reservation_id)
             .with_for_update(of=GpuLaunchReservation)
             .execution_options(populate_existing=True)
         )
@@ -3281,9 +3137,7 @@ async def _lock_current_miner_launch_custody(
     group = (
         await db.execute(
             select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.allocation_group_id == server.gpu_allocation_group_id
-            )
+            .where(GpuAllocationGroup.allocation_group_id == server.gpu_allocation_group_id)
             .with_for_update(of=GpuAllocationGroup)
             .execution_options(populate_existing=True)
         )
@@ -3293,13 +3147,9 @@ async def _lock_current_miner_launch_custody(
             await db.execute(
                 select(GpuLifecycleOperation)
                 .where(
-                    GpuLifecycleOperation.allocation_group_id
-                    == group.allocation_group_id,
-                    GpuLifecycleOperation.allocation_group_generation
-                    == group.generation,
-                    GpuLifecycleOperation.phase.not_in(
-                        ("finalized", "quarantined")
-                    ),
+                    GpuLifecycleOperation.allocation_group_id == group.allocation_group_id,
+                    GpuLifecycleOperation.allocation_group_generation == group.generation,
+                    GpuLifecycleOperation.phase.not_in(("finalized", "quarantined")),
                 )
                 .with_for_update(of=GpuLifecycleOperation)
             )
@@ -3332,8 +3182,7 @@ async def _lock_current_miner_launch_custody(
         or reservation.workload_owner != hotkey
         or reservation.server_id != server.server_id
         or reservation.allocation_group_id != server.gpu_allocation_group_id
-        or reservation.allocation_group_generation
-        != server.gpu_allocation_group_generation
+        or reservation.allocation_group_generation != server.gpu_allocation_group_generation
         or reservation.process_incarnation != server.gpu_process_incarnation
         or reservation.topology_fingerprint != server.gpu_topology_fingerprint
         or group.state != "running"
@@ -3440,9 +3289,7 @@ async def _lock_existing_miner_launch_storage(
         .scalar_one_or_none()
     )
     if config is None or config.user_id != user_id or config.chute_id != chute_id:
-        _miner_launch_replay_conflict(
-            "the persisted request changed before its configuration lock"
-        )
+        _miner_launch_replay_conflict("the persisted request changed before its configuration lock")
     binding = (
         await db.execute(
             select(DefaultChuteFSVolumeBinding)
@@ -3477,9 +3324,7 @@ async def _lock_existing_miner_launch_storage(
         or volume.user_id != user_id
         or volume.deleted
     ):
-        _miner_launch_replay_conflict(
-            "the exact active ChuteFS binding or volume is unavailable"
-        )
+        _miner_launch_replay_conflict("the exact active ChuteFS binding or volume is unavailable")
     return config, binding, volume
 
 
@@ -3569,12 +3414,8 @@ async def _render_replayed_miner_launch_response(
     manifest_digest = config.container_manifest_digest
     await db.commit()
     if config.nonce is not None:
-        assert_gpu_external_work_allowed(
-            db, "replayed launch runtime-integrity nonce publish"
-        )
-        await settings.redis_client.set(
-            f"rint_nonce:{config.config_id}", config.nonce, ex=7200
-        )
+        assert_gpu_external_work_allowed(db, "replayed launch runtime-integrity nonce publish")
+        await settings.redis_client.set(f"rint_nonce:{config.config_id}", config.nonce, ex=7200)
     result = {
         "token": create_launch_jwt_v2(
             config,
@@ -3689,14 +3530,10 @@ async def _validate_locked_miner_launch_replay(
         or not isinstance(config.container_manifest_digest, str)
         or not re.fullmatch(r"sha256:[0-9a-f]{64}", config.container_manifest_digest)
     ):
-        _miner_launch_replay_conflict(
-            "request, workload, storage, or registry authority changed"
-        )
+        _miner_launch_replay_conflict("request, workload, storage, or registry authority changed")
     if (
         await db.execute(
-            select(Instance.instance_id)
-            .where(Instance.config_id == config.config_id)
-            .limit(1)
+            select(Instance.instance_id).where(Instance.config_id == config.config_id).limit(1)
         )
     ).scalar_one_or_none() is not None:
         _miner_launch_replay_conflict("launch config has already been consumed")
@@ -3739,15 +3576,11 @@ async def _validate_locked_miner_launch_replay(
             demand_posture=demand_posture,
         )
     )
-    if not isinstance(
-        config.miner_launch_request_sha256, str
-    ) or not secrets.compare_digest(
+    if not isinstance(config.miner_launch_request_sha256, str) or not secrets.compare_digest(
         config.miner_launch_request_sha256,
         expected_sha256,
     ):
-        _miner_launch_replay_conflict(
-            "canonical request or response-shaping JWT policy changed"
-        )
+        _miner_launch_replay_conflict("canonical request or response-shaping JWT policy changed")
     return await _render_replayed_miner_launch_response(
         db,
         config=config,
@@ -3819,15 +3652,11 @@ async def get_launch_config(
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
     _: User = Depends(
-        get_current_user(
-            raise_not_found=False, registered_to=settings.netuid, purpose="launch"
-        )
+        get_current_user(raise_not_found=False, registered_to=settings.netuid, purpose="launch")
     ),
 ):
     miner = await _check_blacklisted(db, hotkey)
-    chutes_owner_id = await db.scalar(
-        select(User.user_id).where(User.username == "chutes")
-    )
+    chutes_owner_id = await db.scalar(select(User.user_id).where(User.username == "chutes"))
     runtime_server_id = getattr(request.state, "gpu_runtime_server_id", None)
     durable_request_id = None
     if runtime_server_id is not None:
@@ -3859,9 +3688,7 @@ async def get_launch_config(
     # global/workload lifecycle locks, then bind the results to an exact chute snapshot.
     chute = await _load_chute(db, chute_id)
     _require_secure_source_delivery(chute)
-    gpu_selector = (
-        str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "gpu"
-    )
+    gpu_selector = str((chute.node_selector or {}).get("compute_type", "gpu")).lower() == "gpu"
     if not gpu_selector:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -4159,16 +3986,12 @@ async def get_launch_config(
             registry_scope_active=runtime_server_id is not None,
             gpu_management_mode=("miner" if runtime_server_id is not None else None),
             gpu_launch_reservation_id=(
-                runtime_server.gpu_launch_reservation_id
-                if runtime_server_id is not None
-                else None
+                runtime_server.gpu_launch_reservation_id if runtime_server_id is not None else None
             ),
         )
         if durable_request_id is not None:
             if runtime_reservation is None or runtime_group is None:
-                _miner_launch_replay_conflict(
-                    "attested GPU launch custody was not locked"
-                )
+                _miner_launch_replay_conflict("attested GPU launch custody was not locked")
             launch_config.miner_launch_request_sha256 = canonical_sha256(
                 _miner_launch_request_document(
                     request_id=durable_request_id,
@@ -4192,12 +4015,8 @@ async def get_launch_config(
         await db.commit()
         await db.refresh(launch_config)
         if rint_nonce is not None:
-            assert_gpu_external_work_allowed(
-                db, "launch runtime-integrity nonce publish"
-            )
-            await settings.redis_client.set(
-                f"rint_nonce:{config_id}", rint_nonce, ex=7200
-            )
+            assert_gpu_external_work_allowed(db, "launch runtime-integrity nonce publish")
+            await settings.redis_client.set(f"rint_nonce:{config_id}", rint_nonce, ex=7200)
     except IntegrityError as exc:
         await db.rollback()
         if durable_request_id is not None:
@@ -4304,11 +4123,7 @@ async def get_rint_nonce(
 
     # Load the launch config
     launch_config = (
-        (
-            await db.execute(
-                select(LaunchConfig).where(LaunchConfig.config_id == config_id)
-            )
-        )
+        (await db.execute(select(LaunchConfig).where(LaunchConfig.config_id == config_id)))
         .unique()
         .scalar_one_or_none()
     )
@@ -4372,9 +4187,7 @@ def _claim_lineage_snapshot(
         "host": instance.host,
         "port": instance.port,
         "deployment_id": instance.deployment_id,
-        "symmetric_key_sha256": canonical_sha256(
-            {"symmetric_key": instance.symmetric_key}
-        ),
+        "symmetric_key_sha256": canonical_sha256({"symmetric_key": instance.symmetric_key}),
         "nodes": sorted(
             (_claim_node_document(node) for node in nodes),
             key=lambda item: item["uuid"],
@@ -4448,8 +4261,7 @@ async def _locked_current_claim_lineage(
         or launch_config.gpu_launch_reservation_id != snapshot["reservation_id"]
         or instance.gpu_launch_reservation_id != snapshot["reservation_id"]
         or instance.gpu_allocation_group_id != snapshot["allocation_group_id"]
-        or instance.gpu_allocation_group_generation
-        != snapshot["allocation_group_generation"]
+        or instance.gpu_allocation_group_generation != snapshot["allocation_group_generation"]
         or instance.gpu_process_incarnation != snapshot["process_incarnation"]
         or launch_config.miner_hotkey != snapshot["miner_hotkey"]
         or instance.miner_hotkey != snapshot["miner_hotkey"]
@@ -4490,9 +4302,7 @@ async def _locked_current_claim_lineage(
         reservation = (
             await db.execute(
                 select(GpuLaunchReservation)
-                .where(
-                    GpuLaunchReservation.reservation_id == snapshot["reservation_id"]
-                )
+                .where(GpuLaunchReservation.reservation_id == snapshot["reservation_id"])
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
@@ -4502,8 +4312,7 @@ async def _locked_current_claim_lineage(
                 await db.execute(
                     select(GpuAllocationGroup)
                     .where(
-                        GpuAllocationGroup.allocation_group_id
-                        == snapshot["allocation_group_id"]
+                        GpuAllocationGroup.allocation_group_id == snapshot["allocation_group_id"]
                     )
                     .with_for_update()
                     .execution_options(populate_existing=True)
@@ -4544,8 +4353,7 @@ async def _locked_current_claim_lineage(
             or reservation.server_id != server.server_id
             or reservation.reservation_id != server.gpu_launch_reservation_id
             or reservation.allocation_group_id != snapshot["allocation_group_id"]
-            or reservation.allocation_group_generation
-            != snapshot["allocation_group_generation"]
+            or reservation.allocation_group_generation != snapshot["allocation_group_generation"]
             or reservation.process_incarnation != snapshot["process_incarnation"]
             or group.allocation_group_id != reservation.allocation_group_id
             or group.generation != reservation.allocation_group_generation
@@ -4556,8 +4364,7 @@ async def _locked_current_claim_lineage(
             or server.gpu_runtime_session_expires_at is None
             or server.gpu_runtime_session_expires_at <= datetime.now(timezone.utc)
             or server.gpu_allocation_group_id != reservation.allocation_group_id
-            or server.gpu_allocation_group_generation
-            != reservation.allocation_group_generation
+            or server.gpu_allocation_group_generation != reservation.allocation_group_generation
             or server.gpu_process_incarnation != reservation.process_incarnation
             or (
                 mode == "platform"
@@ -4596,9 +4403,7 @@ async def claim_tee_launch_config(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(None, alias=AUTHORIZATION_HEADER),
-    expected_nonce: str = Depends(
-        validate_request_nonce(NoncePurpose.INSTANCE_VERIFICATION)
-    ),
+    expected_nonce: str = Depends(validate_request_nonce(NoncePurpose.INSTANCE_VERIFICATION)),
 ):
     """Claim a TEE launch config, verify attestation, and receive symmetric key."""
     (
@@ -4606,9 +4411,7 @@ async def claim_tee_launch_config(
         nodes,
         instance,
         validator_pubkey,
-    ) = await _validate_tee_launch_config_instance(
-        config_id, args, request, db, authorization
-    )
+    ) = await _validate_tee_launch_config_instance(config_id, args, request, db, authorization)
 
     _validate_launch_config_not_expired(launch_config)
 
@@ -4629,9 +4432,7 @@ async def claim_tee_launch_config(
     await db.refresh(instance)
     gpu_count = len(nodes)
     gpu_type = nodes[0].gpu_identifier if nodes else None
-    asyncio.create_task(
-        notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type)
-    )
+    asyncio.create_task(notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type))
     asyncio.create_task(_maybe_start_log_capture(instance, config_id))
 
     # Verify TEE attestation evidence. CPU chutes have no GPU nodes; skip GPU evidence.
@@ -4646,9 +4447,7 @@ async def claim_tee_launch_config(
             compute_type=compute_type,
         )
         await db.commit()
-        launch_config, instance, nodes = await _locked_current_claim_lineage(
-            db, claim_snapshot
-        )
+        launch_config, instance, nodes = await _locked_current_claim_lineage(db, claim_snapshot)
     except Exception as exc:
         chute_id = launch_config.chute_id
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
@@ -4701,9 +4500,7 @@ async def _mark_launch_config_retrieved(config_id: str) -> None:
     async with get_session() as session:
         await acquire_gpu_lifecycle_lock(session)
         await session.execute(
-            text(
-                "UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"
-            ),
+            text("UPDATE launch_configs SET retrieved_at = NOW() WHERE config_id = :config_id"),
             {"config_id": config_id},
         )
 
@@ -4724,9 +4521,7 @@ async def validate_tee_launch_config_instance(
         nodes,
         instance,
         validator_pubkey,
-    ) = await _validate_tee_launch_config_instance(
-        config_id, args, request, db, authorization
-    )
+    ) = await _validate_tee_launch_config_instance(config_id, args, request, db, authorization)
     _reject_cpu_tee_on_legacy_endpoint(instance)
 
     _validate_launch_config_not_expired(launch_config)
@@ -4751,9 +4546,7 @@ async def validate_tee_launch_config_instance(
     await db.refresh(instance)
     gpu_count = len(nodes)
     gpu_type = nodes[0].gpu_identifier
-    asyncio.create_task(
-        notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type)
-    )
+    asyncio.create_task(notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type))
     asyncio.create_task(_maybe_start_log_capture(instance, config_id))
 
     assert_gpu_external_work_allowed(db, "legacy chute NVIDIA evidence verification")
@@ -4789,9 +4582,7 @@ async def validate_tee_launch_config_instance(
     port_results = await _collect_job_port_results(db, instance)
     await db.commit()
 
-    launch_config, instance, nodes = await _locked_current_claim_lineage(
-        db, claim_snapshot
-    )
+    launch_config, instance, nodes = await _locked_current_claim_lineage(db, claim_snapshot)
     instance = await _reload_verification_context(db, instance.instance_id)
     if (
         canonical_sha256(
@@ -4832,9 +4623,7 @@ async def validate_tee_launch_config_instance(
     await db.refresh(instance)
     _gpu_count = len(nodes) if nodes else None
     _gpu_type = nodes[0].gpu_identifier if nodes else None
-    asyncio.create_task(
-        notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
-    )
+    asyncio.create_task(notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type))
     return return_value
 
 
@@ -4865,9 +4654,7 @@ async def claim_graval_launch_config(
         nodes,
         instance,
         validator_pubkey,
-    ) = await _validate_graval_launch_config_instance(
-        config_id, args, request, db, authorization
-    )
+    ) = await _validate_graval_launch_config_instance(config_id, args, request, db, authorization)
     _reject_cpu_tee_on_legacy_endpoint(instance)
 
     # Persist the exact tentative instance/node claim before invoking Graval.
@@ -4897,9 +4684,7 @@ async def claim_graval_launch_config(
             detail="Graval returned an invalid challenge payload.",
         ) from exc
 
-    launch_config, instance, current_nodes = await _locked_current_claim_lineage(
-        db, claim_snapshot
-    )
+    launch_config, instance, current_nodes = await _locked_current_claim_lineage(db, claim_snapshot)
     current_node = next(
         (item for item in current_nodes if item.uuid == selected_node["uuid"]),
         None,
@@ -4921,9 +4706,7 @@ async def claim_graval_launch_config(
 
     gpu_count = len(current_nodes)
     gpu_type = current_nodes[0].gpu_identifier
-    asyncio.create_task(
-        notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type)
-    )
+    asyncio.create_task(notify_created(instance, gpu_count=gpu_count, gpu_type=gpu_type))
     asyncio.create_task(_maybe_start_log_capture(instance, config_id))
 
     # The miner must decrypt the proposed symmetric key from this response payload,
@@ -4952,11 +4735,7 @@ async def delayed_instance_tls_check(instance_id: str):
         await asyncio.sleep(7)
         async with get_session() as session:
             instance = (
-                (
-                    await session.execute(
-                        select(Instance).where(Instance.instance_id == instance_id)
-                    )
-                )
+                (await session.execute(select(Instance).where(Instance.instance_id == instance_id)))
                 .unique()
                 .scalar_one_or_none()
             )
@@ -4964,9 +4743,7 @@ async def delayed_instance_tls_check(instance_id: str):
                 return
             if not instance.cacert:
                 return
-            live_ok = await _verify_instance_tls_live(
-                instance.host, instance.port, instance.cacert
-            )
+            live_ok = await _verify_instance_tls_live(instance.host, instance.port, instance.cacert)
             if not live_ok:
                 reason = (
                     "Live TLS cert verification failed: "
@@ -4997,9 +4774,7 @@ async def delayed_instance_tls_check(instance_id: str):
                 logger.success(
                     f"Live TLS cert verification passed: {instance.instance_id=} on {instance.host}:{instance.port}"
                 )
-                await invalidate_instance_cache(
-                    instance.chute_id, instance_id=instance.instance_id
-                )
+                await invalidate_instance_cache(instance.chute_id, instance_id=instance.instance_id)
                 asyncio.create_task(notify_activated(instance))
                 return
 
@@ -5009,11 +4784,7 @@ async def delayed_instance_fs_check(instance_id: str):
 
     async with get_session() as session:
         instance = (
-            (
-                await session.execute(
-                    select(Instance).where(Instance.instance_id == instance_id)
-                )
-            )
+            (await session.execute(select(Instance).where(Instance.instance_id == instance_id)))
             .unique()
             .scalar_one_or_none()
         )
@@ -5071,9 +4842,7 @@ def _activation_input_document(
             "verified_at": launch_config.verified_at.isoformat()
             if launch_config.verified_at
             else None,
-            "failed_at": launch_config.failed_at.isoformat()
-            if launch_config.failed_at
-            else None,
+            "failed_at": launch_config.failed_at.isoformat() if launch_config.failed_at else None,
             "completed_at": launch_config.completed_at.isoformat()
             if launch_config.completed_at
             else None,
@@ -5092,20 +4861,14 @@ def _activation_input_document(
             "deployment_id": instance.deployment_id,
             "host": instance.host,
             "port": instance.port,
-            "cacert_sha256": canonical_sha256(instance.cacert)
-            if instance.cacert
-            else None,
+            "cacert_sha256": canonical_sha256(instance.cacert) if instance.cacert else None,
             "active": bool(instance.active),
             "verified": bool(instance.verified),
             "activated": instance.activated_at is not None,
             "bounty": bool(instance.bounty),
             "compute_multiplier": instance.compute_multiplier,
-            "created_at": instance.created_at.isoformat()
-            if instance.created_at
-            else None,
-            "extra_sha256": canonical_sha256(
-                _activation_extra_without_attempt(instance)
-            ),
+            "created_at": instance.created_at.isoformat() if instance.created_at else None,
+            "extra_sha256": canonical_sha256(_activation_extra_without_attempt(instance)),
         },
         "chute": {
             "chute_id": chute.chute_id,
@@ -5136,9 +4899,7 @@ def _activation_attempt(
     *,
     create: bool,
 ) -> tuple[dict, str]:
-    input_sha256 = canonical_sha256(
-        _activation_input_document(launch_config, instance, chute)
-    )
+    input_sha256 = canonical_sha256(_activation_input_document(launch_config, instance, chute))
     attempt_id = _activation_attempt_identity(
         launch_config.config_id,
         instance.instance_id,
@@ -5223,8 +4984,7 @@ def _validate_completed_activation_attempt(
         or attempt.get("instance_id") != instance.instance_id
         or attempt.get("state") != "completed"
         or not isinstance(attempt.get("result"), dict)
-        or attempt.get("result", {}).get("schema")
-        != "chutes.launch-activation-result.v1"
+        or attempt.get("result", {}).get("schema") != "chutes.launch-activation-result.v1"
         or attempt.get("result", {}).get("attempt_id") != expected_attempt_id
         or attempt.get("result_sha256") != canonical_sha256(attempt.get("result"))
         or attempt.get("completed_at") is None
@@ -5282,9 +5042,7 @@ def _parse_activation_warmup_envelope(data, attempt_id: str, chute_id: str) -> d
     try:
         envelope = json.loads(data)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
-        raise RuntimeError(
-            "Activation warmup consume returned an invalid envelope"
-        ) from exc
+        raise RuntimeError("Activation warmup consume returned an invalid envelope") from exc
     if (
         not isinstance(envelope, dict)
         or envelope.get("schema") != "chutes.activation-warmup-result.v1"
@@ -5658,9 +5416,7 @@ async def activate_launch_config_instance(
     if instance.cacert:
         asyncio.create_task(delayed_instance_tls_check(instance.instance_id))
     else:
-        await invalidate_instance_cache(
-            instance.chute_id, instance_id=instance.instance_id
-        )
+        await invalidate_instance_cache(instance.chute_id, instance_id=instance.instance_id)
         asyncio.create_task(notify_activated(instance))
     return {"ok": True}
 
@@ -5679,9 +5435,7 @@ async def verify_port_map(instance, port_map):
             sock.send(b"test")
             logger.info(f"Sent a packet to {instance.instance_id=} on {port_map=}")
             response = sock.recv(1024).decode()
-            logger.success(
-                f"Received a response from {instance.instance_id=} on {port_map=}"
-            )
+            logger.success(f"Received a response from {instance.instance_id=} on {port_map=}")
             sock.close()
         else:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -5690,9 +5444,7 @@ async def verify_port_map(instance, port_map):
             logger.info(f"Sent a packet to {instance.instance_id=} on {port_map=}")
             response, _ = sock.recvfrom(1024)
             response = response.decode()
-            logger.success(
-                f"Received a response from {instance.instance_id=} on {port_map=}"
-            )
+            logger.success(f"Received a response from {instance.instance_id=} on {port_map=}")
             sock.close()
         if "|" not in response:
             logger.error(f"Invalid socket response for {port_map=} {response=}")
@@ -5702,9 +5454,7 @@ async def verify_port_map(instance, port_map):
         decrypted = await asyncio.to_thread(
             aes_decrypt, encrypted_response, instance.symmetric_key, iv_hex
         )
-        expected = (
-            f"response from {port_map['proto'].lower()} {port_map['internal_port']}"
-        )
+        expected = f"response from {port_map['proto'].lower()} {port_map['internal_port']}"
         return decrypted.decode() == expected
     except Exception as e:
         logger.error(f"Port verification failed for {port_map}: {e}")
@@ -5873,9 +5623,7 @@ async def _validate_legacy_filesystem(
             logger.warning("Extended filesystem verification disabled, skipping...")
 
 
-async def _collect_job_port_results(
-    db: AsyncSession, instance: Instance
-) -> dict[str, bool]:
+async def _collect_job_port_results(db: AsyncSession, instance: Instance) -> dict[str, bool]:
     job = instance.job
     results = {}
     if job and instance.server_id is None:
@@ -5909,9 +5657,7 @@ async def _verify_job_ports(
                 continue
             if probe_ports:
                 if port_results is _EXTERNAL_VALUE_UNSET:
-                    assert_gpu_external_work_allowed(
-                        db, "launch job port socket verification"
-                    )
+                    assert_gpu_external_work_allowed(db, "launch job port socket verification")
                     port_ok = await verify_port_map(instance, port_map)
                 else:
                     port_ok = port_results.get(canonical_sha256(port_map), False)
@@ -5989,11 +5735,7 @@ async def _build_launch_config_verified_response(
 
     # Secrets, e.g. private HF tokens etc.
     secrets = (
-        (
-            await db.execute(
-                select(Secret).where(Secret.purpose == launch_config.chute_id)
-            )
-        )
+        (await db.execute(select(Secret).where(Secret.purpose == launch_config.chute_id)))
         .unique()
         .scalars()
         .all()
@@ -6039,9 +5781,7 @@ async def _build_launch_config_verified_response(
                 ),
                 {
                     "config_id": storage_config_id,
-                    "reason": f"Launch-bound ChuteFS session issuance failed: {exc}"[
-                        :2000
-                    ],
+                    "reason": f"Launch-bound ChuteFS session issuance failed: {exc}"[:2000],
                 },
             )
             await db.execute(
@@ -6068,9 +5808,7 @@ async def verify_launch_config_instance(
 ):
     # Backwards compatibility for older client libs; delegates to graval endpoint.
     # TODO: Remove this once all chutes are upgraded to 0.6.0 or later
-    return await verify_graval_launch_config_instance(
-        config_id, request, db, authorization
-    )
+    return await verify_graval_launch_config_instance(config_id, request, db, authorization)
 
 
 @router.put("/launch_config/{config_id}/graval")
@@ -6082,9 +5820,7 @@ async def verify_graval_launch_config_instance(
 ):
     """Verify Graval launch config instance by validating PoVW proof and symmetric key usage."""
     token = authorization.strip().split(" ")[-1]
-    launch_config = await load_launch_config_from_jwt(
-        db, config_id, token, allow_retrieved=True
-    )
+    launch_config = await load_launch_config_from_jwt(db, config_id, token, allow_retrieved=True)
 
     _validate_launch_config_not_expired(launch_config)
 
@@ -6155,10 +5891,7 @@ async def verify_graval_launch_config_instance(
         response = await asyncio.to_thread(
             decrypt_instance_response, ciphertext, instance, iv, force_legacy=True
         )
-        assert (
-            response
-            == f"secret is {launch_config.config_id} {launch_config.seed}".encode()
-        )
+        assert response == f"secret is {launch_config.config_id} {launch_config.seed}".encode()
     except Exception as exc:
         reason = (
             f"PoVW encrypted response for {config_id=} and {instance.instance_id=} "
@@ -6197,9 +5930,7 @@ async def verify_graval_launch_config_instance(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing Graval proof for selected GPU.",
         ) from exc
-    claim_snapshot = _claim_lineage_snapshot(
-        launch_config, instance, list(instance.nodes)
-    )
+    claim_snapshot = _claim_lineage_snapshot(launch_config, instance, list(instance.nodes))
     external_input = _verification_external_input_document(
         launch_config,
         instance,
@@ -6219,9 +5950,7 @@ async def verify_graval_launch_config_instance(
     filesystem_hash = await _collect_legacy_filesystem_hash(db, instance, launch_config)
     port_results = await _collect_job_port_results(db, instance)
 
-    launch_config, instance, current_nodes = await _locked_current_claim_lineage(
-        db, claim_snapshot
-    )
+    launch_config, instance, current_nodes = await _locked_current_claim_lineage(db, claim_snapshot)
     instance = await _reload_verification_context(db, instance.instance_id)
     current_input = _verification_external_input_document(
         launch_config,
@@ -6280,9 +6009,7 @@ async def verify_graval_launch_config_instance(
     )
 
     await db.refresh(instance)
-    asyncio.create_task(
-        notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
-    )
+    asyncio.create_task(notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type))
     return return_value
 
 
@@ -6295,9 +6022,7 @@ async def verify_tee_launch_config_instance(
 ):
     """Verify TEE launch config instance by validating symmetric key usage via dummy ports."""
     token = authorization.strip().split(" ")[-1]
-    launch_config = await load_launch_config_from_jwt(
-        db, config_id, token, allow_retrieved=True
-    )
+    launch_config = await load_launch_config_from_jwt(db, config_id, token, allow_retrieved=True)
 
     _validate_launch_config_not_expired(launch_config)
 
@@ -6336,9 +6061,7 @@ async def verify_tee_launch_config_instance(
     # TEE instances skip PoVW; legacy job port probes are still sockets and
     # must run after the exact claim is durable and every lifecycle lock is released.
     tee_response_document = {"operation": "tee-launch-verification"}
-    claim_snapshot = _claim_lineage_snapshot(
-        launch_config, instance, list(instance.nodes)
-    )
+    claim_snapshot = _claim_lineage_snapshot(launch_config, instance, list(instance.nodes))
     external_input_sha256 = canonical_sha256(
         _verification_external_input_document(
             launch_config,
@@ -6350,9 +6073,7 @@ async def verify_tee_launch_config_instance(
     await db.commit()
     port_results = await _collect_job_port_results(db, instance)
 
-    launch_config, instance, current_nodes = await _locked_current_claim_lineage(
-        db, claim_snapshot
-    )
+    launch_config, instance, current_nodes = await _locked_current_claim_lineage(db, claim_snapshot)
     instance = await _reload_verification_context(db, instance.instance_id)
     if (
         canonical_sha256(
@@ -6378,9 +6099,7 @@ async def verify_tee_launch_config_instance(
     )
 
     await db.refresh(instance)
-    asyncio.create_task(
-        notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type)
-    )
+    asyncio.create_task(notify_verified(instance, gpu_count=_gpu_count, gpu_type=_gpu_type))
     return return_value
 
 
@@ -6394,9 +6113,7 @@ async def get_instance_nonce(request: Request):
     """
     try:
         server_ip = request.state.client_ip
-        nonce_info = await create_nonce(
-            server_ip, purpose=NoncePurpose.INSTANCE_VERIFICATION
-        )
+        nonce_info = await create_nonce(server_ip, purpose=NoncePurpose.INSTANCE_VERIFICATION)
 
         # Return just the nonce string as JSON (library expects this format)
         # The library will use this nonce in the X-Chutes-Nonce header
@@ -6536,9 +6253,7 @@ async def stream_logs(
         port_mappings = list(instance.port_mappings or [])
 
     async def _stream():
-        log_port = next(p for p in port_mappings if p["internal_port"] == 8001)[
-            "external_port"
-        ]
+        log_port = next(p for p in port_mappings if p["internal_port"] == 8001)["external_port"]
         # Build a temporary client for the log port (always plain HTTP, even for v4/TLS instances).
         import httpx as _httpx
 
@@ -6576,9 +6291,7 @@ async def disable_instance_endpoint(
     instance_id: str,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(purpose="instances", registered_to=settings.netuid)
-    ),
+    _: User = Depends(get_current_user(purpose="instances", registered_to=settings.netuid)),
 ):
     instance = await get_instance_by_chute_and_id(db, instance_id, chute_id, hotkey)
     if not instance:
@@ -6606,9 +6319,7 @@ async def delete_instance(
     request: Request,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(purpose="instances", registered_to=settings.netuid)
-    ),
+    _: User = Depends(get_current_user(purpose="instances", registered_to=settings.netuid)),
 ):
     instance = await get_instance_by_chute_and_id(db, instance_id, chute_id, hotkey)
     if not instance:
@@ -6623,6 +6334,14 @@ async def delete_instance(
         trigger="miner",
         origin_ip=origin_ip,
     ).info(f"instance deletion initialized: {instance_id} by {hotkey}")
+
+    # Acquire lifecycle/config/instance custody before touching the related Job. Any intervening
+    # ORM query may autoflush a Job terminal write and otherwise invert model-authority lock order.
+    await prepare_instance_terminal_writes(
+        db,
+        [instance_id],
+        complete_launch_configs=True,
+    )
 
     # Fail the job.
     job = (
@@ -6657,10 +6376,7 @@ async def delete_instance(
     ).scalar_one()
 
     # XXX d899b064-d9ae-5612-99e6-413e9136671b (glm5turbo) keeps crashing, and only one b200, so skip penalty.
-    if (
-        active_count == 0
-        and instance.chute_id != "d899b064-d9ae-5612-99e6-413e9136671b"
-    ):
+    if active_count == 0 and instance.chute_id != "d899b064-d9ae-5612-99e6-413e9136671b":
         # This is the last instance - apply penalties
         if not instance.billed_to:
             # Public chute: negate bounty and apply 10x penalty
@@ -6696,11 +6412,6 @@ async def delete_instance(
 
     evict_instance_ssl(instance_id)
 
-    await prepare_instance_terminal_writes(
-        db,
-        [instance_id],
-        complete_launch_configs=True,
-    )
     await db.delete(instance)
 
     # Update instance audit table.

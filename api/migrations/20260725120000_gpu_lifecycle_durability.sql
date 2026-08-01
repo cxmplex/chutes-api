@@ -116,12 +116,20 @@ ALTER TABLE nodes ADD CONSTRAINT ck_nodes_gpu_allocation_identity CHECK (
 );
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_nodes_gpu_launch_reservation') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_nodes_gpu_launch_reservation'
+          AND conrelid = 'nodes'::regclass
+    ) THEN
         ALTER TABLE nodes ADD CONSTRAINT fk_nodes_gpu_launch_reservation
             FOREIGN KEY (gpu_launch_reservation_id)
             REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'fk_nodes_gpu_inventory_report') THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_nodes_gpu_inventory_report'
+          AND conrelid = 'nodes'::regclass
+    ) THEN
         ALTER TABLE nodes ADD CONSTRAINT fk_nodes_gpu_inventory_report
             FOREIGN KEY (gpu_inventory_report_id)
             REFERENCES gpu_inventory_reports(report_id) ON DELETE RESTRICT;
@@ -481,6 +489,7 @@ CREATE TABLE IF NOT EXISTS gpu_registration_nonces (
     nonce_id VARCHAR PRIMARY KEY,
     client_request_id VARCHAR NOT NULL,
     request_generation INTEGER NOT NULL,
+    registration_generation INTEGER NOT NULL DEFAULT 1,
     peer_spki_sha256 VARCHAR(64) NOT NULL,
     reservation_id VARCHAR NOT NULL REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT,
     server_ip VARCHAR NOT NULL,
@@ -497,7 +506,10 @@ CREATE TABLE IF NOT EXISTS gpu_registration_nonces (
         AND peer_spki_sha256 ~ '^[0-9a-f]{64}$'
     ),
     CONSTRAINT ck_gpu_registration_nonce_generation CHECK (
-        request_generation > 0 AND request_generation <= 1024
+        request_generation > 0
+        AND request_generation <= 1024
+        AND registration_generation > 0
+        AND registration_generation <= 1024
     ),
     CONSTRAINT ck_gpu_registration_nonce_value CHECK (
         (state IN ('issued', 'claimed') AND nonce_value ~ '^[0-9a-f]{64}$')
@@ -519,6 +531,7 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
     attempt_id VARCHAR PRIMARY KEY,
     nonce_id VARCHAR NOT NULL UNIQUE REFERENCES gpu_registration_nonces(nonce_id) ON DELETE RESTRICT,
     reservation_id VARCHAR NOT NULL REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT,
+    registration_generation INTEGER NOT NULL DEFAULT 1,
     registration_id VARCHAR UNIQUE,
     request_sha256 VARCHAR(64) NOT NULL,
     request_payload_ciphertext TEXT,
@@ -548,6 +561,9 @@ CREATE TABLE IF NOT EXISTS gpu_registration_attempts (
         AND (request_payload_key_id IS NULL
              OR request_payload_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
         AND (stable_response_sha256 IS NULL OR stable_response_sha256 ~ '^[0-9a-f]{64}$')
+    ),
+    CONSTRAINT ck_gpu_registration_attempt_generation CHECK (
+        registration_generation > 0 AND registration_generation <= 1024
     ),
     CONSTRAINT ck_gpu_registration_attempt_lease CHECK (
         (processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL)

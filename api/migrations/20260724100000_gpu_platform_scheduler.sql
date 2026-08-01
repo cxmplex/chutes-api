@@ -190,9 +190,9 @@ CREATE INDEX IF NOT EXISTS idx_gpu_launch_reservations_platform_workload
     ON gpu_launch_reservations (management_mode, chute_id, job_id, state);
 
 ALTER TABLE launch_configs
-    ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_management_mode VARCHAR;
 ALTER TABLE launch_configs
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id VARCHAR;
 ALTER TABLE launch_configs
     DROP CONSTRAINT IF EXISTS ck_launch_config_gpu_manager;
 ALTER TABLE launch_configs
@@ -219,11 +219,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_launch_configs_gpu_reservation
       AND gpu_management_mode = 'platform';
 
 ALTER TABLE instances
-    ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_management_mode VARCHAR;
 ALTER TABLE instances
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id VARCHAR;
 ALTER TABLE instances
-    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id VARCHAR;
 ALTER TABLE instances
     ADD COLUMN IF NOT EXISTS gpu_allocation_group_generation INTEGER;
 DO $$
@@ -261,7 +261,7 @@ BEGIN
 END
 $$;
 ALTER TABLE instances
-    ADD COLUMN IF NOT EXISTS gpu_process_incarnation TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_process_incarnation VARCHAR;
 ALTER TABLE instances DROP CONSTRAINT IF EXISTS ck_instances_gpu_manager;
 ALTER TABLE instances
     ADD CONSTRAINT ck_instances_gpu_manager CHECK (
@@ -288,9 +288,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_instances_gpu_reservation
       AND gpu_management_mode = 'platform';
 
 ALTER TABLE jobs
-    ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_management_mode VARCHAR;
 ALTER TABLE jobs
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id VARCHAR
         REFERENCES gpu_launch_reservations(reservation_id) ON DELETE RESTRICT;
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS ck_jobs_gpu_manager;
 ALTER TABLE jobs
@@ -309,13 +309,13 @@ ALTER TABLE jobs
 ALTER TABLE server_attestations
     ADD COLUMN IF NOT EXISTS gpu_evidence JSONB;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_evidence_sha256 TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_evidence_sha256 VARCHAR(64);
 ALTER TABLE server_attestations
     ADD COLUMN IF NOT EXISTS gpu_evidence_certificate_sha256s JSONB;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id VARCHAR;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT
+    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id VARCHAR
         REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT;
 ALTER TABLE server_attestations
     ADD COLUMN IF NOT EXISTS gpu_allocation_group_generation INTEGER;
@@ -324,21 +324,21 @@ ALTER TABLE server_attestations
 ALTER TABLE server_attestations
     ADD COLUMN IF NOT EXISTS gpu_reservation_generation INTEGER;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_management_mode VARCHAR;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_process_incarnation TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_process_incarnation VARCHAR;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_topology_fingerprint TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_topology_fingerprint VARCHAR(64);
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_release_id TEXT REFERENCES guest_releases(release_id) ON DELETE RESTRICT;
+    ADD COLUMN IF NOT EXISTS gpu_release_id VARCHAR REFERENCES guest_releases(release_id) ON DELETE RESTRICT;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_profile_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_profile_id VARCHAR;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_chute_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_chute_id VARCHAR;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_job_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_job_id VARCHAR;
 ALTER TABLE server_attestations
-    ADD COLUMN IF NOT EXISTS gpu_claims_sha256 TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_claims_sha256 VARCHAR(64);
 ALTER TABLE server_attestations DROP CONSTRAINT IF EXISTS ck_server_attestation_gpu_lineage;
 ALTER TABLE server_attestations
     ADD CONSTRAINT ck_server_attestation_gpu_lineage CHECK (
@@ -391,7 +391,7 @@ CREATE INDEX IF NOT EXISTS idx_server_attestations_gpu_lineage
     WHERE gpu_launch_reservation_id IS NOT NULL;
 
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_runtime_session_attestation_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_runtime_session_attestation_id VARCHAR;
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS gpu_runtime_session_expires_at TIMESTAMPTZ;
 ALTER TABLE servers DROP CONSTRAINT IF EXISTS ck_servers_gpu_runtime_session;

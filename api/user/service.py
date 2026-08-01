@@ -17,6 +17,7 @@ from api.server.gpu_sessions import (
     GPU_RUNTIME_SESSION_HEADER,
     validate_gpu_runtime_session,
 )
+from api.server.util import require_live_attested_client_cert
 from fastapi.security import APIKeyHeader
 from api.constants import HOTKEY_HEADER, SIGNATURE_HEADER, AUTHORIZATION_HEADER
 from api.constants import (
@@ -101,6 +102,7 @@ def get_current_user(
                     attested_session,
                     required_purpose=purpose,
                 )
+                require_live_attested_client_cert(request, server)
                 if hotkey is not None and hotkey != server.miner_hotkey:
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,

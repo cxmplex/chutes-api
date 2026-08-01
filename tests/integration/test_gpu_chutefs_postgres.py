@@ -290,9 +290,7 @@ async def _ensure_test_token_key_epoch(db: AsyncSession) -> str:
     key_id = settings.chutefs_token_key_id
     keys = settings.chutefs_token_keys
     fingerprints = token_key_fingerprints(keys)
-    storage_startup._VALIDATED_TOKEN_KEY_FINGERPRINTS = {
-        key_id: fingerprints[key_id]
-    }
+    storage_startup._VALIDATED_TOKEN_KEY_FINGERPRINTS = {key_id: fingerprints[key_id]}
     existing = await db.get(ChuteFSTokenKeyEpoch, key_id)
     if existing is not None:
         return key_id
@@ -339,8 +337,12 @@ async def test_timestamped_migration_applies_with_durable_constraints(pg_session
     )
     trigger_count = await db.scalar(
         text(
-            "SELECT COUNT(*) FROM pg_trigger "
-            "WHERE NOT tgisinternal AND tgname IN ("
+            "SELECT COUNT(*) FROM pg_trigger AS trigger_row "
+            "JOIN pg_class AS relation ON relation.oid = trigger_row.tgrelid "
+            "JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace "
+            "WHERE NOT trigger_row.tgisinternal "
+            "AND namespace.oid = current_schema()::regnamespace "
+            "AND trigger_row.tgname IN ("
             "'trg_default_chutefs_binding_identity', "
             "'trg_revoke_chutefs_session_on_instance_disable', "
             "'trg_revoke_chutefs_session_on_config_failure', "
@@ -641,7 +643,10 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         .scalars()
         .all()
     )
-    assert [row.generation for row in replay_rows] == [issued.generation, rotated.generation]
+    assert [row.generation for row in replay_rows] == [
+        issued.generation,
+        rotated.generation,
+    ]
     assert sum(row.revoked_at is None for row in replay_rows) == 1
     with pytest.raises(HTTPException, match="invalid"):
         await launch_sessions.authorize_default_volume(
@@ -716,6 +721,7 @@ async def test_disable_between_preflight_and_lifecycle_lock_fences_authority(
     monkeypatch,
 ):
     db, redis = pg_session
+    await _install_launch_erasure_migration(db)
     await _ensure_test_token_key_epoch(db)
     chute = await _chute(db, storage_pg.USER_ID, f"disable-race-{uuid.uuid4().hex}")
     _, cert = _identity("disable-race")
@@ -901,9 +907,7 @@ async def test_reexchange_rotates_after_refresh_expiry_with_exact_replay(
         config.config_id,
         request,
     )
-    after_refresh_expiry = datetime.fromisoformat(
-        issued.refresh_expires_at
-    ) + timedelta(seconds=1)
+    after_refresh_expiry = datetime.fromisoformat(issued.refresh_expires_at) + timedelta(seconds=1)
 
     with monkeypatch.context() as future:
         future.setattr(
@@ -1034,9 +1038,7 @@ async def test_delayed_launch_exchange_cannot_replace_refreshed_session(
     pre_rotation_rows = list(
         (
             await db.execute(
-                select(ChuteFSLaunchSession).where(
-                    ChuteFSLaunchSession.config_id == config_id
-                )
+                select(ChuteFSLaunchSession).where(ChuteFSLaunchSession.config_id == config_id)
             )
         )
         .scalars()
@@ -1579,11 +1581,14 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
     )
     await db.commit()
 
-    assert await launch_sessions._prune_expired_session_lineage(
-        db,
-        config.config_id,
-        now=now,
-    ) == 128
+    assert (
+        await launch_sessions._prune_expired_session_lineage(
+            db,
+            config.config_id,
+            now=now,
+        )
+        == 128
+    )
     await db.commit()
     assert (
         await db.scalar(
@@ -1598,11 +1603,14 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
     assert active.rotated_from_session_id == history_ids[0]
     assert active.rotated_from_session_sha256 == digest(history_ids[0])
 
-    assert await launch_sessions._prune_expired_session_lineage(
-        db,
-        config.config_id,
-        now=now,
-    ) == 0
+    assert (
+        await launch_sessions._prune_expired_session_lineage(
+            db,
+            config.config_id,
+            now=now,
+        )
+        == 0
+    )
     await db.commit()
     assert (
         await db.scalar(
@@ -1614,11 +1622,14 @@ async def test_expired_rotation_lineage_prunes_in_bounded_batches(pg_session):
     )
 
     after_replay = active.response_replay_until + timedelta(seconds=1)
-    assert await launch_sessions._prune_expired_session_lineage(
-        db,
-        config.config_id,
-        now=after_replay,
-    ) == 1
+    assert (
+        await launch_sessions._prune_expired_session_lineage(
+            db,
+            config.config_id,
+            now=after_replay,
+        )
+        == 1
+    )
     await db.commit()
     assert await db.get(ChuteFSLaunchSession, history_ids[0]) is None
     assert (

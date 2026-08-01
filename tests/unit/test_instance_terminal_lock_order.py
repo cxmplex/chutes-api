@@ -26,10 +26,7 @@ class _RecordingSession:
     async def execute(self, statement, parameters=None):
         sql = str(statement)
         self.events.append((sql, parameters, statement.compile().params))
-        if (
-            "instances.instance_id, instances.config_id" in sql
-            and "FOR UPDATE" not in sql
-        ):
+        if "instances.instance_id, instances.config_id" in sql and "FOR UPDATE" not in sql:
             return _Rows(
                 [
                     ("instance-b", "config-b"),
@@ -87,10 +84,7 @@ def _terminal_writer_functions() -> dict[str, set[str]]:
                 reasons.add("raw delete")
             if "delete(Instance)" in function_source:
                 reasons.add("bulk delete")
-            if (
-                ".delete(instance)" in function_source
-                or ".delete(job.instance)" in function_source
-            ):
+            if ".delete(instance)" in function_source or ".delete(job.instance)" in function_source:
                 reasons.add("ORM delete")
             if "update(Instance)" in function_source:
                 reasons.add("bulk update")
@@ -154,9 +148,7 @@ def test_every_instance_terminal_writer_uses_the_ordered_helper():
         if identity in allowed_nonterminal:
             continue
         if identity in allowed_non_instance_session_deletes:
-            assert reasons == {
-                "direct db.delete requires explicit classification"
-            }, identity
+            assert reasons == {"direct db.delete requires explicit classification"}, identity
             continue
         relative, function_name = identity.split(":", 1)
         source = (root / relative).read_text(encoding="utf-8")
@@ -181,9 +173,7 @@ def test_every_instance_terminal_writer_uses_the_ordered_helper():
         f"{identity}: {', '.join(reasons)}" for identity, reasons in missing
     )
 
-    storage_source = (
-        root / "storage/launch_sessions.py"
-    ).read_text(encoding="utf-8")
+    storage_source = (root / "storage/launch_sessions.py").read_text(encoding="utf-8")
     assert "lock_launch_configs_before_instances" in storage_source
     erasure_source = (root / "storage/service.py").read_text(encoding="utf-8")
     assert "lock_launch_storage_configurations" in erasure_source
@@ -199,11 +189,7 @@ def _call_path(node: ast.AST) -> str:
 
 
 def _awaited_call_paths(node: ast.Await) -> set[str]:
-    return {
-        _call_path(child.func)
-        for child in ast.walk(node.value)
-        if isinstance(child, ast.Call)
-    }
+    return {_call_path(child.func) for child in ast.walk(node.value) if isinstance(child, ast.Call)}
 
 
 def _is_external_await(node: ast.Await) -> bool:
@@ -249,12 +235,9 @@ def test_lifecycle_helper_calls_commit_before_external_io():
                 call.lineno
                 for call in ast.walk(function)
                 if isinstance(call, ast.Call)
-                and _call_path(call.func).rsplit(".", 1)[-1]
-                in {"commit", "rollback"}
+                and _call_path(call.func).rsplit(".", 1)[-1] in {"commit", "rollback"}
             )
-            for awaited in (
-                child for child in ast.walk(function) if isinstance(child, ast.Await)
-            ):
+            for awaited in (child for child in ast.walk(function) if isinstance(child, ast.Await)):
                 paths = _awaited_call_paths(awaited)
                 if "asyncio.create_task" in paths and any(
                     item.rsplit(".", 1)[-1] == "notify_deleted" for item in paths
@@ -277,11 +260,49 @@ def test_lifecycle_helper_calls_commit_before_external_io():
     assert not failures, "\n".join(failures)
 
 
+def test_instance_delete_locks_lifecycle_before_job_terminal_write():
+    source = (Path(__file__).resolve().parents[2] / "api/instance/router.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "delete_instance"
+    )
+    function_source = ast.get_source_segment(source, function) or ""
+    assert function_source.index("await prepare_instance_terminal_writes") < function_source.index(
+        "job.finished_at ="
+    )
+
+
+def test_chute_disable_commits_before_external_cache_and_bounty_work():
+    source = (Path(__file__).resolve().parents[2] / "api/chute/router.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "update_common_attributes"
+    )
+    function_source = ast.get_source_segment(source, function) or ""
+    lifecycle = function_source.index("await acquire_gpu_lifecycle_lock")
+    disable_write = function_source.index("chute.disabled =")
+    commit = function_source.index("await db.commit()")
+    assert lifecycle < disable_write < commit
+    for external_call in (
+        "await set_chute_disabled",
+        "await invalidate_chute_cache",
+        "await delete_bounty",
+    ):
+        assert commit < function_source.index(external_call)
+
+
 def test_unshipped_migrations_have_no_instance_to_launch_config_trigger():
     root = Path(__file__).resolve().parents[2]
     migration_sources = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (root / "api/migrations").glob("*.sql")
+        path.read_text(encoding="utf-8") for path in (root / "api/migrations").glob("*.sql")
     )
     assert "complete_launch_config_on_instance_terminal" not in migration_sources
     assert "trg_complete_launch_config_on_instance_terminal" not in migration_sources

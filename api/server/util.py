@@ -122,9 +122,7 @@ def extract_client_cert_pem(require_proxy_verified: bool = False):
 
     async def _extract_request_client_cert_pem(request: Request):
         try:
-            cert = _get_client_certificate(
-                request, require_proxy_verified=require_proxy_verified
-            )
+            cert = _get_client_certificate(request, require_proxy_verified=require_proxy_verified)
             return cert.public_bytes(serialization.Encoding.PEM).decode()
         except HTTPException:
             raise
@@ -296,6 +294,37 @@ def _get_client_certificate(request: Request, require_proxy_verified: bool = Tru
     cert = x509.load_pem_x509_certificate(cert_pem, default_backend())
 
     return cert
+
+
+def require_live_attested_client_cert(request: Request, server: Server) -> str:
+    """Require proxy-proven possession of the server's current attested certificate."""
+
+    if not settings.require_mtls_client_verify:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=("Live attested mTLS possession requires a verifying mTLS terminator."),
+        )
+    try:
+        cert_hash = get_public_key_hash(
+            _get_client_certificate(request, require_proxy_verified=True)
+        ).lower()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Current attested mTLS possession could not be verified.",
+        ) from exc
+    expected_cert_hash = (server.attested_cert_pubkey_hash or "").strip().lower()
+    if not expected_cert_hash or not secrets.compare_digest(
+        expected_cert_hash,
+        cert_hash,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=("Presented mTLS identity is not the server's current attested identity."),
+        )
+    return cert_hash
 
 
 def extract_nonce(quote: TdxQuote):

@@ -1,8 +1,8 @@
 -- migrate:up
 
 ALTER TABLE launch_configs
-    ADD COLUMN IF NOT EXISTS container_repository TEXT,
-    ADD COLUMN IF NOT EXISTS container_manifest_digest TEXT,
+    ADD COLUMN IF NOT EXISTS container_repository VARCHAR,
+    ADD COLUMN IF NOT EXISTS container_manifest_digest VARCHAR,
     ADD COLUMN IF NOT EXISTS registry_scope_active BOOLEAN NOT NULL DEFAULT FALSE,
     ADD COLUMN IF NOT EXISTS registry_scope_revoked_at TIMESTAMPTZ;
 

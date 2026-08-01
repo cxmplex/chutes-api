@@ -26,24 +26,33 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from api.chute.schemas import Chute
-from api.config import settings
+from api.config import (
+    measurement_config_fingerprint,
+    measurement_trust_set_fingerprint,
+    settings,
+)
 from api.database import get_db_session
 from api.image.schemas import Image
 from api.instance.schemas import Instance, LaunchConfig
+from api.instance.locking import lock_launch_configs_before_instances
 from api.instance.util import create_launch_jwt_v2
+from api.job.schemas import Job
 from api.server.schemas import (
     DefaultChuteFSVolumeBinding,
     Server,
+    ServerAttestation,
     StorageVolume,
     StorageVolumeKey,
 )
 from api.server.util import get_public_key_hash
+from api.storage import service as storage_service
 from api.storage.router import router as storage_router
 from tests.integration import test_storage_reconciliation_postgres as api_pg
 
@@ -225,6 +234,20 @@ async def _seed_launch(
     requester = None
     if requester_identity is not None:
         cert_pem = requester_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+        measurement = next(
+            config
+            for config in settings.tee_measurements
+            if config.provider == "bare-metal"
+            and config.tee_type == "sev-snp"
+            and not (config.name or "").startswith("storage-")
+            and config.gpu_count == 0
+            and not list(config.expected_gpus or [])
+        )
+        config_fingerprint = measurement.config_fingerprint or measurement_config_fingerprint(
+            measurement
+        )
+        trust_set_fingerprint = measurement_trust_set_fingerprint(settings.tee_measurements)
+        verified_at = datetime.now(timezone.utc)
         requester = Server(
             server_id=f"requester-{suffix}",
             ip="127.0.0.10",
@@ -235,13 +258,29 @@ async def _seed_launch(
             self_registered=True,
             compute_type="cpu",
             tee_type="sev-snp",
-            host_id=f"host-{suffix}",
+            host_id=None,
             storage_role=False,
             attested_cert=cert_pem,
             attested_cert_pubkey_hash=get_public_key_hash(requester_identity[1]),
+            version=measurement.version,
+            measurement_name=measurement.name,
+            measurement_config_fingerprint=config_fingerprint,
+            trust_set_fingerprint=trust_set_fingerprint,
         )
         db.add(requester)
         await db.flush()
+        db.add(
+            ServerAttestation(
+                server_id=requester.server_id,
+                quote_data="current-cpu-model-requester-attestation",
+                measurement_version=measurement.version,
+                measurement_name=measurement.name,
+                measurement_config_fingerprint=config_fingerprint,
+                trust_set_fingerprint=trust_set_fingerprint,
+                created_at=verified_at,
+                verified_at=verified_at,
+            )
+        )
 
     default_volume = StorageVolume(
         user_id=api_pg.USER_ID,
@@ -556,6 +595,236 @@ async def test_model_access_route_verifies_real_launch_jwt_and_consumes_once(
         assert replay.status_code == 401
 
 
+async def test_model_capability_revocation_race_after_locked_revalidation_fails_closed(
+    pg_session,
+    real_capability_redis,
+    monkeypatch,
+):
+    db, _ = pg_session
+    redis = real_capability_redis
+    launch, _, _, _target, target_identity = await _seed_launch(
+        db,
+        redis,
+        env_type="graval",
+    )
+    instance = await db.scalar(select(Instance).where(Instance.config_id == launch.config_id))
+    assert instance is not None
+    token = create_launch_jwt_v2(launch)
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+
+    class RevokingRedis:
+        def __getattr__(self, name):
+            return getattr(redis, name)
+
+        async def setex(self, key, ttl, value):
+            # This runs at the exact durable-check -> Redis-publication boundary. It can acquire
+            # lifecycle custody only if issuance released its transaction first.
+            async with factory() as terminal:
+                await lock_launch_configs_before_instances(
+                    terminal,
+                    config_ids=(launch.config_id,),
+                    instance_ids=(instance.instance_id,),
+                )
+                await terminal.execute(
+                    update(Instance)
+                    .where(Instance.instance_id == instance.instance_id)
+                    .values(verified=False)
+                )
+                await terminal.commit()
+            return await redis.setex(key, ttl, value)
+
+    monkeypatch.setattr(settings, "_redis_client", RevokingRedis())
+    app = _route_app(db.bind)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="https://validator.test",
+    ) as client:
+        issued = await asyncio.wait_for(
+            client.post(
+                "/storage/model/access",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "request_id": REQUEST_ID,
+                    "repo_id": REPO_ID,
+                    "revision": COMMIT,
+                    "requested_revision": COMMIT,
+                },
+            ),
+            timeout=5,
+        )
+        assert issued.status_code == 200, issued.text
+        rejected = await _consume(client, issued.json(), target_identity)
+        assert rejected.status_code == 403
+        assert "revoked or changed" in rejected.text
+
+
+@pytest.mark.parametrize(
+    "revocation",
+    ("completed_config", "disabled_chute", "finished_job"),
+)
+async def test_model_capability_consume_rechecks_terminal_chute_and_job_authority(
+    pg_session,
+    real_capability_redis,
+    revocation,
+):
+    db, _ = pg_session
+    redis = real_capability_redis
+    launch, _, _, _target, target_identity = await _seed_launch(
+        db,
+        redis,
+        env_type="graval",
+    )
+    instance = await db.scalar(select(Instance).where(Instance.config_id == launch.config_id))
+    assert instance is not None
+    job_id = None
+    if revocation == "finished_job":
+        job_id = f"job-{uuid.uuid4().hex}"
+        db.add(
+            Job(
+                job_id=job_id,
+                user_id=api_pg.USER_ID,
+                chute_id=launch.chute_id,
+                version="1",
+                method="run",
+                instance_id=instance.instance_id,
+                active=True,
+                verified=True,
+                job_args={},
+                status="running",
+                miner_history=[],
+                compute_multiplier=1.0,
+            )
+        )
+        launch.job_id = job_id
+        await db.commit()
+
+    token = create_launch_jwt_v2(launch)
+    app = _route_app(db.bind)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="https://validator.test",
+    ) as client:
+        issued = await client.post(
+            "/storage/model/access",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "request_id": REQUEST_ID,
+                "repo_id": REPO_ID,
+                "revision": COMMIT,
+                "requested_revision": COMMIT,
+            },
+        )
+        assert issued.status_code == 200, issued.text
+
+        factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+        async with factory() as revoker:
+            if revocation == "completed_config":
+                await revoker.execute(
+                    update(LaunchConfig)
+                    .where(LaunchConfig.config_id == launch.config_id)
+                    .values(completed_at=datetime.now(timezone.utc))
+                )
+            elif revocation == "disabled_chute":
+                await revoker.execute(
+                    update(Chute)
+                    .where(Chute.chute_id == launch.chute_id)
+                    .values(public=True, disabled=True)
+                )
+            else:
+                await revoker.execute(
+                    update(Job)
+                    .where(Job.job_id == job_id)
+                    .values(finished_at=datetime.now(), status="finished")
+                )
+            await revoker.commit()
+
+        rejected = await _consume(client, issued.json(), target_identity)
+        assert rejected.status_code == 403
+        assert "revoked or changed" in rejected.text
+
+
+async def test_model_capability_consume_rechecks_latest_target_attestation(
+    pg_session,
+    real_capability_redis,
+):
+    db, _ = pg_session
+    redis = real_capability_redis
+    launch, _, _, target, _ = await _seed_launch(
+        db,
+        redis,
+        env_type="graval",
+    )
+    token = create_launch_jwt_v2(launch)
+    app = _route_app(db.bind)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="https://validator.test",
+    ) as client:
+        issued = await client.post(
+            "/storage/model/access",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "request_id": REQUEST_ID,
+                "repo_id": REPO_ID,
+                "revision": COMMIT,
+                "requested_revision": COMMIT,
+            },
+        )
+        assert issued.status_code == 200, issued.text
+        assert await storage_service.is_freshly_attested_storage_server(db, target)
+
+        factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+        async with factory() as revoker:
+            revoker.add(
+                ServerAttestation(
+                    server_id=target.server_id,
+                    quote_data="newer-failed-model-target-attestation",
+                    verification_error="injected latest-attempt failure",
+                )
+            )
+            await revoker.commit()
+
+        with pytest.raises(HTTPException, match="target attestation") as rejected:
+            await storage_service.consume_model_ensure_capability(
+                db,
+                target,
+                issued.json()["capability"],
+                REQUEST_ID,
+                REPO_ID,
+                COMMIT,
+                COMMIT,
+            )
+        assert rejected.value.status_code == 403
+
+
+async def test_cpu_launch_without_server_binding_cannot_use_bearer_model_access(
+    pg_session,
+    real_capability_redis,
+):
+    db, _ = pg_session
+    redis = real_capability_redis
+    launch, _, _, _, _ = await _seed_launch(db, redis, env_type="tee")
+    token = create_launch_jwt_v2(launch)
+    app = _route_app(db.bind)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="https://validator.test",
+    ) as client:
+        rejected = await client.post(
+            "/storage/model/access",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "request_id": REQUEST_ID,
+                "repo_id": REPO_ID,
+                "revision": COMMIT,
+                "requested_revision": COMMIT,
+            },
+        )
+    assert rejected.status_code == 403
+    assert "same non-null attested mTLS server" in rejected.text
+
+
 async def test_model_capabilities_route_requires_live_cpu_mtls_and_consumes_once(
     pg_session,
     real_capability_redis,
@@ -569,6 +838,9 @@ async def test_model_capabilities_route_requires_live_cpu_mtls_and_consumes_once
         env_type="tee",
         requester_identity=requester_identity,
     )
+    assert requester.host_id is None
+    assert requester.launch_reservation_id is None
+    assert requester.launch_boot_generation is None
     token = create_launch_jwt_v2(launch)
     app = _route_app(db.bind)
     body = {
@@ -591,7 +863,7 @@ async def test_model_capabilities_route_requires_live_cpu_mtls_and_consumes_once
             },
             json=body,
         )
-        assert header_only.status_code == 403
+        assert header_only.status_code == 401
 
         response = await client.post(
             "/storage/model/capabilities",
@@ -617,6 +889,62 @@ async def test_model_capabilities_route_requires_live_cpu_mtls_and_consumes_once
 
         replay = await _consume(client, issued, target_identity)
         assert replay.status_code == 401
+
+
+async def test_model_capability_consume_rechecks_latest_cpu_requester_attestation(
+    pg_session,
+    real_capability_redis,
+):
+    db, _ = pg_session
+    redis = real_capability_redis
+    requester_identity = api_pg._attested_identity("cpu-requester-revoked")
+    launch, requester, _, target, target_identity = await _seed_launch(
+        db,
+        redis,
+        env_type="tee",
+        requester_identity=requester_identity,
+    )
+    token = create_launch_jwt_v2(launch)
+    app = _route_app(db.bind)
+    body = {
+        "request_id": REQUEST_ID,
+        "target_server_id": target.server_id,
+        "repo_id": REPO_ID,
+        "revision": COMMIT,
+        "requested_revision": COMMIT,
+    }
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="https://validator.test",
+    ) as client:
+        issued = await client.post(
+            "/storage/model/capabilities",
+            headers={
+                "Authorization": f"Bearer {token}",
+                **_cert_headers(
+                    requester_identity,
+                    "FAILED:self-signed certificate",
+                ),
+            },
+            json=body,
+        )
+        assert issued.status_code == 200, issued.text
+
+        factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+        async with factory() as revoker:
+            revoker.add(
+                ServerAttestation(
+                    server_id=requester.server_id,
+                    quote_data="newer-failed-cpu-model-requester-attestation",
+                    verification_error="injected latest-attempt failure",
+                )
+            )
+            await revoker.commit()
+
+        rejected = await _consume(client, issued.json(), target_identity)
+        assert rejected.status_code == 403
+        assert "Latest attestation attempt is not current" in rejected.text
 
 
 @pytest.mark.cross_repo
@@ -808,7 +1136,7 @@ async def test_cpu_cold_start_crosses_real_routes_tls_storage_and_template(
 
         monkeypatch.setenv("CHUTES_API_URL", validator_url)
         monkeypatch.setenv("CHUTES_LAUNCH_JWT", launch_token)
-        monkeypatch.setenv("CHUTES_HOST_ID", requester.host_id)
+        monkeypatch.delenv("CHUTES_HOST_ID", raising=False)
         monkeypatch.setenv(
             "CHUTES_API_CA_B64",
             base64.b64encode(ca_path.read_bytes()).decode(),
@@ -898,7 +1226,8 @@ async def test_cpu_cold_start_crosses_real_routes_tls_storage_and_template(
         assert (verified_path / "config.json").read_bytes() == content
         assert validator.calls.get("/fixed-proxy-must-not-be-used", 0) == 0
         assert validator.calls["/misc/hf_repo_info"] >= 1
-        assert validator.calls["/storage/peers/local"] == 1
+        assert validator.calls.get("/storage/peers/local", 0) == 0
+        assert validator.calls["/storage/peers/model-target"] == 1
         assert validator.calls["/storage/model/capabilities"] == 1
         assert validator.calls["/storage/model/capabilities/consume"] == 1
         assert validator.calls["mtls:/storage/model/capabilities"] == 1

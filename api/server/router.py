@@ -149,12 +149,9 @@ from api.gpu_registration_service import (
     process_gpu_registration,
 )
 
-_gpu_registration_live_cert_hash = extract_client_cert_hash(
-    require_proxy_verified=True
-)
-_gpu_registration_live_cert_pem = extract_client_cert_pem(
-    require_proxy_verified=True
-)
+_gpu_registration_live_cert_hash = extract_client_cert_hash(require_proxy_verified=True)
+_gpu_registration_live_cert_pem = extract_client_cert_pem(require_proxy_verified=True)
+
 
 async def _runtime_expected_cert_hash(
     request: Request,
@@ -163,10 +160,11 @@ async def _runtime_expected_cert_hash(
 ) -> str:
     """Resolve the cert binding for a runtime quote.
 
-    Model-B agents may not present their self-signed serving cert on the nonce/quote HTTP request.
-    Their launch registration already bound that cert to a one-use reservation and hardware quote,
-    so runtime freshness can safely bind the new quote to the immutable registered hash. Peer and
-    secret-bearing storage operations continue to require live mTLS certificate possession.
+    CPU Model-B agents may not present their self-signed serving cert on the nonce/quote HTTP
+    request. Their launch registration already bound that cert to a one-use reservation and
+    hardware quote, so CPU runtime freshness can bind the quote to the registered hash. GPU
+    guests always have an active attested serving certificate and must prove live possession;
+    no persisted-hash fallback is permitted for GPU authority.
     """
 
     try:
@@ -192,7 +190,9 @@ async def _runtime_expected_cert_hash(
         )
         if (
             server is None
-            or (cpu_reservation is None and gpu_reservation is None)
+            or getattr(server, "compute_type", None) != "cpu"
+            or cpu_reservation is None
+            or gpu_reservation is not None
             or not server.attested_cert_pubkey_hash
         ):
             raise
@@ -407,6 +407,32 @@ async def issue_gpu_registration_nonce_endpoint(
             request.state.client_ip,
             body,
             expected_cert_hash,
+        )
+        await db.commit()
+        return result
+    except HTTPException:
+        await db.rollback()
+        raise
+
+
+@router.post(
+    "/gpu/registration/rekey/nonces",
+    response_model=GpuRegistrationNonceV2,
+    response_model_exclude_none=True,
+)
+async def issue_gpu_registration_rekey_nonce_endpoint(
+    request: Request,
+    body: GpuRegistrationNonceRequestV2,
+    db: AsyncSession = Depends(get_db_session),
+    expected_cert_hash=Depends(_gpu_registration_live_cert_hash),
+):
+    try:
+        result = await issue_gpu_registration_nonce(
+            db,
+            request.state.client_ip,
+            body,
+            expected_cert_hash,
+            rekey=True,
         )
         await db.commit()
         return result

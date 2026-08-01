@@ -56,6 +56,8 @@ async def test_runtime_cert_hash_falls_back_only_for_reservation_backed_server()
     db.get = AsyncMock(
         return_value=Mock(
             launch_reservation_id="reservation",
+            gpu_launch_reservation_id=None,
+            compute_type="cpu",
             attested_cert_pubkey_hash="A" * 64,
         )
     )
@@ -68,6 +70,30 @@ async def test_runtime_cert_hash_falls_back_only_for_reservation_backed_server()
         result = await _runtime_expected_cert_hash(request, db, "server")
 
     assert result == "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_runtime_cert_hash_never_falls_back_for_gpu_server():
+    request = Mock()
+    db = Mock()
+    db.get = AsyncMock(
+        return_value=Mock(
+            launch_reservation_id=None,
+            gpu_launch_reservation_id="gpu-reservation",
+            compute_type="gpu",
+            attested_cert_pubkey_hash="a" * 64,
+        )
+    )
+    extractor = AsyncMock(side_effect=NoClientCertError())
+
+    with (
+        patch(
+            "api.server.router.extract_client_cert_hash",
+            return_value=extractor,
+        ),
+        pytest.raises(NoClientCertError),
+    ):
+        await _runtime_expected_cert_hash(request, db, "server")
 
 
 @pytest.mark.asyncio

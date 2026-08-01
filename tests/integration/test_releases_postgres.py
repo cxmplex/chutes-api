@@ -160,9 +160,7 @@ async def _apply_sql_migration(
     up_sql, down_sql = migration.read_text().split("-- migrate:down", 1)
     sql = up_sql if direction == "up" else down_sql
     parsed = urlsplit(TEST_DATABASE_URL.replace("+asyncpg", ""))
-    connection_url = (
-        f"postgresql://{parsed.username}@{parsed.hostname}:{parsed.port}{parsed.path}"
-    )
+    connection_url = f"postgresql://{parsed.username}@{parsed.hostname}:{parsed.port}{parsed.path}"
     process = await asyncio.create_subprocess_exec(
         "psql",
         connection_url,
@@ -263,11 +261,7 @@ async def test_concurrent_release_activation_keeps_one_active(postgres_schema):
         await asyncio.gather(activate("release-a"), activate("release-b"))
     async with sessions() as check:
         active = (
-            (
-                await check.execute(
-                    select(GuestRelease).where(GuestRelease.status == "active")
-                )
-            )
+            (await check.execute(select(GuestRelease).where(GuestRelease.status == "active")))
             .scalars()
             .all()
         )
@@ -388,9 +382,7 @@ async def test_activation_captures_targets_without_legacy_bearer_tokens(
             .scalars()
             .all()
         )
-    assert [(target.host_id, target.role) for target in targets] == [
-        ("host-target", "chute")
-    ]
+    assert [(target.host_id, target.role) for target in targets] == [("host-target", "chute")]
     assert targets[0].current_token_id.startswith("audit:")
 
 
@@ -436,9 +428,9 @@ async def test_gpu_target_capture_excludes_cpu_host_in_same_channel_and_tdx(
             targets = await release_service._capture_release_targets(session, release)
         await session.commit()
 
-    assert [
-        (target.host_id, target.compute_type, target.role) for target in targets
-    ] == [("gpu-target-host", "gpu", "gpu")]
+    assert [(target.host_id, target.compute_type, target.role) for target in targets] == [
+        ("gpu-target-host", "gpu", "gpu")
+    ]
 
 
 async def test_gpu_release_status_ignores_subsequently_enrolled_non_targets(
@@ -467,6 +459,14 @@ async def test_gpu_release_status_ignores_subsequently_enrolled_non_targets(
         },
         targets_captured_at=datetime.now(timezone.utc),
     )
+    active_cpu = GuestRelease(
+        release_id="gpu-status-active-cpu",
+        channel=target_host.release_channel,
+        tee_type="tdx",
+        compute_type="cpu",
+        status="active",
+        images={"storage": {"sha256": "b" * 64}},
+    )
     target = GuestReleaseTarget(
         target_id="gpu-status-target-id",
         release_id=release.release_id,
@@ -480,7 +480,7 @@ async def test_gpu_release_status_ignores_subsequently_enrolled_non_targets(
         issued_at=datetime.now(timezone.utc),
     )
     async with sessions() as setup:
-        setup.add_all([target_host, unsupported, release])
+        setup.add_all([target_host, unsupported, release, active_cpu])
         await setup.flush()
         setup.add(target)
         await setup.commit()
@@ -508,13 +508,9 @@ async def test_gpu_release_status_ignores_subsequently_enrolled_non_targets(
                 session,
                 release.release_id,
             )
-    assert [row["untrusted_host_id"] for row in status["untrusted_hosts"]] == [
-        target_host.host_id
-    ]
+    assert [row["untrusted_host_id"] for row in status["untrusted_hosts"]] == [target_host.host_id]
     assert status["untrusted_hosts"][0]["untrusted_stage_matches_release"] is False
-    assert status["gpu_storage_siblings"][0]["reason"] == (
-        "gpu_l0_storage_closure_incompatible"
-    )
+    assert status["gpu_storage_siblings"][0]["reason"] == ("gpu_l0_storage_closure_incompatible")
 
 
 async def test_launch_reservation_concurrent_replay_allows_one_consumer(
@@ -560,9 +556,7 @@ async def test_launch_reservation_concurrent_replay_allows_one_consumer(
     async def consume(attestation_id: str):
         async with sessions() as session:
             try:
-                row, _claims = await resolve_launch_reservation(
-                    session, token, commitment
-                )
+                row, _claims = await resolve_launch_reservation(session, token, commitment)
                 await asyncio.sleep(0.05)
                 response_bytes = '{"status":"registered"}'
                 consume_launch_reservation(
@@ -586,6 +580,7 @@ async def test_launch_reservation_concurrent_replay_allows_one_consumer(
         row = await check.get(TdLaunchReservation, claims["reservation_id"])
         assert row.consumed_at is not None
         assert row.consumed_attestation_id in {"attestation-a", "attestation-b"}
+
 
 async def test_consumed_reservation_force_refreshes_and_replays_after_authority_advances(
     postgres_schema,
@@ -687,11 +682,8 @@ async def test_consumed_reservation_force_refreshes_and_replays_after_authority_
             commitment,
             allow_consumed_for_publication=True,
         )
-        assert replayed_after_invalidation.consumed_attestation_id == (
-            "response-replay-winner"
-        )
+        assert replayed_after_invalidation.consumed_attestation_id == ("response-replay-winner")
         await retry_session.rollback()
-
 
 
 async def test_storage_intent_claim_is_server_selected_scoped_and_replay_safe(
@@ -781,9 +773,7 @@ async def test_storage_intent_claim_is_server_selected_scoped_and_replay_safe(
             claims_sha256=first_digest,
         ).model_dump(mode="json", exclude_none=True)
         assert response["claims_sha256"] == canonical_sha256(first_claims)
-        assert response["claims"]["profile_id"] == (
-            "storage-baremetal-tdx-1.10.0-2vcpu-8g"
-        )
+        assert response["claims"]["profile_id"] == ("storage-baremetal-tdx-1.10.0-2vcpu-8g")
         assert response["claims"]["storage_intent_generation"] == 1
         assert not {
             "chute_id",
@@ -923,9 +913,7 @@ async def test_resolve_and_supersede_lock_intent_before_reservation(
 
         async def resolve_while_superseding():
             async with sessions() as resolver:
-                pid = (
-                    await resolver.execute(text("SELECT pg_backend_pid()"))
-                ).scalar_one()
+                pid = (await resolver.execute(text("SELECT pg_backend_pid()"))).scalar_one()
                 pid_ready.set_result(pid)
                 with pytest.raises(LaunchReservationError, match="invalidated"):
                     await resolve_launch_reservation(resolver, token, commitment)
@@ -937,9 +925,7 @@ async def test_resolve_and_supersede_lock_intent_before_reservation(
             for _ in range(200):
                 wait_event_type = (
                     await observer.execute(
-                        text(
-                            "SELECT wait_event_type FROM pg_stat_activity WHERE pid = :pid"
-                        ),
+                        text("SELECT wait_event_type FROM pg_stat_activity WHERE pid = :pid"),
                         {"pid": resolver_pid},
                     )
                 ).scalar_one_or_none()
@@ -1341,9 +1327,7 @@ async def _complete_cpu_enrollment(sessions, host_id: str):
         salt=bytes.fromhex(hashlib.sha256(voucher.voucher.encode("ascii")).hexdigest()),
         info=b"chutes/model-b/enrollment-x25519-proof/v1",
     ).derive(x25519.exchange(peer))
-    signing_aad = challenge_request.signing_bytes() + challenge.challenge_id.encode(
-        "ascii"
-    )
+    signing_aad = challenge_request.signing_bytes() + challenge.challenge_id.encode("ascii")
     plaintext = ChaCha20Poly1305(key).decrypt(
         base64.b64decode(challenge.nonce),
         base64.b64decode(challenge.ciphertext),
@@ -1359,9 +1343,7 @@ async def _complete_cpu_enrollment(sessions, host_id: str):
     )
     redemption = redemption.model_copy(
         update={
-            "ed25519_signature": base64.b64encode(
-                ed25519.sign(redemption.signing_bytes())
-            ).decode()
+            "ed25519_signature": base64.b64encode(ed25519.sign(redemption.signing_bytes())).decode()
         }
     )
     async with sessions() as session:
@@ -1559,9 +1541,7 @@ async def test_gpu_v2_enrollment_persists_compute_and_storage_identity(
         salt=bytes.fromhex(hashlib.sha256(voucher.voucher.encode("ascii")).hexdigest()),
         info=b"chutes/model-b/enrollment-x25519-proof/v2",
     ).derive(x25519.exchange(peer))
-    signing_aad = challenge_request.signing_bytes() + challenge.challenge_id.encode(
-        "ascii"
-    )
+    signing_aad = challenge_request.signing_bytes() + challenge.challenge_id.encode("ascii")
     plaintext = ChaCha20Poly1305(key).decrypt(
         base64.b64decode(challenge.nonce),
         base64.b64decode(challenge.ciphertext),
@@ -1578,9 +1558,7 @@ async def test_gpu_v2_enrollment_persists_compute_and_storage_identity(
     )
     redemption = redemption.model_copy(
         update={
-            "ed25519_signature": base64.b64encode(
-                ed25519.sign(redemption.signing_bytes())
-            ).decode()
+            "ed25519_signature": base64.b64encode(ed25519.sign(redemption.signing_bytes())).decode()
         }
     )
     async with sessions() as session:
@@ -1631,6 +1609,7 @@ async def test_attestation_identity_and_seedless_migrations_accept_create_all_an
                         "'fk_server_attestations_attribution_owner', "
                         "'fk_server_attestations_td_reservation_attribution', "
                         "'uq_td_launch_reservation_attribution') "
+                        "AND connamespace = current_schema()::regnamespace "
                         "GROUP BY conname"
                     )
                 )
@@ -1640,11 +1619,18 @@ async def test_attestation_identity_and_seedless_migrations_accept_create_all_an
             (
                 await session.execute(
                     text(
-                        "SELECT tgname, count(*) FROM pg_trigger "
-                        "WHERE NOT tgisinternal AND tgname IN ("
+                        "SELECT trigger_row.tgname, count(*) "
+                        "FROM pg_trigger AS trigger_row "
+                        "JOIN pg_class AS relation ON relation.oid = trigger_row.tgrelid "
+                        "JOIN pg_namespace AS namespace "
+                        "ON namespace.oid = relation.relnamespace "
+                        "WHERE NOT trigger_row.tgisinternal "
+                        "AND namespace.nspname = current_schema() "
+                        "AND trigger_row.tgname IN ("
                         "'preserve_server_attestation_subject_identity', "
                         "'enforce_server_attestation_subject', "
-                        "'preserve_server_attestation_audit') GROUP BY tgname"
+                        "'preserve_server_attestation_audit') "
+                        "GROUP BY trigger_row.tgname"
                     )
                 )
             ).all()
@@ -1668,8 +1654,7 @@ async def test_attestation_identity_and_seedless_migrations_accept_create_all_an
     [
         (
             [
-                "ALTER TABLE server_attestations "
-                "DROP CONSTRAINT fk_server_attestations_subject",
+                "ALTER TABLE server_attestations DROP CONSTRAINT fk_server_attestations_subject",
                 "ALTER TABLE server_attestations "
                 "ADD CONSTRAINT fk_server_attestations_subject "
                 "FOREIGN KEY (server_id) "
@@ -1681,16 +1666,14 @@ async def test_attestation_identity_and_seedless_migrations_accept_create_all_an
         ),
         (
             [
-                "ALTER TABLE server_attestations "
-                "ALTER COLUMN attempt_sequence DROP DEFAULT",
+                "ALTER TABLE server_attestations ALTER COLUMN attempt_sequence DROP DEFAULT",
             ],
             "20260714070000_release_attestation_identity.sql",
             "attempt_sequence has invalid type, nullability, or default",
         ),
         (
             [
-                "DROP TRIGGER enforce_server_attestation_subject "
-                "ON server_attestations",
+                "DROP TRIGGER enforce_server_attestation_subject ON server_attestations",
                 "CREATE TRIGGER enforce_server_attestation_subject "
                 "AFTER INSERT ON server_attestations FOR EACH ROW "
                 "EXECUTE FUNCTION enforce_server_attestation_subject()",
@@ -1700,8 +1683,7 @@ async def test_attestation_identity_and_seedless_migrations_accept_create_all_an
         ),
         (
             [
-                "ALTER TABLE server_attestations "
-                "DROP CONSTRAINT ck_server_attestation_attribution",
+                "ALTER TABLE server_attestations DROP CONSTRAINT ck_server_attestation_attribution",
                 "ALTER TABLE server_attestations "
                 "ADD CONSTRAINT ck_server_attestation_attribution "
                 "CHECK (attribution_reservation_id IS NULL)",
@@ -1747,9 +1729,7 @@ async def test_followup_migrations_apply_idempotently(
     migration = Path(__file__).resolve().parents[2] / "api/migrations" / migration_name
     up_sql = migration.read_text().split("-- migrate:down", 1)[0]
     parsed = urlsplit(TEST_DATABASE_URL.replace("+asyncpg", ""))
-    connection_url = (
-        f"postgresql://{parsed.username}@{parsed.hostname}:{parsed.port}{parsed.path}"
-    )
+    connection_url = f"postgresql://{parsed.username}@{parsed.hostname}:{parsed.port}{parsed.path}"
     environment = {
         **os.environ,
         "PGPASSWORD": parsed.password or "",
@@ -2058,9 +2038,7 @@ async def test_storage_intent_migration_backfills_active_target_from_reservation
         stored_host = await check.get(Host, host.host_id)
         intent = (
             await check.execute(
-                select(StorageLaunchIntent).where(
-                    StorageLaunchIntent.target_id == target.target_id
-                )
+                select(StorageLaunchIntent).where(StorageLaunchIntent.target_id == target.target_id)
             )
         ).scalar_one()
         assert stored_host.storage_td_vcpus == 2

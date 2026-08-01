@@ -1,6 +1,7 @@
 """Startup ordering for schema migrations and per-worker storage reconciliation."""
 
 import hashlib
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,11 @@ import pytest
 from sqlalchemy.engine import make_url
 
 from api.database import migrations
+
+
+MIGRATION_MANIFEST_LINE = re.compile(
+    r"^(?P<digest>[0-9a-f]{64})  (?P<filename>[0-9]{14}_[a-z0-9_]+\.sql)$"
+)
 
 
 class FakeConnection:
@@ -80,6 +86,35 @@ def test_historical_baseline_is_exact_immutable_production_set():
     assert branch_added_sub_threshold.isdisjoint(versions)
 
 
+def test_api_migration_file_set_and_bytes_are_frozen():
+    migration_dir = Path(__file__).resolve().parents[2] / "api/migrations"
+    manifest_path = migration_dir / "SHA256SUMS"
+    frozen = {}
+    for line in manifest_path.read_text(encoding="ascii").splitlines():
+        match = MIGRATION_MANIFEST_LINE.fullmatch(line)
+        assert match is not None, f"invalid migration hash manifest line: {line!r}"
+        filename = match.group("filename")
+        assert filename not in frozen, f"duplicate migration manifest entry: {filename}"
+        frozen[filename] = match.group("digest")
+
+    migration_files = {path.name: path for path in sorted(migration_dir.glob("*.sql"))}
+    assert len(frozen) == 109
+    assert set(frozen) == set(migration_files), (
+        "API migration file set changed; record every new migration explicitly and never "
+        "rewrite migration history after its first remediation release"
+    )
+    actual = {
+        filename: hashlib.sha256(path.read_bytes()).hexdigest()
+        for filename, path in migration_files.items()
+    }
+    mismatches = {
+        filename: (frozen[filename], actual[filename])
+        for filename in frozen
+        if actual[filename] != frozen[filename]
+    }
+    assert mismatches == {}, f"API migration bytes changed: {mismatches!r}"
+
+
 def test_dbmate_url_preserves_reserved_credentials_ipv6_and_query(monkeypatch):
     source = (
         "postgresql+asyncpg://us%2Fer:p%40ss%3Aword@[2001:db8::1]:5432/"
@@ -109,10 +144,7 @@ def test_dbmate_url_adds_local_sslmode_without_corrupting_query(monkeypatch):
 
 
 def test_dbmate_url_preserves_explicit_local_sslmode(monkeypatch):
-    source = (
-        "postgresql+asyncpg://user:pass@localhost:5432/db"
-        "?sslmode=require&application_name=api"
-    )
+    source = "postgresql+asyncpg://user:pass@localhost:5432/db?sslmode=require&application_name=api"
     monkeypatch.setattr(migrations, "settings", SimpleNamespace(sqlalchemy=source))
     parsed = make_url(migrations.dbmate_url())
     assert dict(parsed.query) == {"application_name": "api", "sslmode": "require"}

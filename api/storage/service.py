@@ -32,8 +32,11 @@ from api.config import (
     settings,
 )
 from api.chute.schemas import Chute
-from api.host.schemas import GpuLaunchReservation
+from api.host.locks import assert_gpu_external_work_allowed
+from api.host.schemas import GpuAllocationGroup, GpuLaunchReservation
+from api.instance.locking import lock_launch_configs_before_instances
 from api.instance.schemas import Instance, LaunchConfig
+from api.job.schemas import Job
 from api.server.quote import build_runtime_quote
 from api.server.schemas import (
     ChuteFSLaunchSession,
@@ -632,6 +635,7 @@ async def authorize_launch_model_request(
             config_id,
             token,
             allow_retrieved=True,
+            acquire_lifecycle_lock=False,
         )
     except HTTPException as exc:
         raise HTTPException(
@@ -644,12 +648,32 @@ async def authorize_launch_model_request(
     chute = (
         await db.execute(select(Chute).where(Chute.chute_id == token_chute_id))
     ).scalar_one_or_none()
+    job = (
+        await db.get(Job, launch_config.job_id) if launch_config and launch_config.job_id else None
+    )
+    current_owner = job.user_id if job is not None else chute.user_id if chute is not None else None
+    current_compute = (
+        getattr(getattr(chute, "image", None), "compute_type", None) if chute is not None else None
+    )
     if (
         launch_config is None
         or instance is None
         or chute is None
         or launch_config.failed_at is not None
+        or launch_config.completed_at is not None
         or launch_config.verified_at is None
+        or chute.disabled
+        or current_owner != launch_config.user_id
+        or current_compute != launch_config.compute_type
+        or (launch_config.job_id is not None and job is None)
+        or (
+            job is not None
+            and (
+                job.chute_id != launch_config.chute_id
+                or job.instance_id != instance.instance_id
+                or job.finished_at is not None
+            )
+        )
         or not instance.verified
         or (
             getattr(instance, "activated_at", None) is not None
@@ -662,6 +686,20 @@ async def authorize_launch_model_request(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Launch token is not bound to a verified running instance.",
+        )
+
+    if launch_config.compute_type == "cpu" and (
+        not isinstance(instance.server_id, str)
+        or not instance.server_id
+        or launch_config.server_id != instance.server_id
+        or expected_server_id != instance.server_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "CPU model access requires the launch config and instance to share the "
+                "same non-null attested mTLS server."
+            ),
         )
 
     if expected_server_id is None:
@@ -807,7 +845,356 @@ async def authorize_launch_model_request(
         "requester_config_id": config_id,
         "requester_chute_id": token_chute_id,
         "requester_deployment_id": instance.deployment_id,
+        "requester_storage_revocation_epoch": int(instance.storage_revocation_epoch),
+        "requester_user_id": launch_config.user_id,
+        "requester_job_id": launch_config.job_id,
+        "requester_compute_type": launch_config.compute_type,
+        "requester_management_mode": launch_config.gpu_management_mode,
+        "requester_env_type": launch_config.env_type,
     }
+
+
+async def _lock_model_ensure_authority(
+    db: AsyncSession,
+    requester: Dict[str, Any],
+    target_server_id: str,
+) -> tuple[Server, int]:
+    """Lock and revalidate the durable requester/target authority snapshot."""
+
+    instance_id = requester.get("requester_instance_id")
+    config_id = requester.get("requester_config_id")
+    chute_id = requester.get("requester_chute_id")
+    expected_epoch = requester.get("requester_storage_revocation_epoch")
+    requester_kind = requester.get("requester_kind")
+    expected_user_id = requester.get("requester_user_id")
+    expected_job_id = requester.get("requester_job_id")
+    if (
+        requester_kind not in {"attested_server", "launch_instance"}
+        or not all(isinstance(value, str) and value for value in (instance_id, config_id, chute_id))
+        or not isinstance(expected_user_id, str)
+        or not expected_user_id
+        or (expected_job_id is not None and not isinstance(expected_job_id, str))
+        or isinstance(expected_epoch, bool)
+        or not isinstance(expected_epoch, int)
+        or expected_epoch < 0
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requester launch authority snapshot is incomplete.",
+        )
+
+    await lock_launch_configs_before_instances(
+        db,
+        config_ids=(config_id,),
+        instance_ids=(instance_id,),
+    )
+    launch_config = (
+        await db.execute(
+            select(LaunchConfig)
+            .where(LaunchConfig.config_id == config_id)
+            .execution_options(populate_existing=True, autoflush=False)
+        )
+    ).scalar_one_or_none()
+    instance = (
+        await db.execute(
+            select(Instance)
+            .where(Instance.instance_id == instance_id)
+            .execution_options(populate_existing=True, autoflush=False)
+        )
+    ).scalar_one_or_none()
+    chute = (
+        (
+            await db.execute(
+                select(Chute)
+                .where(Chute.chute_id == chute_id)
+                .with_for_update(of=Chute)
+                .execution_options(populate_existing=True, autoflush=False)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+    )
+    job = (
+        (
+            await db.execute(
+                select(Job)
+                .where(Job.job_id == expected_job_id)
+                .with_for_update(of=Job)
+                .execution_options(populate_existing=True, autoflush=False)
+            )
+        )
+        .unique()
+        .scalar_one_or_none()
+        if expected_job_id is not None
+        else None
+    )
+
+    requester_server_id = requester.get("requester_server_id")
+    server_ids = {target_server_id}
+    if isinstance(requester_server_id, str) and requester_server_id:
+        server_ids.add(requester_server_id)
+    locked_servers = (
+        (
+            await db.execute(
+                select(Server)
+                .where(Server.server_id.in_(sorted(server_ids)))
+                .order_by(Server.server_id)
+                .with_for_update(of=Server)
+                .execution_options(populate_existing=True, autoflush=False)
+            )
+        )
+        .unique()
+        .scalars()
+        .all()
+    )
+    server_by_id = {server.server_id: server for server in locked_servers}
+    target = server_by_id.get(target_server_id)
+    current_owner = job.user_id if job is not None else chute.user_id if chute is not None else None
+    current_compute = (
+        getattr(getattr(chute, "image", None), "compute_type", None) if chute is not None else None
+    )
+
+    valid_requester = (
+        launch_config is not None
+        and instance is not None
+        and chute is not None
+        and launch_config.failed_at is None
+        and launch_config.completed_at is None
+        and launch_config.verified_at is not None
+        and not chute.disabled
+        and launch_config.user_id == expected_user_id
+        and launch_config.job_id == expected_job_id
+        and current_owner == launch_config.user_id
+        and current_compute == launch_config.compute_type
+        and (expected_job_id is None or job is not None)
+        and (
+            job is None
+            or (
+                job.chute_id == launch_config.chute_id
+                and job.instance_id == instance.instance_id
+                and job.finished_at is None
+            )
+        )
+        and instance.verified
+        and (getattr(instance, "activated_at", None) is None or getattr(instance, "active", False))
+        and launch_config.chute_id == chute_id
+        and instance.chute_id == chute_id
+        and instance.config_id == config_id
+        and instance.deployment_id == requester.get("requester_deployment_id")
+        and instance.server_id == requester_server_id
+        and int(instance.storage_revocation_epoch) == expected_epoch
+        and launch_config.compute_type == requester.get("requester_compute_type")
+        and launch_config.gpu_management_mode == requester.get("requester_management_mode")
+        and launch_config.env_type == requester.get("requester_env_type")
+        and launch_config.server_id == requester_server_id
+    )
+    if not valid_requester:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requester launch authority was revoked or changed.",
+        )
+
+    if launch_config.compute_type == "cpu" and (
+        requester_kind != "attested_server"
+        or not isinstance(requester_server_id, str)
+        or not requester_server_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requester CPU launch authority requires an attested mTLS server.",
+        )
+
+    requester_server = (
+        server_by_id.get(requester_server_id)
+        if isinstance(requester_server_id, str) and requester_server_id
+        else None
+    )
+    if requester_server is not None and requester_server.compute_type != launch_config.compute_type:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requester server compute authority was revoked or changed.",
+        )
+    if requester_kind == "attested_server":
+        expected_cert_hash = requester.get("requester_cert_pubkey_hash")
+        current_cert_hash = (
+            (_server_pubkey_hash(requester_server) or "").strip().lower()
+            if requester_server is not None
+            else ""
+        )
+        if (
+            not isinstance(expected_cert_hash, str)
+            or not expected_cert_hash
+            or not current_cert_hash
+            or not secrets.compare_digest(current_cert_hash, expected_cert_hash)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requester attested server authority was revoked or changed.",
+            )
+
+    if launch_config.compute_type == "gpu" and requester_server is not None:
+        from api.gpu_hotplug_service import (
+            GpuHotplugError,
+            require_gpu_hotplug_runtime_ack,
+        )
+        from api.server.exceptions import MeasurementMismatchError
+        from api.server.gpu_sessions import (
+            _current_attestation,
+            _latest_attestation_attempt,
+            require_completed_gpu_registration,
+        )
+        from api.server.service import runtime_attestation_context_for_server_db
+
+        reservation = (
+            await db.execute(
+                select(GpuLaunchReservation)
+                .where(
+                    GpuLaunchReservation.reservation_id == launch_config.gpu_launch_reservation_id
+                )
+                .with_for_update(of=GpuLaunchReservation)
+                .execution_options(populate_existing=True, autoflush=False)
+            )
+        ).scalar_one_or_none()
+        group = (
+            (
+                await db.execute(
+                    select(GpuAllocationGroup)
+                    .where(
+                        GpuAllocationGroup.allocation_group_id == reservation.allocation_group_id
+                    )
+                    .with_for_update(of=GpuAllocationGroup)
+                    .execution_options(populate_existing=True, autoflush=False)
+                )
+            ).scalar_one_or_none()
+            if reservation is not None
+            else None
+        )
+        latest = await _latest_attestation_attempt(
+            db,
+            requester_server.server_id,
+            for_update=True,
+        )
+        try:
+            await runtime_attestation_context_for_server_db(db, requester_server)
+        except MeasurementMismatchError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requester GPU measurement authority was revoked or changed.",
+            ) from exc
+        try:
+            _current_attestation(
+                requester_server,
+                latest,
+                expected_id=requester_server.gpu_runtime_session_attestation_id,
+            )
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requester GPU attestation authority was revoked or changed.",
+            ) from exc
+        mode = launch_config.gpu_management_mode or "miner"
+        if (
+            mode not in {"platform", "miner"}
+            or requester_server.gpu_management_mode != mode
+            or instance.gpu_management_mode != mode
+            or instance.gpu_launch_reservation_id != launch_config.gpu_launch_reservation_id
+            or requester_server.gpu_retired_at is not None
+            or requester_server.gpu_runtime_session_expires_at is None
+            or requester_server.gpu_runtime_session_expires_at <= datetime.now(timezone.utc)
+            or reservation is None
+            or group is None
+            or reservation.state != "running"
+            or group.state != "running"
+            or reservation.registration_attestation_id is None
+            or reservation.reservation_id != launch_config.gpu_launch_reservation_id
+            or reservation.server_id != requester_server.server_id
+            or reservation.management_mode != mode
+            or (
+                mode == "platform"
+                and (
+                    reservation.chute_id != launch_config.chute_id
+                    or reservation.job_id != launch_config.job_id
+                )
+            )
+            or (
+                mode == "miner"
+                and (reservation.chute_id is not None or reservation.job_id is not None)
+            )
+            or reservation.allocation_group_id != instance.gpu_allocation_group_id
+            or reservation.allocation_group_generation != instance.gpu_allocation_group_generation
+            or reservation.process_incarnation != instance.gpu_process_incarnation
+            or group.allocation_group_id != reservation.allocation_group_id
+            or group.generation != reservation.allocation_group_generation
+            or group.reservation_id != reservation.reservation_id
+            or group.management_mode != mode
+            or group.process_incarnation != reservation.process_incarnation
+            or requester_server.gpu_allocation_group_id != reservation.allocation_group_id
+            or requester_server.gpu_allocation_group_generation
+            != reservation.allocation_group_generation
+            or requester_server.gpu_process_incarnation != reservation.process_incarnation
+            or requester_server.gpu_launch_reservation_id != reservation.reservation_id
+            or (mode == "platform" and reservation.workload_owner != launch_config.user_id)
+            or (
+                job is not None
+                and (
+                    job.gpu_management_mode != mode
+                    or job.gpu_launch_reservation_id != reservation.reservation_id
+                )
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requester GPU runtime lineage was revoked or changed.",
+            )
+        try:
+            await require_completed_gpu_registration(
+                db,
+                reservation,
+                latest,
+                requester_server,
+            )
+            await require_gpu_hotplug_runtime_ack(
+                db,
+                reservation,
+                requester_server.server_id,
+            )
+        except (HTTPException, GpuHotplugError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requester GPU registration or hotplug authority was revoked or changed.",
+            ) from exc
+    elif launch_config.compute_type == "cpu" and requester_server is not None:
+        from api.instance.util import _require_current_attestation_identity
+
+        if requester_kind != "attested_server" or requester_server.storage_role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Requester CPU server authority was revoked or changed.",
+            )
+        await _require_current_attestation_identity(db, requester_server)
+    elif requester_server is not None and requester_server.gpu_retired_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Requester server authority was retired.",
+        )
+
+    target_cert_hash = _server_pubkey_hash(target) if target is not None else None
+    if (
+        target is None
+        or not target.storage_role
+        or not target_cert_hash
+        or not target.storage_incarnation
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model ensure target is not an available attested storage server.",
+        )
+    if not await is_freshly_attested_storage_server(db, target):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Model ensure target attestation is no longer current.",
+        )
+    return target, expected_epoch
 
 
 async def issue_model_ensure_capability(
@@ -835,18 +1222,13 @@ async def issue_model_ensure_capability(
             detail="Requester launch identity is incomplete.",
         )
 
-    target = await db.get(Server, target_server_id)
+    target, requester_epoch = await _lock_model_ensure_authority(
+        db,
+        requester,
+        target_server_id,
+    )
     target_cert_hash = _server_pubkey_hash(target) if target is not None else None
-    if (
-        target is None
-        or not target.storage_role
-        or not target_cert_hash
-        or not target.storage_incarnation
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Model ensure target is not an available attested storage server.",
-        )
+    assert target_cert_hash is not None
 
     capability_id = str(uuid4())
     capability = f"{capability_id}.{secrets.token_urlsafe(48)}"
@@ -865,8 +1247,14 @@ async def issue_model_ensure_capability(
                 "requester_config_id",
                 "requester_chute_id",
                 "requester_deployment_id",
+                "requester_user_id",
+                "requester_job_id",
+                "requester_compute_type",
+                "requester_management_mode",
+                "requester_env_type",
             )
         },
+        "requester_storage_revocation_epoch": requester_epoch,
         "target_server_id": target.server_id,
         "target_cert_pubkey_hash": target_cert_hash.lower(),
         "target_storage_incarnation": target.storage_incarnation,
@@ -876,6 +1264,10 @@ async def issue_model_ensure_capability(
         "issued_at": now.isoformat(),
         "expires_at": expires_at.isoformat(),
     }
+    # Release lifecycle/row custody before the external Redis publication. A revocation racing
+    # after this commit advances the bound epoch and is rejected at consume time.
+    await db.commit()
+    assert_gpu_external_work_allowed(db, "model ensure capability publication")
     try:
         await settings.redis_client.setex(
             _model_ensure_capability_key(capability),
@@ -896,6 +1288,7 @@ async def issue_model_ensure_capability(
 
 
 async def consume_model_ensure_capability(
+    db: AsyncSession,
     target: Server,
     capability: str,
     request_id: str,
@@ -922,6 +1315,8 @@ async def consume_model_ensure_capability(
             encoded = encoded.decode()
         context = json.loads(encoded)
         expires_at = datetime.fromisoformat(context["expires_at"])
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise ValueError("capability expiry must include a timezone")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -950,6 +1345,46 @@ async def consume_model_ensure_capability(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Model ensure capability does not match this target or request.",
+        )
+
+    requester = {
+        field: context.get(field)
+        for field in (
+            "requester_kind",
+            "requester_server_id",
+            "requester_cert_pubkey_hash",
+            "requester_instance_id",
+            "requester_config_id",
+            "requester_chute_id",
+            "requester_deployment_id",
+            "requester_storage_revocation_epoch",
+            "requester_user_id",
+            "requester_job_id",
+            "requester_compute_type",
+            "requester_management_mode",
+            "requester_env_type",
+        )
+    }
+    locked_target, _requester_epoch = await _lock_model_ensure_authority(
+        db,
+        requester,
+        target.server_id,
+    )
+    if expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Model ensure capability expired before final authorization.",
+        )
+    locked_target_cert_hash = (_server_pubkey_hash(locked_target) or "").strip().lower()
+    if not secrets.compare_digest(
+        locked_target_cert_hash, exact_strings["target_cert_pubkey_hash"]
+    ) or not secrets.compare_digest(
+        locked_target.storage_incarnation or "",
+        exact_strings["target_storage_incarnation"],
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Model ensure target authority was revoked or changed.",
         )
 
     return {
@@ -1011,7 +1446,12 @@ async def announce_model_holdings(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    now = datetime.now(timezone.utc)
+    # The stream, server identity, and snapshot row are locked before this sample. Use the
+    # PostgreSQL wall clock so a request whose transaction began earlier cannot publish a later
+    # serialized snapshot with an older ordering marker.
+    now = await db.scalar(select(func.clock_timestamp()))
+    if now is None:
+        raise RuntimeError("Database did not return a model inventory timestamp.")
     if snapshot is None:
         if page_index != 0:
             raise HTTPException(
@@ -1800,9 +2240,7 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
         .all()
     )
     active_binding_by_volume = {
-        binding.volume_id: binding
-        for binding in bindings
-        if binding.lifecycle_state == "active"
+        binding.volume_id: binding for binding in bindings if binding.lifecycle_state == "active"
     }
     volumes = list(
         (
@@ -2197,8 +2635,7 @@ async def plan_object_placement(
         )
     ).correlate(StorageObject)
     pending_reservation_bytes = func.greatest(
-        StorageObject.projected_size_bytes
-        - func.coalesce(pending_predecessor.size_bytes, 0),
+        StorageObject.projected_size_bytes - func.coalesce(pending_predecessor.size_bytes, 0),
         0,
     )
     pending_volume_bytes = (
@@ -2220,9 +2657,7 @@ async def plan_object_placement(
     requested_reservation_bytes = max(0, size_bytes - predecessor_size)
     volume_limit = min(int(locked_volume.quota_bytes), per_volume_entitlement)
     projected = (
-        int(locked_volume.used_bytes)
-        + int(pending_volume_bytes or 0)
-        + requested_reservation_bytes
+        int(locked_volume.used_bytes) + int(pending_volume_bytes or 0) + requested_reservation_bytes
     )
     if projected > volume_limit:
         raise HTTPException(
@@ -2256,9 +2691,7 @@ async def plan_object_placement(
         )
     ).scalar_one()
     aggregate_projected = (
-        int(aggregate_used or 0)
-        + int(aggregate_pending or 0)
-        + requested_reservation_bytes
+        int(aggregate_used or 0) + int(aggregate_pending or 0) + requested_reservation_bytes
     )
     if aggregate_projected > aggregate_entitlement:
         raise HTTPException(
@@ -3180,7 +3613,6 @@ async def record_inventory_page(
             detail="Inventory is not bound to this current storage certificate and incarnation.",
         )
 
-    now = datetime.now(timezone.utc)
     snapshot = (
         await db.execute(
             select(StorageInventorySnapshot)
@@ -3188,6 +3620,12 @@ async def record_inventory_page(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    # Sample the PostgreSQL wall clock only after the per-incarnation stream, server identity, and
+    # snapshot row are locked. Transaction-stable now() can run backwards relative to this
+    # serialization order when an older transaction waits behind a newer request.
+    now = await db.scalar(select(func.clock_timestamp()))
+    if now is None:
+        raise RuntimeError("Database did not return a storage inventory timestamp.")
     if snapshot is None:
         snapshot = StorageInventorySnapshot(
             snapshot_id=snapshot_id,
@@ -5098,7 +5536,6 @@ async def complete_replication_capability(
             detail="Replication capability was not consumed or is already failed.",
         )
 
-    now = datetime.now(timezone.utc)
     locked_servers = await _locked_replication_servers(
         db, capability.source_server_id, capability.target_server_id
     )
@@ -5106,6 +5543,13 @@ async def complete_replication_capability(
     target = locked_servers.get(capability.target_server_id)
     obj = await db.get(StorageObject, capability.object_id, with_for_update=True)
     placement = await db.get(ReplicaPlacement, capability.target_placement_id, with_for_update=True)
+    # Sample both clocks only after every authority row is locked. Capability and placement
+    # deadlines are issued from application time, so expiry must stay in that same clock domain;
+    # the durable receipt uses PostgreSQL wall time so serialized publications remain ordered.
+    expiry_now = datetime.now(timezone.utc)
+    proof_at = await db.scalar(select(func.clock_timestamp()))
+    if proof_at is None:
+        raise RuntimeError("Database did not return a replication receipt timestamp.")
     if ciphertext_sha256 != capability.expected_ciphertext_sha256 or ciphertext_size_bytes != int(
         capability.expected_ciphertext_size_bytes
     ):
@@ -5129,8 +5573,8 @@ async def complete_replication_capability(
         or int(placement.attempt_count or 0) != capability.target_placement_attempt
         or not _placement_identity_matches(placement, target)
         or placement.pending_deadline is None
-        or placement.pending_deadline <= now
-        or capability.transfer_deadline <= now
+        or placement.pending_deadline <= expiry_now
+        or capability.transfer_deadline <= expiry_now
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -5146,17 +5590,17 @@ async def complete_replication_capability(
             detail="Target receipt does not match committed object metadata.",
         )
 
-    capability.completed_at = now
+    capability.completed_at = proof_at
     await db.flush()
     placement.proof_sha256 = ciphertext_sha256
     placement.proof_size_bytes = ciphertext_size_bytes
     placement.proof_capability_id = capability.capability_id
     placement.proof_mode = "replication_capability"
-    placement.proof_at = now
+    placement.proof_at = proof_at
     placement.last_error = None
     if obj.lifecycle_state == OBJECT_COMMITTED:
         placement.status = "present"
-        placement.confirmed_at = now
+        placement.confirmed_at = proof_at
     if obj.lifecycle_state == OBJECT_COMMITTED:
         await _refresh_object_durability(db, obj)
     await db.commit()
@@ -5650,6 +6094,43 @@ def _record_legacy_quarantine(
     return idempotent
 
 
+async def _require_legacy_adoption_server(
+    db: AsyncSession,
+    presented_server_id: str,
+    presented_cert_hash: Optional[str],
+    storage_incarnation: str,
+    *,
+    lock: bool,
+) -> tuple[Server, str]:
+    """Return the current adoption identity, optionally holding its publication fence."""
+    query = select(Server).where(Server.server_id == presented_server_id)
+    if lock:
+        query = query.with_for_update()
+    server = (
+        await db.execute(query.execution_options(populate_existing=True))
+    ).scalar_one_or_none()
+    server_cert_hash = _server_pubkey_hash(server) if server is not None else None
+    if (
+        server is None
+        or not server.storage_role
+        or not await is_freshly_attested_storage_server(db, server)
+        or not settings.require_mtls_client_verify
+        or not server.storage_incarnation
+        or server.storage_incarnation != storage_incarnation
+        or not server_cert_hash
+        or not presented_cert_hash
+        or server_cert_hash.lower() != presented_cert_hash.lower()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Legacy adoption requires this storage TD's current attested mTLS "
+                "certificate and mounted-volume incarnation."
+            ),
+        )
+    return server, server_cert_hash.lower()
+
+
 async def adopt_legacy_replicas(
     db: AsyncSession,
     caller: Server,
@@ -5662,35 +6143,50 @@ async def adopt_legacy_replicas(
     placement becomes the normal capability source; every later copy uses secure replication.
     """
     storage_incarnation = _normalize_incarnation(storage_incarnation)
-    server = (
-        await db.execute(
-            select(Server)
-            .where(Server.server_id == caller.server_id)
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
-    caller_cert_hash = _server_pubkey_hash(caller)
-    server_cert_hash = _server_pubkey_hash(server) if server is not None else None
-    if (
-        server is None
-        or not server.storage_role
-        or not await is_freshly_attested_storage_server(db, server)
-        or not settings.require_mtls_client_verify
-        or not server.storage_incarnation
-        or server.storage_incarnation != storage_incarnation
-        or not server_cert_hash
-        or not caller_cert_hash
-        or server_cert_hash.lower() != caller_cert_hash.lower()
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                "Legacy adoption requires this storage TD's current attested mTLS "
-                "certificate and mounted-volume incarnation."
-            ),
-        )
+    # require_attested_caller and this service share an AsyncSession in production. Snapshot the
+    # presented identity before populate_existing can refresh the same identity-map object.
+    presented_server_id = caller.server_id
+    presented_cert_hash = _server_pubkey_hash(caller)
+    server, server_cert_hash = await _require_legacy_adoption_server(
+        db,
+        presented_server_id,
+        presented_cert_hash,
+        storage_incarnation,
+        lock=False,
+    )
 
-    await mark_storage_online(server.server_id)
+    # A batch may cross account boundaries. Lock every attributable owner in stable order before
+    # taking the server identity publication fence; placement creation follows the same User-first
+    # order before it can acquire a Server FK key-share lock.
+    submitted_object_ids = sorted({submission["object_id"] for submission in submissions})
+    locked_user_ids = set(
+        (
+            await db.execute(
+                select(StorageVolume.user_id)
+                .join(StorageObject, StorageObject.volume_id == StorageVolume.volume_id)
+                .where(StorageObject.object_id.in_(submitted_object_ids))
+                .distinct()
+                .order_by(StorageVolume.user_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for user_id in sorted(locked_user_ids):
+        await _lock_storage_user(db, user_id)
+    if submissions:
+        try:
+            server, server_cert_hash = await _require_legacy_adoption_server(
+                db,
+                presented_server_id,
+                presented_cert_hash,
+                storage_incarnation,
+                lock=True,
+            )
+        except Exception:
+            await db.rollback()
+            raise
+
     outcomes: List[Dict] = []
     for submission in submissions:
         object_id = submission["object_id"]
@@ -5722,7 +6218,8 @@ async def adopt_legacy_replicas(
                         }
                     )
                     continue
-                await _lock_storage_user(db, volume.user_id)
+                if volume.user_id not in locked_user_ids:
+                    raise RuntimeError("Legacy adoption owner changed before authority locking.")
                 locked_volume = (
                     await db.execute(
                         select(StorageVolume)
@@ -5867,7 +6364,9 @@ async def adopt_legacy_replicas(
                     )
                     continue
 
-                now = datetime.now(timezone.utc)
+                now = await db.scalar(select(func.clock_timestamp()))
+                if now is None:
+                    raise RuntimeError("Database did not return a legacy adoption timestamp.")
                 placement.status = "pending"
                 placement.storage_incarnation = storage_incarnation
                 placement.target_cert_pubkey_hash = server_cert_hash.lower()
@@ -5937,6 +6436,8 @@ async def adopt_legacy_replicas(
                 }
             )
     await db.commit()
+    # Redis liveness is an external observation, never part of row-lock custody.
+    await mark_storage_online(server.server_id)
     return outcomes
 
 
@@ -6169,7 +6670,10 @@ async def announce_replicas(
                 existing.proof_plaintext_sha256 = plaintext_sha256
                 existing.proof_capability_id = None
                 existing.proof_mode = "direct_upload"
-                existing.proof_at = func.now()
+                # Inventory omission compares proof_at with a database-clock snapshot cutoff.
+                # Use the database wall clock for the proof event as well, including when this
+                # transaction began before the inventory scan.
+                existing.proof_at = func.clock_timestamp()
                 existing.last_error = None
                 # Before commit, retain the receipt on pending. commit_object performs the only
                 # pending-generation + pending-placement publication transition.

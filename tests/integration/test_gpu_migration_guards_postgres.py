@@ -27,8 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 MIGRATIONS = Path(__file__).resolve().parents[2] / "api/migrations"
 LIFECYCLE_PREFLIGHT = (
-    Path(__file__).resolve().parents[2]
-    / "scripts/preflight_gpu_lifecycle_migration.sql"
+    Path(__file__).resolve().parents[2] / "scripts/preflight_gpu_lifecycle_migration.sql"
 )
 
 PLATFORM = "20260724100000_gpu_platform_scheduler.sql"
@@ -180,12 +179,34 @@ CREATE TABLE instances (
     instance_id TEXT PRIMARY KEY,
     server_id TEXT
 );
-CREATE TABLE registry_sessions (session_id TEXT PRIMARY KEY);
+CREATE TABLE registry_sessions (
+    session_id TEXT PRIMARY KEY,
+    allowed_manifests JSONB NOT NULL DEFAULT '[]'::jsonb,
+    allowed_blobs JSONB NOT NULL DEFAULT '[]'::jsonb,
+    allowed_manifest_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+    descriptor_closure_sha256 TEXT,
+    CONSTRAINT ck_registry_session_closure CHECK (
+        jsonb_typeof(allowed_manifests) = 'array'
+        AND jsonb_typeof(allowed_blobs) = 'array'
+        AND jsonb_typeof(allowed_manifest_tags) = 'array'
+        AND (
+            descriptor_closure_sha256 IS NULL
+            OR descriptor_closure_sha256 ~ '^[0-9a-f]{64}$'
+        )
+    )
+);
+CREATE SEQUENCE server_attestation_attempt_sequence;
 CREATE TABLE server_attestations (
     attestation_id TEXT PRIMARY KEY,
     verification_error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempt_sequence BIGINT NOT NULL DEFAULT
+        nextval('server_attestation_attempt_sequence'::regclass)
 );
+ALTER SEQUENCE server_attestation_attempt_sequence
+    OWNED BY server_attestations.attempt_sequence;
+CREATE UNIQUE INDEX idx_server_attestations_attempt_sequence
+    ON server_attestations (attempt_sequence);
 CREATE TABLE servers (
     server_id TEXT PRIMARY KEY,
     gpu_launch_reservation_id TEXT
@@ -839,10 +860,7 @@ def test_lifecycle_preflight_rejects_current_reservation_from_other_custody():
     try:
         result = _psql(LIFECYCLE_PREFLIGHT.read_text(encoding="utf-8"), schema)
         assert result.returncode == 0, result.stderr.decode()
-        assert (
-            b"gpu-node|server-current|group-current|1||{}|blocking_live"
-            in result.stdout
-        )
+        assert b"gpu-node|server-current|group-current|1||{}|blocking_live" in result.stdout
         assert b"repairable_live" not in result.stdout
     finally:
         _drop_schema(schema)
@@ -900,9 +918,7 @@ async def _assert_writer_cannot_cross_down(
     async def run_writer():
         try:
             await writer.execute(writer_sql)
-        except (
-            Exception
-        ) as exc:  # exact error varies by PostgreSQL plan invalidation point
+        except Exception as exc:  # exact error varies by PostgreSQL plan invalidation point
             return exc
         return None
 
@@ -1028,8 +1044,7 @@ async def test_rotation_down_waits_on_epoch_fence_before_session_rows():
             advisory_name="chutes.chutefs-token-key-epochs.v1",
             before_down_sql="SELECT 1",
             after_down_wait_sql=(
-                "SELECT 1 FROM chutefs_launch_sessions "
-                "WHERE session_id = 'session' FOR UPDATE"
+                "SELECT 1 FROM chutefs_launch_sessions WHERE session_id = 'session' FOR UPDATE"
             ),
         )
     finally:

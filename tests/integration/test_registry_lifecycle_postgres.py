@@ -190,9 +190,11 @@ def test_explicit_launch_and_job_terminal_events_revoke_registry_sessions():
                AND column_name IN ('scope_id', 'launch_config_id');
             SELECT COUNT(*) FROM pg_trigger
              WHERE NOT tgisinternal
+               AND tgrelid = 'launch_configs'::regclass
                AND tgname = 'trg_launch_terminal_registry_scope';
             SELECT COUNT(*) FROM pg_trigger
              WHERE NOT tgisinternal
+               AND tgrelid = 'instances'::regclass
                AND tgname = 'trg_instance_terminal_registry_scope';
             """,
             schema,
@@ -225,9 +227,7 @@ def test_explicit_launch_and_job_terminal_events_revoke_registry_sessions():
             schema,
         )
         assert preserved.returncode == 0, preserved.stderr.decode()
-        assert preserved.stdout.decode().strip() == (
-            f"owner/legacy|sha256:{'c' * 64}|{'e' * 64}"
-        )
+        assert preserved.stdout.decode().strip() == (f"owner/legacy|sha256:{'c' * 64}|{'e' * 64}")
     finally:
         dropped = _psql(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;', "public")
         assert dropped.returncode == 0, dropped.stderr.decode()

@@ -52,6 +52,7 @@ from api.host.schemas import (
 )
 from api.server.exceptions import (
     AttestationError,
+    AttestationSupersededError,
     AttestationVerifierUnavailableError,
     GetEvidenceError,
     GpuEvidenceError,
@@ -86,11 +87,16 @@ class GpuRegistrationLeaseLost(RuntimeError):
     """A processor lost authority while bounded external verification ran."""
 
 
+class GpuRegistrationGenerationSuperseded(RuntimeError):
+    """A newer registration generation won the final publication CAS."""
+
+
 @dataclass(frozen=True)
 class _RegistrationAttemptSnapshot:
     attempt_id: str
     lease_owner: str
     request: GpuRegistrationRequestV2
+    registration_generation: int
     request_sha256: str
     cert_pem: str
     certificate_sha256: str
@@ -102,6 +108,18 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _registration_nonce_matches_operation(
+    nonce: GpuRegistrationNonce,
+    *,
+    rekey: bool,
+) -> bool:
+    """Keep initial and rekey nonce audit rows in disjoint generations."""
+
+    if rekey:
+        return nonce.registration_generation > 1
+    return nonce.registration_generation == 1
+
+
 def _parse_reservation_token(token: str) -> tuple[str, str]:
     try:
         reservation_id, secret = token.split(".", 1)
@@ -110,9 +128,7 @@ def _parse_reservation_token(token: str) -> tuple[str, str]:
             status_code=409, detail="GPU launch reservation token is malformed."
         ) from exc
     if not reservation_id or not secret:
-        raise HTTPException(
-            status_code=409, detail="GPU launch reservation token is malformed."
-        )
+        raise HTTPException(status_code=409, detail="GPU launch reservation token is malformed.")
     return reservation_id, hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
@@ -156,18 +172,14 @@ def _start_registration_response_replay(
                 "GPU registration response readiness audit is inconsistent."
             )
         attempt.response_ready_at = ready_at
-        attempt.registration_replay_until = ready_at + timedelta(
-            seconds=_REPLAY_SECONDS
-        )
+        attempt.registration_replay_until = ready_at + timedelta(seconds=_REPLAY_SECONDS)
         attempt.updated_at = ready_at
         return
     if (
         attempt.registration_replay_until is None
         or attempt.registration_replay_until <= attempt.response_ready_at
     ):
-        raise ServerRegistrationError(
-            "GPU registration response readiness audit is inconsistent."
-        )
+        raise ServerRegistrationError("GPU registration response readiness audit is inconsistent.")
 
 
 def _registration_request_audit(
@@ -185,9 +197,7 @@ def _registration_request_audit(
         "peer_spki_sha256": expected_cert_hash.lower(),
         "quote_sha256": hashlib.sha256(request.quote.encode("utf-8")).hexdigest(),
         "evidence_sha256": canonical_sha256({"gpu_evidence": request.gpu_evidence}),
-        "signature_sha256": hashlib.sha256(
-            request.td_signature.encode("utf-8")
-        ).hexdigest(),
+        "signature_sha256": hashlib.sha256(request.td_signature.encode("utf-8")).hexdigest(),
     }
 
 
@@ -221,9 +231,8 @@ async def _decrypt_registration_request(
         raise ServerRegistrationError(
             "Persisted GPU registration recovery envelope is invalid."
         ) from exc
-    if (
-        plaintext != canonical_json_bytes(request)
-        or not secrets.compare_digest(request.request_sha256(), request_sha256)
+    if plaintext != canonical_json_bytes(request) or not secrets.compare_digest(
+        request.request_sha256(), request_sha256
     ):
         raise ServerRegistrationError(
             "Persisted GPU registration recovery envelope changed identity."
@@ -248,28 +257,17 @@ def _conflict_audit_matches(
 ) -> bool:
     return bool(
         conflict.nonce_id == request.nonce_id
-        and secrets.compare_digest(
-            conflict.request_sha256, str(audit["request_sha256"])
-        )
+        and secrets.compare_digest(conflict.request_sha256, str(audit["request_sha256"]))
         and conflict.peer_certificate_pem == audit["peer_certificate_pem"]
         and secrets.compare_digest(
             conflict.peer_certificate_sha256,
             str(audit["peer_certificate_sha256"]),
         )
-        and secrets.compare_digest(
-            conflict.peer_spki_sha256, str(audit["peer_spki_sha256"])
-        )
-        and secrets.compare_digest(
-            conflict.quote_sha256, str(audit["quote_sha256"])
-        )
-        and secrets.compare_digest(
-            conflict.evidence_sha256, str(audit["evidence_sha256"])
-        )
-        and secrets.compare_digest(
-            conflict.signature_sha256, str(audit["signature_sha256"])
-        )
-        and request.model_dump(mode="json", exclude_none=True)
-        == audit["request_payload"]
+        and secrets.compare_digest(conflict.peer_spki_sha256, str(audit["peer_spki_sha256"]))
+        and secrets.compare_digest(conflict.quote_sha256, str(audit["quote_sha256"]))
+        and secrets.compare_digest(conflict.evidence_sha256, str(audit["evidence_sha256"]))
+        and secrets.compare_digest(conflict.signature_sha256, str(audit["signature_sha256"]))
+        and request.model_dump(mode="json", exclude_none=True) == audit["request_payload"]
     )
 
 
@@ -531,13 +529,11 @@ async def cleanup_expired_gpu_registration_nonces(
                 select(GpuRegistrationNonce)
                 .outerjoin(
                     GpuRegistrationAttempt,
-                    GpuRegistrationAttempt.attempt_id
-                    == GpuRegistrationNonce.claimed_attempt_id,
+                    GpuRegistrationAttempt.attempt_id == GpuRegistrationNonce.claimed_attempt_id,
                 )
                 .outerjoin(
                     GpuLaunchReservation,
-                    GpuLaunchReservation.reservation_id
-                    == GpuRegistrationAttempt.reservation_id,
+                    GpuLaunchReservation.reservation_id == GpuRegistrationAttempt.reservation_id,
                 )
                 .outerjoin(
                     GpuAllocationGroup,
@@ -560,17 +556,12 @@ async def cleanup_expired_gpu_registration_nonces(
                             (GpuRegistrationNonce.state == "claimed")
                             & (GpuRegistrationAttempt.state == "processing")
                             & or_(
-                                GpuRegistrationAttempt.processing_lease_expires_at.is_(
-                                    None
-                                ),
-                                GpuRegistrationAttempt.processing_lease_expires_at
-                                <= now,
+                                GpuRegistrationAttempt.processing_lease_expires_at.is_(None),
+                                GpuRegistrationAttempt.processing_lease_expires_at <= now,
                             )
                             & or_(
                                 GpuLaunchReservation.reservation_id.is_(None),
-                                ~GpuLaunchReservation.state.in_(
-                                    ("launching", "running")
-                                ),
+                                ~GpuLaunchReservation.state.in_(("launching", "running")),
                                 GpuAllocationGroup.allocation_group_id.is_(None),
                                 ~GpuAllocationGroup.state.in_(("launching", "running")),
                                 GpuAllocationGroup.reservation_id
@@ -581,8 +572,7 @@ async def cleanup_expired_gpu_registration_nonces(
                                 != GpuLaunchReservation.reservation_generation,
                                 GpuAllocationGroup.process_incarnation
                                 != GpuLaunchReservation.process_incarnation,
-                                GpuAllocationGroup.host_id
-                                != GpuLaunchReservation.host_id,
+                                GpuAllocationGroup.host_id != GpuLaunchReservation.host_id,
                                 GpuAllocationGroup.host_key_generation
                                 != GpuLaunchReservation.host_key_generation,
                                 GpuAllocationGroup.host_boot_generation
@@ -623,9 +613,7 @@ async def cleanup_expired_gpu_registration_nonces(
             reservation = (
                 await db.execute(
                     select(GpuLaunchReservation)
-                    .where(
-                        GpuLaunchReservation.reservation_id == attempt.reservation_id
-                    )
+                    .where(GpuLaunchReservation.reservation_id == attempt.reservation_id)
                     .with_for_update()
                 )
             ).scalar_one_or_none()
@@ -651,11 +639,7 @@ async def cleanup_expired_gpu_registration_nonces(
                 await _fail_stale_processing_attempt(db, attempt, now)
                 changed += 1
                 continue
-        if (
-            row.state == "revoked"
-            and attempt is not None
-            and attempt.state == "processing"
-        ):
+        if row.state == "revoked" and attempt is not None and attempt.state == "processing":
             attempt.state = "failed"
             attempt.processing_lease_owner = None
             attempt.processing_lease_expires_at = None
@@ -702,11 +686,75 @@ async def cleanup_expired_gpu_registration_nonces(
     return changed
 
 
+async def _current_gpu_registration_server(
+    db: AsyncSession,
+    reservation: GpuLaunchReservation,
+    group: GpuAllocationGroup | None,
+    expected_spki: str | None = None,
+    *,
+    require_current_spki: bool = False,
+) -> Server:
+    """Require exact published authority, optionally possessed by the current SPKI."""
+
+    server = (
+        await db.execute(
+            select(Server).where(Server.server_id == reservation.server_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    exact = bool(
+        server is not None
+        and group is not None
+        and reservation.registration_generation >= 1
+        and reservation.state == "running"
+        and group.state == "running"
+        and reservation.guest_consumed_at is not None
+        and reservation.registration_attestation_id is not None
+        and group.reservation_id == reservation.reservation_id
+        and group.generation == reservation.allocation_group_generation
+        and group.reservation_generation == reservation.reservation_generation
+        and group.process_incarnation == reservation.process_incarnation
+        and server.gpu_retired_at is None
+        and server.server_id == reservation.server_id
+        and server.gpu_launch_reservation_id == reservation.reservation_id
+        and server.gpu_allocation_group_id == reservation.allocation_group_id
+        and server.gpu_allocation_group_generation == reservation.allocation_group_generation
+        and server.gpu_process_incarnation == reservation.process_incarnation
+        and server.gpu_management_mode == reservation.management_mode
+        and server.attested_cert is not None
+        and server.attested_cert_pubkey_hash is not None
+    )
+    if not exact:
+        raise HTTPException(
+            status_code=409,
+            detail="GPU rekey requires the exact current running registration lineage.",
+        )
+    from api.server.gpu_sessions import build_completed_gpu_registration_authority
+
+    try:
+        await build_completed_gpu_registration_authority(db, reservation, server)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="GPU rekey requires exact completed registration authority.",
+        ) from exc
+    if require_current_spki and (
+        expected_spki is None
+        or not secrets.compare_digest(server.attested_cert_pubkey_hash.lower(), expected_spki)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="GPU registration retry does not possess the current serving key.",
+        )
+    return server
+
+
 async def issue_gpu_registration_nonce(
     db: AsyncSession,
     server_ip: str,
     request: GpuRegistrationNonceRequestV2,
     expected_cert_hash: str,
+    *,
+    rekey: bool = False,
 ) -> GpuRegistrationNonceV2:
     """Issue/replay one SPKI-bound nonce generation under exact lineage locks."""
 
@@ -723,10 +771,7 @@ async def issue_gpu_registration_nonce(
     except UnicodeEncodeError as exc:
         raise HTTPException(
             status_code=409,
-            detail=(
-                "GPU registration client_request_id is not canonical for this "
-                "generation."
-            ),
+            detail=("GPU registration client_request_id is not canonical for this generation."),
         ) from exc
     if not secrets.compare_digest(request.client_request_id, expected_request_id):
         raise HTTPException(
@@ -742,16 +787,11 @@ async def issue_gpu_registration_nonce(
         )
     ).scalar_one_or_none()
     if reservation is None:
-        raise HTTPException(
-            status_code=409, detail="GPU launch reservation is unknown."
-        )
+        raise HTTPException(status_code=409, detail="GPU launch reservation is unknown.")
     group = (
         await db.execute(
             select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.allocation_group_id
-                == reservation.allocation_group_id
-            )
+            .where(GpuAllocationGroup.allocation_group_id == reservation.allocation_group_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -786,6 +826,7 @@ async def issue_gpu_registration_nonce(
         if (
             existing.request_generation != request.request_generation
             or not secrets.compare_digest(existing.peer_spki_sha256, expected_spki)
+            or not _registration_nonce_matches_operation(existing, rekey=rekey)
         ):
             raise HTTPException(
                 status_code=409,
@@ -795,17 +836,40 @@ async def issue_gpu_registration_nonce(
             claimed_attempt = (
                 await db.execute(
                     select(GpuRegistrationAttempt)
-                    .where(
-                        GpuRegistrationAttempt.attempt_id == existing.claimed_attempt_id
-                    )
+                    .where(GpuRegistrationAttempt.attempt_id == existing.claimed_attempt_id)
                     .with_for_update()
                 )
             ).scalar_one_or_none()
+            generation_exact = bool(
+                claimed_attempt is not None
+                and claimed_attempt.registration_generation == existing.registration_generation
+                and (
+                    (
+                        claimed_attempt.state == "completed"
+                        and reservation.registration_generation == existing.registration_generation
+                    )
+                    or (
+                        claimed_attempt.state in {"processing", "failed"}
+                        and reservation.registration_generation
+                        == existing.registration_generation - 1
+                    )
+                )
+            )
+            if generation_exact and claimed_attempt.state == "completed":
+                await _current_gpu_registration_server(
+                    db,
+                    reservation,
+                    group,
+                    expected_spki,
+                    require_current_spki=True,
+                )
+            elif generation_exact and existing.registration_generation > 1:
+                await _current_gpu_registration_server(db, reservation, group)
             replay_valid = bool(
                 claimed_attempt is not None
-                and secrets.compare_digest(
-                    claimed_attempt.peer_spki_sha256, expected_spki
-                )
+                and generation_exact
+                and claimed_attempt.registration_generation == existing.registration_generation
+                and secrets.compare_digest(claimed_attempt.peer_spki_sha256, expected_spki)
                 and (
                     claimed_attempt.state == "processing"
                     or (
@@ -825,12 +889,23 @@ async def issue_gpu_registration_nonce(
                     claimed_attempt_id=claimed_attempt.attempt_id,
                     status_url=_status_url(claimed_attempt.attempt_id),
                 )
+        if existing.state == "issued" and existing.registration_generation > 1:
+            await _current_gpu_registration_server(db, reservation, group)
         if (
             existing.state == "issued"
             and existing.expires_at > now
             and existing.nonce_value
-            and reservation.state == "launching"
-            and group.state == "launching"
+            and reservation.registration_generation == existing.registration_generation - 1
+            and (
+                (
+                    existing.registration_generation == 1
+                    and reservation.state == group.state == "launching"
+                )
+                or (
+                    existing.registration_generation > 1
+                    and reservation.state == group.state == "running"
+                )
+            )
         ):
             return GpuRegistrationNonceV2(
                 client_request_id=existing.client_request_id,
@@ -851,15 +926,39 @@ async def issue_gpu_registration_nonce(
             ),
         )
 
-    if (
-        reservation.state != "launching"
-        or group.state != "launching"
-        or reservation.expires_at <= now
+    if rekey:
+        await _current_gpu_registration_server(db, reservation, group)
+        registration_generation = reservation.registration_generation + 1
+        if registration_generation > 1024:
+            raise HTTPException(
+                status_code=409,
+                detail="GPU registration generation limit has been reached.",
+            )
+    elif (
+        reservation.state == "running"
+        and group.state == "running"
+        and reservation.registration_generation >= 1
     ):
+        await _current_gpu_registration_server(db, reservation, group)
         raise HTTPException(
-            status_code=409,
-            detail="GPU registration nonce request does not match a launching reservation.",
+            status_code=status.HTTP_410_GONE,
+            detail={"code": "gpu_registration_rekey_required"},
         )
+    else:
+        registration_generation = 1
+        if (
+            reservation.registration_generation != 0
+            or reservation.state != "launching"
+            or group.state != "launching"
+            or reservation.expires_at <= now
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "GPU registration nonce request does not match an initial "
+                    "launching reservation."
+                ),
+            )
     prior_active_attempt = (
         (
             await db.execute(
@@ -870,6 +969,7 @@ async def issue_gpu_registration_nonce(
                 )
                 .where(
                     GpuRegistrationAttempt.reservation_id == reservation_id,
+                    GpuRegistrationAttempt.registration_generation == registration_generation,
                     GpuRegistrationAttempt.state.in_(("processing", "completed")),
                     or_(
                         GpuRegistrationAttempt.state == "processing",
@@ -916,6 +1016,7 @@ async def issue_gpu_registration_nonce(
         nonce_id=generate_uuid(),
         client_request_id=request.client_request_id,
         request_generation=request.request_generation,
+        registration_generation=registration_generation,
         peer_spki_sha256=expected_spki,
         reservation_id=reservation_id,
         server_ip=server_ip,
@@ -1002,12 +1103,8 @@ def _registration_lineage_current(
         == group.process_incarnation
         == claims.process_incarnation
         and reservation.owner_hotkey == host.miner_hotkey == claims.owner_hotkey
-        and group.reservation_owner
-        == reservation.workload_owner
-        == claims.workload_owner
-        and reservation.management_mode
-        == group.management_mode
-        == claims.management_mode
+        and group.reservation_owner == reservation.workload_owner == claims.workload_owner
+        and reservation.management_mode == group.management_mode == claims.management_mode
         and reservation.server_id == request.server_id == claims.server_id
         and reservation.topology_fingerprint
         == group.topology_fingerprint
@@ -1083,9 +1180,7 @@ async def _claim_attempt(
             and not secrets.compare_digest(nonce.nonce_value, request.nonce)
         )
     ):
-        raise HTTPException(
-            status_code=401, detail="GPU registration nonce is invalid or expired."
-        )
+        raise HTTPException(status_code=401, detail="GPU registration nonce is invalid or expired.")
     identity = (
         await db.execute(
             select(
@@ -1096,9 +1191,7 @@ async def _claim_attempt(
     ).one_or_none()
     host = (
         (
-            await db.execute(
-                select(Host).where(Host.host_id == identity.host_id).with_for_update()
-            )
+            await db.execute(select(Host).where(Host.host_id == identity.host_id).with_for_update())
         ).scalar_one_or_none()
         if identity is not None
         else None
@@ -1107,10 +1200,7 @@ async def _claim_attempt(
         (
             await db.execute(
                 select(GpuAllocationGroup)
-                .where(
-                    GpuAllocationGroup.allocation_group_id
-                    == identity.allocation_group_id
-                )
+                .where(GpuAllocationGroup.allocation_group_id == identity.allocation_group_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -1135,11 +1225,12 @@ async def _claim_attempt(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    allowed_states = (
-        {"launching", "running", "quarantined"}
-        if nonce.state in {"claimed", "expired"}
-        else {"launching"}
-    )
+    if nonce.state in {"claimed", "expired"}:
+        allowed_states = {"launching", "running", "quarantined"}
+    elif nonce.registration_generation == 1:
+        allowed_states = {"launching"}
+    else:
+        allowed_states = {"running"}
     lineage_current = _registration_lineage_current(
         host,
         group,
@@ -1155,12 +1246,20 @@ async def _claim_attempt(
         or (
             nonce.state == "issued"
             and (
-                not secrets.compare_digest(
-                    nonce.peer_spki_sha256, expected_cert_hash.lower()
+                not secrets.compare_digest(nonce.peer_spki_sha256, expected_cert_hash.lower())
+                or nonce.registration_generation != reservation.registration_generation + 1
+                or (
+                    nonce.registration_generation == 1
+                    and (
+                        reservation.expires_at <= now
+                        or group.state != "launching"
+                        or reservation.state != "launching"
+                    )
                 )
-                or reservation.expires_at <= now
-                or group.state != "launching"
-                or reservation.state != "launching"
+                or (
+                    nonce.registration_generation > 1
+                    and (group.state != "running" or reservation.state != "running")
+                )
             )
         )
     ):
@@ -1168,6 +1267,11 @@ async def _claim_attempt(
             status_code=409,
             detail="GPU registration lineage is stale or mismatched.",
         )
+    if (
+        nonce.registration_generation > 1
+        and reservation.registration_generation == nonce.registration_generation - 1
+    ):
+        await _current_gpu_registration_server(db, reservation, group)
     request_sha256 = request.request_sha256()
     certificate_sha256 = hashlib.sha256(cert_pem.encode("utf-8")).hexdigest()
     if nonce.state in {"claimed", "expired"}:
@@ -1183,9 +1287,26 @@ async def _claim_attempt(
                 status_code=409, detail="Claimed GPU registration nonce is incomplete."
             )
         replay_closed = bool(
-            attempt.registration_replay_until is None
-            or attempt.registration_replay_until <= now
+            attempt.registration_replay_until is None or attempt.registration_replay_until <= now
         )
+        generation_exact = bool(
+            attempt.registration_generation == nonce.registration_generation
+            and (
+                (
+                    attempt.state == "completed"
+                    and reservation.registration_generation == attempt.registration_generation
+                )
+                or (
+                    attempt.state in {"processing", "failed"}
+                    and reservation.registration_generation == attempt.registration_generation - 1
+                )
+            )
+        )
+        if not generation_exact:
+            raise HTTPException(
+                status_code=409,
+                detail="GPU registration attempt generation is no longer current.",
+            )
         if nonce.state == "expired" and (
             attempt.state == "processing"
             or (attempt.state == "failed" and replay_closed)
@@ -1196,17 +1317,14 @@ async def _claim_attempt(
             )
         ):
             raise HTTPException(
-                status_code=409,
-                detail="GPU registration nonce replay is no longer active.",
+                status_code=status.HTTP_410_GONE,
+                detail={"code": "gpu_registration_replay_expired"},
             )
         exact = (
             secrets.compare_digest(attempt.request_sha256, request_sha256)
-            and secrets.compare_digest(
-                attempt.peer_spki_sha256, expected_cert_hash.lower()
-            )
-            and secrets.compare_digest(
-                attempt.peer_certificate_sha256, certificate_sha256
-            )
+            and attempt.registration_generation == nonce.registration_generation
+            and secrets.compare_digest(attempt.peer_spki_sha256, expected_cert_hash.lower())
+            and secrets.compare_digest(attempt.peer_certificate_sha256, certificate_sha256)
         )
         if not exact:
             conflict = (
@@ -1215,10 +1333,8 @@ async def _claim_attempt(
                     .where(
                         GpuRegistrationConflict.nonce_id == nonce.nonce_id,
                         GpuRegistrationConflict.request_sha256 == request_sha256,
-                        GpuRegistrationConflict.peer_spki_sha256
-                        == expected_cert_hash.lower(),
-                        GpuRegistrationConflict.peer_certificate_sha256
-                        == certificate_sha256,
+                        GpuRegistrationConflict.peer_spki_sha256 == expected_cert_hash.lower(),
+                        GpuRegistrationConflict.peer_certificate_sha256 == certificate_sha256,
                     )
                     .with_for_update()
                 )
@@ -1237,12 +1353,8 @@ async def _claim_attempt(
                     peer_certificate_pem=cert_pem,
                     peer_certificate_sha256=certificate_sha256,
                     peer_spki_sha256=expected_cert_hash.lower(),
-                    quote_sha256=hashlib.sha256(
-                        request.quote.encode("utf-8")
-                    ).hexdigest(),
-                    evidence_sha256=canonical_sha256(
-                        {"gpu_evidence": request.gpu_evidence}
-                    ),
+                    quote_sha256=hashlib.sha256(request.quote.encode("utf-8")).hexdigest(),
+                    evidence_sha256=canonical_sha256({"gpu_evidence": request.gpu_evidence}),
                     signature_sha256=hashlib.sha256(
                         request.td_signature.encode("utf-8")
                     ).hexdigest(),
@@ -1264,9 +1376,7 @@ async def _claim_attempt(
         if should_process:
             lease_owner = generate_uuid()
             attempt.processing_lease_owner = lease_owner
-            attempt.processing_lease_expires_at = now + timedelta(
-                seconds=_PROCESSING_LEASE_SECONDS
-            )
+            attempt.processing_lease_expires_at = now + timedelta(seconds=_PROCESSING_LEASE_SECONDS)
             attempt.updated_at = now
         return attempt, lease_owner, None
     if nonce.state != "issued":
@@ -1274,10 +1384,9 @@ async def _claim_attempt(
             status_code=409, detail="GPU registration nonce is no longer claimable."
         )
     lease_owner = generate_uuid()
-    ciphertext, key_id = await _encrypt_registration_request(
-        db, request, locked_key=recovery_key
-    )
+    ciphertext, key_id = await _encrypt_registration_request(db, request, locked_key=recovery_key)
     attempt = GpuRegistrationAttempt(
+        registration_generation=nonce.registration_generation,
         attempt_id=generate_uuid(),
         nonce_id=nonce.nonce_id,
         reservation_id=reservation_id,
@@ -1319,9 +1428,7 @@ async def _claim_processing_lease(
     if attempt is None or not secrets.compare_digest(
         attempt.peer_spki_sha256, expected_cert_hash.lower()
     ):
-        raise HTTPException(
-            status_code=404, detail="GPU registration attempt not found."
-        )
+        raise HTTPException(status_code=404, detail="GPU registration attempt not found.")
     now = _now()
     if attempt.state != "processing":
         return attempt, None
@@ -1333,9 +1440,7 @@ async def _claim_processing_lease(
         return attempt, None
     lease_owner = generate_uuid()
     attempt.processing_lease_owner = lease_owner
-    attempt.processing_lease_expires_at = now + timedelta(
-        seconds=_PROCESSING_LEASE_SECONDS
-    )
+    attempt.processing_lease_expires_at = now + timedelta(seconds=_PROCESSING_LEASE_SECONDS)
     attempt.updated_at = now
     await db.flush()
     return attempt, lease_owner
@@ -1374,9 +1479,7 @@ async def _locked_processing_snapshot(
         attempt.request_sha256,
     )
     request_sha256 = request.request_sha256()
-    certificate_sha256 = hashlib.sha256(
-        attempt.peer_certificate_pem.encode("utf-8")
-    ).hexdigest()
+    certificate_sha256 = hashlib.sha256(attempt.peer_certificate_pem.encode("utf-8")).hexdigest()
     nonce = (
         await db.execute(
             select(GpuRegistrationNonce)
@@ -1395,9 +1498,7 @@ async def _locked_processing_snapshot(
     ).one_or_none()
     host = (
         (
-            await db.execute(
-                select(Host).where(Host.host_id == identity.host_id).with_for_update()
-            )
+            await db.execute(select(Host).where(Host.host_id == identity.host_id).with_for_update())
         ).scalar_one_or_none()
         if identity is not None
         else None
@@ -1406,10 +1507,7 @@ async def _locked_processing_snapshot(
         (
             await db.execute(
                 select(GpuAllocationGroup)
-                .where(
-                    GpuAllocationGroup.allocation_group_id
-                    == identity.allocation_group_id
-                )
+                .where(GpuAllocationGroup.allocation_group_id == identity.allocation_group_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -1434,6 +1532,13 @@ async def _locked_processing_snapshot(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if (
+        reservation is not None
+        and reservation.registration_generation != attempt.registration_generation - 1
+    ):
+        raise GpuRegistrationGenerationSuperseded(
+            "GPU registration generation changed before publication."
+        )
     exact = bool(
         nonce is not None
         and reservation is not None
@@ -1442,6 +1547,8 @@ async def _locked_processing_snapshot(
         and report is not None
         and nonce.state == "claimed"
         and nonce.claimed_attempt_id == attempt.attempt_id
+        and nonce.registration_generation == attempt.registration_generation
+        and reservation.registration_generation == attempt.registration_generation - 1
         and nonce.reservation_id == attempt.reservation_id
         and nonce.nonce_value
         and secrets.compare_digest(nonce.nonce_value, request.nonce)
@@ -1453,6 +1560,16 @@ async def _locked_processing_snapshot(
         and secrets.compare_digest(attempt.peer_certificate_sha256, certificate_sha256)
         and request.quote_commitment.attested_spki_sha256 == attempt.peer_spki_sha256
         and secrets.compare_digest(nonce.peer_spki_sha256, attempt.peer_spki_sha256)
+        and (
+            (
+                attempt.registration_generation == 1
+                and reservation.state == group.state == "launching"
+            )
+            or (
+                attempt.registration_generation > 1
+                and reservation.state == group.state == "running"
+            )
+        )
         and reservation.reservation_id == attempt.reservation_id
         and _registration_lineage_current(
             host,
@@ -1468,11 +1585,14 @@ async def _locked_processing_snapshot(
         raise ServerRegistrationError(
             "Persisted GPU registration attempt no longer matches exact lineage."
         )
+    if attempt.registration_generation > 1:
+        await _current_gpu_registration_server(db, reservation, group)
     return _RegistrationAttemptSnapshot(
         attempt_id=attempt.attempt_id,
         lease_owner=lease_owner,
         request=request,
         request_sha256=request_sha256,
+        registration_generation=attempt.registration_generation,
         cert_pem=attempt.peer_certificate_pem,
         certificate_sha256=certificate_sha256,
         spki_sha256=attempt.peer_spki_sha256,
@@ -1484,17 +1604,14 @@ async def _assert_processing_lease_before_publish(
     db: AsyncSession,
     snapshot: _RegistrationAttemptSnapshot,
 ) -> None:
-    current = await _locked_processing_snapshot(
-        db, snapshot.attempt_id, snapshot.lease_owner
-    )
+    current = await _locked_processing_snapshot(db, snapshot.attempt_id, snapshot.lease_owner)
     if (
-        current.request_sha256 != snapshot.request_sha256
+        current.registration_generation != snapshot.registration_generation
+        or current.request_sha256 != snapshot.request_sha256
         or current.certificate_sha256 != snapshot.certificate_sha256
         or current.spki_sha256 != snapshot.spki_sha256
     ):
-        raise GpuRegistrationLeaseLost(
-            "GPU registration immutable processor snapshot changed."
-        )
+        raise GpuRegistrationLeaseLost("GPU registration immutable processor snapshot changed.")
 
 
 async def _mark_attempt_failed(
@@ -1624,8 +1741,8 @@ async def _complete_attempt(
         )
     ).scalar_one_or_none()
     if nonce is not None:
-        nonce.state = "revoked" if nonce.state == "revoked" else "expired"
-        nonce.nonce_value = None
+        if nonce.state != "revoked":
+            nonce.state = "claimed"
     await db.flush()
     competitors = list(
         (
@@ -1658,9 +1775,7 @@ async def _complete_attempt(
             },
         )
         for competitor in competitors:
-            competitor.fence_state = (
-                "requested" if operation is not None else "custody_ended"
-            )
+            competitor.fence_state = "requested" if operation is not None else "custody_ended"
             competitor.fence_operation_id = (
                 operation.operation_id if operation is not None else None
             )
@@ -1674,9 +1789,7 @@ async def registration_attempt_response(
     expected_cert_hash: str,
 ) -> GpuRegistrationResponseV2:
     if not secrets.compare_digest(attempt.peer_spki_sha256, expected_cert_hash.lower()):
-        raise HTTPException(
-            status_code=404, detail="GPU registration attempt not found."
-        )
+        raise HTTPException(status_code=404, detail="GPU registration attempt not found.")
     await acquire_gpu_lifecycle_lock(db)
     attempt = (
         await db.execute(
@@ -1689,13 +1802,15 @@ async def registration_attempt_response(
         return _processing_response(attempt)
     now = _now()
     replay_expired = bool(
-        attempt.registration_replay_until is not None
-        and attempt.registration_replay_until <= now
+        attempt.registration_replay_until is not None and attempt.registration_replay_until <= now
     )
-    replay_missing = bool(
-        attempt.state == "failed"
-        or (attempt.state == "completed" and attempt.response_ready_at is not None)
-    ) and attempt.registration_replay_until is None
+    replay_missing = (
+        bool(
+            attempt.state == "failed"
+            or (attempt.state == "completed" and attempt.response_ready_at is not None)
+        )
+        and attempt.registration_replay_until is None
+    )
     if replay_missing or replay_expired:
         nonce = (
             await db.execute(
@@ -1709,14 +1824,11 @@ async def registration_attempt_response(
         await db.commit()
         raise HTTPException(
             status_code=status.HTTP_410_GONE,
-            detail="GPU registration replay expired.",
+            detail={"code": "gpu_registration_replay_expired"},
         )
     if attempt.state == "failed":
         return _failed_response(attempt)
-    if (
-        attempt.response_ready_at is None
-        and attempt.registration_replay_until is not None
-    ):
+    if attempt.response_ready_at is None and attempt.registration_replay_until is not None:
         raise HTTPException(
             status_code=409,
             detail="GPU registration response readiness audit is invalid.",
@@ -1726,9 +1838,7 @@ async def registration_attempt_response(
     if (
         not stable
         or attempt.stable_response_sha256 is None
-        or not secrets.compare_digest(
-            attempt.stable_response_sha256, canonical_sha256(stable)
-        )
+        or not secrets.compare_digest(attempt.stable_response_sha256, canonical_sha256(stable))
     ):
         raise HTTPException(
             status_code=409,
@@ -1752,18 +1862,13 @@ async def registration_attempt_response(
     group = (
         await db.execute(
             select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.allocation_group_id
-                == stable.get("allocation_group_id")
-            )
+            .where(GpuAllocationGroup.allocation_group_id == stable.get("allocation_group_id"))
             .with_for_update()
         )
     ).scalar_one_or_none()
     server = (
         await db.execute(
-            select(Server)
-            .where(Server.server_id == stable.get("server_id"))
-            .with_for_update()
+            select(Server).where(Server.server_id == stable.get("server_id")).with_for_update()
         )
     ).scalar_one_or_none()
     attestation = (
@@ -1799,14 +1904,10 @@ async def registration_attempt_response(
     )
     node_uuids = [item.uuid for item in nodes]
     registration_report_ids = {
-        item.gpu_inventory_report_id
-        for item in nodes
-        if item.gpu_inventory_report_id is not None
+        item.gpu_inventory_report_id for item in nodes if item.gpu_inventory_report_id is not None
     }
     registration_report_id = (
-        next(iter(registration_report_ids))
-        if len(registration_report_ids) == 1
-        else None
+        next(iter(registration_report_ids)) if len(registration_report_ids) == 1 else None
     )
     registration_report = (
         (
@@ -1858,8 +1959,7 @@ async def registration_attempt_response(
         )
         and all(
             item.gpu_allocation_group_id == stable.get("allocation_group_id")
-            and item.gpu_allocation_group_generation
-            == stable.get("allocation_group_generation")
+            and item.gpu_allocation_group_generation == stable.get("allocation_group_generation")
             and item.gpu_launch_reservation_id == reservation.reservation_id
             and item.gpu_process_incarnation == reservation.process_incarnation
             and item.gpu_inventory_report_id == registration_report_id
@@ -1873,20 +1973,15 @@ async def registration_attempt_response(
                 select(GpuHotplugCommand)
                 .where(
                     GpuHotplugCommand.reservation_id == reservation.reservation_id,
-                    GpuHotplugCommand.reservation_generation
-                    == reservation.reservation_generation,
+                    GpuHotplugCommand.reservation_generation == reservation.reservation_generation,
                     GpuHotplugCommand.claims_sha256 == reservation.claims_sha256,
                     GpuHotplugCommand.host_id == reservation.host_id,
-                    GpuHotplugCommand.host_key_generation
-                    == reservation.host_key_generation,
-                    GpuHotplugCommand.host_boot_generation
-                    == reservation.host_boot_generation,
-                    GpuHotplugCommand.allocation_group_id
-                    == reservation.allocation_group_id,
+                    GpuHotplugCommand.host_key_generation == reservation.host_key_generation,
+                    GpuHotplugCommand.host_boot_generation == reservation.host_boot_generation,
+                    GpuHotplugCommand.allocation_group_id == reservation.allocation_group_id,
                     GpuHotplugCommand.allocation_group_generation
                     == reservation.allocation_group_generation,
-                    GpuHotplugCommand.process_incarnation
-                    == reservation.process_incarnation,
+                    GpuHotplugCommand.process_incarnation == reservation.process_incarnation,
                     GpuHotplugCommand.stable_server_id == reservation.server_id,
                     GpuHotplugCommand.migration_id == reservation.legacy_migration_id,
                 )
@@ -1903,7 +1998,7 @@ async def registration_attempt_response(
                 attempt_id=attempt.attempt_id,
                 state="failed",
                 status_url=_status_url(attempt.attempt_id),
-                failure_code=hotplug.failure_code or "gpu_hotplug_failed",
+                failure_code="gpu_legacy_hotplug_failed",
                 failure_detail=hotplug.failure_reason or "Legacy GPU hotplug failed.",
             )
 
@@ -1914,8 +2009,7 @@ async def registration_attempt_response(
         and attestation is not None
         and host is not None
         and stable_claims is not None
-        and reservation.claims
-        == stable_claims.model_dump(mode="json", exclude_none=True)
+        and reservation.claims == stable_claims.model_dump(mode="json", exclude_none=True)
         and reservation.claims_sha256 == canonical_sha256(stable_claims)
         and stable_claims.owner_hotkey == reservation.owner_hotkey
         and stable_claims.workload_owner == reservation.workload_owner
@@ -1934,19 +2028,18 @@ async def registration_attempt_response(
         and host.miner_hotkey == reservation.owner_hotkey
         and group.management_mode == reservation.management_mode
         and reservation.registration_attestation_id == attempt.attestation_id
+        and reservation.registration_generation == attempt.registration_generation
         and reservation.claims_sha256 == stable.get("claims_sha256")
         and reservation.server_id == stable.get("server_id")
         and reservation.owner_hotkey == stable.get("owner_hotkey")
         and reservation.allocation_group_id == stable.get("allocation_group_id")
-        and reservation.allocation_group_generation
-        == stable.get("allocation_group_generation")
+        and reservation.allocation_group_generation == stable.get("allocation_group_generation")
         and reservation.process_incarnation == stable.get("process_incarnation")
         and reservation.management_mode == stable.get("management_mode")
         and server.gpu_retired_at is None
         and server.gpu_launch_reservation_id == reservation.reservation_id
         and server.gpu_allocation_group_id == reservation.allocation_group_id
-        and server.gpu_allocation_group_generation
-        == reservation.allocation_group_generation
+        and server.gpu_allocation_group_generation == reservation.allocation_group_generation
         and server.gpu_process_incarnation == reservation.process_incarnation
         and server.gpu_management_mode == reservation.management_mode
         and server.attested_cert_pubkey_hash == attempt.peer_spki_sha256
@@ -1957,8 +2050,7 @@ async def registration_attempt_response(
         and attestation.gpu_retired_at is None
         and attestation.gpu_launch_reservation_id == reservation.reservation_id
         and attestation.gpu_allocation_group_id == reservation.allocation_group_id
-        and attestation.gpu_allocation_group_generation
-        == reservation.allocation_group_generation
+        and attestation.gpu_allocation_group_generation == reservation.allocation_group_generation
         and attestation.gpu_process_incarnation == reservation.process_incarnation
         and attestation.gpu_claims_sha256 == reservation.claims_sha256
         and attempt.registration_id == stable.get("registration_id")
@@ -2022,9 +2114,7 @@ async def get_gpu_registration_attempt(
     attempt_id: str,
     expected_cert_hash: str,
 ) -> GpuRegistrationResponseV2:
-    attempt, lease_owner = await _claim_processing_lease(
-        db, attempt_id, expected_cert_hash
-    )
+    attempt, lease_owner = await _claim_processing_lease(db, attempt_id, expected_cert_hash)
     await db.commit()
     if lease_owner is not None:
         return await _run_registration_attempt(
@@ -2048,9 +2138,7 @@ async def _verify_recorded_conflict(
     lease_owner = generate_uuid()
     supplied_audit = (
         _registration_request_audit(request, expected_cert_hash, cert_pem)
-        if request is not None
-        and expected_cert_hash is not None
-        and cert_pem is not None
+        if request is not None and expected_cert_hash is not None and cert_pem is not None
         else None
     )
     supplied_shape_valid = all(
@@ -2092,11 +2180,7 @@ async def _verify_recorded_conflict(
     ):
         await db.commit()
         return "verifying"
-    if (
-        row.state == "recorded"
-        and row.next_attempt_at is not None
-        and row.next_attempt_at > now
-    ):
+    if row.state == "recorded" and row.next_attempt_at is not None and row.next_attempt_at > now:
         await db.commit()
         return "recorded"
     try:
@@ -2136,10 +2220,7 @@ async def _verify_recorded_conflict(
         and _conflict_audit_matches(row, persisted_request, persisted_audit)
         and (
             supplied_audit is None
-            or (
-                request is not None
-                and _conflict_audit_matches(row, request, supplied_audit)
-            )
+            or (request is not None and _conflict_audit_matches(row, request, supplied_audit))
         )
     )
     if not immutable_conflict:
@@ -2217,9 +2298,7 @@ async def _verify_recorded_conflict(
     ).one_or_none()
     host = (
         (
-            await db.execute(
-                select(Host).where(Host.host_id == identity.host_id).with_for_update()
-            )
+            await db.execute(select(Host).where(Host.host_id == identity.host_id).with_for_update())
         ).scalar_one_or_none()
         if identity is not None
         else None
@@ -2228,10 +2307,7 @@ async def _verify_recorded_conflict(
         (
             await db.execute(
                 select(GpuAllocationGroup)
-                .where(
-                    GpuAllocationGroup.allocation_group_id
-                    == identity.allocation_group_id
-                )
+                .where(GpuAllocationGroup.allocation_group_id == identity.allocation_group_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -2259,9 +2335,7 @@ async def _verify_recorded_conflict(
     server = (
         (
             await db.execute(
-                select(Server)
-                .where(Server.server_id == reservation.server_id)
-                .with_for_update()
+                select(Server).where(Server.server_id == reservation.server_id).with_for_update()
             )
         ).scalar_one_or_none()
         if reservation is not None
@@ -2276,9 +2350,7 @@ async def _verify_recorded_conflict(
 
     now = _now()
     try:
-        _, persisted_token_hash = _parse_reservation_token(
-            persisted_request.launch_reservation
-        )
+        _, persisted_token_hash = _parse_reservation_token(persisted_request.launch_reservation)
     except HTTPException:
         persisted_token_hash = ""
     custody_current = bool(
@@ -2310,9 +2382,7 @@ async def _verify_recorded_conflict(
         await db.commit()
         return row.state
     if verification_error is not None:
-        retryable, code, detail = _classify_conflict_verification_error(
-            verification_error
-        )
+        retryable, code, detail = _classify_conflict_verification_error(verification_error)
         if retryable:
             _schedule_conflict_retry(
                 row,
@@ -2353,9 +2423,7 @@ async def _verify_recorded_conflict(
     )
     request = current_request or persisted_request
     try:
-        _, conflict_token_hash = _parse_reservation_token(
-            request.launch_reservation
-        )
+        _, conflict_token_hash = _parse_reservation_token(request.launch_reservation)
         nonce_hash = hashlib.sha256(bytes.fromhex(request.nonce)).hexdigest()
     except (HTTPException, ValueError):
         conflict_token_hash = ""
@@ -2377,14 +2445,9 @@ async def _verify_recorded_conflict(
         and request.nonce_id == nonce.nonce_id
         and nonce.state in {"claimed", "expired"}
         and nonce.claimed_attempt_id == attempt.attempt_id
-        and nonce.reservation_id
-        == attempt.reservation_id
-        == reservation.reservation_id
+        and nonce.reservation_id == attempt.reservation_id == reservation.reservation_id
         and secrets.compare_digest(nonce.nonce_hash, nonce_hash)
-        and (
-            nonce.nonce_value is None
-            or secrets.compare_digest(nonce.nonce_value, request.nonce)
-        )
+        and (nonce.nonce_value is None or secrets.compare_digest(nonce.nonce_value, request.nonce))
         and secrets.compare_digest(nonce.peer_spki_sha256, attempt.peer_spki_sha256)
         and request.quote_commitment.attested_spki_sha256 == row.peer_spki_sha256
         and not (
@@ -2397,11 +2460,8 @@ async def _verify_recorded_conflict(
         )
         and secrets.compare_digest(reservation.token_hash, conflict_token_hash)
         and reservation.claims == claims_document
-        and secrets.compare_digest(
-            reservation.claims_sha256, canonical_sha256(claims_document)
-        )
-        and request.quote_commitment.reservation_sha256
-        == reservation.claims_sha256
+        and secrets.compare_digest(reservation.claims_sha256, canonical_sha256(claims_document))
+        and request.quote_commitment.reservation_sha256 == reservation.claims_sha256
     )
     if attempt.state == "failed":
         final_state = "dismissed"
@@ -2443,9 +2503,7 @@ async def _verify_recorded_conflict(
             primary_token_hash = ""
             primary_nonce_hash = ""
         primary_claims_document = (
-            primary_request.quote_commitment.claims.model_dump(
-                mode="json", exclude_none=True
-            )
+            primary_request.quote_commitment.claims.model_dump(mode="json", exclude_none=True)
             if primary_request is not None
             else None
         )
@@ -2457,8 +2515,7 @@ async def _verify_recorded_conflict(
                 nonce.nonce_value is None
                 or secrets.compare_digest(nonce.nonce_value, primary_request.nonce)
             )
-            and primary_request.quote_commitment.attested_spki_sha256
-            == attempt.peer_spki_sha256
+            and primary_request.quote_commitment.attested_spki_sha256 == attempt.peer_spki_sha256
             and secrets.compare_digest(reservation.token_hash, primary_token_hash)
             and reservation.claims == claims_document == primary_claims_document
             and _registration_lineage_current(
@@ -2508,14 +2565,10 @@ async def _verify_recorded_conflict(
             and attempt.peer_certificate_pem is not None
             and secrets.compare_digest(
                 attempt.peer_certificate_sha256,
-                hashlib.sha256(
-                    attempt.peer_certificate_pem.encode("utf-8")
-                ).hexdigest(),
+                hashlib.sha256(attempt.peer_certificate_pem.encode("utf-8")).hexdigest(),
             )
             and attempt.stable_response_sha256 is not None
-            and secrets.compare_digest(
-                attempt.stable_response_sha256, canonical_sha256(stable)
-            )
+            and secrets.compare_digest(attempt.stable_response_sha256, canonical_sha256(stable))
             and attempt.registration_id == stable.get("registration_id")
             and attempt.attestation_id == stable.get("attestation_id")
             and reservation.guest_consumed_at is not None
@@ -2533,8 +2586,7 @@ async def _verify_recorded_conflict(
             and server.miner_hotkey == reservation.owner_hotkey
             and server.gpu_launch_reservation_id == reservation.reservation_id
             and server.gpu_allocation_group_id == reservation.allocation_group_id
-            and server.gpu_allocation_group_generation
-            == reservation.allocation_group_generation
+            and server.gpu_allocation_group_generation == reservation.allocation_group_generation
             and server.gpu_management_mode == reservation.management_mode
             and server.gpu_process_incarnation == reservation.process_incarnation
             and server.gpu_retired_at is None
@@ -2553,11 +2605,7 @@ async def _verify_recorded_conflict(
                 exact = False
                 detail = str(getattr(exc, "detail", exc))[:2000]
         final_state = "verified_competitor" if exact else "invalid"
-        if (
-            evidence_valid
-            and not exact
-            and detail == "conflicting request independently verified"
-        ):
+        if evidence_valid and not exact and detail == "conflicting request independently verified":
             detail = (
                 "conflicting request evidence verified but post-verification "
                 "lineage, node selection, or immutable audit bytes changed"
@@ -2576,8 +2624,7 @@ async def _verify_recorded_conflict(
             reservation.reservation_id,
             code="gpu_registration_verified_competitor",
             reason=(
-                "A second independently verified request used the completed "
-                "registration nonce."
+                "A second independently verified request used the completed registration nonce."
             ),
             operation_type="normal_delete",
             metadata={
@@ -2586,9 +2633,7 @@ async def _verify_recorded_conflict(
             },
         )
         row.fence_state = "requested" if operation is not None else "custody_ended"
-        row.fence_operation_id = (
-            operation.operation_id if operation is not None else None
-        )
+        row.fence_operation_id = operation.operation_id if operation is not None else None
         row.fence_recorded_at = _now()
     await db.commit()
     return final_state
@@ -2608,11 +2653,7 @@ async def _fence_verified_registration_conflict(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    if (
-        row is None
-        or row.state != "verified_competitor"
-        or row.fence_state != "pending"
-    ):
+    if row is None or row.state != "verified_competitor" or row.fence_state != "pending":
         await db.commit()
         return False
     attempt = (
@@ -2646,10 +2687,7 @@ async def _fence_verified_registration_conflict(
         (
             await db.execute(
                 select(GpuAllocationGroup)
-                .where(
-                    GpuAllocationGroup.allocation_group_id
-                    == reservation.allocation_group_id
-                )
+                .where(GpuAllocationGroup.allocation_group_id == reservation.allocation_group_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -2668,10 +2706,7 @@ async def _fence_verified_registration_conflict(
         db,
         reservation.reservation_id,
         code="gpu_registration_verified_competitor",
-        reason=(
-            "A second independently verified request used the completed "
-            "registration nonce."
-        ),
+        reason=("A second independently verified request used the completed registration nonce."),
         operation_type="normal_delete",
         metadata={
             "attempt_id": attempt.attempt_id,
@@ -2705,16 +2740,10 @@ async def reconcile_gpu_registration_conflicts(
                             ),
                             (
                                 (GpuRegistrationConflict.state == "verifying")
-                                & (
-                                    GpuRegistrationConflict.processing_lease_expires_at
-                                    <= now
-                                )
+                                & (GpuRegistrationConflict.processing_lease_expires_at <= now)
                             ),
                             (
-                                (
-                                    GpuRegistrationConflict.state
-                                    == "verified_competitor"
-                                )
+                                (GpuRegistrationConflict.state == "verified_competitor")
                                 & (GpuRegistrationConflict.fence_state == "pending")
                             ),
                         )
@@ -2767,22 +2796,19 @@ async def _run_registration_attempt(
             snapshot.request.nonce,
             snapshot.spki_sha256,
             snapshot.cert_pem,
-            before_publish=lambda: _assert_processing_lease_before_publish(
-                db, snapshot
-            ),
+            registration_generation=snapshot.registration_generation,
+            before_publish=lambda: _assert_processing_lease_before_publish(db, snapshot),
         )
         completed_reservation = (
-            (
-                await db.execute(
-                    select(GpuLaunchReservation)
-                    .where(
-                        GpuLaunchReservation.reservation_id
-                        == snapshot.request.quote_commitment.claims.reservation_id
-                    )
-                    .with_for_update()
+            await db.execute(
+                select(GpuLaunchReservation)
+                .where(
+                    GpuLaunchReservation.reservation_id
+                    == snapshot.request.quote_commitment.claims.reservation_id
                 )
-            ).scalar_one_or_none()
-        )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
         completed_group = (
             (
                 await db.execute(
@@ -2801,15 +2827,14 @@ async def _run_registration_attempt(
             await ensure_gpu_hotplug_command(db, completed_reservation.reservation_id)
             if completed_reservation is not None
             and completed_group is not None
+            and snapshot.registration_generation == 1
             and completed_reservation.state == "running"
             and completed_group.state == "running"
-            and completed_reservation.registration_attestation_id
-            == result["attestation_id"]
+            and completed_reservation.registration_attestation_id == result["attestation_id"]
             and completed_group.reservation_id == completed_reservation.reservation_id
             and completed_group.reservation_generation
             == completed_reservation.reservation_generation
-            and completed_group.process_incarnation
-            == completed_reservation.process_incarnation
+            and completed_group.process_incarnation == completed_reservation.process_incarnation
             else None
         )
         attempt = await _complete_attempt(
@@ -2828,13 +2853,24 @@ async def _run_registration_attempt(
                     "Durable GPU hotplug dispatch remains retryable for "
                     f"{hotplug_command.command_id}: {dispatch_exc}"
                 )
+    except (GpuRegistrationGenerationSuperseded, AttestationSupersededError) as exc:
+        await db.rollback()
+        attempt = await _mark_attempt_failed(
+            db,
+            attempt_id,
+            lease_owner,
+            "gpu_registration_generation_superseded",
+            str(getattr(exc, "detail", exc)),
+        )
+        await db.commit()
+        if attempt.state == "failed":
+            return _failed_response(attempt)
+        return await registration_attempt_response(db, attempt, expected_cert_hash)
     except GpuRegistrationLeaseLost:
         await db.rollback()
         attempt = await db.get(GpuRegistrationAttempt, attempt_id)
         if attempt is None:
-            raise HTTPException(
-                status_code=404, detail="GPU registration attempt not found."
-            )
+            raise HTTPException(status_code=404, detail="GPU registration attempt not found.")
         return await registration_attempt_response(db, attempt, expected_cert_hash)
     except GpuRegistrationRecoveryKeyUnavailable:
         # The durable ciphertext and processing lease remain recoverable. A
@@ -2852,9 +2888,7 @@ async def _run_registration_attempt(
         await db.rollback()
         if isinstance(exc, AttestationVerifierUnavailableError):
             raise
-        raise AttestationVerifierUnavailableError(
-            str(getattr(exc, "detail", exc))[:2000]
-        ) from exc
+        raise AttestationVerifierUnavailableError(str(getattr(exc, "detail", exc))[:2000]) from exc
     except GpuHotplugError as exc:
         await db.rollback()
         attempt = await _mark_attempt_failed(
@@ -2914,9 +2948,7 @@ async def process_gpu_registration(
         expected_cert_hash,
         cert_pem,
     )
-    await (
-        db.commit()
-    )  # nonce claim and attempt creation become durable before verification
+    await db.commit()  # nonce claim and attempt creation become durable before verification
     if conflict is not None:
         conflict_state = await _verify_recorded_conflict(
             db,

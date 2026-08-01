@@ -3,9 +3,9 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 ALTER TABLE images
-    ADD COLUMN IF NOT EXISTS compute_type TEXT;
+    ADD COLUMN IF NOT EXISTS compute_type VARCHAR;
 ALTER TABLE images
-    ADD COLUMN IF NOT EXISTS artifact_id TEXT;
+    ADD COLUMN IF NOT EXISTS artifact_id VARCHAR;
 
 DO $$
 BEGIN

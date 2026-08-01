@@ -247,7 +247,7 @@ FOR EACH ROW EXECUTE FUNCTION revoke_registry_scope_on_launch_terminal();
 -- storage revocation. The BEFORE trigger auto-advances terminal transitions
 -- while also permitting callers to advance the epoch explicitly under lock.
 ALTER TABLE instances
-    ADD COLUMN IF NOT EXISTS storage_revocation_epoch BIGINT NOT NULL DEFAULT 0;
+    ADD COLUMN IF NOT EXISTS storage_revocation_epoch BIGINT NOT NULL DEFAULT '0'::bigint;
 ALTER TABLE instances
     DROP CONSTRAINT IF EXISTS ck_instances_storage_revocation_epoch;
 ALTER TABLE instances

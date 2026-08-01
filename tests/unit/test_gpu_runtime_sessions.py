@@ -12,6 +12,7 @@ from api.config import settings
 from api.server.schemas import GpuRuntimeSessionResponse
 from api.gpu_hotplug_service import GpuHotplugError
 from api.server.gpu_sessions import (
+    GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS,
     GPU_RUNTIME_SESSION_PURPOSES,
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
     _current_attestation,
@@ -40,8 +41,7 @@ def _server(mode="miner"):
         gpu_process_incarnation="process",
         gpu_topology_fingerprint="d" * 64,
         gpu_runtime_session_attestation_id="attestation",
-        gpu_runtime_session_expires_at=datetime.now(timezone.utc)
-        + timedelta(minutes=15),
+        gpu_runtime_session_expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
         attested_cert_pubkey_hash="a" * 64,
         gpu_retired_at=None,
         measurement_name="gpu-measurement",
@@ -80,6 +80,44 @@ def _attestation(mode="miner"):
     )
 
 
+def _runtime_session_authority_db(server, attestation):
+    reservation = SimpleNamespace(
+        state="running",
+        registration_attestation_id=attestation.attestation_id,
+        server_id=server.server_id,
+        management_mode=server.gpu_management_mode,
+        allocation_group_id=server.gpu_allocation_group_id,
+        allocation_group_generation=server.gpu_allocation_group_generation,
+        process_incarnation=server.gpu_process_incarnation,
+        topology_fingerprint=server.gpu_topology_fingerprint,
+        claims_sha256=attestation.gpu_claims_sha256,
+        gpu_release_id=attestation.gpu_release_id,
+        profile_id=attestation.gpu_profile_id,
+        host_boot_generation=attestation.gpu_host_boot_generation,
+        reservation_generation=attestation.gpu_reservation_generation,
+        gpu_attestation_certificate_sha256s=(attestation.gpu_evidence_certificate_sha256s),
+        legacy_migration_id=None,
+    )
+    db = AsyncMock()
+
+    async def get(model, key):
+        if model.__name__ == "Server":
+            assert key == server.server_id
+            return server
+        if model.__name__ == "ServerAttestation":
+            assert key == attestation.attestation_id
+            return attestation
+        assert model.__name__ == "GpuLaunchReservation"
+        assert key == server.gpu_launch_reservation_id
+        return reservation
+
+    db.get.side_effect = get
+    db.execute.return_value = SimpleNamespace(
+        scalar_one_or_none=lambda: attestation,
+    )
+    return db
+
+
 @pytest.mark.asyncio
 async def test_completed_registration_requires_operational_attestation_before_db_access():
     db = AsyncMock()
@@ -107,6 +145,176 @@ def test_miner_registration_mints_short_scoped_attested_session():
     assert payload["allowed_purposes"] == list(GPU_RUNTIME_SESSION_PURPOSES)
     assert payload["exp"] - payload["iat"] == 900
     assert int(expires_at.timestamp()) == payload["exp"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_iat_accepts_explicit_bounded_future_skew():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    server = _server()
+    attestation = _attestation()
+    db = _runtime_session_authority_db(server, attestation)
+    with (
+        patch(
+            "api.server.gpu_sessions._runtime_session_now",
+            side_effect=[
+                now + timedelta(seconds=GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS),
+                now,
+            ],
+        ),
+        patch(
+            "api.server.gpu_sessions.acquire_gpu_lifecycle_lock",
+            AsyncMock(),
+        ),
+        patch(
+            "api.server.gpu_sessions.require_completed_gpu_registration",
+            AsyncMock(),
+        ),
+        patch(
+            "api.server.gpu_sessions.require_gpu_hotplug_runtime_ack",
+            AsyncMock(),
+        ),
+    ):
+        token, expires_at = mint_gpu_runtime_session(server, attestation)
+        server.gpu_runtime_session_expires_at = expires_at
+        current, payload = await validate_gpu_runtime_session(
+            db,
+            token,
+            required_purpose="miner",
+        )
+
+    assert current is server
+    assert payload["iat"] == (int(now.timestamp()) + GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS)
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_iat_rejects_future_time_beyond_explicit_skew():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    server = _server()
+    attestation = _attestation()
+    db = AsyncMock()
+    with patch(
+        "api.server.gpu_sessions._runtime_session_now",
+        side_effect=[
+            now + timedelta(seconds=GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS + 1),
+            now,
+        ],
+    ):
+        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+        with pytest.raises(HTTPException, match="invalid or expired") as exc:
+            await validate_gpu_runtime_session(
+                db,
+                token,
+                required_purpose="miner",
+            )
+
+    assert exc.value.status_code == 401
+    db.get.assert_not_awaited()
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim", ["iat", "exp"])
+@pytest.mark.parametrize("value", [True, 1.5, "1"])
+async def test_runtime_session_time_claims_require_exact_integers(claim, value):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    server = _server()
+    attestation = _attestation()
+    with patch("api.server.gpu_sessions._runtime_session_now", return_value=now):
+        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+    payload = jwt.decode(
+        token,
+        settings.launch_config_key,
+        algorithms=["HS256"],
+        issuer="chutes",
+    )
+    payload[claim] = value
+    malformed = jwt.encode(
+        payload,
+        settings.launch_config_key,
+        algorithm="HS256",
+    )
+    db = AsyncMock()
+
+    with (
+        patch("api.server.gpu_sessions._runtime_session_now", return_value=now),
+        pytest.raises(HTTPException, match="invalid or expired") as exc,
+    ):
+        await validate_gpu_runtime_session(
+            db,
+            malformed,
+            required_purpose="miner",
+        )
+
+    assert exc.value.status_code == 401
+    db.get.assert_not_awaited()
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_expiry_has_no_clock_skew_grace():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    server = _server()
+    attestation = _attestation()
+    with patch("api.server.gpu_sessions._runtime_session_now", return_value=now):
+        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+    payload = jwt.decode(
+        token,
+        settings.launch_config_key,
+        algorithms=["HS256"],
+        issuer="chutes",
+    )
+    payload["exp"] = int(now.timestamp())
+    expired = jwt.encode(
+        payload,
+        settings.launch_config_key,
+        algorithm="HS256",
+    )
+    db = AsyncMock()
+
+    with (
+        patch("api.server.gpu_sessions._runtime_session_now", return_value=now),
+        pytest.raises(HTTPException, match="invalid or expired") as exc,
+    ):
+        await validate_gpu_runtime_session(
+            db,
+            expired,
+            required_purpose="miner",
+        )
+
+    assert exc.value.status_code == 401
+    db.get.assert_not_awaited()
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_database_expiry_at_validation_now_is_rejected():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    server = _server()
+    attestation = _attestation()
+    db = _runtime_session_authority_db(server, attestation)
+    with (
+        patch(
+            "api.server.gpu_sessions._runtime_session_now",
+            side_effect=[now, now],
+        ),
+        patch(
+            "api.server.gpu_sessions.acquire_gpu_lifecycle_lock",
+            AsyncMock(),
+        ),
+    ):
+        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+        server.gpu_runtime_session_expires_at = now
+        with pytest.raises(
+            HTTPException,
+            match="identity is no longer current",
+        ) as exc:
+            await validate_gpu_runtime_session(
+                db,
+                token,
+                required_purpose="miner",
+            )
+
+    assert exc.value.status_code == 401
 
 
 @pytest.mark.parametrize("value", ["future_status", "soft-pass", 7, True])
@@ -404,9 +612,7 @@ async def test_existing_generic_session_rechecks_legacy_hotplug_ack():
         profile_id=successful.gpu_profile_id,
         host_boot_generation=successful.gpu_host_boot_generation,
         reservation_generation=successful.gpu_reservation_generation,
-        gpu_attestation_certificate_sha256s=(
-            successful.gpu_evidence_certificate_sha256s
-        ),
+        gpu_attestation_certificate_sha256s=(successful.gpu_evidence_certificate_sha256s),
         legacy_migration_id="migration-1",
     )
     db = AsyncMock()
@@ -487,7 +693,9 @@ def test_api_callers_never_pass_none_to_completed_registration_check():
             name = (
                 function.id
                 if isinstance(function, ast.Name)
-                else function.attr if isinstance(function, ast.Attribute) else None
+                else function.attr
+                if isinstance(function, ast.Attribute)
+                else None
             )
             if name != "require_completed_gpu_registration":
                 continue
@@ -497,10 +705,7 @@ def test_api_callers_never_pass_none_to_completed_registration_check():
                 for keyword in node.keywords
                 if keyword.arg == "operational_attestation"
             )
-            if any(
-                isinstance(value, ast.Constant) and value.value is None
-                for value in candidates
-            ):
+            if any(isinstance(value, ast.Constant) and value.value is None for value in candidates):
                 violations.append((str(path.relative_to(api_root)), node.lineno))
 
     assert not violations, f"Missing operational attestation at API call sites: {violations}"

@@ -153,6 +153,7 @@ async def test_direct_upload_commit_restart_replay_is_cross_layer_safe(pg_sessio
     assert replicas == 1
     assert committed.lifecycle_state == "committed"
 
+    store.close()
     restarted_store = ContentStore(
         str(data_dir),
         str(data_dir / "models"),

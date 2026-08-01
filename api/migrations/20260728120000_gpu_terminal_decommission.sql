@@ -203,17 +203,21 @@ BEGIN
             RAISE EXCEPTION 'decommissioned GPU server rows are immutable';
         END IF;
     ELSIF TG_OP = 'INSERT' THEN
-        IF TG_TABLE_NAME = 'gpu_infra_custodies' AND EXISTS (
-            SELECT 1 FROM gpu_server_decommissions
-             WHERE server_id = NEW.server_id
-        ) THEN
-            RAISE EXCEPTION 'decommissioned GPU custody cannot be recreated';
-        ELSIF TG_TABLE_NAME = 'gpu_legacy_migrations' AND EXISTS (
-            SELECT 1 FROM gpu_server_decommissions
-             WHERE server_id = NEW.legacy_server_id
-                OR server_id = NEW.target_server_id
-        ) THEN
-            RAISE EXCEPTION 'decommissioned GPU migration lineage cannot be recreated';
+        IF TG_TABLE_NAME = 'gpu_infra_custodies' THEN
+            IF EXISTS (
+                SELECT 1 FROM gpu_server_decommissions
+                 WHERE server_id = NEW.server_id
+            ) THEN
+                RAISE EXCEPTION 'decommissioned GPU custody cannot be recreated';
+            END IF;
+        ELSIF TG_TABLE_NAME = 'gpu_legacy_migrations' THEN
+            IF EXISTS (
+                SELECT 1 FROM gpu_server_decommissions
+                 WHERE server_id = NEW.legacy_server_id
+                    OR server_id = NEW.target_server_id
+            ) THEN
+                RAISE EXCEPTION 'decommissioned GPU migration lineage cannot be recreated';
+            END IF;
         END IF;
         RETURN NEW;
     ELSIF (to_jsonb(OLD)->>'state') = 'decommissioned' THEN

@@ -26,6 +26,7 @@ class GpuRegistrationNonce(Base):
     nonce_id = Column(String, primary_key=True, default=generate_uuid)
     client_request_id = Column(String, nullable=False)
     request_generation = Column(Integer, nullable=False)
+    registration_generation = Column(Integer, nullable=False, default=1, server_default="1")
     peer_spki_sha256 = Column(String(64), nullable=False)
     reservation_id = Column(
         String,
@@ -36,9 +37,7 @@ class GpuRegistrationNonce(Base):
     nonce_value = Column(String(64), nullable=True)
     nonce_hash = Column(String(64), nullable=False)
     state = Column(String, nullable=False, default="issued", server_default="issued")
-    issued_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
     claimed_attempt_id = Column(
         String,
@@ -68,7 +67,8 @@ class GpuRegistrationNonce(Base):
             name="ck_gpu_registration_nonce_digest",
         ),
         CheckConstraint(
-            "request_generation > 0 AND request_generation <= 1024",
+            "request_generation > 0 AND request_generation <= 1024 "
+            "AND registration_generation > 0 AND registration_generation <= 1024",
             name="ck_gpu_registration_nonce_generation",
         ),
         CheckConstraint(
@@ -76,9 +76,7 @@ class GpuRegistrationNonce(Base):
             "(state IN ('expired', 'revoked') AND nonce_value IS NULL)",
             name="ck_gpu_registration_nonce_value",
         ),
-        CheckConstraint(
-            "expires_at > issued_at", name="ck_gpu_registration_nonce_expiry"
-        ),
+        CheckConstraint("expires_at > issued_at", name="ck_gpu_registration_nonce_expiry"),
         CheckConstraint(
             "(state = 'claimed' AND claimed_attempt_id IS NOT NULL) OR "
             "(state = 'issued' AND claimed_attempt_id IS NULL) OR "
@@ -114,6 +112,7 @@ class GpuRegistrationAttempt(Base):
         ForeignKey("gpu_launch_reservations.reservation_id", ondelete="RESTRICT"),
         nullable=False,
     )
+    registration_generation = Column(Integer, nullable=False, default=1, server_default="1")
     registration_id = Column(String, nullable=True, unique=True)
     request_sha256 = Column(String(64), nullable=False)
     request_payload_ciphertext = Column(Text, nullable=True)
@@ -129,9 +128,7 @@ class GpuRegistrationAttempt(Base):
     peer_certificate_pem = Column(Text, nullable=False)
     peer_certificate_sha256 = Column(String(64), nullable=False)
     peer_spki_sha256 = Column(String(64), nullable=False)
-    state = Column(
-        String, nullable=False, default="processing", server_default="processing"
-    )
+    state = Column(String, nullable=False, default="processing", server_default="processing")
     processing_lease_owner = Column(String, nullable=True)
     processing_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attestation_id = Column(
@@ -145,12 +142,8 @@ class GpuRegistrationAttempt(Base):
     registration_replay_until = Column(DateTime(timezone=True), nullable=True)
     failure_code = Column(String, nullable=True)
     failure_detail = Column(Text, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -166,6 +159,10 @@ class GpuRegistrationAttempt(Base):
             "request_payload_key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') "
             "AND (stable_response_sha256 IS NULL OR stable_response_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_gpu_registration_attempt_digests",
+        ),
+        CheckConstraint(
+            "registration_generation > 0 AND registration_generation <= 1024",
+            name="ck_gpu_registration_attempt_generation",
         ),
         CheckConstraint(
             "(processing_lease_owner IS NULL AND processing_lease_expires_at IS NULL) OR "
@@ -249,17 +246,11 @@ class GpuRegistrationConflict(Base):
     quote_sha256 = Column(String(64), nullable=False)
     evidence_sha256 = Column(String(64), nullable=False)
     signature_sha256 = Column(String(64), nullable=False)
-    state = Column(
-        String, nullable=False, default="recorded", server_default="recorded"
-    )
+    state = Column(String, nullable=False, default="recorded", server_default="recorded")
     processing_lease_owner = Column(String, nullable=True)
     processing_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
-    verification_attempt_count = Column(
-        Integer, nullable=False, default=0, server_default="0"
-    )
-    next_attempt_at = Column(
-        DateTime(timezone=True), nullable=True, server_default=func.now()
-    )
+    verification_attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True, server_default=func.now())
     last_attempt_at = Column(DateTime(timezone=True), nullable=True)
     last_transient_error_code = Column(String, nullable=True)
     last_transient_error_detail = Column(Text, nullable=True)
@@ -268,9 +259,7 @@ class GpuRegistrationConflict(Base):
     fence_state = Column(String, nullable=True)
     fence_operation_id = Column(String, nullable=True)
     fence_recorded_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     verified_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -380,9 +369,7 @@ class GpuRegistrationRecoveryKeyEpoch(Base):
     )
     state = Column(String, nullable=False)
     required_replica_ids = Column(JSONB, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     activated_at = Column(DateTime(timezone=True), nullable=True)
     retiring_at = Column(DateTime(timezone=True), nullable=True)
     retired_at = Column(DateTime(timezone=True), nullable=True)
@@ -396,8 +383,7 @@ class GpuRegistrationRecoveryKeyEpoch(Base):
             postgresql_where=text("state = 'active'"),
         ),
         CheckConstraint(
-            "key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "
-            "AND key_sha256 ~ '^[0-9a-f]{64}$'",
+            "key_id ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' AND key_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_gpu_registration_recovery_key_epoch_identity",
         ),
         CheckConstraint(
@@ -447,9 +433,7 @@ class GpuRegistrationRecoveryKeyReplicaAck(Base):
     key_ids = Column(JSONB, nullable=False)
     key_fingerprints = Column(JSONB, nullable=False)
     keyring_sha256 = Column(String(64), nullable=False)
-    acknowledged_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    acknowledged_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
         CheckConstraint(
@@ -485,9 +469,7 @@ class GpuRegistrationRecoveryKeyEpochOperation(Base):
     reason = Column(String, nullable=True)
     response_json = Column(JSONB, nullable=False)
     response_sha256 = Column(String(64), nullable=False)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
         CheckConstraint(
@@ -514,9 +496,7 @@ class GpuLifecycleOperation(Base):
     operation_id = Column(String, primary_key=True)
     operation_type = Column(String, nullable=False)
     phase = Column(String, nullable=False, default="intent", server_default="intent")
-    host_id = Column(
-        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
-    )
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
     host_key_generation = Column(Integer, nullable=False)
     host_boot_generation = Column(Integer, nullable=False)
     allocation_group_id = Column(
@@ -546,9 +526,7 @@ class GpuLifecycleOperation(Base):
     physical_result = Column(JSONB, nullable=True)
     physical_result_sha256 = Column(String(64), nullable=True)
     result_outcome = Column(String, nullable=True)
-    reporting_state = Column(
-        String, nullable=False, default="pending", server_default="pending"
-    )
+    reporting_state = Column(String, nullable=False, default="pending", server_default="pending")
     receipt_id = Column(String, nullable=True, unique=True)
     receipt_sha256 = Column(String(64), nullable=True)
     receipt_accepted_at = Column(DateTime(timezone=True), nullable=True)
@@ -559,12 +537,8 @@ class GpuLifecycleOperation(Base):
     lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     failure_code = Column(String, nullable=True)
     failure_reason = Column(Text, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     finalized_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -703,9 +677,7 @@ class GpuRecoveryAuthorization(Base):
         nullable=False,
         unique=True,
     )
-    host_id = Column(
-        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
-    )
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
     host_key_generation = Column(Integer, nullable=False)
     host_boot_generation = Column(Integer, nullable=False)
     prior_host_key_generation = Column(Integer, nullable=False)
@@ -740,9 +712,7 @@ class GpuRecoveryAuthorization(Base):
     recovery_nonce = Column(String(128), nullable=False)
     recovery_nonce_hash = Column(String(64), nullable=False)
     authorized_by = Column(String, nullable=False)
-    issued_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    issued_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     expires_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
@@ -787,9 +757,7 @@ class GpuHostLossEvent(Base):
         nullable=False,
         unique=True,
     )
-    host_id = Column(
-        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
-    )
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
     allocation_group_id = Column(
         String,
         ForeignKey("gpu_allocation_groups.allocation_group_id", ondelete="RESTRICT"),
@@ -804,9 +772,7 @@ class GpuHostLossEvent(Base):
     receipt_sha256 = Column(String(64), nullable=False)
     reason = Column(Text, nullable=False)
     authorized_by = Column(String, nullable=False)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
         CheckConstraint(
@@ -858,12 +824,8 @@ class GpuRecoveryEvent(Base):
     current_inventory_report_sha256 = Column(String(64), nullable=True)
     current_host_key_generation = Column(Integer, nullable=True)
     current_host_boot_generation = Column(Integer, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
@@ -915,9 +877,7 @@ class GpuHotplugCommand(Base):
     __tablename__ = "gpu_hotplug_commands"
 
     command_id = Column(String, primary_key=True)
-    host_id = Column(
-        String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False
-    )
+    host_id = Column(String, ForeignKey("hosts.host_id", ondelete="RESTRICT"), nullable=False)
     host_key_generation = Column(Integer, nullable=False)
     host_boot_generation = Column(Integer, nullable=False)
     reservation_id = Column(
@@ -942,9 +902,7 @@ class GpuHotplugCommand(Base):
     dispatch_lease_owner = Column(String, nullable=True)
     dispatch_lease_expires_at = Column(DateTime(timezone=True), nullable=True)
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
-    next_attempt_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    next_attempt_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     alerted_at = Column(DateTime(timezone=True), nullable=True)
     last_dispatch_error = Column(Text, nullable=True)
     dispatched_at = Column(DateTime(timezone=True), nullable=True)
@@ -953,12 +911,8 @@ class GpuHotplugCommand(Base):
     acknowledged_at = Column(DateTime(timezone=True), nullable=True)
     failure_code = Column(String, nullable=True)
     failure_reason = Column(Text, nullable=True)
-    created_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at = Column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     __table_args__ = (
         UniqueConstraint(

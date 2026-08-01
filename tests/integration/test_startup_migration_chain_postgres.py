@@ -135,7 +135,16 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
             triggers = set(
                 (
                     await connection.execute(
-                        text("SELECT tgname FROM pg_trigger WHERE NOT tgisinternal")
+                        text(
+                            "SELECT trigger_row.tgname "
+                            "FROM pg_trigger AS trigger_row "
+                            "JOIN pg_class AS relation "
+                            "ON relation.oid = trigger_row.tgrelid "
+                            "JOIN pg_namespace AS namespace "
+                            "ON namespace.oid = relation.relnamespace "
+                            "WHERE NOT trigger_row.tgisinternal "
+                            "AND namespace.oid = current_schema()::regnamespace"
+                        )
                     )
                 )
                 .scalars()
@@ -282,9 +291,7 @@ async def test_create_all_then_full_ordered_migration_chain_installs_invariants(
 
 async def test_storage_object_key_migrations_accept_exact_legacy_and_reject_mixed():
     schema, admin, engine = await _new_schema()
-    bootstrap_up, _bootstrap_down = _split(
-        MIGRATIONS / "20260629120000_chutefs_storage.sql"
-    )
+    bootstrap_up, _bootstrap_down = _split(MIGRATIONS / "20260629120000_chutefs_storage.sql")
     object_key_up, object_key_down = _split(
         MIGRATIONS / "20260703120000_chutefs_object_key_partial_unique.sql"
     )
@@ -440,10 +447,7 @@ async def test_scheduler_readiness_stays_false_until_exact_schema_commit():
     try:
         async with engine.begin() as connection:
             await connection.execute(
-                text(
-                    "CREATE TABLE schema_migrations "
-                    "(version VARCHAR(255) PRIMARY KEY)"
-                )
+                text("CREATE TABLE schema_migrations (version VARCHAR(255) PRIMARY KEY)")
             )
             await connection.execute(
                 text("INSERT INTO schema_migrations(version) VALUES (:version)"),
@@ -454,9 +458,7 @@ async def test_scheduler_readiness_stays_false_until_exact_schema_commit():
             async with engine.connect() as migration_connection:
                 migration = await migration_connection.begin()
                 await migration_connection.execute(
-                    text(
-                        "INSERT INTO schema_migrations(version) VALUES (:version)"
-                    ),
+                    text("INSERT INTO schema_migrations(version) VALUES (:version)"),
                     {"version": gpu_scheduler.REQUIRED_GPU_SCHEMA_VERSION},
                 )
                 # The exact row remains invisible to the readiness connection until
@@ -478,10 +480,7 @@ async def test_scheduler_main_does_no_election_or_orm_work_before_real_schema_ba
     try:
         async with engine.begin() as connection:
             await connection.execute(
-                text(
-                    "CREATE TABLE schema_migrations "
-                    "(version VARCHAR(255) PRIMARY KEY)"
-                )
+                text("CREATE TABLE schema_migrations (version VARCHAR(255) PRIMARY KEY)")
             )
             await connection.execute(
                 text("INSERT INTO schema_migrations(version) VALUES (:version)"),

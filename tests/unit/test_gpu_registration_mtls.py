@@ -53,8 +53,11 @@ def _request(cert_pem: str, verify: str | None, path: str) -> Request:
 def test_all_gpu_registration_v2_routes_use_live_certificate_dependency() -> None:
     routes = {route.path: route for route in router.routes}
     nonce_calls = {
+        dependency.call for dependency in routes["/gpu/registration/nonces"].dependant.dependencies
+    }
+    rekey_nonce_calls = {
         dependency.call
-        for dependency in routes["/gpu/registration/nonces"].dependant.dependencies
+        for dependency in routes["/gpu/registration/rekey/nonces"].dependant.dependencies
     }
     post_calls = {
         dependency.call
@@ -62,11 +65,10 @@ def test_all_gpu_registration_v2_routes_use_live_certificate_dependency() -> Non
     }
     get_calls = {
         dependency.call
-        for dependency in routes[
-            "/gpu/registration/attempts/{attempt_id}"
-        ].dependant.dependencies
+        for dependency in routes["/gpu/registration/attempts/{attempt_id}"].dependant.dependencies
     }
     assert _gpu_registration_live_cert_hash in nonce_calls
+    assert _gpu_registration_live_cert_hash in rekey_nonce_calls
     assert _gpu_registration_live_cert_hash in post_calls
     assert _gpu_registration_live_cert_pem in post_calls
     assert _gpu_registration_live_cert_hash in get_calls
@@ -80,6 +82,7 @@ async def test_forwarded_certificate_without_live_handshake_cannot_register_or_r
     cert_pem = _certificate()
     for path in (
         "/gpu/registration/nonces",
+        "/gpu/registration/rekey/nonces",
         "/gpu/registration/attempts",
         "/gpu/registration/attempts/attempt-id",
     ):
@@ -96,9 +99,7 @@ async def test_forwarded_certificate_without_live_handshake_cannot_register_or_r
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verify", ["SUCCESS", "FAILED:self-signed certificate"])
-async def test_optional_no_ca_live_client_verification_is_accepted(
-    monkeypatch, verify
-) -> None:
+async def test_optional_no_ca_live_client_verification_is_accepted(monkeypatch, verify) -> None:
     monkeypatch.setattr(settings, "require_mtls_client_verify", True)
     cert_pem = _certificate()
     request = _request(cert_pem, verify, "/gpu/registration/attempts")

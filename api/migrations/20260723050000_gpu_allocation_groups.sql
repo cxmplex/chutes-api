@@ -264,6 +264,7 @@ CREATE TABLE IF NOT EXISTS gpu_launch_reservations (
         REFERENCES gpu_allocation_groups(allocation_group_id) ON DELETE RESTRICT,
     allocation_group_generation INTEGER NOT NULL,
     reservation_generation INTEGER NOT NULL,
+    registration_generation INTEGER NOT NULL DEFAULT 0,
     management_mode TEXT NOT NULL,
     server_id TEXT NOT NULL,
     process_incarnation TEXT NOT NULL,
@@ -320,6 +321,8 @@ CREATE TABLE IF NOT EXISTS gpu_launch_reservations (
         AND host_boot_generation > 0
         AND allocation_group_generation > 0
         AND reservation_generation > 0
+        AND registration_generation >= 0
+        AND registration_generation <= 1024
     ),
     CONSTRAINT ck_gpu_launch_mode CHECK (
         management_mode IN ('platform', 'miner')
@@ -398,9 +401,9 @@ ALTER TABLE gpu_allocation_groups
     ON DELETE RESTRICT;
 
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_launch_reservation_id VARCHAR;
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id VARCHAR;
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS gpu_allocation_group_generation INTEGER;
 DO $$
@@ -428,11 +431,11 @@ BEGIN
 END
 $$;
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_management_mode TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_management_mode VARCHAR;
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_process_incarnation TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_process_incarnation VARCHAR;
 ALTER TABLE servers
-    ADD COLUMN IF NOT EXISTS gpu_topology_fingerprint TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_topology_fingerprint VARCHAR(64);
 ALTER TABLE servers
     ADD COLUMN IF NOT EXISTS gpu_retired_at TIMESTAMPTZ;
 ALTER TABLE servers
@@ -466,7 +469,7 @@ ALTER TABLE servers
     );
 
 ALTER TABLE nodes
-    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id TEXT;
+    ADD COLUMN IF NOT EXISTS gpu_allocation_group_id VARCHAR;
 ALTER TABLE nodes
     ADD COLUMN IF NOT EXISTS gpu_allocation_group_generation INTEGER;
 DO $$

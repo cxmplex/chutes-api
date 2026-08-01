@@ -43,6 +43,14 @@ LifecyclePhase = Literal[
     "finalized",
     "quarantined",
 ]
+GpuRegistrationFailureCode = Literal[
+    "gpu_registration_verification_failed",
+    "gpu_registration_lineage_ended",
+    "gpu_registration_nonce_revoked",
+    "gpu_legacy_hotplug_custody_mismatch",
+    "gpu_legacy_hotplug_failed",
+    "gpu_registration_generation_superseded",
+]
 
 
 def gpu_registration_client_request_id(
@@ -74,9 +82,13 @@ def gpu_registration_client_request_id(
 
 
 class GpuRegistrationNonceRequestV2(FrozenWireModel):
-    schema: Literal["chutes.gpu-registration-nonce.v2"] = (
-        "chutes.gpu-registration-nonce.v2"
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        str_strip_whitespace=False,
     )
+    schema: Literal["chutes.gpu-registration-nonce.v2"] = "chutes.gpu-registration-nonce.v2"
     version: Literal[2] = 2
     client_request_id: str = Field(..., min_length=1, max_length=256)
     request_generation: int = Field(..., ge=1, le=1024)
@@ -84,11 +96,16 @@ class GpuRegistrationNonceRequestV2(FrozenWireModel):
     claims_sha256: str = Field(..., pattern=_HEX)
     server_id: str = Field(..., min_length=1, max_length=256)
 
+    @field_validator("version", mode="before")
+    @classmethod
+    def _exact_integer_version(cls, value: Any) -> int:
+        if type(value) is not int or value != 2:
+            raise ValueError("GPU registration nonce request version must be integer 2")
+        return value
+
 
 class GpuRegistrationNonceV2(FrozenWireModel):
-    schema: Literal["chutes.gpu-registration-nonce.v2"] = (
-        "chutes.gpu-registration-nonce.v2"
-    )
+    schema: Literal["chutes.gpu-registration-nonce.v2"] = "chutes.gpu-registration-nonce.v2"
     version: Literal[2] = 2
     client_request_id: str
     request_generation: int = Field(..., ge=1, le=1024)
@@ -102,9 +119,7 @@ class GpuRegistrationNonceV2(FrozenWireModel):
     @model_validator(mode="after")
     def _claimed_shape(self) -> "GpuRegistrationNonceV2":
         if (self.claimed_attempt_id is None) != (self.status_url is None):
-            raise ValueError(
-                "claimed_attempt_id and status_url must be present or absent together"
-            )
+            raise ValueError("claimed_attempt_id and status_url must be present or absent together")
         if self.claimed_attempt_id is not None and self.status_url != (
             f"/servers/gpu/registration/attempts/{self.claimed_attempt_id}"
         ):
@@ -113,9 +128,13 @@ class GpuRegistrationNonceV2(FrozenWireModel):
 
 
 class GpuRegistrationRequestV2(FrozenWireModel):
-    schema: Literal["chutes.gpu-registration-request.v2"] = (
-        "chutes.gpu-registration-request.v2"
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        str_strip_whitespace=False,
     )
+    schema: Literal["chutes.gpu-registration-request.v2"] = "chutes.gpu-registration-request.v2"
     version: Literal[2] = 2
     nonce_id: str
     nonce: str = Field(..., pattern=_HEX)
@@ -129,6 +148,13 @@ class GpuRegistrationRequestV2(FrozenWireModel):
     external_host: Optional[str] = None
     external_ports: Optional[Dict[str, int]] = None
     endpoints: Optional[Dict[str, Any]] = None
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _exact_integer_version(cls, value: Any) -> int:
+        if type(value) is not int or value != 2:
+            raise ValueError("GPU registration request version must be integer 2")
+        return value
 
     @field_validator("gpu_uuids")
     @classmethod
@@ -147,9 +173,7 @@ class GpuRegistrationRequestV2(FrozenWireModel):
         else:
             valid_selection = bool(selected) and selected.issubset(reserved)
         if not valid_selection:
-            raise ValueError(
-                "GPU registration UUID selection does not match its management mode"
-            )
+            raise ValueError("GPU registration UUID selection does not match its management mode")
         return self
 
     def signing_bytes(self) -> bytes:
@@ -163,15 +187,13 @@ class GpuRegistrationRequestV2(FrozenWireModel):
 
 
 class GpuRegistrationResponseV2(FrozenWireModel):
-    schema: Literal["chutes.gpu-registration-response.v2"] = (
-        "chutes.gpu-registration-response.v2"
-    )
+    schema: Literal["chutes.gpu-registration-response.v2"] = "chutes.gpu-registration-response.v2"
     version: Literal[2] = 2
     attempt_id: str
     state: Literal["processing", "completed", "failed"]
     status_url: str
     retry_after_seconds: Optional[int] = Field(None, ge=1, le=300)
-    failure_code: Optional[str] = None
+    failure_code: Optional[GpuRegistrationFailureCode] = None
     failure_detail: Optional[str] = None
     server_id: Optional[str] = None
     owner_hotkey: Optional[str] = None
@@ -247,9 +269,7 @@ class GpuRegistrationResponseV2(FrozenWireModel):
 
 
 class GpuLifecycleOperationV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-lifecycle-operation.v1"] = (
-        "chutes.gpu-lifecycle-operation.v1"
-    )
+    schema: Literal["chutes.gpu-lifecycle-operation.v1"] = "chutes.gpu-lifecycle-operation.v1"
     version: Literal[1] = 1
     operation_id: str
     operation_type: LifecycleOperationType
@@ -300,9 +320,7 @@ class GpuLifecycleOperationV1(FrozenWireModel):
         except (TypeError, ValueError, AttributeError) as exc:
             raise ValueError("lifecycle operation_id must be a UUID") from exc
         if str(parsed) != value:
-            raise ValueError(
-                "lifecycle operation_id must be a bare canonical lowercase UUID"
-            )
+            raise ValueError("lifecycle operation_id must be a bare canonical lowercase UUID")
         return value
 
     @field_validator("gpu_bdfs")
@@ -331,27 +349,21 @@ class GpuLifecycleOperationV1(FrozenWireModel):
             if any(present) and not all(present):
                 raise ValueError("pre-slot lineage must be either absent or complete")
         elif not all(present):
-            raise ValueError(
-                "reservation-backed lifecycle intent requires complete lineage"
-            )
+            raise ValueError("reservation-backed lifecycle intent requires complete lineage")
         if self.phase == "quarantined":
             if not self.failure_code or not self.failure_reason:
                 raise ValueError(
                     "quarantined lifecycle response requires a durable failure code and reason"
                 )
         elif self.failure_code is not None or self.failure_reason is not None:
-            raise ValueError(
-                "only a quarantined lifecycle response may carry failure details"
-            )
+            raise ValueError("only a quarantined lifecycle response may carry failure details")
         if (self.receipt_id is None) != (self.receipt_sha256 is None):
             raise ValueError("lifecycle receipt id and digest must be present together")
         if self.local_release_ack_sha256 is not None and self.receipt_id is None:
             raise ValueError("lifecycle local-release ACK requires a durable receipt")
         terminal = self.phase in {"finalized", "quarantined"}
         if terminal != (self.finalized_at is not None):
-            raise ValueError(
-                "lifecycle finalized_at must be present exactly for terminal phases"
-            )
+            raise ValueError("lifecycle finalized_at must be present exactly for terminal phases")
         return self
 
 
@@ -371,9 +383,7 @@ class GpuSourceReaderSourceV1(FrozenWireModel):
 
 
 class GpuSourceReaderResultV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-source-reader-result.v1"] = (
-        "chutes.gpu-source-reader-result.v1"
-    )
+    schema: Literal["chutes.gpu-source-reader-result.v1"] = "chutes.gpu-source-reader-result.v1"
     version: Literal[1] = 1
     migration_id: Optional[str] = None
     readers_absent: bool
@@ -382,9 +392,7 @@ class GpuSourceReaderResultV1(FrozenWireModel):
     @model_validator(mode="after")
     def _exact_sources(self) -> "GpuSourceReaderResultV1":
         if [item.namespace for item in self.sources] != ["storage", "tdx-cache"]:
-            raise ValueError(
-                "forced recovery requires exact storage and tdx-cache sources"
-            )
+            raise ValueError("forced recovery requires exact storage and tdx-cache sources")
         no_readers = all(not item.reader_pids for item in self.sources)
         if self.readers_absent != no_readers:
             raise ValueError(
@@ -431,14 +439,9 @@ class GpuPhysicalResultV1(FrozenWireModel):
             self.qemu_absent
             and self.reset_succeeded
             and self.original_drivers_restored
-            and (
-                self.source_reader_result is None
-                or self.source_reader_result.readers_absent
-            )
+            and (self.source_reader_result is None or self.source_reader_result.readers_absent)
         )
-        if success and (
-            self.failure_code is not None or self.failure_reason is not None
-        ):
+        if success and (self.failure_code is not None or self.failure_reason is not None):
             raise ValueError("successful physical result cannot carry failure metadata")
         if not success and (not self.failure_code or not self.failure_reason):
             raise ValueError("failed physical result requires exact failure metadata")
@@ -466,9 +469,7 @@ class GpuResetReceiptV1(FrozenWireModel):
 
 
 class GpuLocalReleaseAckV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-local-release-ack.v1"] = (
-        "chutes.gpu-local-release-ack.v1"
-    )
+    schema: Literal["chutes.gpu-local-release-ack.v1"] = "chutes.gpu-local-release-ack.v1"
     version: Literal[1] = 1
     operation_id: str
     receipt_id: str
@@ -485,9 +486,7 @@ class GpuLocalReleaseAckV1(FrozenWireModel):
 
 
 class GpuRecoveryAuthorizationEnvelopeV1(FrozenWireModel):
-    schema: Literal["chutes.gpu-recovery-authorization.v1"] = (
-        "chutes.gpu-recovery-authorization.v1"
-    )
+    schema: Literal["chutes.gpu-recovery-authorization.v1"] = "chutes.gpu-recovery-authorization.v1"
     version: Literal[1] = 1
     authorization_id: str
     operation: GpuLifecycleOperationV1
@@ -561,9 +560,7 @@ class GpuRecoveryEventV1(FrozenWireModel):
                 self.current_host_boot_generation,
             )
         ):
-            raise ValueError(
-                "only reclaimed recovery event may carry current reclaim binding"
-            )
+            raise ValueError("only reclaimed recovery event may carry current reclaim binding")
         return self
 
 
@@ -615,16 +612,9 @@ class GpuHotplugCommandV1(FrozenWireModel):
     @model_validator(mode="after")
     def _identity(self) -> "GpuHotplugCommandV1":
         if canonical_sha256(self.payload) != self.payload_sha256:
-            raise ValueError(
-                "GPU hotplug payload digest differs from canonical payload"
-            )
-        if (
-            self.command_id
-            != f"gpu-hotplug-{canonical_sha256(self.identity_document())}"
-        ):
-            raise ValueError(
-                "GPU hotplug command id differs from deterministic identity"
-            )
+            raise ValueError("GPU hotplug payload digest differs from canonical payload")
+        if self.command_id != f"gpu-hotplug-{canonical_sha256(self.identity_document())}":
+            raise ValueError("GPU hotplug command id differs from deterministic identity")
         if (
             self.payload.server_id != self.stable_server_id
             or self.payload.reservation_id != self.reservation_id
@@ -708,19 +698,11 @@ class GpuHotplugCommandAckV1(_StrictGpuHotplugWireModel):
                 for item in self.objects
             )
         )
-        if self.state == "acked" and (
-            not exact or self.failure_code or self.failure_reason
-        ):
-            raise ValueError(
-                "successful hotplug ACK requires both exact backend/frontend bindings"
-            )
-        if self.state == "failed" and (
-            not self.failure_code or not self.failure_reason
-        ):
+        if self.state == "acked" and (not exact or self.failure_code or self.failure_reason):
+            raise ValueError("successful hotplug ACK requires both exact backend/frontend bindings")
+        if self.state == "failed" and (not self.failure_code or not self.failure_reason):
             raise ValueError("failed hotplug ACK requires failure metadata")
-        document = self.model_dump(
-            mode="json", exclude={"ack_sha256"}, exclude_none=True
-        )
+        document = self.model_dump(mode="json", exclude={"ack_sha256"}, exclude_none=True)
         if canonical_sha256(document) != self.ack_sha256:
             raise ValueError("GPU hotplug ACK digest differs from canonical ACK")
         return self

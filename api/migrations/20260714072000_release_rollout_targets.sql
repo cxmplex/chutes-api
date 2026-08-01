@@ -53,13 +53,19 @@ ALTER TABLE hosts
 DO $$
 BEGIN
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'ck_hosts_capacity_nonnegative'
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'ck_hosts_capacity_nonnegative'
+           AND conrelid = 'hosts'::regclass
     ) THEN
         ALTER TABLE hosts
             ADD CONSTRAINT ck_hosts_capacity_nonnegative CHECK (capacity >= 0);
     END IF;
     IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'ck_hosts_zero_capacity_storage_only'
+        SELECT 1
+          FROM pg_constraint
+         WHERE conname = 'ck_hosts_zero_capacity_storage_only'
+           AND conrelid = 'hosts'::regclass
     ) THEN
         ALTER TABLE hosts
             ADD CONSTRAINT ck_hosts_zero_capacity_storage_only

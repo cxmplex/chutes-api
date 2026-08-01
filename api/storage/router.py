@@ -511,12 +511,14 @@ async def issue_launch_model_access(
 )
 async def consume_model_ensure_capability(
     body: ModelEnsureCapabilityConsumeRequest,
+    db: AsyncSession = Depends(get_db_session),
     target: Server = Depends(require_fresh_storage_caller),
 ):
     """Consume an exact capability over the selected target's own attested mTLS."""
     return ModelEnsureCapabilityBinding(
         **(
             await service.consume_model_ensure_capability(
+                db,
                 target,
                 body.capability,
                 body.request_id,
@@ -815,18 +817,12 @@ async def _authorize_default_volume_with_storage_observation(
 ):
     """Stage Redis liveness between two exact launch-authority checks."""
 
-    initial = await launch_sessions.authorize_default_volume(
-        db, authorization, request, operation
-    )
-    expected_authority = launch_sessions.default_volume_authorization_sha256(
-        initial, operation
-    )
+    initial = await launch_sessions.authorize_default_volume(db, authorization, request, operation)
+    expected_authority = launch_sessions.default_volume_authorization_sha256(initial, operation)
     await db.commit()
     observed_live_storage_ids = await service.observe_storage_liveness(db)
     await db.commit()
-    current = await launch_sessions.authorize_default_volume(
-        db, authorization, request, operation
-    )
+    current = await launch_sessions.authorize_default_volume(db, authorization, request, operation)
     if not secrets.compare_digest(
         expected_authority,
         launch_sessions.default_volume_authorization_sha256(current, operation),
@@ -846,11 +842,10 @@ async def plan_default_placement(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized, observed_live_storage_ids = (
-        await _authorize_default_volume_with_storage_observation(
-            db, authorization, request, "put"
-        )
-    )
+    (
+        authorized,
+        observed_live_storage_ids,
+    ) = await _authorize_default_volume_with_storage_observation(db, authorization, request, "put")
     obj, peers = await service.plan_object_placement(
         db,
         authorized.volume,
@@ -879,11 +874,10 @@ async def commit_default_object(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized, observed_live_storage_ids = (
-        await _authorize_default_volume_with_storage_observation(
-            db, authorization, request, "put"
-        )
-    )
+    (
+        authorized,
+        observed_live_storage_ids,
+    ) = await _authorize_default_volume_with_storage_observation(db, authorization, request, "put")
     obj, replicas_confirmed = await service.commit_object(
         db,
         authorized.volume,
@@ -912,11 +906,10 @@ async def locate_default_object(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized, observed_live_storage_ids = (
-        await _authorize_default_volume_with_storage_observation(
-            db, authorization, request, "get"
-        )
-    )
+    (
+        authorized,
+        observed_live_storage_ids,
+    ) = await _authorize_default_volume_with_storage_observation(db, authorization, request, "get")
     obj, peers, replicas_confirmed = await service.locate_object(
         db,
         authorized.volume,
@@ -1004,12 +997,8 @@ async def issue_default_volume_grant(
     db: AsyncSession = Depends(get_db_session),
     authorization: str = Header(..., alias=AUTHORIZATION_HEADER),
 ):
-    authorized = await launch_sessions.authorize_default_volume(
-        db, authorization, request, body.op
-    )
-    expected_authority = launch_sessions.default_volume_authorization_sha256(
-        authorized, body.op
-    )
+    authorized = await launch_sessions.authorize_default_volume(db, authorization, request, body.op)
+    expected_authority = launch_sessions.default_volume_authorization_sha256(authorized, body.op)
     from api.storage.service import GRANT_TTL_SECONDS
 
     remaining_access_seconds = max(
@@ -1032,9 +1021,7 @@ async def issue_default_volume_grant(
         ttl_seconds=effective_ttl,
     )
     await db.commit()
-    current = await launch_sessions.authorize_default_volume(
-        db, authorization, request, body.op
-    )
+    current = await launch_sessions.authorize_default_volume(db, authorization, request, body.op)
     if not secrets.compare_digest(
         expected_authority,
         launch_sessions.default_volume_authorization_sha256(current, body.op),
