@@ -3786,7 +3786,9 @@ async def process_runtime_attestation(
             selected_uuids = await _validate_runtime_gpu_selection(
                 db, server, reservation, claims, verified_gpu_evidence
             )
-            from api.server.gpu_sessions import build_completed_gpu_registration_authority
+            from api.server.gpu_sessions import (
+                build_completed_gpu_registration_authority,
+            )
 
             registration = await build_completed_gpu_registration_authority(db, reservation, server)
             runtime_certificates = tuple(

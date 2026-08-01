@@ -1116,9 +1116,7 @@ async def _tick_with_lock() -> None:
     tick_task = asyncio.create_task(_run_scheduler_tick())
     renew_task = asyncio.create_task(_renew_scheduler_lock(lock_id))
     try:
-        done, _ = await asyncio.wait(
-            {tick_task, renew_task}, return_when=asyncio.FIRST_COMPLETED
-        )
+        done, _ = await asyncio.wait({tick_task, renew_task}, return_when=asyncio.FIRST_COMPLETED)
         if renew_task in done:
             lease_error = renew_task.exception()
             if not tick_task.done():

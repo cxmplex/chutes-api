@@ -161,10 +161,7 @@ def test_missing_referenced_predecessor_blocks_only_replay_and_recovers(monkeypa
         "chutefs_token_keys_json",
         json.dumps({"old-key": "o" * 32, "new-key": "n" * 32}),
     )
-    assert (
-        launch_sessions._derived_token(row, launch_sessions._ACCESS_PREFIX, "access")
-        == expected
-    )
+    assert launch_sessions._derived_token(row, launch_sessions._ACCESS_PREFIX, "access") == expected
 
 
 def test_keyring_rejects_missing_active_and_duplicate_ids(monkeypatch):
@@ -281,17 +278,13 @@ def test_current_lineage_binds_certificate_and_operational_attestation():
     advanced = launch_sessions._current_session_identity(
         config, instance, binding, volume, server, reservation
     )
-    assert not launch_sessions._session_matches_current(
-        SimpleNamespace(**current), advanced
-    )
+    assert not launch_sessions._session_matches_current(SimpleNamespace(**current), advanced)
 
     instance.storage_revocation_epoch += 1
     revoked = launch_sessions._current_session_identity(
         config, instance, binding, volume, server, reservation
     )
-    assert not launch_sessions._session_matches_current(
-        SimpleNamespace(**advanced), revoked
-    )
+    assert not launch_sessions._session_matches_current(SimpleNamespace(**advanced), revoked)
 
 
 def test_disable_persists_revocation_epoch_before_redis_fast_path():
@@ -303,16 +296,15 @@ def test_disable_persists_revocation_epoch_before_redis_fast_path():
     assert "prepare_instance_terminal_writes" in source[:durable_epoch]
     terminal_source = inspect.getsource(instance_util.prepare_instance_terminal_writes)
     assert "lock_launch_configs_before_instances" in terminal_source
-    ordered_source = inspect.getsource(
-        launch_sessions.lock_launch_configs_before_instances
+    ordered_source = inspect.getsource(launch_sessions.lock_launch_configs_before_instances)
+    assert (
+        ordered_source.index("acquire_gpu_lifecycle_lock")
+        < ordered_source.index("select(LaunchConfig.config_id)")
+        < ordered_source.rindex("select(Instance.instance_id)")
     )
-    assert ordered_source.index("acquire_gpu_lifecycle_lock") < ordered_source.index(
-        "select(LaunchConfig.config_id)"
-    ) < ordered_source.rindex("select(Instance.instance_id)")
 
     migration = (
-        Path(__file__).parents[2]
-        / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
+        Path(__file__).parents[2] / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
     ).read_text()
     up = migration.split("-- migrate:down", maxsplit=1)[0]
     assert "NEW.storage_revocation_epoch < OLD.storage_revocation_epoch" in up
@@ -332,20 +324,16 @@ def test_revocation_preflight_and_binding_locks_follow_shared_order():
         "select(ChuteFSLaunchSession)",
         configuration_reload,
     )
-    ordered_source = inspect.getsource(
-        launch_sessions.lock_launch_configs_before_instances
-    )
+    ordered_source = inspect.getsource(launch_sessions.lock_launch_configs_before_instances)
 
     assert (
-        revocation_preflight
-        < user_lock
-        < ordered_launch_rows
-        < configuration_reload
-        < session_lock
+        revocation_preflight < user_lock < ordered_launch_rows < configuration_reload < session_lock
     )
-    assert ordered_source.index("acquire_gpu_lifecycle_lock") < ordered_source.index(
-        "select(LaunchConfig.config_id)"
-    ) < ordered_source.rindex("select(Instance.instance_id)")
+    assert (
+        ordered_source.index("acquire_gpu_lifecycle_lock")
+        < ordered_source.index("select(LaunchConfig.config_id)")
+        < ordered_source.rindex("select(Instance.instance_id)")
+    )
     assert ".order_by(User.user_id)" in lock_source
     assert ".order_by(LaunchConfig.config_id)" in ordered_source
     assert ".order_by(Instance.instance_id)" in ordered_source
@@ -367,20 +355,18 @@ def test_purge_and_account_erasure_do_not_prelock_the_user():
     ):
         source = inspect.getsource(function)
         assert "_lock_storage_user" not in source
-    assert "additional_user_ids=[user_id]" in inspect.getsource(
-        storage_service.delete_volume
-    )
+    assert "additional_user_ids=[user_id]" in inspect.getsource(storage_service.delete_volume)
     assert "additional_user_ids=[user_id]" in inspect.getsource(
         storage_service.prepare_user_storage_erasure
     )
     delete_source = inspect.getsource(storage_service.delete_volume)
     erasure_source = inspect.getsource(storage_service.prepare_user_storage_erasure)
-    assert delete_source.index(
-        "select(DefaultChuteFSVolumeBinding)"
-    ) < delete_source.index("select(StorageVolume)")
-    assert erasure_source.index(
-        "select(DefaultChuteFSVolumeBinding)"
-    ) < erasure_source.index("select(StorageVolume)")
+    assert delete_source.index("select(DefaultChuteFSVolumeBinding)") < delete_source.index(
+        "select(StorageVolume)"
+    )
+    assert erasure_source.index("select(DefaultChuteFSVolumeBinding)") < erasure_source.index(
+        "select(StorageVolume)"
+    )
 
 
 def test_rotation_migration_locks_and_guards_only_its_state():
@@ -392,18 +378,12 @@ def test_rotation_migration_locks_and_guards_only_its_state():
 
     assert "SELECT pg_advisory_xact_lock(" in down
     advisory = down.index("chutes.chutefs-token-key-epochs.v1")
-    epoch_lock = down.index(
-        "LOCK TABLE chutefs_token_key_epochs IN ACCESS EXCLUSIVE MODE;"
-    )
-    ack_lock = down.index(
-        "LOCK TABLE chutefs_token_key_replica_acks IN ACCESS EXCLUSIVE MODE;"
-    )
+    epoch_lock = down.index("LOCK TABLE chutefs_token_key_epochs IN ACCESS EXCLUSIVE MODE;")
+    ack_lock = down.index("LOCK TABLE chutefs_token_key_replica_acks IN ACCESS EXCLUSIVE MODE;")
     operation_lock = down.index(
         "LOCK TABLE chutefs_token_key_epoch_operations IN ACCESS EXCLUSIVE MODE;"
     )
-    session_lock = down.index(
-        "LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;"
-    )
+    session_lock = down.index("LOCK TABLE chutefs_launch_sessions IN ACCESS EXCLUSIVE MODE;")
     assert advisory < epoch_lock < ack_lock < operation_lock < session_lock
     assert "LOCK TABLE chutefs_token_key_epochs IN ACCESS EXCLUSIVE MODE;" in down
     assert "LOCK TABLE chutefs_token_key_replica_acks IN ACCESS EXCLUSIVE MODE;" in down
@@ -442,9 +422,7 @@ def test_rotation_migration_locks_and_guards_only_its_state():
     ):
         assert f"NEW.{field} IS DISTINCT FROM OLD.{field}" in up
     assert "acknowledged_keyring_sha256 IS DISTINCT FROM expected_keyring_sha256" in up
-    assert (
-        "acknowledged_key_fingerprints IS DISTINCT FROM expected_key_fingerprints" in up
-    )
+    assert "acknowledged_key_fingerprints IS DISTINCT FROM expected_key_fingerprints" in up
     assert "fk_chutefs_launch_session_token_key" in up
     assert "require_active_chutefs_token_key_on_session_insert" in up
     assert "FOR SHARE" in up
@@ -461,9 +439,7 @@ def test_key_epoch_bootstrap_orders_stage_ack_then_activation():
 
 def test_key_epoch_ack_is_background_only_and_probes_are_read_only():
     source = (Path(__file__).parents[2] / "api/main.py").read_text()
-    ping = source.split("async def ping():", maxsplit=1)[1].split(
-        "async def ready(", maxsplit=1
-    )[0]
+    ping = source.split("async def ping():", maxsplit=1)[1].split("async def ready(", maxsplit=1)[0]
     ready = source.split("async def ready(", maxsplit=1)[1].split(
         "def _tee_trust_metrics", maxsplit=1
     )[0]
@@ -481,8 +457,7 @@ def test_key_epoch_ack_is_background_only_and_probes_are_read_only():
 
 def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
     migration = (
-        Path(__file__).parents[2]
-        / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
+        Path(__file__).parents[2] / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
     ).read_text()
     down = migration.split("-- migrate:down", maxsplit=1)[1]
     guard_end = down.index("$$;", down.index("DO $$"))
@@ -492,9 +467,7 @@ def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
     assert "SELECT pg_advisory_xact_lock(" in down
     assert down.index("chutes.chutefs-schema-fence.v1") < down.index("LOCK TABLE ")
     lock_targets = [
-        line.split()[2]
-        for line in down[:guard_end].splitlines()
-        if line.startswith("LOCK TABLE ")
+        line.split()[2] for line in down[:guard_end].splitlines() if line.startswith("LOCK TABLE ")
     ]
     assert lock_targets == [
         "gpu_launch_reservations",
@@ -524,16 +497,13 @@ def test_default_volume_down_guard_is_locked_binding_scoped_and_precedes_ddl():
 
 def test_server_revocation_trigger_uses_distinct_identity_changes():
     migration = (
-        Path(__file__).parents[2]
-        / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
+        Path(__file__).parents[2] / "api/migrations/20260724234500_gpu_chutefs_default_volume.sql"
     ).read_text()
     function = migration.split(
         "CREATE OR REPLACE FUNCTION revoke_chutefs_session_on_server_change()",
         maxsplit=1,
     )[1].split("$$;", maxsplit=1)[0]
-    assert (
-        "gpu_runtime_session_attestation_id\n            IS DISTINCT FROM" in function
-    )
+    assert "gpu_runtime_session_attestation_id\n            IS DISTINCT FROM" in function
     assert "attested_cert_pubkey_hash\n            IS DISTINCT FROM" in function
     assert "gpu_runtime_session_attestation_id IS NULL" not in function
 

@@ -196,9 +196,7 @@ async def _locked_current_lineage(
     runtime_payload: dict[str, Any],
     cert_hash: str,
 ) -> tuple[Server, GpuLaunchReservation, GpuAllocationGroup, Host]:
-    observed_live_storage_ids = await observe_gpu_storage_liveness(
-        db, runtime_server.host_id
-    )
+    observed_live_storage_ids = await observe_gpu_storage_liveness(db, runtime_server.host_id)
     await acquire_gpu_lifecycle_lock(db)
     server = (
         await db.execute(
@@ -228,20 +226,14 @@ async def _locked_current_lineage(
     registration_attestation = (
         await db.execute(
             select(ServerAttestation)
-            .where(
-                ServerAttestation.attestation_id
-                == registration_id
-            )
+            .where(ServerAttestation.attestation_id == registration_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
     registration_attempt = (
         await db.execute(
             select(GpuRegistrationAttempt)
-            .where(
-                GpuRegistrationAttempt.attestation_id
-                == registration_id
-            )
+            .where(GpuRegistrationAttempt.attestation_id == registration_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -276,27 +268,21 @@ async def _locked_current_lineage(
         or reservation.reservation_id != runtime_payload.get("reservation_id")
         or registration_attempt.state != "completed"
         or registration_attempt.reservation_id != reservation.reservation_id
-        or registration_attempt.attestation_id
-        != reservation.registration_attestation_id
+        or registration_attempt.attestation_id != reservation.registration_attestation_id
         or registration_attempt.peer_spki_sha256 != cert_hash.lower()
         or registration_attempt.peer_certificate_pem != server.attested_cert
         or registration_attestation.server_id != server.server_id
         or registration_attestation.verification_error is not None
         or registration_attestation.verified_at is None
         or registration_attestation.gpu_retired_at is not None
-        or registration_attestation.gpu_launch_reservation_id
-        != reservation.reservation_id
-        or registration_attestation.gpu_allocation_group_id
-        != reservation.allocation_group_id
+        or registration_attestation.gpu_launch_reservation_id != reservation.reservation_id
+        or registration_attestation.gpu_allocation_group_id != reservation.allocation_group_id
         or registration_attestation.gpu_allocation_group_generation
         != reservation.allocation_group_generation
-        or registration_attestation.gpu_host_boot_generation
-        != reservation.host_boot_generation
-        or registration_attestation.gpu_reservation_generation
-        != reservation.reservation_generation
+        or registration_attestation.gpu_host_boot_generation != reservation.host_boot_generation
+        or registration_attestation.gpu_reservation_generation != reservation.reservation_generation
         or registration_attestation.gpu_management_mode != "miner"
-        or registration_attestation.gpu_process_incarnation
-        != reservation.process_incarnation
+        or registration_attestation.gpu_process_incarnation != reservation.process_incarnation
         or registration_attestation.gpu_claims_sha256 != reservation.claims_sha256
         or reservation.allocation_group_id != group.allocation_group_id
         or reservation.allocation_group_generation != group.generation
@@ -959,15 +945,12 @@ async def lease_gpu_infra(
                 select(GpuHotplugCommand)
                 .where(
                     GpuHotplugCommand.reservation_id == reservation.reservation_id,
-                    GpuHotplugCommand.reservation_generation
-                    == reservation.reservation_generation,
+                    GpuHotplugCommand.reservation_generation == reservation.reservation_generation,
                     GpuHotplugCommand.claims_sha256 == reservation.claims_sha256,
-                    GpuHotplugCommand.allocation_group_id
-                    == reservation.allocation_group_id,
+                    GpuHotplugCommand.allocation_group_id == reservation.allocation_group_id,
                     GpuHotplugCommand.allocation_group_generation
                     == reservation.allocation_group_generation,
-                    GpuHotplugCommand.process_incarnation
-                    == reservation.process_incarnation,
+                    GpuHotplugCommand.process_incarnation == reservation.process_incarnation,
                     GpuHotplugCommand.stable_server_id == server.server_id,
                     GpuHotplugCommand.migration_id == migration.migration_id,
                 )
@@ -981,9 +964,7 @@ async def lease_gpu_infra(
             or hotplug.ack_sha256 is None
             or hotplug.acknowledged_at is None
         ):
-            _conflict(
-                "Legacy gpu-infra adoption requires the exact successful hotplug ACK."
-            )
+            _conflict("Legacy gpu-infra adoption requires the exact successful hotplug ACK.")
     custody = (
         await db.execute(
             select(GpuInfraCustody)
@@ -1732,8 +1713,7 @@ async def force_seal_gpu_infra_from_recovery(
         return
     if (
         source_reader_result.readers_absent is not True
-        or [item.namespace for item in source_reader_result.sources]
-        != ["storage", "tdx-cache"]
+        or [item.namespace for item in source_reader_result.sources] != ["storage", "tdx-cache"]
         or any(item.reader_pids for item in source_reader_result.sources)
         or source_reader_result.migration_id != reservation.legacy_migration_id
         or custody.owner_hotkey != reservation.owner_hotkey
@@ -1742,8 +1722,7 @@ async def force_seal_gpu_infra_from_recovery(
         or custody.reservation_id != reservation.reservation_id
         or custody.reservation_generation != reservation.reservation_generation
         or custody.allocation_group_id != reservation.allocation_group_id
-        or custody.allocation_group_generation
-        != reservation.allocation_group_generation
+        or custody.allocation_group_generation != reservation.allocation_group_generation
         or custody.management_mode != reservation.management_mode
         or custody.migration_id != reservation.legacy_migration_id
         or custody.state in {"conflict", "decommissioned"}
@@ -1790,8 +1769,7 @@ async def require_gpu_infra_sealed(
 def _gpu_reservation_decommissionable(reservation: GpuLaunchReservation) -> bool:
     if reservation.state == "released":
         return bool(
-            reservation.reset_completed_at is not None
-            and reservation.released_at is not None
+            reservation.reset_completed_at is not None and reservation.released_at is not None
         )
     if reservation.state == "expired":
         return bool(
@@ -1803,7 +1781,9 @@ def _gpu_reservation_decommissionable(reservation: GpuLaunchReservation) -> bool
     return False
 
 
-def _gpu_decommission_response(audit: GpuServerDecommission) -> GpuDecommissionResponseV1:
+def _gpu_decommission_response(
+    audit: GpuServerDecommission,
+) -> GpuDecommissionResponseV1:
     return GpuDecommissionResponseV1.model_validate(audit.response_json)
 
 
@@ -1936,9 +1916,7 @@ async def decommission_gpu_server(
 
     custody = (
         await db.execute(
-            select(GpuInfraCustody)
-            .where(GpuInfraCustody.server_id == server_id)
-            .with_for_update()
+            select(GpuInfraCustody).where(GpuInfraCustody.server_id == server_id).with_for_update()
         )
     ).scalar_one_or_none()
     if custody is not None and (
@@ -2117,11 +2095,37 @@ async def decommission_gpu_server(
         request_id=request.request_id,
         owner_hotkey=owner_hotkey,
         reason=request.reason,
-        host_id=(custody.host_id if custody is not None else reservation.host_id if reservation else None),
-        reservation_id=(custody.reservation_id if custody is not None else reservation.reservation_id if reservation else None),
-        reservation_generation=(custody.reservation_generation if custody is not None else reservation.reservation_generation if reservation else None),
-        allocation_group_id=(custody.allocation_group_id if custody is not None else reservation.allocation_group_id if reservation else None),
-        allocation_group_generation=(custody.allocation_group_generation if custody is not None else reservation.allocation_group_generation if reservation else None),
+        host_id=(
+            custody.host_id if custody is not None else reservation.host_id if reservation else None
+        ),
+        reservation_id=(
+            custody.reservation_id
+            if custody is not None
+            else reservation.reservation_id
+            if reservation
+            else None
+        ),
+        reservation_generation=(
+            custody.reservation_generation
+            if custody is not None
+            else reservation.reservation_generation
+            if reservation
+            else None
+        ),
+        allocation_group_id=(
+            custody.allocation_group_id
+            if custody is not None
+            else reservation.allocation_group_id
+            if reservation
+            else None
+        ),
+        allocation_group_generation=(
+            custody.allocation_group_generation
+            if custody is not None
+            else reservation.allocation_group_generation
+            if reservation
+            else None
+        ),
         migration_ids=[item.migration_id for item in migrations],
         response_json=response.model_dump(mode="json"),
         decommissioned_at=now,

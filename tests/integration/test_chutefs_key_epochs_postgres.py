@@ -62,9 +62,7 @@ async def _install_rotation_migration(db) -> None:
     async with db.bind.begin() as connection:
         raw = await connection.get_raw_connection()
         await raw.driver_connection.execute(
-            storage_pg._migration_up_sql(
-                "20260726121000_chutefs_session_rotation_replay.sql"
-            )
+            storage_pg._migration_up_sql("20260726121000_chutefs_session_rotation_replay.sql")
         )
     await db.rollback()
 
@@ -188,10 +186,7 @@ async def test_rolling_replicas_ack_activate_retire_and_replay_lost_responses(
         )
         == retired
     )
-    assert (
-        await db.scalar(select(func.count()).select_from(ChuteFSTokenKeyEpochOperation))
-        == 3
-    )
+    assert await db.scalar(select(func.count()).select_from(ChuteFSTokenKeyEpochOperation)) == 3
 
 
 async def test_same_key_ids_with_different_secret_bytes_cannot_activate(
@@ -413,9 +408,7 @@ async def test_retirement_requires_access_refresh_and_response_replay_expiry(
     )
 
     referenced_session = await db.scalar(
-        select(ChuteFSLaunchSession).where(
-            ChuteFSLaunchSession.token_key_id == "old-key"
-        )
+        select(ChuteFSLaunchSession).where(ChuteFSLaunchSession.token_key_id == "old-key")
     )
     assert referenced_session is not None
     _configure(

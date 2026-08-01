@@ -573,7 +573,6 @@ def test_host_registration_schema_accepts_zero_only_as_nonnegative_input():
         HostRegistrationArgs(host_id="zero-compute", capacity=0)
 
 
-
 def test_legacy_cpu_storage_payload_and_explicit_false_are_distinct():
     legacy = HostRegistrationArgs(
         host_id="legacy-cpu-storage",
@@ -593,6 +592,7 @@ def test_legacy_cpu_storage_payload_and_explicit_false_are_distinct():
             disk_total_gb=100,
             disk_free_gb=50,
         )
+
 
 def test_cpu_storage_capability_requires_current_disk_health():
     with pytest.raises(ValidationError, match="current disk capacity"):

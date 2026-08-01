@@ -204,9 +204,7 @@ class TestSendGpuReservationTeardown:
         assert result == "command-1"
         target, command, payload = send.await_args.args
         assert (target, command) == ("host-1", "delete_gpu")
-        assert payload["lifecycle_operation"] == gpu_lifecycle_intent_document(
-            operation
-        )
+        assert payload["lifecycle_operation"] == gpu_lifecycle_intent_document(operation)
         assert not {"group_state", "created_at", "updated_at"}.intersection(
             payload["lifecycle_operation"]
         )
@@ -841,14 +839,10 @@ class TestAgentAuthenticate:
         clean_sio.disconnect.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_bound_reauthentication_evicts_legacy_socket(
-        self, clean_sio, pass_auth
-    ):
+    async def test_bound_reauthentication_evicts_legacy_socket(self, clean_sio, pass_auth):
         key, cert_pem = _attested_keypair_and_cert()
         headers = dict(AGENT_HEADERS)
-        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(
-            key, "srv-1:12345:sockets-attest"
-        )
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(key, "srv-1:12345:sockets-attest")
         server = _server_row(
             attested_cert=cert_pem,
             attested_cert_pubkey_hash="a" * 64,
@@ -872,9 +866,7 @@ class TestAgentAuthenticate:
     async def test_missing_attested_spki_rejected(self, clean_sio, pass_auth):
         key, cert_pem = _attested_keypair_and_cert()
         headers = dict(AGENT_HEADERS)
-        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(
-            key, "srv-1:12345:sockets-attest"
-        )
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(key, "srv-1:12345:sockets-attest")
         session = _auth_session(server=_server_row(attested_cert=cert_pem))
         with (
             patch.object(ss, "get_session", _session_ctx(session)),
@@ -886,14 +878,10 @@ class TestAgentAuthenticate:
         clean_sio.disconnect.assert_awaited_once_with("sess-1")
 
     @pytest.mark.asyncio
-    async def test_newer_failed_attestation_rejects_valid_td_channel(
-        self, clean_sio, pass_auth
-    ):
+    async def test_newer_failed_attestation_rejects_valid_td_channel(self, clean_sio, pass_auth):
         key, cert_pem = _attested_keypair_and_cert()
         headers = dict(AGENT_HEADERS)
-        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(
-            key, "srv-1:12345:sockets-attest"
-        )
+        headers[ATTEST_SIGNATURE_HEADER] = _sign_attest(key, "srv-1:12345:sockets-attest")
         server = _server_row(
             attested_cert=cert_pem,
             attested_cert_pubkey_hash="a" * 64,

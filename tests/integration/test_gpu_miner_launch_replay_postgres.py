@@ -255,9 +255,7 @@ async def test_lost_response_replays_same_config_without_side_effects(
     monkeypatch.setattr(
         instance_router,
         "ensure_default_volume_binding",
-        AsyncMock(
-            side_effect=AssertionError("replay created/looked up default volume")
-        ),
+        AsyncMock(side_effect=AssertionError("replay created/looked up default volume")),
     )
     redis.publish.side_effect = AssertionError("replay duplicated launch event")
     async with sessions() as session:
@@ -317,9 +315,7 @@ async def test_lost_response_replays_same_config_without_side_effects(
         assert constraint == 1
         assert index == 1
         assert trigger == 1
-        with pytest.raises(
-            DBAPIError, match="miner launch request identity is immutable"
-        ):
+        with pytest.raises(DBAPIError, match="miner launch request identity is immutable"):
             await session.execute(
                 text(
                     "UPDATE launch_configs "
@@ -370,9 +366,7 @@ async def test_replay_accepts_fresh_attestation_but_rejects_policy_or_secret_mut
     async with sessions() as session:
         server = await session.get(Server, lineage["server_id"])
         server.gpu_runtime_session_attestation_id = "runtime-attestation-b"
-        server.gpu_runtime_session_expires_at = datetime.now(timezone.utc) + timedelta(
-            minutes=15
-        )
+        server.gpu_runtime_session_expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
         await session.commit()
     async with sessions() as session:
         replay = await _issue(session, lineage, request_id)
@@ -509,9 +503,7 @@ async def test_node_selector_or_demand_posture_change_rejects_replay(
     async with sessions() as session:
         chute = await session.get(Chute, lineage["chute_id"])
         original_selector = dict(chute.node_selector)
-        chute.node_selector = NodeSelector(
-            **{**original_selector, "gpu_count": 4}
-        )
+        chute.node_selector = NodeSelector(**{**original_selector, "gpu_count": 4})
         await session.commit()
     async with sessions() as session:
         with pytest.raises(HTTPException) as exc:
@@ -635,12 +627,7 @@ async def test_stop_intent_and_active_operation_independently_fence_launches(
     assert redis.publish.await_count == 1
     async with sessions() as session:
         assert await session.scalar(select(func.count()).select_from(LaunchConfig)) == 1
-        assert (
-            await session.scalar(
-                select(func.count()).select_from(GpuLifecycleOperation)
-            )
-            == 1
-        )
+        assert await session.scalar(select(func.count()).select_from(GpuLifecycleOperation)) == 1
         job = await session.get(Job, lineage["job_id"])
         assert job.miner_history == ["owner"]
         assert first["config_id"] is not None

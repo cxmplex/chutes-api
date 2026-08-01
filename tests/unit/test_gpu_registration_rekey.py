@@ -254,7 +254,9 @@ async def test_rekey_nonce_targets_exact_next_registration_generation(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_successful_rekey_exact_nonce_retry_uses_published_generation(monkeypatch):
+async def test_successful_rekey_exact_nonce_retry_uses_published_generation(
+    monkeypatch,
+):
     token, request = _nonce_request(request_generation=2)
     reservation, group = _lineage(
         token=token,

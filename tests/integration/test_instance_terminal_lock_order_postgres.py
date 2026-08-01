@@ -117,9 +117,7 @@ async def test_former_inverse_interleaving_finishes_without_deadlock():
                 [instance_id],
                 complete_launch_configs=True,
             )
-            await db.execute(
-                delete(Instance).where(Instance.instance_id == instance_id)
-            )
+            await db.execute(delete(Instance).where(Instance.instance_id == instance_id))
             await db.commit()
 
     storage_task = asyncio.create_task(storage_writer())
@@ -158,9 +156,7 @@ async def test_former_inverse_interleaving_finishes_without_deadlock():
             await _set_search_path(check, schema)
             assert (
                 await check.scalar(
-                    select(Instance.instance_id).where(
-                        Instance.instance_id == instance_id
-                    )
+                    select(Instance.instance_id).where(Instance.instance_id == instance_id)
                 )
                 is None
             )
@@ -180,9 +176,7 @@ async def test_former_inverse_interleaving_finishes_without_deadlock():
         let_storage_lock_instance.set()
         await asyncio.gather(storage_task, terminal_task, return_exceptions=True)
         async with engine.begin() as connection:
-            await connection.execute(
-                text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-            )
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await engine.dispose()
 
 
@@ -254,10 +248,7 @@ async def test_platform_teardown_runs_after_lifecycle_transaction_commit(monkeyp
             },
         )
         await connection.execute(
-            text(
-                f'INSERT INTO "{schema}".instance_audit (instance_id) '
-                "VALUES (:instance_id)"
-            ),
+            text(f'INSERT INTO "{schema}".instance_audit (instance_id) VALUES (:instance_id)'),
             {"instance_id": instance_id},
         )
 
@@ -310,10 +301,7 @@ async def test_platform_teardown_runs_after_lifecycle_transaction_commit(monkeyp
             await _set_search_path(check, schema)
             assert (
                 await check.scalar(
-                    text(
-                        "SELECT instance_id FROM instances "
-                        "WHERE instance_id = :instance_id"
-                    ),
+                    text("SELECT instance_id FROM instances WHERE instance_id = :instance_id"),
                     {"instance_id": instance_id},
                 )
                 is None
@@ -343,7 +331,5 @@ async def test_platform_teardown_runs_after_lifecycle_transaction_commit(monkeyp
             )
     finally:
         async with engine.begin() as connection:
-            await connection.execute(
-                text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
-            )
+            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
         await engine.dispose()

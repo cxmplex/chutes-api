@@ -59,9 +59,7 @@ def _mark_success(
     state.last_success_monotonic = time.monotonic()
     state.last_error = None
     state.missing_referenced_key_ids = (
-        result.missing_referenced_key_ids
-        if isinstance(result, KeyAuthorityRefreshResult)
-        else ()
+        result.missing_referenced_key_ids if isinstance(result, KeyAuthorityRefreshResult) else ()
     )
 
 
@@ -145,8 +143,7 @@ def key_authority_health() -> dict[str, dict[str, object]]:
         elif stale:
             status = "stale"
             error = (
-                f"Last successful key-authority ACK is older than "
-                f"{state.max_age_seconds} seconds."
+                f"Last successful key-authority ACK is older than {state.max_age_seconds} seconds."
             )
         elif state.last_error is not None:
             status = "degraded"
@@ -155,8 +152,7 @@ def key_authority_health() -> dict[str, dict[str, object]]:
             status = "degraded"
             error = (
                 "Database-referenced predecessor keys are unavailable on this "
-                "replica: "
-                + ", ".join(state.missing_referenced_key_ids)
+                "replica: " + ", ".join(state.missing_referenced_key_ids)
             )
         else:
             status = "degraded"
@@ -167,9 +163,7 @@ def key_authority_health() -> dict[str, dict[str, object]]:
             "ack_age_seconds": age,
             "max_ack_age_seconds": state.max_age_seconds,
             "last_error": error,
-            "missing_referenced_key_ids": list(
-                state.missing_referenced_key_ids
-            ),
+            "missing_referenced_key_ids": list(state.missing_referenced_key_ids),
         }
     return health
 

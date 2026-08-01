@@ -14,7 +14,11 @@ from api.host.locks import GPU_LIFECYCLE_LOCK_INFO_KEY
 from api.releases import service as release_service
 from api.releases.provenance import ProvenanceError
 from api.server import router as server_router, service as server_service
-from api.storage import launch_sessions, router as storage_router, service as storage_service
+from api.storage import (
+    launch_sessions,
+    router as storage_router,
+    service as storage_service,
+)
 from tests.unit.test_gpu_allocations import _report
 
 import api.gpu_scheduler as gpu_scheduler
@@ -85,7 +89,9 @@ def test_verified_at_is_applied_only_after_port_cas():
 
 
 @pytest.mark.asyncio
-async def test_default_storage_observation_runs_between_exact_authorizations(monkeypatch):
+async def test_default_storage_observation_runs_between_exact_authorizations(
+    monkeypatch,
+):
     db = _BoundaryDb()
     calls = []
     first = SimpleNamespace(snapshot="same")
@@ -111,7 +117,10 @@ async def test_default_storage_observation_runs_between_exact_authorizations(mon
     monkeypatch.setattr(launch_sessions, "default_volume_authorization_sha256", _snapshot)
     monkeypatch.setattr(storage_service, "observe_storage_liveness", _observe)
 
-    current, observed = await storage_router._authorize_default_volume_with_storage_observation(
+    (
+        current,
+        observed,
+    ) = await storage_router._authorize_default_volume_with_storage_observation(
         db, "Bearer token", SimpleNamespace(), "put"
     )
 
@@ -122,7 +131,9 @@ async def test_default_storage_observation_runs_between_exact_authorizations(mon
 
 
 @pytest.mark.asyncio
-async def test_default_object_commit_uses_only_preobserved_storage_liveness(monkeypatch):
+async def test_default_object_commit_uses_only_preobserved_storage_liveness(
+    monkeypatch,
+):
     db = _BoundaryDb()
     volume = SimpleNamespace(
         used_bytes=7,
@@ -161,9 +172,7 @@ async def test_default_object_commit_uses_only_preobserved_storage_liveness(monk
     monkeypatch.setattr(storage_service, "commit_object", _commit)
 
     response = await storage_router.commit_default_object(
-        storage_router.CommitObjectRequest(
-            object_id="object-1", key="model.bin", salt="salt-1"
-        ),
+        storage_router.CommitObjectRequest(object_id="object-1", key="model.bin", salt="salt-1"),
         SimpleNamespace(),
         db,
         "Bearer launch-session",
@@ -293,9 +302,7 @@ def test_host_control_dispatches_pass_the_guarded_database_context():
 
 
 @pytest.mark.asyncio
-async def test_provenance_locked_refetch_is_cache_only_and_eviction_rejects(
-    monkeypatch, tmp_path
-):
+async def test_provenance_locked_refetch_is_cache_only_and_eviction_rejects(monkeypatch, tmp_path):
     key_path = tmp_path / "cosign.pub"
     key_path.write_bytes(b"trusted-key-bytes")
     monkeypatch.setattr(
@@ -350,9 +357,7 @@ def test_release_provenance_preflight_precedes_activation_locks():
     assert activation_source.index("_preverify_release_images") < activation_source.index(
         "await acquire_gpu_lifecycle_lock"
     )
-    validator_source = inspect.getsource(
-        release_service._verified_provenance_document
-    )
+    validator_source = inspect.getsource(release_service._verified_provenance_document)
     locked_branch = validator_source.index("GPU_LIFECYCLE_LOCK_INFO_KEY")
     verifier_call = validator_source.rindex("verify_provenance_signature")
     assert locked_branch < verifier_call
@@ -384,9 +389,7 @@ def test_gpu_release_preverification_precedes_every_lifecycle_call_site():
         "await preverify_active_gpu_release_for_host"
     ) < registration_source.index("await before_publish()")
 
-    platform_route_source = inspect.getsource(
-        host_router.create_platform_gpu_reservation_endpoint
-    )
+    platform_route_source = inspect.getsource(host_router.create_platform_gpu_reservation_endpoint)
     assert platform_route_source.index(
         "await _preverify_active_gpu_release"
     ) < platform_route_source.index("await acquire_gpu_workload_lock")
@@ -459,9 +462,7 @@ def _scheduler_inventory_state(report):
 @pytest.mark.asyncio
 async def test_scheduler_uses_host_latest_r2_capacity_after_reset():
     base = _report()
-    current = base.model_copy(
-        update={"report_id": "report-r2", "report_generation": 2}
-    )
+    current = base.model_copy(update={"report_id": "report-r2", "report_generation": 2})
     group, host, report_row = _scheduler_inventory_state(current)
     selector = NodeSelector(
         compute_type="gpu",
@@ -470,9 +471,7 @@ async def test_scheduler_uses_host_latest_r2_capacity_after_reset():
         include=["b200"],
     )
 
-    assert not gpu_allocations._latest_gpu_inventory_matches_group(
-        host, group, report_row
-    )
+    assert not gpu_allocations._latest_gpu_inventory_matches_group(host, group, report_row)
     assert gpu_allocations._latest_gpu_inventory_matches_group(
         host,
         group,
@@ -494,11 +493,14 @@ async def test_scheduler_uses_host_latest_r2_capacity_after_reset():
         }
     )
     reduced_group, reduced_host, reduced_row = _scheduler_inventory_state(reduced)
-    assert await gpu_scheduler._candidate_groups(
-        _CandidateSession(reduced_group, reduced_host, reduced_row),
-        selector,
-        required_disk_mib=10 * 1024,
-    ) == []
+    assert (
+        await gpu_scheduler._candidate_groups(
+            _CandidateSession(reduced_group, reduced_host, reduced_row),
+            selector,
+            required_disk_mib=10 * 1024,
+        )
+        == []
+    )
 
 
 def test_scheduler_carries_latest_report_into_locked_reservation_cas():

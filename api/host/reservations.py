@@ -795,9 +795,7 @@ async def resolve_launch_reservation(
         raise LaunchReservationError(
             "Launch reservation is unknown, expired, invalidated, or consumed."
         )
-    if row.consumed_at is None and (
-        row.invalidated_at is not None or row.expires_at <= now
-    ):
+    if row.consumed_at is None and (row.invalidated_at is not None or row.expires_at <= now):
         raise LaunchReservationError(
             "Launch reservation is unknown, expired, invalidated, or consumed."
         )
@@ -840,9 +838,7 @@ async def resolve_launch_reservation(
         "boot_generation": claims.boot_generation,
     }
     if any(getattr(commitment, name) != value for name, value in expected.items()):
-        raise LaunchReservationError(
-            "TD quote commitment does not match the launch reservation."
-        )
+        raise LaunchReservationError("TD quote commitment does not match the launch reservation.")
     if row.consumed_at is not None:
         # Exact committed response replay authenticates immutable reservation/token/commitment
         # identity above. Later release, host-key, intent, expiry, or revocation transitions must

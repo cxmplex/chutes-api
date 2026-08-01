@@ -47,11 +47,7 @@ def registry_subject_lock_keys(
 ) -> tuple[str, ...]:
     """Return the deterministic registry lock set for one authenticated subject."""
 
-    if (
-        not isinstance(server_id, str)
-        or not server_id
-        or server_id != server_id.strip()
-    ):
+    if not isinstance(server_id, str) or not server_id or server_id != server_id.strip():
         raise ValueError("registry subject requires a canonical server id")
     keys = {f"{REGISTRY_SUBJECT_LOCK_PREFIX}:server:{server_id}"}
     if launch_config_id is not None:

@@ -123,19 +123,14 @@ def _assert_authenticated_host(
     boot_matches = host.boot_generation == row.host_boot_generation
     if allow_reboot_resume and isinstance(row, GpuLifecycleOperation):
         recovery_crossed_physical_boundary = bool(
-            row.operation_type
-            in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
-            and row.phase
-            in {"physical_result", "receipt_accepted", "local_release_acked"}
+            row.operation_type in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
+            and row.phase in {"physical_result", "receipt_accepted", "local_release_acked"}
         )
         if (
-            row.operation_type
-            not in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
+            row.operation_type not in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
             or recovery_crossed_physical_boundary
         ):
-            boot_matches = int(host.boot_generation or 0) >= int(
-                row.host_boot_generation or 0
-            )
+            boot_matches = int(host.boot_generation or 0) >= int(row.host_boot_generation or 0)
     if (
         host.host_id != row.host_id
         or host.active_key_generation != row.host_key_generation
@@ -174,9 +169,7 @@ def _assert_group_snapshot(
         or list(group.gpu_bdfs) != intent.gpu_bdfs
         or list(group.gpu_uuids) != intent.gpu_uuids
     ):
-        raise GpuLifecycleError(
-            "GPU lifecycle intent differs from current host inventory."
-        )
+        raise GpuLifecycleError("GPU lifecycle intent differs from current host inventory.")
 
 
 def _assert_reservation_snapshot(
@@ -225,9 +218,7 @@ def _assert_reservation_snapshot(
         or group.reservation_owner != reservation.workload_owner
         or group.management_mode != reservation.management_mode
     ):
-        raise GpuLifecycleError(
-            "GPU lifecycle intent differs from reservation custody."
-        )
+        raise GpuLifecycleError("GPU lifecycle intent differs from reservation custody.")
 
 
 def _assert_ownerless_snapshot(
@@ -252,9 +243,7 @@ def _assert_ownerless_snapshot(
         or group.process_incarnation is not None
         or group.state not in eligible_states
     ):
-        raise GpuLifecycleError(
-            "Ownerless GPU lifecycle intent has conflicting custody."
-        )
+        raise GpuLifecycleError("Ownerless GPU lifecycle intent has conflicting custody.")
 
 
 async def _locked_host(
@@ -263,9 +252,7 @@ async def _locked_host(
 ) -> Host:
     host = (
         await db.execute(
-            select(Host)
-            .where(Host.host_id == authenticated_host.host_id)
-            .with_for_update()
+            select(Host).where(Host.host_id == authenticated_host.host_id).with_for_update()
         )
     ).scalar_one_or_none()
     if host is None:
@@ -287,9 +274,7 @@ async def _locked_current_logical_host(
         or authenticated_host.boot_generation != current.boot_generation
         or current.host_id != row.host_id
     ):
-        raise GpuLifecycleError(
-            "Authenticated GPU host identity changed before lifecycle replay."
-        )
+        raise GpuLifecycleError("Authenticated GPU host identity changed before lifecycle replay.")
     return current
 
 
@@ -453,9 +438,7 @@ async def _append_recovery_event(
         state=state,
         reset_result_sha256=row.physical_result_sha256,
         source_reader_result_sha256=(
-            canonical_sha256(source_reader_result)
-            if source_reader_result is not None
-            else None
+            canonical_sha256(source_reader_result) if source_reader_result is not None else None
         ),
         receipt_id=row.receipt_id,
         receipt_sha256=row.receipt_sha256,
@@ -529,9 +512,7 @@ async def _group_is_permanently_lost(
             .limit(1)
         )
     ).scalar_one_or_none()
-    return bool(
-        event_id is not None or group.failure_code == "gpu_host_permanently_lost"
-    )
+    return bool(event_id is not None or group.failure_code == "gpu_host_permanently_lost")
 
 
 async def _revoke_unstarted_recovery(
@@ -545,9 +526,7 @@ async def _revoke_unstarted_recovery(
 ) -> None:
     row = await _locked_operation(db, authorization.operation_id)
     if await _recovery_event_exists(db, row.operation_id, "started"):
-        raise GpuLifecycleError(
-            "A started GPU recovery cannot be replaced by a new authorization."
-        )
+        raise GpuLifecycleError("A started GPU recovery cannot be replaced by a new authorization.")
     if not await _recovery_event_exists(db, row.operation_id, "revoked"):
         await _append_recovery_event(db, row, "revoked", occurred_at=now)
     if row.phase == "intent":
@@ -558,9 +537,7 @@ async def _revoke_unstarted_recovery(
         row.finalized_at = now
         row.updated_at = now
     elif row.phase != "quarantined":
-        raise GpuLifecycleError(
-            "GPU recovery authorization has already changed physical state."
-        )
+        raise GpuLifecycleError("GPU recovery authorization has already changed physical state.")
     if group.recovery_authorization_id == authorization.authorization_id:
         group.recovery_authorization_id = None
         group.recovery_report_id = None
@@ -606,8 +583,7 @@ def _assert_successor_recovery_custody(
         or operation.allocation_group_id != group.allocation_group_id
         or operation.allocation_group_generation != group.generation
         or operation.allocation_group_id != authorization.allocation_group_id
-        or operation.allocation_group_generation
-        != authorization.allocation_group_generation
+        or operation.allocation_group_generation != authorization.allocation_group_generation
         or operation.topology_fingerprint != group.topology_fingerprint
         or operation.topology_fingerprint != authorization.topology_fingerprint
         or operation.gpu_bdfs != list(group.gpu_bdfs)
@@ -639,9 +615,7 @@ def _assert_successor_recovery_custody(
                 )
             )
         ):
-            raise GpuLifecycleError(
-                "Failed ownerless GPU recovery acquired conflicting custody."
-            )
+            raise GpuLifecycleError("Failed ownerless GPU recovery acquired conflicting custody.")
         return
     if (
         operation.operation_type != "forced_dead_guest_recovery"
@@ -691,8 +665,7 @@ async def _locked_recovery_predecessor_history(
     else:
         query = query.where(
             GpuRecoveryAuthorization.reservation_id == reservation.reservation_id,
-            GpuRecoveryAuthorization.reservation_generation
-            == reservation.reservation_generation,
+            GpuRecoveryAuthorization.reservation_generation == reservation.reservation_generation,
         )
     authorizations = (
         (
@@ -737,9 +710,7 @@ async def _locked_recovery_predecessor_history(
         for item in matches
     }
     if len(prior_lineages) != 1:
-        raise GpuLifecycleError(
-            "Revoked GPU recovery history has ambiguous prior host lineage."
-        )
+        raise GpuLifecycleError("Revoked GPU recovery history has ambiguous prior host lineage.")
     return matches[0]
 
 
@@ -774,13 +745,9 @@ async def authorize_gpu_recovery(
     await acquire_gpu_lifecycle_lock(db)
     group = await _locked_group(db, allocation_group_id)
     if await _group_is_permanently_lost(db, group):
-        raise GpuLifecycleError(
-            "Permanently lost GPU custody cannot be recovered or reclaimed."
-        )
+        raise GpuLifecycleError("Permanently lost GPU custody cannot be recovered or reclaimed.")
     host = (
-        await db.execute(
-            select(Host).where(Host.host_id == group.host_id).with_for_update()
-        )
+        await db.execute(select(Host).where(Host.host_id == group.host_id).with_for_update())
     ).scalar_one_or_none()
     if host is None:
         raise GpuLifecycleError("GPU recovery host is unknown.")
@@ -800,19 +767,15 @@ async def authorize_gpu_recovery(
             await db.execute(
                 select(GpuRecoveryAuthorization)
                 .where(
-                    GpuRecoveryAuthorization.authorization_id
-                    == group.recovery_authorization_id,
+                    GpuRecoveryAuthorization.authorization_id == group.recovery_authorization_id,
                     GpuRecoveryAuthorization.allocation_group_id == allocation_group_id,
-                    GpuRecoveryAuthorization.allocation_group_generation
-                    == group.generation,
+                    GpuRecoveryAuthorization.allocation_group_generation == group.generation,
                 )
                 .with_for_update()
             )
         ).scalar_one_or_none()
         if existing is None:
-            raise GpuLifecycleError(
-                "GPU recovery group points to an unknown authorization."
-            )
+            raise GpuLifecycleError("GPU recovery group points to an unknown authorization.")
     if existing is not None:
         operation = await _locked_operation(db, existing.operation_id)
         started = await _recovery_event_exists(db, existing.operation_id, "started")
@@ -881,9 +844,7 @@ async def authorize_gpu_recovery(
                 group,
                 now,
                 failure_code="gpu_recovery_authorization_expired",
-                failure_reason=(
-                    "GPU recovery authorization expired before presentation."
-                ),
+                failure_reason=("GPU recovery authorization expired before presentation."),
             )
             _assert_successor_recovery_custody(
                 host,
@@ -927,10 +888,7 @@ async def authorize_gpu_recovery(
         )
         if historical is not None:
             predecessor, _operation, predecessor_started = historical
-            if (
-                predecessor_started
-                and predecessor.inventory_report_id == request.report_id
-            ):
+            if predecessor_started and predecessor.inventory_report_id == request.report_id:
                 raise GpuLifecycleError(
                     "Failed GPU recovery requires a fresh current inventory report."
                 )
@@ -972,9 +930,7 @@ async def authorize_gpu_recovery(
             or group.process_incarnation != reservation.process_incarnation
             or group.management_mode != reservation.management_mode
         ):
-            raise GpuLifecycleError(
-                "Forced GPU recovery custody is stale or incomplete."
-            )
+            raise GpuLifecycleError("Forced GPU recovery custody is stale or incomplete.")
         if reservation.management_mode != "miner" or not reservation.server_id:
             raise GpuLifecycleError(
                 "Forced dead-guest recovery is supported only for exact miner custody."
@@ -1009,9 +965,7 @@ async def authorize_gpu_recovery(
             reservation.reservation_generation if reservation is not None else None
         ),
         claims_sha256=reservation.claims_sha256 if reservation is not None else None,
-        process_incarnation=(
-            reservation.process_incarnation if reservation is not None else None
-        ),
+        process_incarnation=(reservation.process_incarnation if reservation is not None else None),
         topology_fingerprint=group.topology_fingerprint,
         gpu_bdfs=list(group.gpu_bdfs),
         gpu_uuids=list(group.gpu_uuids),
@@ -1024,9 +978,7 @@ async def authorize_gpu_recovery(
 
     group.recovery_authorization_id = authorization_id
     group.recovery_report_id = report.report_id
-    group.recovery_nonce_hash = hashlib.sha256(
-        recovery_nonce.encode("ascii")
-    ).hexdigest()
+    group.recovery_nonce_hash = hashlib.sha256(recovery_nonce.encode("ascii")).hexdigest()
     group.recovery_authorized_by = authorized_by
     group.recovery_authorized_at = now
     group.recovery_started_at = None
@@ -1057,9 +1009,7 @@ async def authorize_gpu_recovery(
             reservation.reservation_generation if reservation is not None else None
         ),
         claims_sha256=reservation.claims_sha256 if reservation is not None else None,
-        process_incarnation=(
-            reservation.process_incarnation if reservation is not None else None
-        ),
+        process_incarnation=(reservation.process_incarnation if reservation is not None else None),
         allocation_group_id=group.allocation_group_id,
         allocation_group_generation=group.generation,
         topology_fingerprint=group.topology_fingerprint,
@@ -1112,8 +1062,7 @@ async def _locked_recovery_authorization(
             select(GpuRecoveryAuthorization)
             .where(
                 GpuRecoveryAuthorization.operation_id == row.operation_id,
-                GpuRecoveryAuthorization.authorization_id
-                == row.recovery_authorization_id,
+                GpuRecoveryAuthorization.authorization_id == row.recovery_authorization_id,
             )
             .with_for_update()
         )
@@ -1164,9 +1113,7 @@ async def _validate_recovery_authorization(
         try:
             report_claims = GpuInventoryReportV1.model_validate(report.claims)
         except ValueError as exc:
-            raise GpuLifecycleError(
-                "GPU recovery inventory report is malformed."
-            ) from exc
+            raise GpuLifecycleError("GPU recovery inventory report is malformed.") from exc
         _assert_recovery_inventory(
             authenticated_host,
             group,
@@ -1207,12 +1154,9 @@ async def _validate_recovery_authorization(
         reservation = await _locked_reservation(db, authorization.reservation_id)
         if (
             reservation is None
-            or reservation.host_key_generation
-            != authorization.prior_host_key_generation
-            or reservation.host_boot_generation
-            != authorization.prior_host_boot_generation
-            or reservation.reservation_generation
-            != authorization.reservation_generation
+            or reservation.host_key_generation != authorization.prior_host_key_generation
+            or reservation.host_boot_generation != authorization.prior_host_boot_generation
+            or reservation.reservation_generation != authorization.reservation_generation
             or reservation.claims_sha256 != authorization.claims_sha256
             or reservation.process_incarnation != authorization.process_incarnation
         ):
@@ -1293,9 +1237,7 @@ async def start_gpu_recovery(
         or group.recovery_authorization_id != authorization.authorization_id
         or group.recovery_report_id != authorization.inventory_report_id
     ):
-        raise GpuLifecycleError(
-            "GPU recovery group left authorized quarantine custody."
-        )
+        raise GpuLifecycleError("GPU recovery group left authorized quarantine custody.")
     # Wall time may step backwards under host clock correction. Preserve the
     # database recovery chronology instead of producing a started timestamp
     # earlier than its immutable authorization.
@@ -1310,9 +1252,7 @@ async def start_gpu_recovery(
             or group.reservation_id != reservation.reservation_id
             or group.process_incarnation != reservation.process_incarnation
         ):
-            raise GpuLifecycleError(
-                "GPU recovery reservation custody changed before start."
-            )
+            raise GpuLifecycleError("GPU recovery reservation custody changed before start.")
         reservation.state = "resetting"
         reservation.teardown_started_at = reservation.teardown_started_at or now
         reservation.quarantined_at = None
@@ -1392,16 +1332,10 @@ async def create_gpu_lifecycle_operation(
         raise GpuLifecycleError(
             "GPU recovery intents may only be created by an administrator authorization."
         )
-    if is_recovery and (
-        recovery_prior_lineage is None or min(recovery_prior_lineage) < 1
-    ):
-        raise GpuLifecycleError(
-            "GPU recovery intent is missing immutable prior host lineage."
-        )
+    if is_recovery and (recovery_prior_lineage is None or min(recovery_prior_lineage) < 1):
+        raise GpuLifecycleError("GPU recovery intent is missing immutable prior host lineage.")
     if not is_recovery and recovery_prior_lineage is not None:
-        raise GpuLifecycleError(
-            "Ordinary lifecycle intent cannot carry recovery prior lineage."
-        )
+        raise GpuLifecycleError("Ordinary lifecycle intent cannot carry recovery prior lineage.")
     _assert_intent_input(intent)
     intent_document = gpu_lifecycle_intent_document(intent)
     intent_sha256 = canonical_sha256(intent_document)
@@ -1415,9 +1349,7 @@ async def create_gpu_lifecycle_operation(
     ).scalar_one_or_none()
     if existing is not None:
         if not secrets.compare_digest(existing.intent_sha256, intent_sha256):
-            raise GpuLifecycleError(
-                "GPU lifecycle operation id was reused with new intent."
-            )
+            raise GpuLifecycleError("GPU lifecycle operation id was reused with new intent.")
         if existing.phase in {"finalized", "quarantined"}:
             await _locked_current_logical_host(db, authenticated_host, existing)
         else:
@@ -1444,9 +1376,7 @@ async def create_gpu_lifecycle_operation(
         )
     ).scalar_one_or_none()
     if active is not None:
-        raise GpuLifecycleError(
-            f"GPU group generation already has lifecycle operation {active}."
-        )
+        raise GpuLifecycleError(f"GPU group generation already has lifecycle operation {active}.")
 
     reservation = await _locked_reservation(db, intent.reservation_id)
     if reservation is None:
@@ -1527,9 +1457,7 @@ async def ensure_reservation_lifecycle_operation(
         raise GpuLifecycleError("GPU lifecycle reservation is unknown.")
     group = await _locked_group(db, reservation.allocation_group_id)
     host = (
-        await db.execute(
-            select(Host).where(Host.host_id == reservation.host_id).with_for_update()
-        )
+        await db.execute(select(Host).where(Host.host_id == reservation.host_id).with_for_update())
     ).scalar_one_or_none()
     if host is None:
         raise GpuLifecycleError("GPU lifecycle reservation host is unknown.")
@@ -1538,8 +1466,7 @@ async def ensure_reservation_lifecycle_operation(
             await db.execute(
                 select(GpuLifecycleOperation)
                 .where(
-                    GpuLifecycleOperation.allocation_group_id
-                    == reservation.allocation_group_id,
+                    GpuLifecycleOperation.allocation_group_id == reservation.allocation_group_id,
                     GpuLifecycleOperation.allocation_group_generation
                     == reservation.allocation_group_generation,
                     GpuLifecycleOperation.reservation_id == reservation.reservation_id,
@@ -1642,9 +1569,7 @@ async def gpu_lifecycle_operation_response(
             # directive until the exact local-release ACK makes quarantine
             # terminal. V1 permits failure fields only on a quarantined phase.
             "failure_code": row.failure_code if row.phase == "quarantined" else None,
-            "failure_reason": row.failure_reason
-            if row.phase == "quarantined"
-            else None,
+            "failure_reason": row.failure_reason if row.phase == "quarantined" else None,
             "created_at": row.created_at,
             "updated_at": row.updated_at,
             "finalized_at": row.finalized_at,
@@ -1663,9 +1588,7 @@ async def get_gpu_lifecycle_operation(
     if row.phase in {"finalized", "quarantined"}:
         await _locked_current_logical_host(db, authenticated_host, row)
     else:
-        await _locked_authenticated_host(
-            db, authenticated_host, row, allow_reboot_resume=True
-        )
+        await _locked_authenticated_host(db, authenticated_host, row, allow_reboot_resume=True)
     return await gpu_lifecycle_operation_response(db, row)
 
 
@@ -1688,13 +1611,9 @@ def _assert_result_snapshot(
         raise GpuLifecycleError("GPU physical result differs from lifecycle intent.")
     if row.operation_type == "forced_dead_guest_recovery":
         if result.source_reader_result is None:
-            raise GpuLifecycleError(
-                "Forced GPU recovery requires an exact source-reader result."
-            )
+            raise GpuLifecycleError("Forced GPU recovery requires an exact source-reader result.")
         if result.source_reader_result.migration_id != row.migration_id:
-            raise GpuLifecycleError(
-                "Forced GPU source-reader result changed migration identity."
-            )
+            raise GpuLifecycleError("Forced GPU source-reader result changed migration identity.")
     elif result.source_reader_result is not None:
         raise GpuLifecycleError(
             "Source-reader evidence is valid only for forced dead-guest recovery."
@@ -1739,9 +1658,7 @@ async def _accept_physical_result(
     if exact_persisted_replay:
         await _locked_current_logical_host(db, authenticated_host, row)
     else:
-        await _locked_authenticated_host(
-            db, authenticated_host, row, allow_reboot_resume=True
-        )
+        await _locked_authenticated_host(db, authenticated_host, row, allow_reboot_resume=True)
     if not secrets.compare_digest(row.physical_result_sha256 or "", result_sha256):
         raise GpuLifecycleError("GPU lifecycle result replay changed canonical bytes.")
     if row.phase in {
@@ -1766,9 +1683,7 @@ async def _accept_physical_result(
             or group.process_incarnation is not None
             or group.management_mode is not None
         ):
-            raise GpuLifecycleError(
-                "Ownerless GPU custody changed before reset receipt."
-            )
+            raise GpuLifecycleError("Ownerless GPU custody changed before reset receipt.")
     elif (
         group.reservation_id != row.reservation_id
         or group.reservation_generation != row.reservation_generation
@@ -1844,9 +1759,7 @@ async def _accept_physical_result(
         code = result.failure_code or (
             "gpu_guest_shutdown_unclean"
             if unclean_normal_miner_shutdown
-            else (
-                "gpu_infra_unclosed" if infra_failure else "gpu_reset_evidence_mismatch"
-            )
+            else ("gpu_infra_unclosed" if infra_failure else "gpu_reset_evidence_mismatch")
         )
         reason = (
             result.failure_reason
@@ -1913,9 +1826,7 @@ async def record_gpu_physical_result(
             not secrets.compare_digest(row.physical_result_sha256 or "", result_sha256)
             or row.physical_result != result_document
         ):
-            raise GpuLifecycleError(
-                "GPU lifecycle result replay changed canonical bytes."
-            )
+            raise GpuLifecycleError("GPU lifecycle result replay changed canonical bytes.")
         current_host = await _locked_current_logical_host(db, authenticated_host, row)
         if row.phase in {
             "receipt_accepted",
@@ -1932,20 +1843,14 @@ async def record_gpu_physical_result(
             "ownerless_group_recovery",
             "forced_dead_guest_recovery",
         }:
-            await _validate_recovery_authorization(
-                db, current_host, row, require_started=True
-            )
+            await _validate_recovery_authorization(db, current_host, row, require_started=True)
     if row.physical_result_sha256 is None:
         if row.phase != "intent":
-            raise GpuLifecycleError(
-                "GPU lifecycle operation cannot accept a physical result."
-            )
+            raise GpuLifecycleError("GPU lifecycle operation cannot accept a physical result.")
         group = await _locked_group(db, row.allocation_group_id)
         reservation = await _locked_reservation(db, row.reservation_id)
         if group.generation != row.allocation_group_generation:
-            raise GpuLifecycleError(
-                "GPU group generation changed before physical result."
-            )
+            raise GpuLifecycleError("GPU group generation changed before physical result.")
         if reservation is None:
             if group.state != "resetting" or group.reservation_id is not None:
                 raise GpuLifecycleError("Ownerless GPU group left exact reset custody.")
@@ -2132,9 +2037,7 @@ async def record_gpu_local_release_ack(
             not secrets.compare_digest(row.local_release_ack_sha256 or "", ack_sha256)
             or row.local_release_ack != ack_document
         ):
-            raise GpuLifecycleError(
-                "GPU local-release ACK replay changed canonical bytes."
-            )
+            raise GpuLifecycleError("GPU local-release ACK replay changed canonical bytes.")
         await _locked_current_logical_host(db, authenticated_host, row)
         if row.phase in {"finalized", "quarantined"}:
             return await gpu_lifecycle_operation_response(db, row)
@@ -2143,13 +2046,9 @@ async def record_gpu_local_release_ack(
         # assertion. A successor key may replay an ACK only after its exact bytes
         # are durable above; logical host identity alone does not prove custody of
         # the old CHUTES_DATA journal or physical device state.
-        await _locked_authenticated_host(
-            db, authenticated_host, row, allow_reboot_resume=True
-        )
+        await _locked_authenticated_host(db, authenticated_host, row, allow_reboot_resume=True)
         if row.phase != "receipt_accepted" or row.result_outcome != "accepted":
-            raise GpuLifecycleError(
-                "GPU lifecycle operation cannot accept local release."
-            )
+            raise GpuLifecycleError("GPU lifecycle operation cannot accept local release.")
         row.local_release_ack = ack_document
         row.local_release_ack_sha256 = ack_sha256
         row.local_release_acked_at = _now()
@@ -2233,8 +2132,7 @@ async def finalize_gpu_host_loss(
             reservation is not None
             and (
                 reservation.allocation_group_id != row.allocation_group_id
-                or reservation.allocation_group_generation
-                != row.allocation_group_generation
+                or reservation.allocation_group_generation != row.allocation_group_generation
                 or reservation.process_incarnation != row.process_incarnation
             )
         )

@@ -55,13 +55,9 @@ async def _run_down(
         transaction = await connection.begin()
         try:
             if started is not None:
-                started.set_result(
-                    await connection.scalar(text("SELECT pg_backend_pid()"))
-                )
+                started.set_result(await connection.scalar(text("SELECT pg_backend_pid()")))
             raw = await connection.get_raw_connection()
-            await raw.driver_connection.execute(
-                storage_pg._migration_down_sql(migration)
-            )
+            await raw.driver_connection.execute(storage_pg._migration_down_sql(migration))
         except BaseException:
             await transaction.rollback()
             raise
@@ -72,10 +68,7 @@ async def _wait_for_database_lock(engine, pid: int) -> None:
     for _ in range(500):
         async with engine.connect() as observer:
             waiting = await observer.scalar(
-                text(
-                    "SELECT wait_event_type = 'Lock' "
-                    "FROM pg_stat_activity WHERE pid = :pid"
-                ),
+                text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"),
                 {"pid": pid},
             )
         if waiting:
@@ -184,9 +177,7 @@ async def _run_runtime_helper_across_down(
         async with sessions() as candidate:
             try:
                 if preselect_session_table:
-                    await candidate.execute(
-                        text("SELECT 1 FROM chutefs_launch_sessions")
-                    )
+                    await candidate.execute(text("SELECT 1 FROM chutefs_launch_sessions"))
                 await launch_sessions.lock_launch_storage_configurations(
                     candidate,
                     [config_id],
@@ -212,9 +203,7 @@ async def _run_runtime_helper_across_down(
     return runtime_result
 
 
-async def test_default_down_does_not_invert_real_helper_preflight(
-    pg_session, monkeypatch
-):
+async def test_default_down_does_not_invert_real_helper_preflight(pg_session, monkeypatch):
     db, _redis = pg_session
     await _apply_up(db, DEFAULT_VOLUME_MIGRATION)
 
@@ -274,9 +263,7 @@ async def test_rotation_down_rejects_nonbootstrap_history_without_catalog_damage
         )
         == 1
     )
-    assert await db.scalar(
-        text("SELECT to_regclass('chutefs_token_key_replica_acks') IS NOT NULL")
-    )
+    assert await db.scalar(text("SELECT to_regclass('chutefs_token_key_replica_acks') IS NOT NULL"))
 
 
 async def test_helper_rejects_pending_orm_writes_before_preflight_autoflush(pg_session):

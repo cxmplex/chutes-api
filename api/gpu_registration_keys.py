@@ -123,8 +123,7 @@ async def _replay_operation(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                "GPU registration recovery-key request ID is already bound to "
-                "different input."
+                "GPU registration recovery-key request ID is already bound to different input."
             ),
         )
     response = dict(operation.response_json)
@@ -204,15 +203,12 @@ def _active_epoch(
     active = [epoch for epoch in epochs if epoch.state == "active"]
     if len(active) != 1:
         raise GpuRegistrationRecoveryKeyUnavailable(
-            "GPU registration recovery-key authority does not have exactly one "
-            "active epoch."
+            "GPU registration recovery-key authority does not have exactly one active epoch."
         )
     return active[0]
 
 
-def _configured_keyring() -> tuple[
-    dict[str, str], dict[str, Fernet], dict[str, str], str, str
-]:
+def _configured_keyring() -> tuple[dict[str, str], dict[str, Fernet], dict[str, str], str, str]:
     materials = settings.gpu_registration_recovery_key_materials
     ciphers = settings.gpu_registration_recovery_keys
     fingerprints = registration_recovery_key_fingerprints(materials)
@@ -248,9 +244,7 @@ async def _acknowledge_configured_epochs(
                 select(GpuRegistrationRecoveryKeyReplicaAck)
                 .where(
                     GpuRegistrationRecoveryKeyReplicaAck.replica_id == replica_id,
-                    GpuRegistrationRecoveryKeyReplicaAck.key_id.not_in(
-                        acknowledgeable_key_ids
-                    ),
+                    GpuRegistrationRecoveryKeyReplicaAck.key_id.not_in(acknowledgeable_key_ids),
                 )
                 .with_for_update()
             )
@@ -533,8 +527,7 @@ async def stage_gpu_registration_recovery_key_epoch(
     materials, _, fingerprints, keyring_sha256, replica_id = _configured_keyring()
     if key_id not in materials:
         raise GpuRegistrationRecoveryKeyUnavailable(
-            "The handling replica does not hold the proposed GPU registration "
-            "recovery key."
+            "The handling replica does not hold the proposed GPU registration recovery key."
         )
     if replica_id not in required:
         raise HTTPException(
@@ -640,11 +633,7 @@ async def activate_gpu_registration_recovery_key_epoch(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    if (
-        target is None
-        or target.state != "staged"
-        or target.predecessor_key_id != active.key_id
-    ):
+    if target is None or target.state != "staged" or target.predecessor_key_id != active.key_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="GPU registration recovery key is not the active key's staged successor.",
@@ -654,8 +643,7 @@ async def activate_gpu_registration_recovery_key_epoch(
     )
     if configured_fingerprints.get(target.key_id) != target.key_sha256:
         raise GpuRegistrationRecoveryKeyUnavailable(
-            "The handling replica does not hold the exact staged GPU registration "
-            "recovery key."
+            "The handling replica does not hold the exact staged GPU registration recovery key."
         )
     acknowledgements = list(
         (
@@ -671,9 +659,7 @@ async def activate_gpu_registration_recovery_key_epoch(
     )
     by_replica = {ack.replica_id: ack for ack in acknowledgements}
     required_acks = [by_replica.get(item) for item in target.required_replica_ids]
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        seconds=RECOVERY_KEY_ACK_MAX_AGE_SECONDS
-    )
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=RECOVERY_KEY_ACK_MAX_AGE_SECONDS)
     if any(ack is None or ack.acknowledged_at < cutoff for ack in required_acks):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -760,11 +746,7 @@ async def retire_gpu_registration_recovery_key_epoch(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    if (
-        target is None
-        or target.state != "retiring"
-        or active.predecessor_key_id != target.key_id
-    ):
+    if target is None or target.state != "retiring" or active.predecessor_key_id != target.key_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="GPU registration recovery key is not the retiring predecessor.",
@@ -862,11 +844,7 @@ async def cancel_gpu_registration_recovery_key_epoch(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    if (
-        target is None
-        or target.state != "staged"
-        or target.predecessor_key_id != active.key_id
-    ):
+    if target is None or target.state != "staged" or target.predecessor_key_id != active.key_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="GPU registration recovery key is not the active key's staged successor.",

@@ -479,7 +479,9 @@ async def test_l0_publication_rejects_equivocation_and_backward_key_epoch(tmp_pa
             await release_service._admit_l0_bootstrap(db, release)
 
 
-def test_real_asgi_staged_only_404_then_active_response_verifies_in_miner_cli(tmp_path, monkeypatch):
+def test_real_asgi_staged_only_404_then_active_response_verifies_in_miner_cli(
+    tmp_path, monkeypatch
+):
     miner_cli_source = repository_root("miner", start=Path(__file__)) / "src" / "chutes-miner-cli"
     now = datetime.now(timezone.utc).replace(microsecond=0)
     private_key = Ed25519PrivateKey.generate()

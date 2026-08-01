@@ -897,9 +897,7 @@ class TestHostCapacityFence:
         assert "servers.self_registered IS true" in server_sql
         assert "servers.storage_role IS false" in server_sql
 
-        reservation_sql = str(
-            session.statements[3].compile(dialect=postgresql.dialect())
-        )
+        reservation_sql = str(session.statements[3].compile(dialect=postgresql.dialect()))
         assert "td_launch_reservations.host_id =" in reservation_sql
         assert "td_launch_reservations.role =" in reservation_sql
         assert "td_launch_reservations.consumed_at IS NULL" in reservation_sql
@@ -1111,9 +1109,7 @@ class TestLaunchOnHost:
         send.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_final_capacity_recheck_blocks_stale_candidate(
-        self, mock_settings, monkeypatch
-    ):
+    async def test_final_capacity_recheck_blocks_stale_candidate(self, mock_settings, monkeypatch):
         handlers = self._handlers([self._host(capacity=1)])
         session = FakeSession(handlers)
         send = AsyncMock(return_value="cmd-1")

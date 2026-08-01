@@ -187,20 +187,18 @@ def test_api_gpu_claim_fixture_is_byte_identical_and_parses_in_sek8s():
 
 
 def test_miner_persists_and_sends_the_api_required_launch_request_uuid():
-    miner_source = (
-        _repository("miner") / "src/chutes-miner/chutes_miner/gepetto.py"
-    ).read_text(encoding="utf-8")
+    miner_source = (_repository("miner") / "src/chutes-miner/chutes_miner/gepetto.py").read_text(
+        encoding="utf-8"
+    )
     assert "intent_id = str(uuid.uuid4())" in miner_source
     assert '"miner_launch_request_id": intent_id' in miner_source
     assert 'params["miner_launch_request_id"] = intent_id' in miner_source
 
     handler_source = inspect.getsource(get_launch_config)
-    attested_branch = handler_source.split("if runtime_server_id is not None:", 1)[
-        1
-    ].split("# Resolve external demand telemetry", 1)[0]
-    assert (
-        "_canonical_miner_launch_request_id(miner_launch_request_id)" in attested_branch
-    )
+    attested_branch = handler_source.split("if runtime_server_id is not None:", 1)[1].split(
+        "# Resolve external demand telemetry", 1
+    )[0]
+    assert "_canonical_miner_launch_request_id(miner_launch_request_id)" in attested_branch
     request_id = "88888888-8888-4888-8888-888888888888"
     assert _canonical_miner_launch_request_id(request_id) == request_id
     with pytest.raises(HTTPException) as exc:

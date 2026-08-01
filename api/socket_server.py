@@ -94,10 +94,7 @@ async def _validate_agent_session(session_id: str) -> bool:
                 valid = readiness.control_channel_eligible
         elif attested_spki:
             server = await session.get(Server, meta["server_id"])
-            valid = bool(
-                server is not None
-                and server.attested_cert_pubkey_hash == attested_spki
-            )
+            valid = bool(server is not None and server.attested_cert_pubkey_hash == attested_spki)
             if valid:
                 try:
                     await _require_current_server_attestation(session, server)

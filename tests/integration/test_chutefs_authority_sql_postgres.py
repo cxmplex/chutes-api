@@ -41,14 +41,10 @@ async def _install_rotation_migration(db) -> None:
     async with db.bind.begin() as connection:
         raw = await connection.get_raw_connection()
         await raw.driver_connection.execute(
-            storage_pg._migration_up_sql(
-                "20260724234500_gpu_chutefs_default_volume.sql"
-            )
+            storage_pg._migration_up_sql("20260724234500_gpu_chutefs_default_volume.sql")
         )
         await raw.driver_connection.execute(
-            storage_pg._migration_up_sql(
-                "20260726121000_chutefs_session_rotation_replay.sql"
-            )
+            storage_pg._migration_up_sql("20260726121000_chutefs_session_rotation_replay.sql")
         )
     await db.rollback()
 
@@ -70,9 +66,7 @@ async def _assert_authority_update_rejected(
                 ),
                 {"session_id": session_id},
             )
-    assert "launch-bound ChuteFS session authority is immutable" in str(
-        captured.value.orig
-    )
+    assert "launch-bound ChuteFS session authority is immutable" in str(captured.value.orig)
 
 
 async def test_every_chutefs_authority_and_replay_field_is_sql_immutable(
@@ -170,8 +164,6 @@ async def test_every_chutefs_authority_and_replay_field_is_sql_immutable(
     )
     await db.commit()
     stored_revoked_at = await db.scalar(
-        select(ChuteFSLaunchSession.revoked_at).where(
-            ChuteFSLaunchSession.session_id == session_id
-        )
+        select(ChuteFSLaunchSession.revoked_at).where(ChuteFSLaunchSession.session_id == session_id)
     )
     assert stored_revoked_at == revoked_at

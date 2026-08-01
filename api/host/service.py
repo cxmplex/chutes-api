@@ -94,47 +94,54 @@ async def _assert_gpu_credential_change_safe(
     from api.host.schemas import GpuAllocationGroup
 
     operations = (
-        await db.execute(
-            select(GpuLifecycleOperation)
-            .where(
-                GpuLifecycleOperation.host_id == host.host_id,
-                GpuLifecycleOperation.phase.notin_(("finalized", "quarantined")),
+        (
+            await db.execute(
+                select(GpuLifecycleOperation)
+                .where(
+                    GpuLifecycleOperation.host_id == host.host_id,
+                    GpuLifecycleOperation.phase.notin_(("finalized", "quarantined")),
+                )
+                .order_by(GpuLifecycleOperation.operation_id)
+                .with_for_update()
             )
-            .order_by(GpuLifecycleOperation.operation_id)
-            .with_for_update()
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     safe_phases = {"local_release_acked"}
     unsafe_operation = next(
         (
             item
             for item in operations
             if item.phase not in safe_phases
-            or item.operation_type
-            in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
+            or item.operation_type in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
         ),
         None,
     )
     active_groups = (
-        await db.execute(
-            select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.host_id == host.host_id,
-                GpuAllocationGroup.state.in_(
-                    (
-                        "reserved",
-                        "launching",
-                        "running",
-                        "resetting",
-                        "release_pending",
-                        "recovery_required",
-                    )
-                ),
+        (
+            await db.execute(
+                select(GpuAllocationGroup)
+                .where(
+                    GpuAllocationGroup.host_id == host.host_id,
+                    GpuAllocationGroup.state.in_(
+                        (
+                            "reserved",
+                            "launching",
+                            "running",
+                            "resetting",
+                            "release_pending",
+                            "recovery_required",
+                        )
+                    ),
+                )
+                .order_by(GpuAllocationGroup.allocation_group_id)
+                .with_for_update()
             )
-            .order_by(GpuAllocationGroup.allocation_group_id)
-            .with_for_update()
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if unsafe_operation is not None or any(
         item.state == "recovery_required" for item in active_groups
     ):
@@ -146,8 +153,7 @@ async def _assert_gpu_credential_change_safe(
         return False
 
     protected_groups = {
-        (item.allocation_group_id, item.allocation_group_generation)
-        for item in operations
+        (item.allocation_group_id, item.allocation_group_generation) for item in operations
     }
     if any(
         (item.allocation_group_id, item.generation) not in protected_groups
@@ -478,8 +484,7 @@ async def redeem_enrollment_voucher(
     # GPU enrollment always carries storage. CPU storage is an explicit operator opt-in and must
     # survive identity/key rotation rather than being derived from compute type on every redeem.
     storage_requested_after_enrollment = request_compute == "gpu" or bool(
-        host is not None
-        and (host.storage_requested or host.storage_enabled)
+        host is not None and (host.storage_requested or host.storage_enabled)
     )
     if host is None:
         host = Host(
@@ -803,9 +808,7 @@ async def verify_host_socket_authentication(
         from api.host.gpu_allocations import _preverify_active_gpu_release
         from api.host.reservations import observe_gpu_storage_liveness
 
-        observed_live_storage_ids = await observe_gpu_storage_liveness(
-            db, authentication.host_id
-        )
+        observed_live_storage_ids = await observe_gpu_storage_liveness(db, authentication.host_id)
         await _preverify_active_gpu_release(db, authentication.host_id)
     await acquire_gpu_lifecycle_lock(db)
     host = (

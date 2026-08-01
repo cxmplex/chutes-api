@@ -187,9 +187,7 @@ async def stage_token_key_epoch(
             status_code=status.HTTP_409_CONFLICT,
             detail="ChuteFS token key ID already has an epoch.",
         )
-    configured_fingerprints = token_key_fingerprints(
-        settings.chutefs_token_keys
-    )
+    configured_fingerprints = token_key_fingerprints(settings.chutefs_token_keys)
     target_fingerprint = configured_fingerprints.get(key_id)
     if (
         target_fingerprint is None
@@ -262,18 +260,12 @@ async def activate_token_key_epoch(
     epochs = await _locked_epochs(db)
     active = _active_epoch(epochs)
     target = next((epoch for epoch in epochs if epoch.key_id == key_id), None)
-    if (
-        target is None
-        or target.state != "staged"
-        or target.predecessor_key_id != active.key_id
-    ):
+    if target is None or target.state != "staged" or target.predecessor_key_id != active.key_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="ChuteFS token key epoch is not the staged successor of the active key.",
         )
-    configured_fingerprints = token_key_fingerprints(
-        settings.chutefs_token_keys
-    )
+    configured_fingerprints = token_key_fingerprints(settings.chutefs_token_keys)
     if (
         configured_fingerprints.get(target.key_id) != target.key_sha256
         or configured_fingerprints.get(active.key_id) != active.key_sha256
@@ -301,13 +293,8 @@ async def activate_token_key_epoch(
     by_replica = {ack.replica_id: ack for ack in acknowledgements}
     required = list(target.required_replica_ids)
     required_acks = [by_replica.get(replica_id) for replica_id in required]
-    freshness_cutoff = datetime.now(timezone.utc) - timedelta(
-        seconds=TOKEN_KEY_ACK_MAX_AGE_SECONDS
-    )
-    if any(
-        ack is None or ack.acknowledged_at < freshness_cutoff
-        for ack in required_acks
-    ):
+    freshness_cutoff = datetime.now(timezone.utc) - timedelta(seconds=TOKEN_KEY_ACK_MAX_AGE_SECONDS)
+    if any(ack is None or ack.acknowledged_at < freshness_cutoff for ack in required_acks):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -322,10 +309,8 @@ async def activate_token_key_epoch(
         if (
             key_id not in acknowledgement.key_ids
             or active.key_id not in acknowledgement.key_ids
-            or acknowledgement.key_fingerprints.get(key_id)
-            != target.key_sha256
-            or acknowledgement.key_fingerprints.get(active.key_id)
-            != active.key_sha256
+            or acknowledgement.key_fingerprints.get(key_id) != target.key_sha256
+            or acknowledgement.key_fingerprints.get(active.key_id) != active.key_sha256
             or acknowledgement.key_ids != first.key_ids
             or acknowledgement.key_fingerprints != first.key_fingerprints
             or acknowledgement.keyring_sha256 != first.keyring_sha256
@@ -394,11 +379,7 @@ async def retire_token_key_epoch(
     epochs = await _locked_epochs(db)
     active = _active_epoch(epochs)
     target = next((epoch for epoch in epochs if epoch.key_id == key_id), None)
-    if (
-        target is None
-        or target.state != "retiring"
-        or active.predecessor_key_id != target.key_id
-    ):
+    if target is None or target.state != "retiring" or active.predecessor_key_id != target.key_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="ChuteFS token key is not the retiring predecessor of the active key.",

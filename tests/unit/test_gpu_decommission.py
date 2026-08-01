@@ -69,9 +69,7 @@ def _server(*, retired=True):
 
 
 def test_reservation_terminal_gate_requires_positive_physical_evidence():
-    assert not gpu_infra._gpu_reservation_decommissionable(
-        SimpleNamespace(state="quarantined")
-    )
+    assert not gpu_infra._gpu_reservation_decommissionable(SimpleNamespace(state="quarantined"))
     assert not gpu_infra._gpu_reservation_decommissionable(
         SimpleNamespace(state="released", reset_completed_at=None, released_at=None)
     )
@@ -407,15 +405,11 @@ async def test_exact_decommission_retry_replays_audit_and_mismatch_fails_closed(
     )
     db = _Db([_Result(scalar=server), _Result(scalar=server), _Result(rows=[audit])])
     with patch.object(gpu_infra, "acquire_gpu_lifecycle_lock", AsyncMock()):
-        replay = await gpu_infra.decommission_gpu_server(
-            db, server.server_id, "owner", request
-        )
+        replay = await gpu_infra.decommission_gpu_server(db, server.server_id, "owner", request)
     assert replay.decommissioned_at == timestamp
     db.add.assert_not_called()
 
-    mismatch_db = _Db(
-        [_Result(scalar=server), _Result(scalar=server), _Result(rows=[audit])]
-    )
+    mismatch_db = _Db([_Result(scalar=server), _Result(scalar=server), _Result(rows=[audit])])
     with (
         patch.object(gpu_infra, "acquire_gpu_lifecycle_lock", AsyncMock()),
         pytest.raises(HTTPException, match="identity was already consumed") as exc,

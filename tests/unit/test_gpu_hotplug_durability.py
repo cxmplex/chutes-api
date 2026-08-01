@@ -61,20 +61,14 @@ def _failed_ack(row):
             {
                 "namespace": namespace,
                 "block_node_name": (
-                    "gpu-legacy-storage-node"
-                    if namespace == "storage"
-                    else "gpu-legacy-cache-node"
+                    "gpu-legacy-storage-node" if namespace == "storage" else "gpu-legacy-cache-node"
                 ),
                 "device_id": (
                     "gpu-legacy-storage-device"
                     if namespace == "storage"
                     else "gpu-legacy-cache-device"
                 ),
-                "serial": (
-                    "gpu-legacy-storage"
-                    if namespace == "storage"
-                    else "gpu-legacy-cache"
-                ),
+                "serial": ("gpu-legacy-storage" if namespace == "storage" else "gpu-legacy-cache"),
                 "source_identity": {
                     "schema": "chutes.gpu-hotplug-source-identity.v1",
                     "version": 1,
@@ -456,9 +450,7 @@ async def test_hotplug_ack_rejects_luks_identity_mismatch_before_commit():
         AsyncMock(return_value=None),
     ):
         with pytest.raises(GpuHotplugError, match="source identity differs"):
-            await record_gpu_hotplug_ack(
-                db, current_host, row.command_id, _failed_ack(row)
-            )
+            await record_gpu_hotplug_ack(db, current_host, row.command_id, _failed_ack(row))
 
     assert row.ack is None
     assert row.ack_sha256 is None

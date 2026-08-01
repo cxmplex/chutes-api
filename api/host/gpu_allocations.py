@@ -177,9 +177,7 @@ async def _stable_miner_identity(
         db.add(identity)
         await db.flush()
     elif identity.owner_hotkey != host.miner_hotkey:
-        raise GpuAllocationError(
-            "Stable GPU miner identity belongs to another host owner."
-        )
+        raise GpuAllocationError("Stable GPU miner identity belongs to another host owner.")
     elif legacy_vm_name is not None and legacy_vm_name != identity.legacy_vm_name:
         raise GpuAllocationError(
             "Stable GPU miner identity cannot change its legacy migration source."
@@ -187,10 +185,7 @@ async def _stable_miner_identity(
     server = await db.get(Server, identity.server_id)
     if server is not None and (
         server.miner_hotkey != host.miner_hotkey
-        or (
-            server.gpu_retired_at is None
-            and server.gpu_launch_reservation_id is not None
-        )
+        or (server.gpu_retired_at is None and server.gpu_launch_reservation_id is not None)
     ):
         raise GpuAllocationError(
             "Stable GPU miner identity still has an active or conflicting server lineage."
@@ -217,16 +212,12 @@ async def _require_resumable_legacy_migration(
     ).scalar_one_or_none()
     target_server = (
         await db.execute(
-            select(Server)
-            .where(Server.server_id == migration.target_server_id)
-            .with_for_update()
+            select(Server).where(Server.server_id == migration.target_server_id).with_for_update()
         )
     ).scalar_one_or_none()
     legacy_server = (
         await db.execute(
-            select(Server)
-            .where(Server.server_id == migration.legacy_server_id)
-            .with_for_update()
+            select(Server).where(Server.server_id == migration.legacy_server_id).with_for_update()
         )
     ).scalar_one_or_none()
     if custody is None:
@@ -247,9 +238,7 @@ async def _require_resumable_legacy_migration(
                 .where(
                     GpuLifecycleOperation.reservation_id
                     == (
-                        prior_reservation.reservation_id
-                        if prior_reservation is not None
-                        else None
+                        prior_reservation.reservation_id if prior_reservation is not None else None
                     ),
                     GpuLifecycleOperation.result_outcome == "accepted",
                     GpuLifecycleOperation.phase.in_(("finalized", "quarantined")),
@@ -317,9 +306,7 @@ async def _require_resumable_legacy_migration(
         or any(key in floors for key in ("storage", "tdx-cache"))
         or any(key in leases for key in ("storage", "tdx-cache"))
     ):
-        raise GpuAllocationError(
-            "Prior target teardown or legacy dual-reader fence is not exact."
-        )
+        raise GpuAllocationError("Prior target teardown or legacy dual-reader fence is not exact.")
 
 
 async def _active_gpu_release(
@@ -354,9 +341,7 @@ async def _active_gpu_release(
     try:
         provenance = load_canonical_provenance(payload)
     except ProvenanceError as exc:
-        raise GpuAllocationError(
-            f"Active GPU release provenance is not trusted: {exc}"
-        ) from exc
+        raise GpuAllocationError(f"Active GPU release provenance is not trusted: {exc}") from exc
     if (
         provenance.get("schema_version") != 3
         or provenance.get("compute_type") != "gpu"
@@ -445,9 +430,7 @@ def _platform_workload_identity(
         container_repository=image_ref.rsplit(":", 1)[0],
         container_manifest_digest=manifest_digest,
         ref_str=chute.ref_str,
-        chutes_version=(
-            job.chutes_version if job is not None else chute.chutes_version
-        ),
+        chutes_version=(job.chutes_version if job is not None else chute.chutes_version),
         allow_external_egress=bool(chute.allow_external_egress),
         lock_modules=bool(chute.standard_template or chute.lock_modules),
         disk_gb=(
@@ -473,13 +456,9 @@ def _validated_platform_workload_identity(
             raise GpuAllocationError("Miner GPU reservation carries platform workload identity.")
         return None
     try:
-        identity = GpuPlatformWorkloadIdentityV1.model_validate(
-            reservation.workload_identity
-        )
+        identity = GpuPlatformWorkloadIdentityV1.model_validate(reservation.workload_identity)
     except (TypeError, ValueError) as exc:
-        raise GpuAllocationError(
-            "Persisted platform GPU workload identity is malformed."
-        ) from exc
+        raise GpuAllocationError("Persisted platform GPU workload identity is malformed.") from exc
     if (
         not reservation.workload_identity_sha256
         or not secrets.compare_digest(
@@ -491,8 +470,7 @@ def _validated_platform_workload_identity(
         or identity.job_id != reservation.job_id
         or identity.chute_version != reservation.chute_version
         or identity.container_repository != reservation.container_repository
-        or identity.container_manifest_digest
-        != reservation.container_manifest_digest
+        or identity.container_manifest_digest != reservation.container_manifest_digest
     ):
         raise GpuAllocationError(
             "Persisted platform GPU workload identity does not match its reservation."
@@ -513,9 +491,7 @@ async def _trusted_platform_workload(
         await db.execute(select(Chute).where(Chute.chute_id == request.chute_id))
     ).scalar_one_or_none()
     if chute is None or not chute.tee or chute.disabled:
-        raise GpuAllocationError(
-            "Platform GPU reservation requires an enabled TEE chute."
-        )
+        raise GpuAllocationError("Platform GPU reservation requires an enabled TEE chute.")
     image = (
         await db.execute(select(Image).where(Image.image_id == chute.image_id))
     ).scalar_one_or_none()
@@ -525,9 +501,7 @@ async def _trusted_platform_workload(
         or image.user_id != chute.user_id
         or image.status != "built and pushed"
     ):
-        raise GpuAllocationError(
-            "Chute GPU image is not a completed validator-owned build."
-        )
+        raise GpuAllocationError("Chute GPU image is not a completed validator-owned build.")
     job = None
     if request.job_id is not None:
         job = (
@@ -545,11 +519,7 @@ async def _trusted_platform_workload(
             )
     try:
         selector = NodeSelector(
-            **(
-                job.node_selector
-                if job is not None and job.node_selector
-                else chute.node_selector
-            )
+            **(job.node_selector if job is not None and job.node_selector else chute.node_selector)
         )
     except ValueError as exc:
         raise GpuAllocationError("GPU workload selector is malformed.") from exc
@@ -566,13 +536,9 @@ async def _trusted_platform_workload(
     repository = image_ref.rsplit(":", 1)[0]
     assert_gpu_external_work_allowed(db, "registry image digest resolution")
     try:
-        manifest_digest = await get_image_digest(
-            f"{settings.registry_host}/{image_ref}"
-        )
+        manifest_digest = await get_image_digest(f"{settings.registry_host}/{image_ref}")
     except Exception as exc:
-        raise GpuAllocationError(
-            "Validator could not resolve the chute image digest."
-        ) from exc
+        raise GpuAllocationError("Validator could not resolve the chute image digest.") from exc
     from api.registry.oci import OciClosureError, resolve_oci_descriptor_closure
 
     assert_gpu_external_work_allowed(db, "OCI descriptor closure resolution")
@@ -628,9 +594,7 @@ async def _assert_platform_workload_current(
         )
     ).scalar_one_or_none()
     if chute is None or not chute.tee or chute.disabled:
-        raise GpuAllocationError(
-            "Platform GPU reservation requires an enabled TEE chute."
-        )
+        raise GpuAllocationError("Platform GPU reservation requires an enabled TEE chute.")
     image = (
         await db.execute(
             select(Image)
@@ -646,9 +610,7 @@ async def _assert_platform_workload_current(
         or image.user_id != chute.user_id
         or image.status != "built and pushed"
     ):
-        raise GpuAllocationError(
-            "Chute GPU image changed during descriptor resolution."
-        )
+        raise GpuAllocationError("Chute GPU image changed during descriptor resolution.")
     job = None
     if request.job_id is not None:
         job = (
@@ -670,11 +632,7 @@ async def _assert_platform_workload_current(
             raise GpuAllocationError("GPU job changed during descriptor resolution.")
     try:
         selector = NodeSelector(
-            **(
-                job.node_selector
-                if job is not None and job.node_selector
-                else chute.node_selector
-            )
+            **(job.node_selector if job is not None and job.node_selector else chute.node_selector)
         )
     except ValueError as exc:
         raise GpuAllocationError("GPU workload selector is malformed.") from exc
@@ -769,21 +727,13 @@ def _profile_for_report(
         or group.model == "B300"
         or any(device.gpu_identifier == "b300" for device in group.devices)
     ):
-        raise GpuAllocationError(
-            "B300 inventory is uncharacterized and cannot enter allocation."
-        )
+        raise GpuAllocationError("B300 inventory is uncharacterized and cannot enter allocation.")
     profile = next(
-        (
-            item
-            for item in contract["profiles"]
-            if item["id"] == group.reported_profile_id
-        ),
+        (item for item in contract["profiles"] if item["id"] == group.reported_profile_id),
         None,
     )
     if profile is None:
-        raise GpuAllocationError(
-            "Inventory cannot select a profile absent from signed provenance."
-        )
+        raise GpuAllocationError("Inventory cannot select a profile absent from signed provenance.")
     allocation = profile["allocation"]
     if allocation != {
         "kind": "whole-fabric",
@@ -814,23 +764,16 @@ def _profile_for_report(
         group.host_numa_nodes != topology["host_numa_nodes"]
         or len(group.nvswitches) != topology["nvswitch_count"]
         or len(group.infiniband_devices) != topology["infiniband_count"]
-        or any(
-            item.link_count != topology["nvlink_links_per_pair"]
-            for item in group.nvlink_edges
-        )
+        or any(item.link_count != topology["nvlink_links_per_pair"] for item in group.nvlink_edges)
     ):
         raise GpuAllocationError(
             "Inventory host NUMA/NVSwitch/InfiniBand dimensions differ from signed profile."
         )
     if topology["kind"] == "numa-pxb":
         if observed_nodes != topology["gpu_numa_nodes"]:
-            raise GpuAllocationError(
-                "Inventory GPU NUMA topology does not match signed profile."
-            )
+            raise GpuAllocationError("Inventory GPU NUMA topology does not match signed profile.")
     elif len(devices) != profile["gpu_count"]:
-        raise GpuAllocationError(
-            "Flat GPU topology count does not match signed profile."
-        )
+        raise GpuAllocationError("Flat GPU topology count does not match signed profile.")
     return profile
 
 
@@ -840,11 +783,7 @@ def _l0_gpu_profile_id(
 ) -> str:
     profile_id = manifest.get("gpu_profile_id")
     environment = next(
-        (
-            item
-            for item in provenance["launch_environments"]
-            if item["profile_id"] == profile_id
-        ),
+        (item for item in provenance["launch_environments"] if item["profile_id"] == profile_id),
         None,
     )
     if (
@@ -888,8 +827,7 @@ def _validate_resource_budget(
     ):
         raise GpuAllocationError("GPU profile exceeds QEMU integer limits.")
     if (
-        resources.storage_vcpus + resources.l0_reserved_vcpus
-        > signed_host["reserved_logical_cpus"]
+        resources.storage_vcpus + resources.l0_reserved_vcpus > signed_host["reserved_logical_cpus"]
         or guest["vcpus"] + resources.storage_vcpus + resources.l0_reserved_vcpus
         > resources.logical_cpus
     ):
@@ -1157,9 +1095,7 @@ async def _quarantine_group_reservations(
         operation,
         operation_reservation,
         phase_two_preserved,
-    ) = await _terminalize_lifecycle_before_quarantine(
-        db, group, code=code, reason=reason, now=now
-    )
+    ) = await _terminalize_lifecycle_before_quarantine(db, group, code=code, reason=reason, now=now)
     if phase_two_preserved:
         return
     reservations = (
@@ -1167,8 +1103,7 @@ async def _quarantine_group_reservations(
             await db.execute(
                 select(GpuLaunchReservation)
                 .where(
-                    GpuLaunchReservation.allocation_group_id
-                    == group.allocation_group_id,
+                    GpuLaunchReservation.allocation_group_id == group.allocation_group_id,
                     GpuLaunchReservation.state.in_(_ACTIVE_RESERVATION_STATES),
                 )
                 .order_by(GpuLaunchReservation.reservation_generation)
@@ -1179,8 +1114,7 @@ async def _quarantine_group_reservations(
         .all()
     )
     if operation_reservation is not None and all(
-        item.reservation_id != operation_reservation.reservation_id
-        for item in reservations
+        item.reservation_id != operation_reservation.reservation_id for item in reservations
     ):
         reservations.append(operation_reservation)
     for reservation in reservations:
@@ -1249,8 +1183,7 @@ async def fence_gpu_host_authority(
                 await db.execute(
                     select(GpuLaunchReservation)
                     .where(
-                        GpuLaunchReservation.allocation_group_id
-                        == group.allocation_group_id,
+                        GpuLaunchReservation.allocation_group_id == group.allocation_group_id,
                         GpuLaunchReservation.state.in_(_ACTIVE_RESERVATION_STATES),
                     )
                     .order_by(GpuLaunchReservation.reservation_generation)
@@ -1261,8 +1194,7 @@ async def fence_gpu_host_authority(
             .all()
         )
         if operation_reservation is not None and all(
-            item.reservation_id != operation_reservation.reservation_id
-            for item in reservations
+            item.reservation_id != operation_reservation.reservation_id for item in reservations
         ):
             reservations.append(operation_reservation)
         for reservation in reservations:
@@ -1327,9 +1259,7 @@ async def advance_gpu_host_boot(
         raise GpuAllocationError("GPU host key generation changed during registration.")
     if host.boot_id == boot_id:
         if int(host.boot_generation or 0) < 1:
-            raise GpuAllocationError(
-                "GPU host has an invalid persisted boot generation."
-            )
+            raise GpuAllocationError("GPU host has an invalid persisted boot generation.")
         return int(host.boot_generation)
 
     now = _utcnow()
@@ -1370,8 +1300,7 @@ async def advance_gpu_host_boot(
                 select(GpuLifecycleOperation)
                 .where(
                     GpuLifecycleOperation.host_id == host.host_id,
-                    GpuLifecycleOperation.host_key_generation
-                    == host.active_key_generation,
+                    GpuLifecycleOperation.host_key_generation == host.active_key_generation,
                     GpuLifecycleOperation.phase.notin_(("finalized", "quarantined")),
                 )
                 .with_for_update()
@@ -1395,8 +1324,7 @@ async def advance_gpu_host_boot(
             operation.allocation_group_generation,
         ): operation
         for operation in nonterminal_operations
-        if operation.operation_type
-        in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
+        if operation.operation_type in {"ownerless_group_recovery", "forced_dead_guest_recovery"}
     }
     groups_by_id = {item.allocation_group_id: item for item in groups}
     reservations_by_id = {item.reservation_id: item for item in reservations}
@@ -1440,9 +1368,7 @@ async def advance_gpu_host_boot(
         )
 
     async def _close_old_boot_recovery(group: GpuAllocationGroup) -> bool:
-        operation = recovery_operations.get(
-            (group.allocation_group_id, group.generation)
-        )
+        operation = recovery_operations.get((group.allocation_group_id, group.generation))
         if operation is None:
             return False
         if operation.phase in {
@@ -1505,9 +1431,7 @@ async def advance_gpu_host_boot(
                 reservation,
                 group,
                 code="gpu_recovery_host_boot_changed",
-                reason=(
-                    "GPU host rebooted before the authorized recovery reached final release."
-                ),
+                reason=("GPU host rebooted before the authorized recovery reached final release."),
                 metadata={
                     "operation_id": operation.operation_id,
                     "previous_boot_id": host.boot_id,
@@ -1525,9 +1449,7 @@ async def advance_gpu_host_boot(
             _quarantine_group(
                 group,
                 code="gpu_recovery_host_boot_changed",
-                reason=(
-                    "GPU host rebooted before the authorized recovery reached final release."
-                ),
+                reason=("GPU host rebooted before the authorized recovery reached final release."),
                 metadata={
                     "operation_id": operation.operation_id,
                     "previous_boot_id": host.boot_id,
@@ -1562,12 +1484,9 @@ async def advance_gpu_host_boot(
             await db.execute(
                 select(GpuRecoveryAuthorization)
                 .where(
-                    GpuRecoveryAuthorization.authorization_id
-                    == group.recovery_authorization_id,
-                    GpuRecoveryAuthorization.allocation_group_id
-                    == group.allocation_group_id,
-                    GpuRecoveryAuthorization.allocation_group_generation
-                    == group.generation,
+                    GpuRecoveryAuthorization.authorization_id == group.recovery_authorization_id,
+                    GpuRecoveryAuthorization.allocation_group_id == group.allocation_group_id,
+                    GpuRecoveryAuthorization.allocation_group_generation == group.generation,
                 )
                 .with_for_update()
             )
@@ -1613,14 +1532,11 @@ async def advance_gpu_host_boot(
             and authorization.inventory_report_id == group.recovery_report_id
             and authorization.recovery_nonce_hash == group.recovery_nonce_hash
             and authorization.reservation_id == reservation.reservation_id
-            and authorization.reservation_generation
-            == reservation.reservation_generation
+            and authorization.reservation_generation == reservation.reservation_generation
             and authorization.claims_sha256 == reservation.claims_sha256
             and authorization.process_incarnation == reservation.process_incarnation
-            and authorization.prior_host_key_generation
-            == reservation.host_key_generation
-            and authorization.prior_host_boot_generation
-            == reservation.host_boot_generation
+            and authorization.prior_host_key_generation == reservation.host_key_generation
+            and authorization.prior_host_boot_generation == reservation.host_boot_generation
             and group.host_id == host.host_id
             and group.host_key_generation == host.active_key_generation
             and group.host_boot_generation <= host.boot_generation
@@ -1648,9 +1564,7 @@ async def advance_gpu_host_boot(
                     reservation,
                     group,
                     code="host_boot_changed_with_ownership",
-                    reason=(
-                        "Logical host boot changed while PCI ownership was not proven reset."
-                    ),
+                    reason=("Logical host boot changed while PCI ownership was not proven reset."),
                     metadata={"previous_boot_id": host.boot_id, "new_boot_id": boot_id},
                     now=now,
                 )
@@ -1679,9 +1593,7 @@ async def advance_gpu_host_boot(
             db,
             group,
             code="host_boot_changed_with_ambiguous_state",
-            reason=(
-                "Logical host boot changed without an exact resumable reset journal."
-            ),
+            reason=("Logical host boot changed without an exact resumable reset journal."),
             now=now,
         )
         if group.state in {"discovered", "available", "reserved"} and not any(
@@ -1757,8 +1669,7 @@ async def _expire_locked_reservations(
                 await db.execute(
                     select(GpuLaunchReservation)
                     .where(
-                        GpuLaunchReservation.allocation_group_id
-                        == group.allocation_group_id,
+                        GpuLaunchReservation.allocation_group_id == group.allocation_group_id,
                         GpuLaunchReservation.state.in_(_LAUNCH_DEADLINE_STATES),
                         GpuLaunchReservation.expires_at <= now,
                     )
@@ -1790,9 +1701,7 @@ async def _expire_locked_reservations(
                         group.reserved_at = None
                         group.updated_at = now
                 else:
-                    reservation.teardown_requested_at = (
-                        reservation.teardown_requested_at or now
-                    )
+                    reservation.teardown_requested_at = reservation.teardown_requested_at or now
                     reservation.teardown_reason = (
                         reservation.teardown_reason
                         or "GPU launch reservation expired after command dispatch."
@@ -1801,16 +1710,11 @@ async def _expire_locked_reservations(
                         (reservation.reservation_id, "pre_slot_claim_quarantine")
                     )
             elif reservation.state in {"claimed", "launching"}:
-                reservation.teardown_requested_at = (
-                    reservation.teardown_requested_at or now
-                )
+                reservation.teardown_requested_at = reservation.teardown_requested_at or now
                 reservation.teardown_reason = (
-                    reservation.teardown_reason
-                    or "GPU launch deadline expired after host claim."
+                    reservation.teardown_reason or "GPU launch deadline expired after host claim."
                 )
-                lifecycle_operations.append(
-                    (reservation.reservation_id, "launch_rollback")
-                )
+                lifecycle_operations.append((reservation.reservation_id, "launch_rollback"))
     if lifecycle_operations:
         from api.gpu_lifecycle_service import (
             ensure_reservation_lifecycle_operation,
@@ -1848,9 +1752,7 @@ async def reconcile_gpu_inventory(
         or report.host_boot_id != host.boot_id
         or report.host_boot_generation != host.boot_generation
     ):
-        raise GpuAllocationError(
-            "GPU inventory host/key/boot generation is stale or mismatched."
-        )
+        raise GpuAllocationError("GPU inventory host/key/boot generation is stale or mismatched.")
     expected_generation = int(host.gpu_inventory_report_generation or 0) + 1
     if report.report_generation != expected_generation:
         raise GpuAllocationError(
@@ -1950,9 +1852,7 @@ async def reconcile_gpu_inventory(
         ).append(operation)
 
     def _exact_reset_journal(group: GpuAllocationGroup) -> bool:
-        matches = operations_by_group.get(
-            (group.allocation_group_id, group.generation), []
-        )
+        matches = operations_by_group.get((group.allocation_group_id, group.generation), [])
         if len(matches) != 1:
             return False
         operation = matches[0]
@@ -1988,9 +1888,7 @@ async def reconcile_gpu_inventory(
     if protected:
         allocation_group = protected[0]
         protected_values = (
-            _group_values(report, profile)
-            if status == "accepted" and profile is not None
-            else None
+            _group_values(report, profile) if status == "accepted" and profile is not None else None
         )
         closure_matches = bool(
             len(protected) == 1
@@ -1999,8 +1897,7 @@ async def reconcile_gpu_inventory(
             and allocation_group.topology_fingerprint == topology_fingerprint
             and allocation_group.gpu_release_id == report.gpu_release_id
             and all(
-                getattr(allocation_group, key) == value
-                for key, value in protected_values.items()
+                getattr(allocation_group, key) == value for key, value in protected_values.items()
             )
         )
         if not closure_matches:
@@ -2013,9 +1910,7 @@ async def reconcile_gpu_inventory(
                 (allocation_group.allocation_group_id, allocation_group.generation),
                 [],
             )
-            operation = (
-                matching_operations[0] if len(matching_operations) == 1 else None
-            )
+            operation = matching_operations[0] if len(matching_operations) == 1 else None
             if allocation_group.state == "recovery_required":
                 # The finalized operation and its response bytes are immutable.
                 # Revoke only the completed recovery authorization and fence the
@@ -2039,10 +1934,7 @@ async def reconcile_gpu_inventory(
                     (
                         await db.execute(
                             select(GpuLifecycleOperation)
-                            .where(
-                                GpuLifecycleOperation.operation_id
-                                == authorization.operation_id
-                            )
+                            .where(GpuLifecycleOperation.operation_id == authorization.operation_id)
                             .with_for_update()
                         )
                     ).scalar_one_or_none()
@@ -2053,8 +1945,7 @@ async def reconcile_gpu_inventory(
                     revoked = (
                         await db.execute(
                             select(GpuRecoveryEvent.event_id).where(
-                                GpuRecoveryEvent.operation_id
-                                == completed_operation.operation_id,
+                                GpuRecoveryEvent.operation_id == completed_operation.operation_id,
                                 GpuRecoveryEvent.state == "revoked",
                             )
                         )
@@ -2067,14 +1958,10 @@ async def reconcile_gpu_inventory(
                                 operation_id=completed_operation.operation_id,
                                 state="revoked",
                                 reset_result=completed_operation.physical_result,
-                                reset_result_sha256=(
-                                    completed_operation.physical_result_sha256
-                                ),
+                                reset_result_sha256=(completed_operation.physical_result_sha256),
                                 receipt_id=completed_operation.receipt_id,
                                 receipt_sha256=completed_operation.receipt_sha256,
-                                local_release_ack=(
-                                    completed_operation.local_release_ack
-                                ),
+                                local_release_ack=(completed_operation.local_release_ack),
                                 local_release_ack_sha256=(
                                     completed_operation.local_release_ack_sha256
                                 ),
@@ -2158,8 +2045,7 @@ async def reconcile_gpu_inventory(
                 quarantine_closure_matches = bool(
                     allocation_group.gpu_release_id == report.gpu_release_id
                     and all(
-                        getattr(allocation_group, key) == value
-                        for key, value in values.items()
+                        getattr(allocation_group, key) == value for key, value in values.items()
                     )
                 )
                 status = "quarantined"
@@ -2187,8 +2073,7 @@ async def reconcile_gpu_inventory(
                 }
                 if (
                     allocation_group.host_key_generation != report.host_key_generation
-                    or allocation_group.host_boot_generation
-                    != report.host_boot_generation
+                    or allocation_group.host_boot_generation != report.host_boot_generation
                     or allocation_group.gpu_release_id != report.gpu_release_id
                 ):
                     immutable_mismatch["lineage"] = (
@@ -2248,9 +2133,7 @@ async def reconcile_gpu_inventory(
                         item,
                         code="inventory_changed_with_non_idle_group",
                         reason=reason,
-                        metadata={
-                            "reported_topology_fingerprint": topology_fingerprint
-                        },
+                        metadata={"reported_topology_fingerprint": topology_fingerprint},
                         now=now,
                     )
             allocation_group = non_idle[0]
@@ -2321,9 +2204,7 @@ async def reconcile_gpu_inventory(
         host_boot_generation=report.host_boot_generation,
         status=status,
         allocation_group_id=(
-            allocation_group.allocation_group_id
-            if allocation_group is not None
-            else None
+            allocation_group.allocation_group_id if allocation_group is not None else None
         ),
         allocation_group_generation=(
             allocation_group.generation if allocation_group is not None else None
@@ -2333,9 +2214,7 @@ async def reconcile_gpu_inventory(
     )
 
 
-def gpu_reservation_token(
-    reservation_id: str, expected_hash: Optional[str] = None
-) -> str:
+def gpu_reservation_token(reservation_id: str, expected_hash: Optional[str] = None) -> str:
     """Reconstruct one reservation capability for idempotent command retries.
 
     Only the validator can derive the token because the HMAC key is the existing
@@ -2513,10 +2392,7 @@ async def _replay_reclaimed_gpu_group(
     group = (
         await db.execute(
             select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.allocation_group_id
-                == authorization.allocation_group_id
-            )
+            .where(GpuAllocationGroup.allocation_group_id == authorization.allocation_group_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -2541,8 +2417,7 @@ async def _replay_reclaimed_gpu_group(
                 GpuInventoryReport.host_id == host.host_id,
                 GpuInventoryReport.host_key_generation == host.active_key_generation,
                 GpuInventoryReport.host_boot_generation == host.boot_generation,
-                GpuInventoryReport.report_generation
-                == host.gpu_inventory_report_generation,
+                GpuInventoryReport.report_generation == host.gpu_inventory_report_generation,
             )
             .with_for_update()
         )
@@ -2620,25 +2495,17 @@ async def _replay_reclaimed_gpu_group(
             and group.topology_fingerprint != expected_topology_fingerprint
         )
     ):
-        raise GpuAllocationError(
-            "GPU forced-recovery reclaim replay is stale or conflicting."
-        )
+        raise GpuAllocationError("GPU forced-recovery reclaim replay is stale or conflicting.")
     claims = _validate_row_claims(reservation)
     if claims.miner_hourly_cost != request.miner_hourly_cost:
-        raise GpuAllocationError(
-            "GPU forced-recovery reclaim replay is stale or conflicting."
-        )
-    token = gpu_reservation_token(
-        reservation.reservation_id, expected_hash=reservation.token_hash
-    )
+        raise GpuAllocationError("GPU forced-recovery reclaim replay is stale or conflicting.")
+    token = gpu_reservation_token(reservation.reservation_id, expected_hash=reservation.token_hash)
     response = GpuLaunchReservationResponseV1(
         token=token,
         claims=claims,
         claims_sha256=reservation.claims_sha256,
     )
-    if not hmac.compare_digest(
-        event.reclaim_response_sha256 or "", canonical_sha256(response)
-    ):
+    if not hmac.compare_digest(event.reclaim_response_sha256 or "", canonical_sha256(response)):
         raise GpuAllocationError("GPU forced-recovery reclaim replay bytes changed.")
     return response
 
@@ -2656,9 +2523,7 @@ async def reserve_gpu_group(
     expected_inventory_report_sha256: Optional[str] = None,
     recovery_authorization_id: Optional[str] = None,
     observed_live_storage_ids: Optional[set[str]] = None,
-    trusted_platform_workload: Optional[
-        tuple[str, str, str, str, str, dict[str, Any]]
-    ] = None,
+    trusted_platform_workload: Optional[tuple[str, str, str, str, str, dict[str, Any]]] = None,
 ) -> GpuLaunchReservationResponseV1:
     """Lock one exact available group and create its capability in one transaction."""
 
@@ -2667,9 +2532,7 @@ async def reserve_gpu_group(
     )
     if recovery_authorization_id is not None and management_mode != "miner":
         raise GpuAllocationError("GPU forced-recovery reclaim is miner-managed only.")
-    if (expected_inventory_report_id is None) != (
-        expected_inventory_report_sha256 is None
-    ):
+    if (expected_inventory_report_id is None) != (expected_inventory_report_sha256 is None):
         raise GpuAllocationError(
             "GPU reservation inventory CAS requires both report ID and digest."
         )
@@ -2800,10 +2663,7 @@ async def reserve_gpu_group(
         authorization = (
             await db.execute(
                 select(GpuRecoveryAuthorization)
-                .where(
-                    GpuRecoveryAuthorization.authorization_id
-                    == recovery_authorization_id
-                )
+                .where(GpuRecoveryAuthorization.authorization_id == recovery_authorization_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -2819,9 +2679,7 @@ async def reserve_gpu_group(
         old_reservation = (
             await db.execute(
                 select(GpuLaunchReservation)
-                .where(
-                    GpuLaunchReservation.reservation_id == authorization.reservation_id
-                )
+                .where(GpuLaunchReservation.reservation_id == authorization.reservation_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -2869,9 +2727,7 @@ async def reserve_gpu_group(
             None,
             authorization.allocation_group_id,
         }:
-            raise GpuAllocationError(
-                "GPU reclaim changed its authorized allocation group."
-            )
+            raise GpuAllocationError("GPU reclaim changed its authorized allocation group.")
         expected_allocation_group_id = authorization.allocation_group_id
         if (
             operation is None
@@ -2892,14 +2748,11 @@ async def reserve_gpu_group(
             or authorization.management_mode != "miner"
             or authorization.migration_id != legacy_migration_id
             or authorization.reservation_id != old_reservation.reservation_id
-            or authorization.reservation_generation
-            != old_reservation.reservation_generation
+            or authorization.reservation_generation != old_reservation.reservation_generation
             or authorization.claims_sha256 != old_reservation.claims_sha256
             or authorization.process_incarnation != old_reservation.process_incarnation
-            or authorization.prior_host_key_generation
-            != old_reservation.host_key_generation
-            or authorization.prior_host_boot_generation
-            != old_reservation.host_boot_generation
+            or authorization.prior_host_key_generation != old_reservation.host_key_generation
+            or authorization.prior_host_boot_generation != old_reservation.host_boot_generation
             or old_reservation.state != "quarantined"
             or old_reservation.failure_code != "gpu_forced_recovery_required"
             or old_reservation.failure_metadata
@@ -2911,9 +2764,7 @@ async def reserve_gpu_group(
             or report.report_id != authorization.inventory_report_id
             or report.claims_sha256 != authorization.inventory_report_sha256
         ):
-            raise GpuAllocationError(
-                "GPU forced-recovery reclaim lineage is stale or incomplete."
-            )
+            raise GpuAllocationError("GPU forced-recovery reclaim lineage is stale or incomplete.")
         reclaim_context = {
             "authorization": authorization,
             "operation": operation,
@@ -2927,24 +2778,16 @@ async def reserve_gpu_group(
                 select(GpuAllocationGroup)
                 .where(
                     GpuAllocationGroup.host_id == host.host_id,
-                    GpuAllocationGroup.host_key_generation
-                    == host.active_key_generation,
+                    GpuAllocationGroup.host_key_generation == host.active_key_generation,
                     GpuAllocationGroup.host_boot_generation == host.boot_generation,
                     GpuAllocationGroup.gpu_release_id == release.release_id,
                     GpuAllocationGroup.profile_id == l0_profile_id,
                     GpuAllocationGroup.state
-                    == (
-                        "recovery_required"
-                        if reclaim_context is not None
-                        else "available"
-                    ),
+                    == ("recovery_required" if reclaim_context is not None else "available"),
                     GpuAllocationGroup.gpu_count == request.gpu_count,
                     GpuAllocationGroup.vram_mib >= request.minimum_vram_mib,
                     *(
-                        (
-                            GpuAllocationGroup.allocation_group_id
-                            == expected_allocation_group_id,
-                        )
+                        (GpuAllocationGroup.allocation_group_id == expected_allocation_group_id,)
                         if expected_allocation_group_id is not None
                         else ()
                     ),
@@ -2954,10 +2797,7 @@ async def reserve_gpu_group(
                         else ()
                     ),
                     *(
-                        (
-                            GpuAllocationGroup.topology_fingerprint
-                            == expected_topology_fingerprint,
-                        )
+                        (GpuAllocationGroup.topology_fingerprint == expected_topology_fingerprint,)
                         if expected_topology_fingerprint is not None
                         else ()
                     ),
@@ -2973,11 +2813,7 @@ async def reserve_gpu_group(
         .all()
     )
     group = next(
-        (
-            item
-            for item in groups
-            if set(item.gpu_identifiers) == {request.gpu_identifier}
-        ),
+        (item for item in groups if set(item.gpu_identifiers) == {request.gpu_identifier}),
         None,
     )
     if group is None:
@@ -2988,11 +2824,9 @@ async def reserve_gpu_group(
                 select(GpuInventoryReport)
                 .where(
                     GpuInventoryReport.host_id == host.host_id,
-                    GpuInventoryReport.host_key_generation
-                    == host.active_key_generation,
+                    GpuInventoryReport.host_key_generation == host.active_key_generation,
                     GpuInventoryReport.host_boot_generation == host.boot_generation,
-                    GpuInventoryReport.report_generation
-                    == host.gpu_inventory_report_generation,
+                    GpuInventoryReport.report_generation == host.gpu_inventory_report_generation,
                 )
                 .with_for_update()
             )
@@ -3025,11 +2859,9 @@ async def reserve_gpu_group(
                 select(GpuInventoryReport)
                 .where(
                     GpuInventoryReport.host_id == host.host_id,
-                    GpuInventoryReport.host_key_generation
-                    == host.active_key_generation,
+                    GpuInventoryReport.host_key_generation == host.active_key_generation,
                     GpuInventoryReport.host_boot_generation == host.boot_generation,
-                    GpuInventoryReport.report_generation
-                    == host.gpu_inventory_report_generation,
+                    GpuInventoryReport.report_generation == host.gpu_inventory_report_generation,
                 )
                 .with_for_update()
             )
@@ -3063,9 +2895,7 @@ async def reserve_gpu_group(
             or operation.allocation_group_id != group.allocation_group_id
             or operation.allocation_group_generation != group.generation
         ):
-            raise GpuAllocationError(
-                "GPU recovery-required group changed before exact reclaim."
-            )
+            raise GpuAllocationError("GPU recovery-required group changed before exact reclaim.")
     profile = next(
         (
             item
@@ -3086,8 +2916,7 @@ async def reserve_gpu_group(
         (
             item
             for item in provenance["measurements"]
-            if item["profile_id"] == group.profile_id
-            and item["management_mode"] == management_mode
+            if item["profile_id"] == group.profile_id and item["management_mode"] == management_mode
         ),
         None,
     )
@@ -3104,9 +2933,7 @@ async def reserve_gpu_group(
             code="reservation_profile_evidence_mismatch",
             reason="Allocation group no longer matches active signed GPU provenance.",
         )
-        raise GpuAllocationError(
-            "GPU allocation group no longer matches active signed provenance."
-        )
+        raise GpuAllocationError("GPU allocation group no longer matches active signed provenance.")
     artifacts = provenance["artifacts"]
     release_target_sha256 = _gpu_release_target_sha256(
         release=release,
@@ -3136,9 +2963,7 @@ async def reserve_gpu_group(
         gpu_bdfs=list(group.gpu_bdfs),
         gpu_uuids=list(group.gpu_uuids),
         gpu_identifiers=list(group.gpu_identifiers),
-        gpu_attestation_certificate_sha256s=list(
-            group.gpu_attestation_certificate_sha256s
-        ),
+        gpu_attestation_certificate_sha256s=list(group.gpu_attestation_certificate_sha256s),
         topology_fingerprint=group.topology_fingerprint,
         gpu_release_id=release.release_id,
         gpu_profile_id=group.profile_id,
@@ -3160,15 +2985,9 @@ async def reserve_gpu_group(
         legacy_vm_name=legacy_vm_name,
         legacy_migration_id=legacy_migration_id,
         chute_id=(
-            request.chute_id
-            if isinstance(request, GpuPlatformReservationRequestV1)
-            else None
+            request.chute_id if isinstance(request, GpuPlatformReservationRequestV1) else None
         ),
-        job_id=(
-            request.job_id
-            if isinstance(request, GpuPlatformReservationRequestV1)
-            else None
-        ),
+        job_id=(request.job_id if isinstance(request, GpuPlatformReservationRequestV1) else None),
         container_repository=container_repository,
         container_manifest_digest=container_manifest_digest,
         descriptor_closure_sha256=descriptor_closure["descriptor_closure_sha256"],
@@ -3177,9 +2996,7 @@ async def reserve_gpu_group(
         allowed_manifest_tags=descriptor_closure["allowed_manifest_tags"],
         manifest_tag_digests=descriptor_closure["manifest_tag_digests"],
         miner_hourly_cost=(
-            request.miner_hourly_cost
-            if isinstance(request, GpuMinerReservationRequestV1)
-            else None
+            request.miner_hourly_cost if isinstance(request, GpuMinerReservationRequestV1) else None
         ),
         launch_nonce=base64.b64encode(
             hmac.new(
@@ -3221,9 +3038,7 @@ async def reserve_gpu_group(
         gpu_bdfs=list(group.gpu_bdfs),
         gpu_uuids=list(group.gpu_uuids),
         gpu_identifiers=list(group.gpu_identifiers),
-        gpu_attestation_certificate_sha256s=list(
-            group.gpu_attestation_certificate_sha256s
-        ),
+        gpu_attestation_certificate_sha256s=list(group.gpu_attestation_certificate_sha256s),
         qemu_binary_sha256=environment["qemu_binary_sha256"],
         qemu_package_version=environment["qemu_package_version"],
         machine_type=environment["machine_type"],
@@ -3245,9 +3060,7 @@ async def reserve_gpu_group(
             else None
         ),
         workload_identity_sha256=(
-            canonical_sha256(workload_identity)
-            if workload_identity is not None
-            else None
+            canonical_sha256(workload_identity) if workload_identity is not None else None
         ),
         descriptor_closure_sha256=descriptor_closure["descriptor_closure_sha256"],
         allowed_manifests=descriptor_closure["allowed_manifests"],
@@ -3285,9 +3098,7 @@ async def reserve_gpu_group(
             )
         )
         if result.rowcount != 1:
-            raise GpuAllocationError(
-                "GPU job manager changed during reservation arbitration."
-            )
+            raise GpuAllocationError("GPU job manager changed during reservation arbitration.")
     if reclaim_context is not None:
         from api.gpu_contracts import GpuRecoveryEventV1
         from api.gpu_models import GpuRecoveryEvent
@@ -3296,9 +3107,7 @@ async def reserve_gpu_group(
         operation = reclaim_context["operation"]
         reclaim_time = _utcnow()
         if reclaim_request_sha256 is None:
-            raise GpuAllocationError(
-                "GPU forced-recovery reclaim request audit is incomplete."
-            )
+            raise GpuAllocationError("GPU forced-recovery reclaim request audit is incomplete.")
         reclaimed_event = GpuRecoveryEventV1(
             event_id=f"gpu-recovery-event-{generate_uuid()}",
             authorization_id=authorization.authorization_id,
@@ -3319,25 +3128,15 @@ async def reserve_gpu_group(
                 operation_id=reclaimed_event.operation_id,
                 state=reclaimed_event.state,
                 reclaim_reservation_id=reclaimed_event.reclaim_reservation_id,
-                reclaim_reservation_generation=(
-                    reclaimed_event.reclaim_reservation_generation
-                ),
+                reclaim_reservation_generation=(reclaimed_event.reclaim_reservation_generation),
                 reclaim_request_sha256=reclaim_request_sha256,
                 reclaim_response_sha256=canonical_sha256(response),
                 reclaim_replay_until=reclaim_time
                 + timedelta(seconds=_GPU_RECOVERY_RECLAIM_REPLAY_SECONDS),
-                current_inventory_report_id=(
-                    reclaimed_event.current_inventory_report_id
-                ),
-                current_inventory_report_sha256=(
-                    reclaimed_event.current_inventory_report_sha256
-                ),
-                current_host_key_generation=(
-                    reclaimed_event.current_host_key_generation
-                ),
-                current_host_boot_generation=(
-                    reclaimed_event.current_host_boot_generation
-                ),
+                current_inventory_report_id=(reclaimed_event.current_inventory_report_id),
+                current_inventory_report_sha256=(reclaimed_event.current_inventory_report_sha256),
+                current_host_key_generation=(reclaimed_event.current_host_key_generation),
+                current_host_boot_generation=(reclaimed_event.current_host_boot_generation),
                 created_at=reclaim_time,
                 updated_at=reclaim_time,
                 completed_at=reclaimed_event.completed_at,
@@ -3373,9 +3172,7 @@ def _validate_row_claims(
     try:
         claims = GpuLaunchReservationClaimsV1.model_validate(reservation.claims)
     except ValueError as exc:
-        raise GpuAllocationError(
-            "Persisted GPU reservation claims are malformed."
-        ) from exc
+        raise GpuAllocationError("Persisted GPU reservation claims are malformed.") from exc
     comparisons = {
         "reservation_id": reservation.reservation_id,
         "owner_hotkey": reservation.owner_hotkey,
@@ -3422,9 +3219,7 @@ def _validate_row_claims(
         != reservation.gpu_attestation_certificate_sha256s
         or canonical_sha256(claims) != reservation.claims_sha256
     ):
-        raise GpuAllocationError(
-            "Persisted GPU reservation row does not match canonical claims."
-        )
+        raise GpuAllocationError("Persisted GPU reservation row does not match canonical claims.")
     return claims
 
 
@@ -3446,9 +3241,7 @@ async def _locked_reservation_group(
     group = (
         await db.execute(
             select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.allocation_group_id == identity.allocation_group_id
-            )
+            .where(GpuAllocationGroup.allocation_group_id == identity.allocation_group_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
@@ -3461,10 +3254,7 @@ async def _locked_reservation_group(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    if (
-        reservation is None
-        or reservation.allocation_group_id != group.allocation_group_id
-    ):
+    if reservation is None or reservation.allocation_group_id != group.allocation_group_id:
         raise GpuAllocationError("GPU reservation changed during lock acquisition.")
     return reservation, group
 
@@ -3734,9 +3524,7 @@ async def _retire_gpu_runtime_lineage(
     instance_ids.extend(
         (
             await db.execute(
-                select(Instance.instance_id).where(
-                    Instance.server_id == server.server_id
-                )
+                select(Instance.instance_id).where(Instance.server_id == server.server_id)
             )
         )
         .scalars()
@@ -3747,10 +3535,7 @@ async def _retire_gpu_runtime_lineage(
         (
             await db.execute(
                 select(LaunchConfig.config_id)
-                .where(
-                    LaunchConfig.gpu_launch_reservation_id
-                    == reservation.reservation_id
-                )
+                .where(LaunchConfig.gpu_launch_reservation_id == reservation.reservation_id)
                 .order_by(LaunchConfig.config_id)
             )
         ).scalars()
@@ -3918,9 +3703,7 @@ async def record_gpu_command_dispatch(
     now = _utcnow()
     if command == "launch_gpu":
         if reservation.state not in {"reserved", "claimed", "launching"}:
-            raise GpuAllocationError(
-                "GPU launch command targets a non-launchable reservation."
-            )
+            raise GpuAllocationError("GPU launch command targets a non-launchable reservation.")
         if (
             reservation.launch_command_id is not None
             and reservation.launch_command_id != command_id
@@ -3940,16 +3723,12 @@ async def record_gpu_command_dispatch(
             "quarantined",
             "released",
         }:
-            raise GpuAllocationError(
-                "GPU teardown command targets a terminal reservation."
-            )
+            raise GpuAllocationError("GPU teardown command targets a terminal reservation.")
         if (
             reservation.teardown_command_id is not None
             and reservation.teardown_command_id != command_id
         ):
-            raise GpuAllocationError(
-                "GPU teardown retry changed its durable command id."
-            )
+            raise GpuAllocationError("GPU teardown retry changed its durable command id.")
         reservation.teardown_command_id = command_id
         reservation.teardown_dispatched_at = now
         reservation.teardown_ack_at = None
@@ -4057,8 +3836,7 @@ async def record_gpu_command_ack(
                     reservation.reservation_id,
                     operation_type=(
                         "pre_slot_claim_quarantine"
-                        if reservation.state == "reserved"
-                        and reservation.claimed_at is None
+                        if reservation.state == "reserved" and reservation.claimed_at is None
                         else None
                     ),
                 )
@@ -4107,9 +3885,7 @@ async def quarantine_gpu_reservation_control_plane(
         _operation,
         _operation_reservation,
         phase_two_preserved,
-    ) = await _terminalize_lifecycle_before_quarantine(
-        db, group, code=code, reason=reason, now=now
-    )
+    ) = await _terminalize_lifecycle_before_quarantine(db, group, code=code, reason=reason, now=now)
     if phase_two_preserved:
         await db.flush()
         return
@@ -4153,9 +3929,7 @@ async def quarantine_gpu_reservation(
         _operation,
         _operation_reservation,
         phase_two_preserved,
-    ) = await _terminalize_lifecycle_before_quarantine(
-        db, group, code=code, reason=reason, now=now
-    )
+    ) = await _terminalize_lifecycle_before_quarantine(db, group, code=code, reason=reason, now=now)
     if phase_two_preserved:
         await db.flush()
         return

@@ -24,8 +24,7 @@ MIGRATION = (
     / "api/migrations/20260714070000_release_attestation_identity.sql"
 )
 SEEDLESS_MIGRATION = (
-    Path(__file__).resolve().parents[2]
-    / "api/migrations/20260720200000_seedless_model_b.sql"
+    Path(__file__).resolve().parents[2] / "api/migrations/20260720200000_seedless_model_b.sql"
 )
 
 
@@ -121,8 +120,7 @@ async def test_sequence_backfill_and_reverse_commit_keep_latest_attempt_authorit
         migrated_order = [
             row["attestation_id"]
             for row in await admin.fetch(
-                "SELECT attestation_id FROM server_attestations "
-                "ORDER BY attempt_sequence"
+                "SELECT attestation_id FROM server_attestations ORDER BY attempt_sequence"
             )
         ]
         assert migrated_order == legacy_sequence_order
@@ -244,13 +242,10 @@ async def test_sequence_backfill_and_reverse_commit_keep_latest_attempt_authorit
 
         # Legacy ORM delete-orphan behavior issues child DELETEs before deleting Server. The DB
         # keeps those immutable rows as no-ops while allowing the operational parent to disappear.
-        await admin.execute(
-            "DELETE FROM server_attestations WHERE attestation_id = 'legacy-old'"
-        )
+        await admin.execute("DELETE FROM server_attestations WHERE attestation_id = 'legacy-old'")
         assert (
             await admin.fetchval(
-                "SELECT count(*) FROM server_attestations "
-                "WHERE attestation_id = 'legacy-old'"
+                "SELECT count(*) FROM server_attestations WHERE attestation_id = 'legacy-old'"
             )
             == 1
         )
@@ -264,9 +259,7 @@ async def test_sequence_backfill_and_reverse_commit_keep_latest_attempt_authorit
 
         # The next unshipped migration accepts the legacy-upgraded catalog, and both migrations
         # accept their own exact final catalog on re-entry without duplicating authority.
-        seedless_up = SEEDLESS_MIGRATION.read_text(encoding="utf-8").split(
-            "-- migrate:down", 1
-        )[0]
+        seedless_up = SEEDLESS_MIGRATION.read_text(encoding="utf-8").split("-- migrate:down", 1)[0]
         await admin.execute(seedless_up)
         await admin.execute(up)
         await admin.execute(seedless_up)

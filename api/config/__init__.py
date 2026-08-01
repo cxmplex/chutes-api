@@ -1147,8 +1147,7 @@ class Settings(BaseSettings):
         "GPU_REGISTRATION_RECOVERY_KEYS_JSON"
     )
     gpu_registration_allow_insecure_dev_key: bool = (
-        os.getenv("GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY", "false").lower()
-        == "true"
+        os.getenv("GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY", "false").lower() == "true"
     )
     gpu_registration_recovery_replica_id: str = os.getenv(
         "GPU_REGISTRATION_RECOVERY_REPLICA_ID",
@@ -1168,8 +1167,7 @@ class Settings(BaseSettings):
             # Tests and local validators receive a purpose-separated dev key. Production
             # never derives a ChuteFS key from a default or from the launch-JWT key.
             dev_key = hashlib.sha256(
-                b"chutes.dev.chutefs-token-key.v1\0"
-                + self.launch_config_key.encode("ascii")
+                b"chutes.dev.chutefs-token-key.v1\0" + self.launch_config_key.encode("ascii")
             ).hexdigest()
             keys = {"chutefs-dev-key-v1": dev_key}
         else:
@@ -1231,9 +1229,9 @@ class Settings(BaseSettings):
                 + self.launch_config_key.encode("ascii")
             ).digest()
             keys = {
-                "gpu-registration-dev-key-v1": base64.urlsafe_b64encode(
-                    dev_material
-                ).decode("ascii")
+                "gpu-registration-dev-key-v1": base64.urlsafe_b64encode(dev_material).decode(
+                    "ascii"
+                )
             }
         else:
 
@@ -1253,9 +1251,7 @@ class Settings(BaseSettings):
                     object_pairs_hook=unique_keyring,
                 )
             except json.JSONDecodeError as exc:
-                raise ValueError(
-                    "GPU_REGISTRATION_RECOVERY_KEYS_JSON must be valid JSON"
-                ) from exc
+                raise ValueError("GPU_REGISTRATION_RECOVERY_KEYS_JSON must be valid JSON") from exc
         if (
             not isinstance(keys, dict)
             or not keys
@@ -1273,21 +1269,15 @@ class Settings(BaseSettings):
                 "containing GPU_REGISTRATION_RECOVERY_KEY_ID"
             )
         cache_key = os.getenv("CACHE_PASSPHRASE_KEY")
-        if cache_key and any(
-            hmac.compare_digest(secret, cache_key) for secret in keys.values()
-        ):
-            raise ValueError(
-                "GPU registration recovery keys must not reuse CACHE_PASSPHRASE_KEY"
-            )
+        if cache_key and any(hmac.compare_digest(secret, cache_key) for secret in keys.values()):
+            raise ValueError("GPU registration recovery keys must not reuse CACHE_PASSPHRASE_KEY")
         chutefs_keys = self.chutefs_token_keys
         if any(
             hmac.compare_digest(secret, chutefs_secret)
             for secret in keys.values()
             for chutefs_secret in chutefs_keys.values()
         ):
-            raise ValueError(
-                "GPU registration recovery keys must not reuse a ChuteFS token key"
-            )
+            raise ValueError("GPU registration recovery keys must not reuse a ChuteFS token key")
         if (
             not isinstance(self.gpu_registration_recovery_replica_id, str)
             or re.fullmatch(

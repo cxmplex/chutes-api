@@ -228,9 +228,7 @@ def test_dispatch_builds_snapshot_payload_before_commit_and_never_reloads_mutabl
 
 def test_unshipped_scheduler_migration_owns_snapshot_columns_and_rollback_guard():
     root = Path(__file__).resolve().parents[2]
-    sql = (
-        root / "api/migrations/20260724100000_gpu_platform_scheduler.sql"
-    ).read_text()
+    sql = (root / "api/migrations/20260724100000_gpu_platform_scheduler.sql").read_text()
     assert "ADD COLUMN IF NOT EXISTS workload_identity JSONB" in sql
     assert "ADD COLUMN IF NOT EXISTS workload_identity_sha256 TEXT" in sql
     assert "jsonb_typeof(workload_identity) = 'object'" in sql

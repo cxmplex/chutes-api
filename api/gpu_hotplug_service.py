@@ -68,9 +68,7 @@ def _mark_retry_alert(
 def _emit_retry_alert(alert: Optional[dict[str, object]]) -> None:
     if alert is None:
         return
-    logger.bind(**alert).error(
-        "Durable GPU hotplug command exceeded the retry alert threshold."
-    )
+    logger.bind(**alert).error("Durable GPU hotplug command exceeded the retry alert threshold.")
 
 
 def _command_from_row(row: GpuHotplugCommand) -> GpuHotplugCommandV1:
@@ -165,16 +163,13 @@ async def require_gpu_hotplug_runtime_ack(
     expected = _new_command(reservation)
     row = (
         await db.execute(
-            select(GpuHotplugCommand).where(
-                GpuHotplugCommand.command_id == expected.command_id
-            )
+            select(GpuHotplugCommand).where(GpuHotplugCommand.command_id == expected.command_id)
         )
     ).scalar_one_or_none()
     group = (
         await db.execute(
             select(GpuAllocationGroup).where(
-                GpuAllocationGroup.allocation_group_id
-                == reservation.allocation_group_id
+                GpuAllocationGroup.allocation_group_id == reservation.allocation_group_id
             )
         )
     ).scalar_one_or_none()
@@ -187,16 +182,12 @@ async def require_gpu_hotplug_runtime_ack(
         or group.reservation_generation != reservation.reservation_generation
         or group.process_incarnation != reservation.process_incarnation
     ):
-        raise GpuHotplugError(
-            "Legacy GPU runtime access requires current hotplug custody."
-        )
+        raise GpuHotplugError("Legacy GPU runtime access requires current hotplug custody.")
     try:
         stored = _command_from_row(row)
         ack = GpuHotplugCommandAckV1.model_validate(row.ack)
     except (TypeError, ValueError) as exc:
-        raise GpuHotplugError(
-            "Legacy GPU hotplug command or ACK is not canonical."
-        ) from exc
+        raise GpuHotplugError("Legacy GPU hotplug command or ACK is not canonical.") from exc
     if (
         canonical_sha256(stored) != canonical_sha256(expected)
         or row.state != "acked"
@@ -233,17 +224,12 @@ async def ensure_gpu_hotplug_command(
     group = (
         await db.execute(
             select(GpuAllocationGroup)
-            .where(
-                GpuAllocationGroup.allocation_group_id
-                == reservation.allocation_group_id
-            )
+            .where(GpuAllocationGroup.allocation_group_id == reservation.allocation_group_id)
             .with_for_update()
         )
     ).scalar_one_or_none()
     host = (
-        await db.execute(
-            select(Host).where(Host.host_id == reservation.host_id).with_for_update()
-        )
+        await db.execute(select(Host).where(Host.host_id == reservation.host_id).with_for_update())
     ).scalar_one_or_none()
     migration = (
         await db.execute(
@@ -282,9 +268,7 @@ async def ensure_gpu_hotplug_command(
     ).scalar_one_or_none()
     if existing is not None:
         if canonical_sha256(_command_from_row(existing)) != canonical_sha256(command):
-            raise GpuHotplugError(
-                "GPU hotplug command identity changed canonical bytes."
-            )
+            raise GpuHotplugError("GPU hotplug command identity changed canonical bytes.")
         return command
     now = _now()
     db.add(
@@ -329,15 +313,11 @@ def _cancel_stale_hotplug_command(row: GpuHotplugCommand, reason: str) -> None:
     row.updated_at = now
 
 
-async def _locked_hotplug_dispatch_custody(
-    db: AsyncSession, row: GpuHotplugCommand
-) -> bool:
+async def _locked_hotplug_dispatch_custody(db: AsyncSession, row: GpuHotplugCommand) -> bool:
     """Revalidate the exact current running lineage before each dispatch step."""
 
     host = (
-        await db.execute(
-            select(Host).where(Host.host_id == row.host_id).with_for_update()
-        )
+        await db.execute(select(Host).where(Host.host_id == row.host_id).with_for_update())
     ).scalar_one_or_none()
     group = (
         await db.execute(
@@ -602,13 +582,9 @@ async def get_gpu_hotplug_command(
     if row.state == "acked":
         return _command_from_row(row)
     if row.state == "failed":
-        raise GpuHotplugGoneError(
-            "GPU hotplug command is terminal and must not be executed."
-        )
+        raise GpuHotplugGoneError("GPU hotplug command is terminal and must not be executed.")
     current_host = (
-        await db.execute(
-            select(Host).where(Host.host_id == row.host_id).with_for_update()
-        )
+        await db.execute(select(Host).where(Host.host_id == row.host_id).with_for_update())
     ).scalar_one_or_none()
     authenticated_host_current = bool(
         current_host is not None
@@ -616,16 +592,12 @@ async def get_gpu_hotplug_command(
         and host.active_key_generation == current_host.active_key_generation
         and host.boot_generation == current_host.boot_generation
     )
-    if not authenticated_host_current or not await _locked_hotplug_dispatch_custody(
-        db, row
-    ):
+    if not authenticated_host_current or not await _locked_hotplug_dispatch_custody(db, row):
         _cancel_stale_hotplug_command(
             row, "Legacy GPU hotplug custody changed before command readback."
         )
         await db.commit()
-        raise GpuHotplugGoneError(
-            "GPU hotplug command custody ended and must not be executed."
-        )
+        raise GpuHotplugGoneError("GPU hotplug command custody ended and must not be executed.")
     return _command_from_row(row)
 
 
@@ -656,9 +628,7 @@ async def record_gpu_hotplug_ack(
             raise GpuHotplugError("GPU hotplug ACK replay changed canonical bytes.")
         return _command_from_row(row)
     locked_host = (
-        await db.execute(
-            select(Host).where(Host.host_id == row.host_id).with_for_update()
-        )
+        await db.execute(select(Host).where(Host.host_id == row.host_id).with_for_update())
     ).scalar_one_or_none()
     reservation = (
         await db.execute(
@@ -716,20 +686,14 @@ async def record_gpu_hotplug_ack(
     if not custody_current and ack.state != "failed":
         raise GpuHotplugError("GPU hotplug custody changed before acknowledgement.")
     if migration is None:
-        raise GpuHotplugError(
-            "GPU hotplug ACK source identity has no authoritative migration."
-        )
-    ack_luks_uuids = {
-        item.namespace: item.source_identity.luks_uuid for item in ack.objects
-    }
+        raise GpuHotplugError("GPU hotplug ACK source identity has no authoritative migration.")
+    ack_luks_uuids = {item.namespace: item.source_identity.luks_uuid for item in ack.objects}
     expected_luks_uuids = {
         "storage": migration.storage_luks_uuid,
         "tdx-cache": migration.cache_luks_uuid,
     }
     if ack_luks_uuids != expected_luks_uuids:
-        raise GpuHotplugError(
-            "GPU hotplug ACK source identity differs from migration custody."
-        )
+        raise GpuHotplugError("GPU hotplug ACK source identity differs from migration custody.")
     now = _now()
     row.ack = ack.model_dump(mode="json", exclude_none=True)
     row.ack_sha256 = ack.ack_sha256

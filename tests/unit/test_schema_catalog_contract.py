@@ -93,9 +93,7 @@ def test_unshipped_migrations_create_the_same_named_lineage_constraints():
         "fk_nodes_gpu_allocation_group",
     ):
         assert f"ADD CONSTRAINT {constraint_name}" in migration_sources
-    server_migration = (
-        MIGRATIONS / "20260529160000_instance_server_id.sql"
-    ).read_text()
+    server_migration = (MIGRATIONS / "20260529160000_instance_server_id.sql").read_text()
     assert (
         "CONSTRAINT fk_launch_configs_server\n"
         "            FOREIGN KEY (server_id) REFERENCES servers(server_id) ON DELETE RESTRICT"
@@ -112,22 +110,19 @@ def test_registry_closure_check_matches_final_manifest_tag_shape():
     orm_expression = str(check.sqltext)
     assert "jsonb_typeof(manifest_tag_digests) = 'object'" in orm_expression
 
-    migration = (
-        MIGRATIONS / "20260724100000_gpu_platform_scheduler.sql"
-    ).read_text()
+    migration = (MIGRATIONS / "20260724100000_gpu_platform_scheduler.sql").read_text()
     up, down = migration.split("-- migrate:down", maxsplit=1)
     registry_rewrite = up.split(
-        "ALTER TABLE registry_sessions DROP CONSTRAINT IF EXISTS "
-        "ck_registry_session_closure;",
+        "ALTER TABLE registry_sessions DROP CONSTRAINT IF EXISTS ck_registry_session_closure;",
         maxsplit=1,
     )[1]
     assert "jsonb_typeof(manifest_tag_digests) = 'object'" in registry_rewrite
     assert down.index("DROP CONSTRAINT IF EXISTS ck_registry_session_closure") < down.index(
         "DROP COLUMN IF EXISTS manifest_tag_digests"
     )
-    restored = down.split(
-        "ADD CONSTRAINT ck_registry_session_closure", maxsplit=1
-    )[1].split("DROP COLUMN IF EXISTS manifest_tag_digests", maxsplit=1)[0]
+    restored = down.split("ADD CONSTRAINT ck_registry_session_closure", maxsplit=1)[1].split(
+        "DROP COLUMN IF EXISTS manifest_tag_digests", maxsplit=1
+    )[0]
     assert "manifest_tag_digests" not in restored
 
 
@@ -142,9 +137,7 @@ def test_attestation_attempt_order_is_database_generated_and_catalog_aligned():
     )
     assert index.unique is True
 
-    migration = (
-        MIGRATIONS / "20260714070000_release_attestation_identity.sql"
-    ).read_text()
+    migration = (MIGRATIONS / "20260714070000_release_attestation_identity.sql").read_text()
     up = migration.split("-- migrate:down", maxsplit=1)[0]
     assert "CREATE SEQUENCE server_attestation_attempt_sequence" in up
     assert "partial server attestation attempt sequence catalog" in up
@@ -169,8 +162,10 @@ def test_attestation_attempt_order_is_database_generated_and_catalog_aligned():
         "verified_at",
     ]
     trust_migration = (
-        MIGRATIONS / "20260714100000_attestation_trust_fingerprints.sql"
-    ).read_text().split("-- migrate:down", maxsplit=1)[0]
+        (MIGRATIONS / "20260714100000_attestation_trust_fingerprints.sql")
+        .read_text()
+        .split("-- migrate:down", maxsplit=1)[0]
+    )
     release_rebuild = trust_migration.split(
         "DROP INDEX IF EXISTS idx_server_attestations_release_identity;", maxsplit=1
     )[1]
@@ -179,15 +174,16 @@ def test_attestation_attempt_order_is_database_generated_and_catalog_aligned():
     assert "ON server_attestations (server_id, attempt_sequence DESC)" in release_rebuild
 
     gpu_migration = (
-        MIGRATIONS / "20260724100000_gpu_platform_scheduler.sql"
-    ).read_text().split("-- migrate:down", maxsplit=1)[0]
+        (MIGRATIONS / "20260724100000_gpu_platform_scheduler.sql")
+        .read_text()
+        .split("-- migrate:down", maxsplit=1)[0]
+    )
     gpu_index = gpu_migration.split(
         "CREATE INDEX IF NOT EXISTS idx_server_attestations_gpu_lineage",
         maxsplit=1,
     )[1].split(";", maxsplit=1)[0]
     assert "attempt_sequence DESC" in gpu_index
     assert "created_at DESC" not in gpu_index
-
 
 
 def test_attestation_subject_and_model_b_attribution_catalogs_are_fail_closed():
@@ -246,9 +242,7 @@ def test_attestation_subject_and_model_b_attribution_catalogs_are_fail_closed():
     assert "cannot restore legacy attestation FK" in identity_down
     assert "ON DELETE CASCADE" in identity_down
 
-    seedless = (
-        MIGRATIONS / "20260720200000_seedless_model_b.sql"
-    ).read_text()
+    seedless = (MIGRATIONS / "20260720200000_seedless_model_b.sql").read_text()
     seedless_up, seedless_down = seedless.split("-- migrate:down", maxsplit=1)
     for marker in (
         "uq_td_launch_reservation_attribution",
@@ -261,27 +255,22 @@ def test_attestation_subject_and_model_b_attribution_catalogs_are_fail_closed():
         "has invalid or duplicate authority",
     ):
         assert marker in seedless_up
-    assert (
-        seedless_down.index(
-            "DROP CONSTRAINT IF EXISTS fk_server_attestations_td_reservation_attribution"
-        )
-        < seedless_down.index("DROP TABLE IF EXISTS td_launch_reservations")
-    )
+    assert seedless_down.index(
+        "DROP CONSTRAINT IF EXISTS fk_server_attestations_td_reservation_attribution"
+    ) < seedless_down.index("DROP TABLE IF EXISTS td_launch_reservations")
 
 
 def test_default_volume_migration_contains_final_unshipped_authority_shape():
-    migration = (
-        MIGRATIONS / "20260724234500_gpu_chutefs_default_volume.sql"
-    ).read_text()
+    migration = (MIGRATIONS / "20260724234500_gpu_chutefs_default_volume.sql").read_text()
     up = migration.split("-- migrate:down", maxsplit=1)[0]
-    session_table = up.split(
-        "CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (", maxsplit=1
-    )[1].split(");", maxsplit=1)[0]
+    session_table = up.split("CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (", maxsplit=1)[
+        1
+    ].split(");", maxsplit=1)[0]
     assert "revocation_epoch               BIGINT NOT NULL," in session_table
     assert "revocation_epoch               BIGINT NOT NULL DEFAULT" not in session_table
-    scope = up.split(
-        "CONSTRAINT ck_chutefs_launch_session_scope CHECK (", maxsplit=1
-    )[1].split("CONSTRAINT ck_chutefs_launch_session_access_hash", maxsplit=1)[0]
+    scope = up.split("CONSTRAINT ck_chutefs_launch_session_scope CHECK (", maxsplit=1)[1].split(
+        "CONSTRAINT ck_chutefs_launch_session_access_hash", maxsplit=1
+    )[0]
     assert "attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$'" in scope
     identity = up.split(
         "CREATE OR REPLACE FUNCTION enforce_chutefs_launch_session_identity()",
@@ -304,9 +293,9 @@ def test_default_volume_migration_contains_final_unshipped_authority_shape():
         maxsplit=1,
     )[1].split("$$;", maxsplit=1)[0]
     assert "NEW.attested_cert_pubkey_hash" in server_change
-    trigger = up.split(
-        "CREATE TRIGGER trg_revoke_chutefs_session_on_server_change", maxsplit=1
-    )[1].split(";", maxsplit=1)[0]
+    trigger = up.split("CREATE TRIGGER trg_revoke_chutefs_session_on_server_change", maxsplit=1)[
+        1
+    ].split(";", maxsplit=1)[0]
     assert "attested_cert_pubkey_hash ON servers" in trigger
     terminal = up.split(
         "CREATE OR REPLACE FUNCTION revoke_registry_scope_on_launch_terminal()",

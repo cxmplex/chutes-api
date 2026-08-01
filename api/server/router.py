@@ -3,7 +3,16 @@ FastAPI routes for server management and TDX attestation.
 """
 
 from typing import Dict, Any, List
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status, Header, Query
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    status,
+    Header,
+    Query,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, DatabaseError

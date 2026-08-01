@@ -60,9 +60,7 @@ def test_registration_v2_fixture_bytes_validate() -> None:
 
 def test_lifecycle_v1_fixture_bytes_validate() -> None:
     lifecycle = _load_fixture()["lifecycle_v1"]
-    intents = [
-        GpuLifecycleOperationV1.model_validate(item) for item in lifecycle["intents"]
-    ]
+    intents = [GpuLifecycleOperationV1.model_validate(item) for item in lifecycle["intents"]]
     assert [item.operation_type for item in intents] == [
         "pre_slot_claim_quarantine",
         "launch_rollback",
@@ -82,9 +80,7 @@ def test_lifecycle_v1_fixture_bytes_validate() -> None:
         "finalized",
     ]
     assert all(
-        item["phase"] == "quarantined"
-        and item["failure_code"]
-        and item["failure_reason"]
+        item["phase"] == "quarantined" and item["failure_code"] and item["failure_reason"]
         for item in lifecycle["quarantined_frontiers"]
     )
     GpuPhysicalResultV1.model_validate(lifecycle["physical_result"])
@@ -92,9 +88,7 @@ def test_lifecycle_v1_fixture_bytes_validate() -> None:
     GpuResetReceiptV1.model_validate(lifecycle["reset_receipt"])
     GpuLocalReleaseAckV1.model_validate(lifecycle["local_release_ack"])
     GpuSourceReaderResultV1.model_validate(lifecycle["source_reader_result"])
-    GpuRecoveryAuthorizationEnvelopeV1.model_validate(
-        lifecycle["recovery_authorization"]
-    )
+    GpuRecoveryAuthorizationEnvelopeV1.model_validate(lifecycle["recovery_authorization"])
     for event in lifecycle["recovery_events"]:
         GpuRecoveryEventV1.model_validate(event)
     GpuHotplugCommandV1.model_validate(lifecycle["hotplug_command"])
@@ -122,9 +116,7 @@ def test_lifecycle_v1_fixture_bytes_validate() -> None:
             "Field required",
         ),
         (
-            lambda ack: ack["objects"][0]["source_identity"].__setitem__(
-                "inode", "1001"
-            ),
+            lambda ack: ack["objects"][0]["source_identity"].__setitem__("inode", "1001"),
             "integer",
         ),
         (
@@ -132,9 +124,7 @@ def test_lifecycle_v1_fixture_bytes_validate() -> None:
             "boolean",
         ),
         (
-            lambda ack: ack["objects"][0].__setitem__(
-                "device_id", "gpu-legacy-cache-device"
-            ),
+            lambda ack: ack["objects"][0].__setitem__("device_id", "gpu-legacy-cache-device"),
             "namespace binding tuple",
         ),
         (
@@ -156,9 +146,7 @@ def test_hotplug_ack_shared_fixture_negatives_fail_closed(mutation, match) -> No
 
 
 def test_hotplug_source_identity_has_no_reboot_local_device_number() -> None:
-    ack = GpuHotplugCommandAckV1.model_validate(
-        _load_fixture()["lifecycle_v1"]["hotplug_acked"]
-    )
+    ack = GpuHotplugCommandAckV1.model_validate(_load_fixture()["lifecycle_v1"]["hotplug_acked"])
 
     assert all(
         set(item.source_identity.model_dump())
@@ -198,9 +186,7 @@ def test_recovery_authorization_uses_one_shared_canonical_document() -> None:
     assert gpu_recovery_authorization_bytes(envelope) == canonical_json_bytes(expected)
 
 
-def test_recovery_authorization_omits_optional_fields_and_rejects_response_fields() -> (
-    None
-):
+def test_recovery_authorization_omits_optional_fields_and_rejects_response_fields() -> None:
     lifecycle = _load_fixture()["lifecycle_v1"]
     reference = GpuRecoveryAuthorizationEnvelopeV1.model_validate(
         lifecycle["recovery_authorization"]
@@ -230,11 +216,7 @@ def test_recovery_authorization_omits_optional_fields_and_rejects_response_field
     assert b"null" not in gpu_recovery_authorization_bytes(envelope)
 
     contaminated = envelope.model_copy(
-        update={
-            "operation": ownerless_intent.model_copy(
-                update={"group_state": "resetting"}
-            )
-        }
+        update={"operation": ownerless_intent.model_copy(update={"group_state": "resetting"})}
     )
     with pytest.raises(GpuLifecycleError, match="accepts an intent only"):
         gpu_recovery_authorization_document(contaminated)

@@ -143,9 +143,7 @@ async def load_chute_target(instance_id: str) -> Instance:
                 serialized = await asyncio.to_thread(pickle.dumps, instance)
                 await settings.redis_client.set(cache_key, serialized, ex=300)
             except Exception as exc:
-                logger.error(
-                    f"Error setting cache for {instance.instance_id=}: {str(exc)}"
-                )
+                logger.error(f"Error setting cache for {instance.instance_id=}: {str(exc)}")
         return instance
 
 
@@ -312,14 +310,10 @@ async def _check_cascade_and_delete(
             )
             # Extend the disable timeout instead of deleting
             disabled_key = f"instance_disabled:{instance_id}"
-            await settings.redis_client.expire(
-                disabled_key, INSTANCE_DISABLE_BASE_TIMEOUT * 3
-            )
+            await settings.redis_client.expire(disabled_key, INSTANCE_DISABLE_BASE_TIMEOUT * 3)
         else:
             # Safe to delete
-            await _execute_instance_deletion(
-                instance_id, chute_id, miner_hotkey, reason
-            )
+            await _execute_instance_deletion(instance_id, chute_id, miner_hotkey, reason)
     except Exception as e:
         logger.error(f"Error in cascade check for {instance_id}: {e}")
     finally:
@@ -347,9 +341,7 @@ async def disable_instance(
             complete_launch_configs=False,
         )
         instance = (
-            await db.execute(
-                select(Instance).where(Instance.instance_id == instance_id)
-            )
+            await db.execute(select(Instance).where(Instance.instance_id == instance_id))
         ).scalar_one_or_none()
         if instance is not None:
             instance.storage_revocation_epoch += 1
@@ -367,9 +359,7 @@ async def disable_instance(
         instance_id=instance_id,
         chute_id=chute_id,
         miner_hotkey=miner_hotkey,
-    ).warning(
-        f"instance disabled: {instance_id} (chute {chute_id}, miner {miner_hotkey})"
-    )
+    ).warning(f"instance disabled: {instance_id} (chute {chute_id}, miner {miner_hotkey})")
 
     # Sliding window: track each disable as a ZSET entry scored by timestamp.
     # Trim entries older than 1 hour, then count remaining.
@@ -383,15 +373,11 @@ async def disable_instance(
     results = await pipe.execute()
     disable_count = results[2]
 
-    should_delete = (
-        disable_count > MAX_INSTANCE_DISABLES or skip_disable_loop or instant_delete
-    )
+    should_delete = disable_count > MAX_INSTANCE_DISABLES or skip_disable_loop or instant_delete
 
     if should_delete:
         if instant_delete:
-            reason = (
-                "catastrophic error (invalid/empty response or verification failure)"
-            )
+            reason = "catastrophic error (invalid/empty response or verification failure)"
         elif skip_disable_loop:
             reason = f"server error after {disable_count} consecutive failure events"
         else:
@@ -400,16 +386,12 @@ async def disable_instance(
         # For catastrophic errors (instant_delete) or server errors (skip_disable_loop),
         # delete immediately - no cascade check needed because connection worked
         if instant_delete or skip_disable_loop:
-            await _execute_instance_deletion(
-                instance_id, chute_id, miner_hotkey, reason
-            )
+            await _execute_instance_deletion(instance_id, chute_id, miner_hotkey, reason)
         else:
             # For network-related deletions (timeouts, disconnects), use cascade detection
             # Mark as pending deletion and schedule background check
             pending_key = f"pending_deletion:{instance_id}"
-            await settings.lite_redis_client.set(
-                pending_key, b"1", ex=CASCADE_PENDING_TTL
-            )
+            await settings.lite_redis_client.set(pending_key, b"1", ex=CASCADE_PENDING_TTL)
             asyncio.create_task(
                 _check_cascade_and_delete(instance_id, chute_id, miner_hotkey, reason)
             )
@@ -499,9 +481,7 @@ async def start_instance_invalidation_listener():
                 except Exception as exc:
                     logger.warning(f"Error processing pubsub message: {exc}")
         except Exception as exc:
-            logger.warning(
-                f"Instance invalidation listener error: {exc}, reconnecting in 2s"
-            )
+            logger.warning(f"Instance invalidation listener error: {exc}, reconnecting in 2s")
         finally:
             if pubsub:
                 try:
@@ -609,9 +589,7 @@ class LeastConnManager:
 
         return near_min + rest
 
-    async def _handle_prefix_routing(
-        self, counts, grouped_by_count, min_count, prefixes
-    ):
+    async def _handle_prefix_routing(self, counts, grouped_by_count, min_count, prefixes):
         likely_cached = set()
         for size, prefix_hash in prefixes:
             try:
@@ -646,11 +624,7 @@ class LeastConnManager:
         # Add remaining instances
         for count in sorted(grouped_by_count.keys()):
             result.extend(
-                [
-                    inst
-                    for inst in grouped_by_count[count]
-                    if inst.instance_id not in r_inst_ids
-                ]
+                [inst for inst in grouped_by_count[count] if inst.instance_id not in r_inst_ids]
             )
 
         return result
@@ -664,9 +638,7 @@ class LeastConnManager:
             pipe.expire("active_chutes", self.connection_expiry)
             pipe.sadd(f"cc_inst:{self.chute_id}", instance_id)
             pipe.expire(f"cc_inst:{self.chute_id}", self.connection_expiry)
-            pipe.set(
-                f"cc_conc:{self.chute_id}", self.concurrency, ex=self.connection_expiry
-            )
+            pipe.set(f"cc_conc:{self.chute_id}", self.concurrency, ex=self.connection_expiry)
             await pipe.execute()
         except Exception as e:
             logger.error(f"Error tracking active chute/instance: {e}")
@@ -718,19 +690,13 @@ class LeastConnManager:
                     async def _decr():
                         val = await self.redis_client.client.decr(key)
                         if val < 0:
-                            await self.redis_client.client.set(
-                                key, 0, ex=self.connection_expiry
-                            )
+                            await self.redis_client.client.set(key, 0, ex=self.connection_expiry)
 
                     await asyncio.shield(_decr())
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        f"Timeout cleaning up connection for {instance.instance_id}"
-                    )
+                    logger.warning(f"Timeout cleaning up connection for {instance.instance_id}")
                 except Exception as e:
-                    logger.error(
-                        f"Error cleaning up connection for {instance.instance_id}: {e}"
-                    )
+                    logger.error(f"Error cleaning up connection for {instance.instance_id}: {e}")
             return
 
         instance = None
@@ -756,9 +722,7 @@ class LeastConnManager:
 
             if not instance:
                 # Check if there are actually any active instances (bypass LRU cache).
-                real_ids = await load_chute_target_ids(
-                    self.chute_id, nonce=int(time.time())
-                )
+                real_ids = await load_chute_target_ids(self.chute_id, nonce=int(time.time()))
                 if not real_ids:
                     yield None, "No infrastructure available to serve request"
                 else:
@@ -785,9 +749,7 @@ class LeastConnManager:
         except asyncio.TimeoutError:
             logger.error("Timeout getting targets")
             # Fallback to random instance
-            available = [
-                inst for iid, inst in self.instances.items() if iid not in avoid
-            ]
+            available = [inst for iid, inst in self.instances.items() if iid not in avoid]
             if available:
                 yield random.choice(available), None
             else:
@@ -808,19 +770,13 @@ class LeastConnManager:
                     async def _decr():
                         val = await self.redis_client.client.decr(key)
                         if val < 0:
-                            await self.redis_client.client.set(
-                                key, 0, ex=self.connection_expiry
-                            )
+                            await self.redis_client.client.set(key, 0, ex=self.connection_expiry)
 
                     await asyncio.shield(_decr())
                 except asyncio.TimeoutError:
-                    logger.warning(
-                        f"Timeout cleaning up connection for {instance.instance_id}"
-                    )
+                    logger.warning(f"Timeout cleaning up connection for {instance.instance_id}")
                 except Exception as e:
-                    logger.error(
-                        f"Error cleaning up connection for {instance.instance_id}: {e}"
-                    )
+                    logger.error(f"Error cleaning up connection for {instance.instance_id}: {e}")
 
 
 async def get_chute_target_manager(
@@ -860,9 +816,7 @@ async def get_chute_target_manager(
             chute_id=chute_id, concurrency=chute.concurrency or 1, instances=instances
         )
     async with MANAGERS[chute_id].lock:
-        MANAGERS[chute_id].instances = {
-            instance.instance_id: instance for instance in instances
-        }
+        MANAGERS[chute_id].instances = {instance.instance_id: instance for instance in instances}
         MANAGERS[chute_id].concurrency = chute.concurrency or 1
     return MANAGERS[chute_id]
 
@@ -946,11 +900,7 @@ def launch_identity_claims(launch_config: LaunchConfig) -> dict:
         "compute_type": getattr(launch_config, "compute_type", None),
         "default_volume_id": getattr(launch_config, "default_volume_id", None),
     }
-    missing = [
-        name
-        for name, value in required.items()
-        if not isinstance(value, str) or not value
-    ]
+    missing = [name for name, value in required.items() if not isinstance(value, str) or not value]
     if missing:
         raise ValueError(
             f"Launch config is missing authoritative identity fields: {', '.join(sorted(missing))}."
@@ -1001,9 +951,7 @@ def create_launch_jwt_v2(
         payload["job_id"] = launch_config.job_id
     if disk_gb:
         payload["disk_gb"] = disk_gb
-    encoded_jwt = jwt.encode(
-        payload, settings.launch_config_private_key_bytes, algorithm="ES256"
-    )
+    encoded_jwt = jwt.encode(payload, settings.launch_config_private_key_bytes, algorithm="ES256")
     return encoded_jwt
 
 
@@ -1032,9 +980,7 @@ def create_provision_jwt(server_id: str, ttl_minutes: int = 30) -> str:
         # authorization, so this token cannot be replayed.
         "jti": uuid.uuid4().hex,
     }
-    return jwt.encode(
-        payload, settings.launch_config_private_key_bytes, algorithm="ES256"
-    )
+    return jwt.encode(payload, settings.launch_config_private_key_bytes, algorithm="ES256")
 
 
 def generate_fs_key(launch_config) -> str:
@@ -1043,9 +989,7 @@ def generate_fs_key(launch_config) -> str:
     """
     timestamp = int(time.time())
     message = f"{timestamp}:{launch_config.chute_id}:{launch_config.config_id}".encode()
-    signature = settings.launch_config_private_key.sign(
-        message, ec.ECDSA(hashes.SHA256())
-    )
+    signature = settings.launch_config_private_key.sign(message, ec.ECDSA(hashes.SHA256()))
     encoded_signature = base64.urlsafe_b64encode(signature).decode().rstrip("=")
     return f"{timestamp}:{encoded_signature}"
 
@@ -1084,11 +1028,7 @@ async def load_launch_config_from_jwt(
         payload = _decode_chutes_jwt(token, require_exp=True)
         if config_id == payload["sub"]:
             config = (
-                (
-                    await db.execute(
-                        select(LaunchConfig).where(LaunchConfig.config_id == config_id)
-                    )
-                )
+                (await db.execute(select(LaunchConfig).where(LaunchConfig.config_id == config_id)))
                 .unique()
                 .scalar_one_or_none()
             )
@@ -1116,8 +1056,7 @@ async def load_launch_config_from_jwt(
                 if (
                     token_identity != expected_identity
                     or payload.get("env_type") != config.env_type
-                    or payload.get("storage_session_exchange_allowed")
-                    is not expected_exchange
+                    or payload.get("storage_session_exchange_allowed") is not expected_exchange
                     or payload.get("permissions")
                     != (["storage_session:exchange"] if expected_exchange else [])
                 ):
@@ -1140,9 +1079,7 @@ async def load_launch_config_from_jwt(
         else:
             detail = f"Launch config {config_id=} does not match token!"
     except jwt.InvalidTokenError:
-        logger.warning(
-            f"Attempted to use invalid token for launch config: {config_id=}"
-        )
+        logger.warning(f"Attempted to use invalid token for launch config: {config_id=}")
     except Exception as exc:
         logger.warning(f"Unhandled exception checking launch config JWT: {exc}")
 
@@ -1216,9 +1153,7 @@ RETURNING instances.instance_id;
             await session.execute(text(query), {"instance_id": instance_id})
             logger.success(f"Updated instance shutdown timestamp: {instance_id=}")
     except Exception as exc:
-        logger.warning(
-            f"Failed to push back instance shutdown time for {instance_id=}: {str(exc)}"
-        )
+        logger.warning(f"Failed to push back instance shutdown time for {instance_id=}: {str(exc)}")
 
 
 async def update_shutdown_timestamp(instance_id: str):
@@ -1229,9 +1164,7 @@ async def update_shutdown_timestamp(instance_id: str):
             return
         await _update_shutdown_timestamp(instance_id)
     except Exception as exc:
-        logger.warning(
-            f"Failed to push back instance shutdown time for {instance_id=}: {exc}"
-        )
+        logger.warning(f"Failed to push back instance shutdown time for {instance_id=}: {exc}")
         try:
             await settings.redis_client.delete(key)
         except Exception:
@@ -1310,33 +1243,23 @@ async def verify_tee_chute(
                     detail="e2e_pubkey required for chute attestation (chutes >= 0.6.0)",
                 )
             expected_report_data = (
-                hashlib.sha256((expected_nonce + e2e_pubkey).encode())
-                .hexdigest()
-                .lower()
+                hashlib.sha256((expected_nonce + e2e_pubkey).encode()).hexdigest().lower()
             )
             assert_gpu_external_work_allowed(db, "chute quote verification")
             await verify_quote(quote, expected_report_data, expected_cert_hash)
             if not is_cpu:
-                assert_gpu_external_work_allowed(
-                    db, "chute NVIDIA evidence verification"
-                )
+                assert_gpu_external_work_allowed(db, "chute NVIDIA evidence verification")
                 await verify_gpu_evidence(gpu_evidence, expected_report_data)
         else:
             assert_gpu_external_work_allowed(db, "chute quote verification")
             await verify_quote(quote, expected_nonce, expected_cert_hash)
             if not is_cpu:
-                assert_gpu_external_work_allowed(
-                    db, "chute NVIDIA evidence verification"
-                )
+                assert_gpu_external_work_allowed(db, "chute NVIDIA evidence verification")
                 await verify_gpu_evidence(gpu_evidence, expected_nonce)
 
-        logger.success(
-            f"Successfully verified attestation for chute deployment {deployment_id}"
-        )
+        logger.success(f"Successfully verified attestation for chute deployment {deployment_id}")
     except GetEvidenceError as exc:
-        logger.error(
-            f"Failed to get evidence from chute proxy for {instance.host}: {exc}"
-        )
+        logger.error(f"Failed to get evidence from chute proxy for {instance.host}: {exc}")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Attestation service unavailable. The chute attestation proxy could not be reached or returned an error. Please ensure the server is accessible and the attestation service is running.",
@@ -1375,19 +1298,14 @@ async def require_attested_client_cert(db, request: Request, instance) -> None:
     server = None
     if getattr(instance, "server_id", None):
         server = (
-            await db.execute(
-                select(Server).where(Server.server_id == instance.server_id)
-            )
+            await db.execute(select(Server).where(Server.server_id == instance.server_id))
         ).scalar_one_or_none()
     if (
         server is None
         or not getattr(server, "self_registered", False)
         or (
             server.compute_type != "cpu"
-            and not (
-                server.compute_type == "gpu"
-                and server.gpu_management_mode == "platform"
-            )
+            and not (server.compute_type == "gpu" and server.gpu_management_mode == "platform")
         )
     ):
         return
@@ -1464,9 +1382,7 @@ async def _require_current_attestation_identity(db, server: Server) -> None:
             else:
                 _current_attestation_identity(server, latest)
     except MeasurementMismatchError as exc:
-        logger.warning(
-            f"Rejecting stale CPU-TEE server identity {server.server_id}: {exc}"
-        )
+        logger.warning(f"Rejecting stale CPU-TEE server identity {server.server_id}: {exc}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -1491,11 +1407,7 @@ async def get_server_for_gpus(db, gpu_uuids: list[str]) -> Server | None:
         .subquery()
     )
     servers = (
-        (
-            await db.execute(
-                select(Server).where(Server.server_id.in_(select(server_id_subq)))
-            )
-        )
+        (await db.execute(select(Server).where(Server.server_id.in_(select(server_id_subq)))))
         .scalars()
         .all()
     )
@@ -1559,9 +1471,7 @@ async def purge(target, reason, valid_termination=False):
         trigger="monitoring",
         deletion_reason=reason,
         valid_termination=valid_termination,
-    ).warning(
-        f"purging instance {target.instance_id} (chute {target.chute_id}): {reason}"
-    )
+    ).warning(f"purging instance {target.instance_id} (chute {target.chute_id}): {reason}")
     job_to_notify = None
     async with get_session() as session:
         await prepare_instance_terminal_writes(
@@ -1585,11 +1495,7 @@ async def purge(target, reason, valid_termination=False):
         )
 
         job = (
-            (
-                await session.execute(
-                    select(Job).where(Job.instance_id == target.instance_id)
-                )
-            )
+            (await session.execute(select(Job).where(Job.instance_id == target.instance_id)))
             .unique()
             .scalar_one_or_none()
         )

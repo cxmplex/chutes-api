@@ -74,9 +74,7 @@ def _activation_objects(*, extra=None):
         bounty=False,
         compute_multiplier=2.0,
         created_at=now,
-        extra=copy.deepcopy(extra)
-        if extra is not None
-        else {"warmup_compute_multiplier": 2.0},
+        extra=copy.deepcopy(extra) if extra is not None else {"warmup_compute_multiplier": 2.0},
     )
     chute = SimpleNamespace(
         chute_id="chute-1",
@@ -304,9 +302,7 @@ async def test_bounty_claim_lost_response_replays_exact_envelope(monkeypatch):
         "bounty_cooldown:chute-1",
     )
     assert "redis.call('GET', replay_key)" in bounty_util.CLAIM_BOUNTY_REPLAY_LUA
-    assert (
-        "redis.call('SET', replay_key, envelope" in bounty_util.CLAIM_BOUNTY_REPLAY_LUA
-    )
+    assert "redis.call('SET', replay_key, envelope" in bounty_util.CLAIM_BOUNTY_REPLAY_LUA
     assert "redis.call('DEL', bounty_key)" in bounty_util.CLAIM_BOUNTY_REPLAY_LUA
 
 
@@ -320,9 +316,7 @@ async def test_warmup_consume_lost_response_replays_exact_envelope(monkeypatch):
 
     with pytest.raises(RuntimeError, match="no durable result"):
         await instance_router._consume_activation_warmup(db, "chute-1", attempt_id)
-    replayed = await instance_router._consume_activation_warmup(
-        db, "chute-1", attempt_id
-    )
+    replayed = await instance_router._consume_activation_warmup(db, "chute-1", attempt_id)
 
     assert replayed == expected
     assert redis.calls[0] == redis.calls[1]
@@ -332,19 +326,14 @@ async def test_warmup_consume_lost_response_replays_exact_envelope(monkeypatch):
         "activation_warmup_result:attempt-1",
     )
     assert "redis.call('GET', replay_key)" in instance_router._CONSUME_WARMUP_REPLAY_LUA
-    assert (
-        "redis.call('SET', replay_key, envelope"
-        in instance_router._CONSUME_WARMUP_REPLAY_LUA
-    )
+    assert "redis.call('SET', replay_key, envelope" in instance_router._CONSUME_WARMUP_REPLAY_LUA
     assert "redis.call('DEL', warmup_key)" in instance_router._CONSUME_WARMUP_REPLAY_LUA
 
 
 @pytest.mark.asyncio
 async def test_warmup_consume_guard_blocks_redis():
     with pytest.raises(RuntimeError, match="warmup telemetry consume"):
-        await instance_router._consume_activation_warmup(
-            _Db(locked=True), "chute-1", "attempt-1"
-        )
+        await instance_router._consume_activation_warmup(_Db(locked=True), "chute-1", "attempt-1")
 
 
 def test_same_config_uses_one_durable_activation_attempt_identity():
@@ -361,16 +350,14 @@ def test_same_config_uses_one_durable_activation_attempt_identity():
     assert attempt_a["attempt_id"] == attempt_b["attempt_id"]
     assert attempt_a["input_sha256"] == attempt_b["input_sha256"] == input_a == input_b
     assert attempt_a["state"] == attempt_b["state"] == "processing"
-    assert instance_router._activation_input_document(
-        config_a, instance_a, chute_a
-    ) == (instance_router._activation_input_document(config_b, instance_b, chute_b))
+    assert instance_router._activation_input_document(config_a, instance_a, chute_a) == (
+        instance_router._activation_input_document(config_b, instance_b, chute_b)
+    )
 
 
 def test_completed_activation_applies_one_exact_result_and_rejects_conflict():
     launch_config, instance, chute = _activation_objects()
-    attempt, _ = instance_router._activation_attempt(
-        launch_config, instance, chute, create=True
-    )
+    attempt, _ = instance_router._activation_attempt(launch_config, instance, chute, create=True)
     bounty, warmup = _external_results(attempt["attempt_id"])
     result, result_sha256 = instance_router._activation_external_result(
         attempt["attempt_id"], chute.chute_id, bounty, warmup
@@ -408,9 +395,7 @@ def test_completed_activation_applies_one_exact_result_and_rejects_conflict():
 
 def test_active_retry_rejects_malformed_completed_result_hash():
     launch_config, instance, chute = _activation_objects()
-    attempt, _ = instance_router._activation_attempt(
-        launch_config, instance, chute, create=True
-    )
+    attempt, _ = instance_router._activation_attempt(launch_config, instance, chute, create=True)
     bounty, warmup = _external_results(attempt["attempt_id"])
     result, _ = instance_router._activation_external_result(
         attempt["attempt_id"], chute.chute_id, bounty, warmup
@@ -508,9 +493,7 @@ async def test_concurrent_same_config_activation_applies_bounty_once(monkeypatch
     monkeypatch.setattr(instance_router, "invalidate_instance_cache", _invalidate)
     monkeypatch.setattr(instance_router, "notify_activated", _notify)
     monkeypatch.setattr(instance_router, "track_warmup_seconds", lambda *a, **k: None)
-    monkeypatch.setattr(
-        instance_router, "track_warmup_seconds_since", lambda *a, **k: None
-    )
+    monkeypatch.setattr(instance_router, "track_warmup_seconds_since", lambda *a, **k: None)
     monkeypatch.setattr(
         instance_router,
         "instance_logger",
@@ -526,9 +509,7 @@ async def test_concurrent_same_config_activation_applies_bounty_once(monkeypatch
         )
 
     first, second = await __import__("asyncio").wait_for(
-        __import__("asyncio").gather(
-            _activate(_SerializedDb()), _activate(_SerializedDb())
-        ),
+        __import__("asyncio").gather(_activate(_SerializedDb()), _activate(_SerializedDb())),
         timeout=5,
     )
     await __import__("asyncio").sleep(0)
@@ -540,9 +521,7 @@ async def test_concurrent_same_config_activation_applies_bounty_once(monkeypatch
     assert instance.bounty is True
     expected_boost = instance_router.calculate_bounty_boost(50)
     assert instance.compute_multiplier == pytest.approx(2.0 * expected_boost)
-    assert instance.compute_multiplier != pytest.approx(
-        2.0 * expected_boost * expected_boost
-    )
+    assert instance.compute_multiplier != pytest.approx(2.0 * expected_boost * expected_boost)
     completed = instance.extra[instance_router._ACTIVATION_ATTEMPT_EXTRA_KEY]
     assert completed["state"] == "completed"
     assert completed["attempt_id"] == claim_attempt_ids[0]
@@ -570,9 +549,7 @@ def test_activation_envelopes_reject_malformed_and_cross_chute_results():
             "chute-1",
         )
     with pytest.raises(RuntimeError, match="invalid envelope"):
-        instance_router._parse_activation_warmup_envelope(
-            b"not-json", attempt_id, "chute-1"
-        )
+        instance_router._parse_activation_warmup_envelope(b"not-json", attempt_id, "chute-1")
 
 
 def test_launch_external_snapshot_hash_and_compare_and_set():

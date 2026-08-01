@@ -40,11 +40,11 @@ def token_key_fingerprints(keys: Mapping[str, str]) -> dict[str, str]:
 
     return {
         key_id: hashlib.sha256(
-                b"chutes.chutefs-token-key-fingerprint.v1\0"
-                + key_id.encode("ascii")
-                + b"\0"
-                + secret.encode("ascii")
-            ).hexdigest()
+            b"chutes.chutefs-token-key-fingerprint.v1\0"
+            + key_id.encode("ascii")
+            + b"\0"
+            + secret.encode("ascii")
+        ).hexdigest()
         for key_id, secret in sorted(keys.items())
     }
 
@@ -121,9 +121,7 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
                 ),
                 {
                     "key_id": settings.chutefs_token_key_id,
-                    "key_sha256": key_fingerprints[
-                        settings.chutefs_token_key_id
-                    ],
+                    "key_sha256": key_fingerprints[settings.chutefs_token_key_id],
                     "replicas": json.dumps([replica_id], separators=(",", ":")),
                 },
             )
@@ -143,8 +141,7 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
             ]
             if (
                 len(active_epochs) != 1
-                or key_fingerprints.get(active_epochs[0][0])
-                != active_epochs[0][1]
+                or key_fingerprints.get(active_epochs[0][0]) != active_epochs[0][1]
             ):
                 raise RuntimeError(
                     "ChuteFS token key activation barrier rejected this replica's "
@@ -201,13 +198,17 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
             )
 
         active_rows = (
-            await connection.execute(
-                text(
-                    "SELECT key_id FROM chutefs_token_key_epochs "
-                    "WHERE state = 'active' ORDER BY key_id"
+            (
+                await connection.execute(
+                    text(
+                        "SELECT key_id FROM chutefs_token_key_epochs "
+                        "WHERE state = 'active' ORDER BY key_id"
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         if len(active_rows) != 1 or active_rows[0] not in configured_keys:
             raise RuntimeError(
                 "ChuteFS token key activation barrier requires exactly one "
@@ -226,10 +227,7 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
                 )
             )
         ).all()
-        epoch_fingerprints = {
-            key_id: key_sha256
-            for key_id, _state, key_sha256 in epoch_rows
-        }
+        epoch_fingerprints = {key_id: key_sha256 for key_id, _state, key_sha256 in epoch_rows}
 
     validated_fingerprints = {
         key_id: expected_fingerprint

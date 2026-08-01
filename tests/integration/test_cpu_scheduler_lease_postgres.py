@@ -37,10 +37,7 @@ async def _wait_for_database_lock(engine, pid: int) -> None:
     for _ in range(500):
         async with engine.connect() as observer:
             waiting = await observer.scalar(
-                text(
-                    "SELECT wait_event_type = 'Lock' "
-                    "FROM pg_stat_activity WHERE pid = :pid"
-                ),
+                text("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = :pid"),
                 {"pid": pid},
             )
         if waiting:
@@ -83,9 +80,7 @@ async def test_locked_capacity_refreshes_cached_host_after_concurrent_commit(
         await first.flush()
 
         second_pid = await second.scalar(text("SELECT pg_backend_pid()"))
-        contender = asyncio.create_task(
-            cpu_scheduler._lock_host_with_capacity(second, host_id)
-        )
+        contender = asyncio.create_task(cpu_scheduler._lock_host_with_capacity(second, host_id))
         await _wait_for_database_lock(first.bind, second_pid)
         assert not contender.done()
 

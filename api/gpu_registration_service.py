@@ -227,7 +227,13 @@ async def _decrypt_registration_request(
         plaintext = cipher.decrypt(ciphertext.encode("ascii"))
         document = json.loads(plaintext)
         request = GpuRegistrationRequestV2.model_validate(document)
-    except (InvalidToken, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (
+        InvalidToken,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        json.JSONDecodeError,
+    ) as exc:
         raise ServerRegistrationError(
             "Persisted GPU registration recovery envelope is invalid."
         ) from exc

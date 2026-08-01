@@ -303,13 +303,11 @@ def _key_authority_metrics(health: dict[str, dict[str, object]]) -> bytes:
         entry = health[authority]
         lines.append(
             f'chutes_key_authority_ready{{authority="{authority}"}} '
-            f'{1 if entry.get("ready") else 0}'
+            f"{1 if entry.get('ready') else 0}"
         )
         age = entry.get("ack_age_seconds")
         if isinstance(age, (int, float)):
-            lines.append(
-                f'chutes_key_authority_ack_age_seconds{{authority="{authority}"}} {age}'
-            )
+            lines.append(f'chutes_key_authority_ack_age_seconds{{authority="{authority}"}} {age}')
     return ("\n".join(lines) + "\n").encode()
 
 

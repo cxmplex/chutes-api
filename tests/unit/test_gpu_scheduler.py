@@ -471,9 +471,7 @@ async def test_scheduler_readiness_requires_exact_version_not_higher_unrelated()
     higher_only = _SchemaEngine({"99999999999999"})
     with patch.object(gpu_scheduler, "engine", higher_only):
         assert await gpu_scheduler.required_gpu_schema_present() is False
-    exact = _SchemaEngine(
-        {"99999999999999", gpu_scheduler.REQUIRED_GPU_SCHEMA_VERSION}
-    )
+    exact = _SchemaEngine({"99999999999999", gpu_scheduler.REQUIRED_GPU_SCHEMA_VERSION})
     with patch.object(gpu_scheduler, "engine", exact):
         assert await gpu_scheduler.required_gpu_schema_present() is True
     assert gpu_scheduler.scheduler_liveness_healthy() is True
@@ -504,9 +502,7 @@ async def test_scheduler_does_not_elect_or_query_before_exact_schema_barrier():
             "settings",
             SimpleNamespace(redis_client=redis),
         ),
-        patch.object(
-            gpu_scheduler, "required_gpu_schema_present", side_effect=barrier
-        ),
+        patch.object(gpu_scheduler, "required_gpu_schema_present", side_effect=barrier),
         patch.object(gpu_scheduler, "_tick_with_lock", tick),
         patch.object(gpu_scheduler, "schedule_once", schedule),
         patch.object(gpu_scheduler.asyncio, "sleep", sleep),

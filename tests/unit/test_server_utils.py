@@ -817,7 +817,9 @@ async def test_verify_quote_signature_classifies_collateral_timeout_as_unavailab
 
 
 @pytest.mark.asyncio
-async def test_module_identity_fallback_preserves_pinned_root_verification(sample_boot_quote):
+async def test_module_identity_fallback_preserves_pinned_root_verification(
+    sample_boot_quote,
+):
     from api.server.intel_root import INTEL_SGX_ROOT_CA_DER
 
     collateral = Mock()

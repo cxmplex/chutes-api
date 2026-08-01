@@ -60,9 +60,7 @@ async def lock_launch_configs_before_instances(
         ).all()
         instance_config_map.update(targeted_rows)
         ordered_configs.update(
-            config_id
-            for _instance_id, config_id in targeted_rows
-            if config_id is not None
+            config_id for _instance_id, config_id in targeted_rows if config_id is not None
         )
 
     final_config_ids = tuple(sorted(ordered_configs))
@@ -91,9 +89,7 @@ async def lock_launch_configs_before_instances(
         instance_config_map.update(config_rows)
 
     instance_config_ids = tuple(sorted(instance_config_map.items()))
-    final_instance_ids = tuple(
-        instance_id for instance_id, _config_id in instance_config_ids
-    )
+    final_instance_ids = tuple(instance_id for instance_id, _config_id in instance_config_ids)
     if final_instance_ids:
         await db.execute(
             select(Instance.instance_id)

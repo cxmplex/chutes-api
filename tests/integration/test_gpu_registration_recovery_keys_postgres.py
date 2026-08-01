@@ -178,9 +178,7 @@ async def test_stale_stage_requires_audited_cancellation_and_cannot_poison_activ
         )
         assert replay == cancelled
 
-    replacement_material = settings.gpu_registration_recovery_key_materials[
-        replacement_id
-    ]
+    replacement_material = settings.gpu_registration_recovery_key_materials[replacement_id]
     _configure_keyring(
         monkeypatch,
         {
@@ -334,10 +332,7 @@ async def test_direct_sql_requires_successor_ack_and_rejects_epoch_delete(
         await session.rollback()
         with pytest.raises(DBAPIError, match="cannot be deleted"):
             await session.execute(
-                text(
-                    "DELETE FROM gpu_registration_recovery_key_epochs "
-                    "WHERE key_id = :key_id"
-                ),
+                text("DELETE FROM gpu_registration_recovery_key_epochs WHERE key_id = :key_id"),
                 {"key_id": active_id},
             )
         await session.rollback()
@@ -424,8 +419,7 @@ async def test_mismatched_key_preserves_attempt_and_conflict_ciphertext_then_res
         assert persisted_conflict.last_attempt_at is not None
         assert persisted_conflict.next_attempt_at is not None
         assert (
-            persisted_conflict.last_transient_error_code
-            == "GpuRegistrationRecoveryKeyUnavailable"
+            persisted_conflict.last_transient_error_code == "GpuRegistrationRecoveryKeyUnavailable"
         )
 
         _configure_keyring(
@@ -515,9 +509,7 @@ async def test_retirement_blocks_attempt_then_conflict_and_exact_replay_is_stabl
         assert selected_id == successor_id
         await session.rollback()
 
-        successor_material = settings.gpu_registration_recovery_key_materials[
-            successor_id
-        ]
+        successor_material = settings.gpu_registration_recovery_key_materials[successor_id]
         _configure_keyring(
             monkeypatch,
             {successor_id: successor_material},
@@ -753,15 +745,9 @@ async def test_create_all_first_unresolved_ciphertext_preflight_preserves_catalo
         attempt_id = attempt.attempt_id
         key_id = attempt.request_payload_key_id
         await session.commit()
-        await session.execute(
-            text("DROP TABLE gpu_registration_recovery_key_epoch_operations")
-        )
-        await session.execute(
-            text("DROP TABLE gpu_registration_recovery_key_replica_acks")
-        )
-        await session.execute(
-            text("DROP TABLE gpu_registration_recovery_key_epochs CASCADE")
-        )
+        await session.execute(text("DROP TABLE gpu_registration_recovery_key_epoch_operations"))
+        await session.execute(text("DROP TABLE gpu_registration_recovery_key_replica_acks"))
+        await session.execute(text("DROP TABLE gpu_registration_recovery_key_epochs CASCADE"))
         await session.commit()
 
     with pytest.raises(AssertionError, match=attempt_id):

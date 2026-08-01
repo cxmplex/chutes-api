@@ -155,7 +155,6 @@ async def _current_attested_registry_server(db: AsyncSession, cert_hash: str) ->
     return server
 
 
-
 def _cpu_registry_attestation_current(
     server: Server,
     latest: ServerAttestation | None,
@@ -170,8 +169,7 @@ def _cpu_registry_attestation_current(
         or latest.verified_at is None
         or latest.verified_at < cutoff
         or latest.measurement_name != server.measurement_name
-        or latest.measurement_config_fingerprint
-        != server.measurement_config_fingerprint
+        or latest.measurement_config_fingerprint != server.measurement_config_fingerprint
         or latest.trust_set_fingerprint != server.trust_set_fingerprint
     ):
         raise HTTPException(
@@ -249,10 +247,7 @@ async def _locked_registry_authority(
             (
                 await db.execute(
                     select(GpuAllocationGroup)
-                    .where(
-                        GpuAllocationGroup.allocation_group_id
-                        == server.gpu_allocation_group_id
-                    )
+                    .where(GpuAllocationGroup.allocation_group_id == server.gpu_allocation_group_id)
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
@@ -298,8 +293,7 @@ async def _locked_registry_authority(
             or reservation.server_id != server.server_id
             or reservation.management_mode != server.gpu_management_mode
             or reservation.allocation_group_id != server.gpu_allocation_group_id
-            or reservation.allocation_group_generation
-            != server.gpu_allocation_group_generation
+            or reservation.allocation_group_generation != server.gpu_allocation_group_generation
             or reservation.process_incarnation != server.gpu_process_incarnation
             or reservation.topology_fingerprint != server.gpu_topology_fingerprint
             or group.management_mode != reservation.management_mode
@@ -333,10 +327,7 @@ async def _locked_registry_authority(
     reservation = (
         await db.execute(
             select(TdLaunchReservation)
-            .where(
-                TdLaunchReservation.reservation_id
-                == snapshot["launch_reservation_id"]
-            )
+            .where(TdLaunchReservation.reservation_id == snapshot["launch_reservation_id"])
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -359,6 +350,7 @@ async def _locked_registry_authority(
             detail="CPU runtime lineage changed during descriptor resolution.",
         )
     return server, reservation
+
 
 def _encode_registry_session(row: RegistrySession) -> str:
     claims = RegistrySessionClaimsV1(
@@ -485,9 +477,7 @@ async def create_registry_session(
                     .scalar_one_or_none()
                 )
             valid_scope = bool(
-                await _miner_launch_scope_current(
-                    db, server, launch_config, for_update=True
-                )
+                await _miner_launch_scope_current(db, server, launch_config, for_update=True)
                 and launch_config.container_repository == body.repository
                 and launch_config.container_manifest_digest == body.manifest_digest
             )
@@ -862,19 +852,13 @@ async def _validate_registry_session(
             detail="Registry session purpose is invalid.",
         )
     session_id = payload.get("session_id")
-    if (
-        not isinstance(session_id, str)
-        or not session_id
-        or session_id != session_id.strip()
-    ):
+    if not isinstance(session_id, str) or not session_id or session_id != session_id.strip():
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Registry session identity is invalid.",
         )
     preflight = (
-        await db.execute(
-            select(RegistrySession).where(RegistrySession.session_id == session_id)
-        )
+        await db.execute(select(RegistrySession).where(RegistrySession.session_id == session_id))
     ).scalar_one_or_none()
     preflight = _validated_registry_session_row(
         preflight,

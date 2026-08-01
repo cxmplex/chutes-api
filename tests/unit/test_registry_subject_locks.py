@@ -285,6 +285,7 @@ async def test_same_registry_server_serializes_different_configs():
     await asyncio.wait_for(first_entered.wait(), timeout=1)
     second_task = asyncio.create_task(enter_second())
     try:
+
         async def shared_key_was_attempted():
             while shared_server_key not in second.attempts:
                 await asyncio.sleep(0)

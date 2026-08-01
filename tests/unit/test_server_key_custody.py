@@ -130,9 +130,7 @@ def _db_with(server: Server) -> AsyncMock:
     attestation_result.scalar_one_or_none.return_value = attestation
 
     def execute_result(stmt):
-        entities = {
-            desc.get("entity") for desc in getattr(stmt, "column_descriptions", [])
-        }
+        entities = {desc.get("entity") for desc in getattr(stmt, "column_descriptions", [])}
         if ServerAttestation in entities:
             return attestation_result
         return server_result
@@ -452,9 +450,7 @@ async def test_storage_luks_capability_is_invalid_after_newer_attestation_attemp
 
     with (
         patch("api.server.service.build_runtime_quote") as build_quote,
-        patch(
-            "api.server.service.lease_luks_passphrases", new_callable=AsyncMock
-        ) as rotate,
+        patch("api.server.service.lease_luks_passphrases", new_callable=AsyncMock) as rotate,
         pytest.raises(HTTPException, match="Latest attestation attempt"),
     ):
         await process_luks_attest_request(

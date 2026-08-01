@@ -48,9 +48,7 @@ from tests.unit.test_release_provenance import _gpu_document
 
 UUIDS = [f"GPU-00000000-0000-0000-0000-{index:012x}" for index in range(1, 9)]
 BDFS = [f"0000:{index:02x}:00.0" for index in range(1, 9)]
-GPU_CLAIM_FIXTURE_SHA256 = (
-    "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197"
-)
+GPU_CLAIM_FIXTURE_SHA256 = "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197"
 
 
 @pytest.mark.asyncio
@@ -74,10 +72,7 @@ async def test_gpu_registration_nonce_rejects_non_ascii_request_id_before_db_wor
 def test_gpu_claims_receive_measured_es256_envelope(monkeypatch):
     claims = GpuLaunchReservationClaimsV1.model_validate(
         json.loads(
-            (
-                Path(__file__).resolve().parents[1]
-                / "fixtures/gpu_launch_claims_v1.json"
-            ).read_text()
+            (Path(__file__).resolve().parents[1] / "fixtures/gpu_launch_claims_v1.json").read_text()
         )
     )
     private_key = ec.generate_private_key(ec.SECP256R1())
@@ -111,10 +106,7 @@ def test_gpu_claims_receive_measured_es256_envelope(monkeypatch):
 def test_gpu_claim_signing_fails_without_validator_asymmetric_key(monkeypatch):
     claims = GpuLaunchReservationClaimsV1.model_validate(
         json.loads(
-            (
-                Path(__file__).resolve().parents[1]
-                / "fixtures/gpu_launch_claims_v1.json"
-            ).read_text()
+            (Path(__file__).resolve().parents[1] / "fixtures/gpu_launch_claims_v1.json").read_text()
         )
     )
     monkeypatch.setattr(
@@ -130,10 +122,7 @@ def test_gpu_claim_signing_fails_without_validator_asymmetric_key(monkeypatch):
 def test_gpu_claim_signing_rejects_nonpositive_key_epoch(monkeypatch):
     claims = GpuLaunchReservationClaimsV1.model_validate(
         json.loads(
-            (
-                Path(__file__).resolve().parents[1]
-                / "fixtures/gpu_launch_claims_v1.json"
-            ).read_text()
+            (Path(__file__).resolve().parents[1] / "fixtures/gpu_launch_claims_v1.json").read_text()
         )
     )
     monkeypatch.setattr(
@@ -252,11 +241,7 @@ def test_exact_inventory_canonicalization_binds_every_topology_field():
     disconnected = _group()
     disconnected["nvlink_edges"].pop()
     disconnected["topology_fingerprint"] = canonical_sha256(
-        {
-            key: value
-            for key, value in disconnected.items()
-            if key != "topology_fingerprint"
-        }
+        {key: value for key, value in disconnected.items() if key != "topology_fingerprint"}
     )
     with pytest.raises(ValidationError, match="complete and connected"):
         GpuInventoryGroupV1.model_validate(disconnected)
@@ -271,15 +256,9 @@ def test_exact_inventory_canonicalization_binds_every_topology_field():
         GpuInventoryGroupV1.model_validate(unsafe)
 
     contradictory = _group()
-    contradictory["devices"][1]["iommu_group"] = contradictory["devices"][0][
-        "iommu_group"
-    ]
+    contradictory["devices"][1]["iommu_group"] = contradictory["devices"][0]["iommu_group"]
     contradictory["topology_fingerprint"] = canonical_sha256(
-        {
-            key: value
-            for key, value in contradictory.items()
-            if key != "topology_fingerprint"
-        }
+        {key: value for key, value in contradictory.items() if key != "topology_fingerprint"}
     )
     with pytest.raises(ValidationError, match="contradictory"):
         GpuInventoryGroupV1.model_validate(contradictory)
@@ -287,11 +266,7 @@ def test_exact_inventory_canonicalization_binds_every_topology_field():
     arbitrary_fabric = _group()
     arbitrary_fabric["fabrics"][0]["fabric_id"] = "f" * 64
     arbitrary_fabric["topology_fingerprint"] = canonical_sha256(
-        {
-            key: value
-            for key, value in arbitrary_fabric.items()
-            if key != "topology_fingerprint"
-        }
+        {key: value for key, value in arbitrary_fabric.items() if key != "topology_fingerprint"}
     )
     with pytest.raises(ValidationError, match="fabric_id"):
         GpuInventoryGroupV1.model_validate(arbitrary_fabric)
@@ -319,8 +294,7 @@ def test_inventory_profile_is_selected_only_from_signed_provenance():
 def test_inventory_profile_is_bound_to_signed_l0_qemu_tdvf_closure():
     provenance = json.loads(
         (
-            Path(__file__).resolve().parents[1]
-            / "fixtures/gpu_provenance_v3_complete.json"
+            Path(__file__).resolve().parents[1] / "fixtures/gpu_provenance_v3_complete.json"
         ).read_text()
     )
     environment = provenance["launch_environments"][0]
@@ -384,9 +358,7 @@ def _claims(mode="platform"):
         "gpu_bdfs": BDFS,
         "gpu_uuids": sorted(UUIDS),
         "gpu_identifiers": ["b200"] * 8,
-        "gpu_attestation_certificate_sha256s": [
-            f"{index:064x}" for index in range(1, 9)
-        ],
+        "gpu_attestation_certificate_sha256s": [f"{index:064x}" for index in range(1, 9)],
         "topology_fingerprint": "1" * 64,
         "gpu_release_id": "release",
         "gpu_profile_id": "b200-8gpu",
@@ -408,9 +380,7 @@ def _claims(mode="platform"):
         "miner_hourly_cost": 12.5 if mode == "miner" else None,
         "chute_id": "chute" if mode == "platform" else None,
         "container_repository": "org/image" if mode == "platform" else None,
-        "container_manifest_digest": f"sha256:{'9' * 64}"
-        if mode == "platform"
-        else None,
+        "container_manifest_digest": f"sha256:{'9' * 64}" if mode == "platform" else None,
         "launch_nonce": "bm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm4=",
         "issued_at": now,
         "expires_at": now + timedelta(minutes=15),
@@ -668,9 +638,7 @@ async def test_failed_target_cutover_rebinds_same_migration_after_exact_reset(st
         def first(self):
             return self.value
 
-    db = SimpleNamespace(
-        execute=AsyncMock(side_effect=[Result(value) for value in values])
-    )
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(value) for value in values]))
     await _require_resumable_legacy_migration(
         db,
         migration,
@@ -752,9 +720,7 @@ async def test_failed_target_cutover_rejects_ambiguous_qemu_reset():
         def first(self):
             return self.value
 
-    db = SimpleNamespace(
-        execute=AsyncMock(side_effect=[Result(value) for value in values])
-    )
+    db = SimpleNamespace(execute=AsyncMock(side_effect=[Result(value) for value in values]))
     with pytest.raises(GpuAllocationError, match="not exact"):
         await _require_resumable_legacy_migration(
             db,

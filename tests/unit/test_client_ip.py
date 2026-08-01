@@ -81,9 +81,7 @@ def test_operator_endpoint_uses_direct_peer_and_ignores_forwarding_headers(monke
         ["10.0.0.0/8"],
     )
 
-    _require_operator_peer(
-        _request("10.20.30.40", {"X-Resolved-IP": "198.51.100.20"})
-    )
+    _require_operator_peer(_request("10.20.30.40", {"X-Resolved-IP": "198.51.100.20"}))
 
     denied = _request(
         "198.51.100.20",

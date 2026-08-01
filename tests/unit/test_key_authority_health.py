@@ -69,9 +69,7 @@ async def test_startup_attempts_both_authorities_then_fails_closed(monkeypatch):
 async def test_missing_gpu_active_key_remains_startup_fatal(monkeypatch):
     chutefs = AsyncMock()
     gpu_registration = AsyncMock(
-        side_effect=RuntimeError(
-            "database-active GPU registration recovery key is unavailable"
-        )
+        side_effect=RuntimeError("database-active GPU registration recovery key is unavailable")
     )
     monkeypatch.setattr(
         authority_health,
@@ -169,9 +167,7 @@ async def test_referenced_predecessor_degrades_without_aborting_and_recovers(
     health = authority_health.key_authority_health()
     assert health[degraded_authority]["status"] == "degraded"
     assert health[degraded_authority]["ready"] is False
-    assert health[degraded_authority]["missing_referenced_key_ids"] == [
-        "retiring-key-v1"
-    ]
+    assert health[degraded_authority]["missing_referenced_key_ids"] == ["retiring-key-v1"]
     assert authority_health.key_authorities_ready(health) is False
 
     degraded.return_value = KeyAuthorityRefreshResult()
@@ -192,11 +188,5 @@ def test_authority_metrics_are_fixed_cardinality_and_report_ack_age():
     ).decode()
 
     assert 'chutes_key_authority_ready{authority="chutefs_token"} 1' in rendered
-    assert (
-        'chutes_key_authority_ready{authority="gpu_registration_recovery"} 0'
-        in rendered
-    )
-    assert (
-        'chutes_key_authority_ack_age_seconds{authority="chutefs_token"} 4.5'
-        in rendered
-    )
+    assert 'chutes_key_authority_ready{authority="gpu_registration_recovery"} 0' in rendered
+    assert 'chutes_key_authority_ack_age_seconds{authority="chutefs_token"} 4.5' in rendered

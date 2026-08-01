@@ -105,17 +105,12 @@ def historical_migration_versions() -> list[str]:
             files_by_version.setdefault(version, []).append(migration_path)
 
     missing = [
-        version
-        for version in PRODUCTION_BASE_MIGRATION_VERSIONS
-        if version not in files_by_version
+        version for version in PRODUCTION_BASE_MIGRATION_VERSIONS if version not in files_by_version
     ]
-    duplicates = {
-        version: paths for version, paths in files_by_version.items() if len(paths) != 1
-    }
+    duplicates = {version: paths for version, paths in files_by_version.items() if len(paths) != 1}
     if missing or duplicates:
         duplicate_names = {
-            version: [path.name for path in paths]
-            for version, paths in sorted(duplicates.items())
+            version: [path.name for path in paths] for version, paths in sorted(duplicates.items())
         }
         raise RuntimeError(
             "The immutable production migration baseline does not match disk: "

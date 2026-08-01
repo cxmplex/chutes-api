@@ -301,9 +301,7 @@ async def enrollment_status_endpoint(
         or host.active_key_generation is None
         or host.enrolled_at is None
     ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Host not enrolled."
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Host not enrolled.")
     key = await db.get(HostKeyGeneration, (host.host_id, host.active_key_generation))
     if key is None:
         raise HTTPException(
@@ -346,9 +344,7 @@ async def host_auth_challenge_endpoint(
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-        return await host_service.create_host_auth_challenge(
-            db, host_id, key_generation
-        )
+        return await host_service.create_host_auth_challenge(db, host_id, key_generation)
     except host_service.HostAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc))
 
@@ -553,9 +549,7 @@ async def create_platform_gpu_reservation_endpoint(
         # compares the database lineage before creating authority.
         trusted_workload = await _trusted_platform_workload(db, body)
         observed_live_storage_ids = await observe_gpu_storage_liveness(db, host_id)
-        target = (
-            1 if body.job_id is not None else await _target_count(db, body.chute_id)
-        )
+        target = 1 if body.job_id is not None else await _target_count(db, body.chute_id)
         await _preverify_active_gpu_release(db, host_id)
         await acquire_gpu_workload_lock(db, body.chute_id, body.job_id)
         chute = await db.get(Chute, body.chute_id)
@@ -651,9 +645,7 @@ async def create_miner_gpu_reservation_endpoint(
                 else None
             )
             if identity is None or identity.owner_hotkey != owner or migration is None:
-                raise GpuAllocationError(
-                    "Legacy migration closure has not been established."
-                )
+                raise GpuAllocationError("Legacy migration closure has not been established.")
             if migration.state == "guest_closed":
                 await db.rollback()
                 command = "confirm_gpu_legacy_sources"
@@ -666,18 +658,14 @@ async def create_miner_gpu_reservation_endpoint(
                 }
                 acknowledgement = None
                 for _attempt in range(2):
-                    assert_gpu_external_work_allowed(
-                        db, "legacy source-confirm command dispatch"
-                    )
+                    assert_gpu_external_work_allowed(db, "legacy source-confirm command dispatch")
                     await send_agent_command(
                         host_id,
                         command,
                         command_data,
                         command_id=command_id,
                     )
-                    assert_gpu_external_work_allowed(
-                        db, "legacy source-confirm ACK wait"
-                    )
+                    assert_gpu_external_work_allowed(db, "legacy source-confirm ACK wait")
                     acknowledgement = await wait_for_agent_command_ack(
                         host_id,
                         command,
@@ -783,9 +771,7 @@ async def stop_miner_gpu_server_endpoint(
         or server.gpu_management_mode != "miner"
         or not server.gpu_launch_reservation_id
     ):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="GPU server not found."
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GPU server not found.")
     try:
         reservation = await request_gpu_teardown(
             db,
@@ -802,9 +788,7 @@ async def stop_miner_gpu_server_endpoint(
             server_id=server.server_id,
             reservation_id=reservation.reservation_id,
             status=(
-                "released"
-                if reservation.state in {"released", "expired"}
-                else "teardown_requested"
+                "released" if reservation.state in {"released", "expired"} else "teardown_requested"
             ),
         )
     except GpuAllocationError as exc:
@@ -1256,10 +1240,7 @@ async def finalize_gpu_host_loss_endpoint(
     """Permanently fence a phase-two group whose original L0 cannot return."""
 
     _require_admin(current_user)
-    if (
-        body.operation_id != operation_id
-        or body.allocation_group_id != allocation_group_id
-    ):
+    if body.operation_id != operation_id or body.allocation_group_id != allocation_group_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="GPU host-loss request identity differs from its path.",
@@ -1316,9 +1297,7 @@ async def register_host_endpoint(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error(
-            f"Unexpected error in host registration: host_id={args.host_id} error={exc}"
-        )
+        logger.error(f"Unexpected error in host registration: host_id={args.host_id} error={exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Host registration failed due to an unexpected error.",
@@ -1357,9 +1336,7 @@ async def upgrade_host_image_endpoint(
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error(
-            f"Unexpected error in host image upgrade: host_id={host_id} error={exc}"
-        )
+        logger.error(f"Unexpected error in host image upgrade: host_id={host_id} error={exc}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Host image upgrade failed due to an unexpected error.",
@@ -1395,9 +1372,7 @@ async def reboot_host_endpoint(
             detail="Missing miner hotkey header.",
         )
     try:
-        return await request_host_reboot(
-            db, host_id, hotkey, target_l0_version=target_l0_version
-        )
+        return await request_host_reboot(db, host_id, hotkey, target_l0_version=target_l0_version)
     except ServerRegistrationError as exc:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
     except HTTPException:
@@ -1429,11 +1404,7 @@ async def list_hosts(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing hotkey header."
         )
-    hosts = (
-        (await db.execute(select(Host).where(Host.miner_hotkey == hotkey)))
-        .scalars()
-        .all()
-    )
+    hosts = (await db.execute(select(Host).where(Host.miner_hotkey == hotkey))).scalars().all()
     # Per-host TD usage in one grouped query (mirrors api/cpu_scheduler.py _launch_on_host) rather
     # than a COUNT per host.
     used_rows = (
@@ -1461,9 +1432,7 @@ async def list_hosts(
             await gpu_host_storage_readiness(
                 db,
                 h,
-                observed_live_storage_ids=observed_storage_by_host.get(
-                    h.host_id, set()
-                ),
+                observed_live_storage_ids=observed_storage_by_host.get(h.host_id, set()),
             )
             if h.compute_type == "gpu"
             else None
@@ -1487,16 +1456,12 @@ async def list_hosts(
                     readiness.trusted_storage_ready if readiness is not None else None
                 ),
                 "control_channel_eligible": (
-                    readiness.control_channel_eligible
-                    if readiness is not None
-                    else None
+                    readiness.control_channel_eligible if readiness is not None else None
                 ),
                 "trusted_schedulable": (
                     readiness.trusted_schedulable if readiness is not None else None
                 ),
-                "trusted_storage_reason": (
-                    readiness.reason if readiness is not None else None
-                ),
+                "trusted_storage_reason": (readiness.reason if readiness is not None else None),
                 "untrusted_gpu_inventory": h.untrusted_gpu_inventory,
                 "untrusted_gpu_inventory_ready": h.untrusted_gpu_inventory_ready,
             }

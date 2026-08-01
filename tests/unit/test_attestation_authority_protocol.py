@@ -91,12 +91,8 @@ def _runtime_server(*, compute_type: str, storage_role: bool = False):
         self_registered=True,
         tee_type="tdx",
         host_id=HOST_ID,
-        launch_reservation_id=(
-            CPU_RESERVATION_ID if compute_type == "cpu" else None
-        ),
-        launch_boot_generation=(
-            CPU_BOOT_GENERATION if compute_type == "cpu" else None
-        ),
+        launch_reservation_id=(CPU_RESERVATION_ID if compute_type == "cpu" else None),
+        launch_boot_generation=(CPU_BOOT_GENERATION if compute_type == "cpu" else None),
         gpu_retired_at=None,
         attested_cert="attested-certificate",
         attested_cert_pubkey_hash=CERT_HASH,
@@ -217,7 +213,12 @@ def _measurement(*, storage: bool):
 def _quote():
     return SimpleNamespace(
         mrtd="0" * 96,
-        rtmrs={"rtmr0": "0" * 96, "rtmr1": "0" * 96, "rtmr2": "0" * 96, "rtmr3": "0" * 96},
+        rtmrs={
+            "rtmr0": "0" * 96,
+            "rtmr1": "0" * 96,
+            "rtmr2": "0" * 96,
+            "rtmr3": "0" * 96,
+        },
     )
 
 
@@ -251,10 +252,7 @@ def test_cpu_runtime_context_projects_exact_consumed_reservation_lineage():
         assert context.cpu_claims_sha256 == canonical_sha256(
             TdLaunchReservationClaimsV1.model_validate(reservation.claims)
         )
-        assert (
-            context.cpu_registration_attestation_id
-            == CPU_REGISTRATION_ATTESTATION_ID
-        )
+        assert context.cpu_registration_attestation_id == CPU_REGISTRATION_ATTESTATION_ID
 
         reservation.process_incarnation = "row-claims-drift"
         with pytest.raises(
@@ -613,7 +611,6 @@ async def test_older_runtime_failure_cannot_fence_newer_gpu_success():
     lifecycle_fence.assert_not_awaited()
 
 
-
 @pytest.mark.asyncio
 async def test_gpu_claim_corruption_finalizes_durable_pending_attempt_before_verification():
     db = _async_db()
@@ -739,9 +736,7 @@ def _persist_exact_cpu_registration_response(reservation, document=None):
     reservation.consumed_attestation_id = "completed-registration"
     reservation.consumed_cert_pubkey_hash = CERT_HASH
     reservation.registration_response_bytes = response_bytes.decode("ascii")
-    reservation.registration_response_sha256 = hashlib.sha256(
-        response_bytes
-    ).hexdigest()
+    reservation.registration_response_sha256 = hashlib.sha256(response_bytes).hexdigest()
     return document, response_bytes
 
 
@@ -864,7 +859,10 @@ async def test_model_b_reenrollment_commits_pending_attempt_before_verification_
     ]
 
     with (
-        patch("api.server.service.settings", SimpleNamespace(skip_metagraph_check=False, netuid=64)),
+        patch(
+            "api.server.service.settings",
+            SimpleNamespace(skip_metagraph_check=False, netuid=64),
+        ),
         patch(
             "api.server.service.resolve_launch_reservation",
             new_callable=AsyncMock,
@@ -944,7 +942,10 @@ async def test_model_b_first_registration_failure_persists_attributed_attempt_wi
     ]
 
     with (
-        patch("api.server.service.settings", SimpleNamespace(skip_metagraph_check=False, netuid=64)),
+        patch(
+            "api.server.service.settings",
+            SimpleNamespace(skip_metagraph_check=False, netuid=64),
+        ),
         patch(
             "api.server.service.resolve_launch_reservation",
             new_callable=AsyncMock,
@@ -985,9 +986,9 @@ async def test_model_b_first_registration_failure_persists_attributed_attempt_wi
         ("flush", "CPU registration attestation did not complete."),
         ("commit", "CPU registration attestation did not complete."),
     ]
-    assert events.index(("commit", "CPU registration attestation did not complete.")) < events.index(
-        ("verify", None)
-    )
+    assert events.index(
+        ("commit", "CPU registration attestation did not complete.")
+    ) < events.index(("verify", None))
     assert events[-1] == ("commit", "first verifier unavailable")
     db.rollback.assert_awaited_once()
 
@@ -1040,16 +1041,17 @@ async def test_older_model_b_attempt_replays_newer_response_after_verification()
         nonlocal resolve_calls
         resolve_calls += 1
         if resolve_calls == 2:
-            document, response_bytes = _persist_exact_cpu_registration_response(
-                reservation
-            )
+            document, response_bytes = _persist_exact_cpu_registration_response(reservation)
             reservation.consumed_attestation_id = "newer-success"
             winner["document"] = document
             winner["response_bytes"] = response_bytes
         return reservation, claims
 
     with (
-        patch("api.server.service.settings", SimpleNamespace(skip_metagraph_check=False, netuid=64)),
+        patch(
+            "api.server.service.settings",
+            SimpleNamespace(skip_metagraph_check=False, netuid=64),
+        ),
         patch(
             "api.server.service.resolve_launch_reservation",
             new_callable=AsyncMock,
@@ -1064,7 +1066,10 @@ async def test_older_model_b_attempt_replays_newer_response_after_verification()
             new_callable=AsyncMock,
             return_value=SimpleNamespace(revocation_status={"authority": "candidate"}),
         ),
-        patch("api.server.service.get_matching_measurement_config", return_value=measurement),
+        patch(
+            "api.server.service.get_matching_measurement_config",
+            return_value=measurement,
+        ),
         patch(
             "api.server.service._measurement_fingerprints",
             return_value=(CONFIG_FINGERPRINT, TRUST_FINGERPRINT),
@@ -1111,8 +1116,7 @@ async def test_older_model_b_attempt_replays_newer_response_after_verification()
     assert authority_before == vars(current_server)
     assert len(resolve.await_args_list) == 2
     assert all(
-        call.kwargs == {"allow_consumed_for_publication": True}
-        for call in resolve.await_args_list
+        call.kwargs == {"allow_consumed_for_publication": True} for call in resolve.await_args_list
     )
 
 

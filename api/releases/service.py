@@ -108,9 +108,7 @@ def _provenance_verification_key(payload: str, signature: str) -> tuple[str, ...
     try:
         key_sha256 = hashlib.sha256(key_path.read_bytes()).hexdigest()
     except OSError as exc:
-        raise ProvenanceError(
-            f"trusted provenance public key is unavailable: {key_path}"
-        ) from exc
+        raise ProvenanceError(f"trusted provenance public key is unavailable: {key_path}") from exc
     return (
         hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         hashlib.sha256(signature.encode("utf-8")).hexdigest(),
@@ -150,9 +148,7 @@ def _verified_provenance_document(
         snapshot_keys.add(key)
         _PROVENANCE_VERIFICATION_CACHE.move_to_end(key)
         return cached
-    assert_gpu_external_work_allowed(
-        db, f"{image_role} release provenance cosign verification"
-    )
+    assert_gpu_external_work_allowed(db, f"{image_role} release provenance cosign verification")
     document = verify_provenance_signature(
         payload,
         signature,
@@ -1190,13 +1186,9 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
             image = (release.images or {}).get(image_role)
             if image:
                 if image_role == "gpu":
-                    _validate_gpu_image_provenance(
-                        release, image, loaded_by_name, db=db
-                    )
+                    _validate_gpu_image_provenance(release, image, loaded_by_name, db=db)
                 else:
-                    _validate_image_provenance(
-                        release, image_role, image, loaded_by_name, db=db
-                    )
+                    _validate_image_provenance(release, image_role, image, loaded_by_name, db=db)
         await _validate_gpu_storage_stream(db, release)
         publication = await _validate_l0_bootstrap(db, release)
         await _mark_l0_publication_active(db, release, publication)
@@ -1354,7 +1346,11 @@ def _target_roles_for_host(release: GuestRelease, host: Host) -> List[str]:
     storage = images.get("storage") or {}
     if chute and not chute.get("_inherited") and int(host.capacity or 0) > 0:
         roles.append("chute")
-    if storage and not storage.get("_inherited") and bool(getattr(host, "storage_requested", False)):
+    if (
+        storage
+        and not storage.get("_inherited")
+        and bool(getattr(host, "storage_requested", False))
+    ):
         roles.append("storage")
     return roles
 
@@ -2205,13 +2201,9 @@ def _validate_active_release(
         image = images.get(role)
         if image:
             if role == "gpu":
-                _validate_gpu_image_provenance(
-                    release, image, loaded_by_name, db=db
-                )
+                _validate_gpu_image_provenance(release, image, loaded_by_name, db=db)
             else:
-                _validate_image_provenance(
-                    release, role, image, loaded_by_name, db=db
-                )
+                _validate_image_provenance(release, role, image, loaded_by_name, db=db)
 
 
 async def preverify_active_gpu_release_for_host(
@@ -2227,11 +2219,7 @@ async def preverify_active_gpu_release_for_host(
             )
         )
     ).one_or_none()
-    if (
-        identity is None
-        or identity.compute_type != "gpu"
-        or identity.tee_type != "tdx"
-    ):
+    if identity is None or identity.compute_type != "gpu" or identity.tee_type != "tdx":
         raise ReleaseError("GPU host has no eligible release stream identity.")
     release = await get_active_release(
         db,
@@ -2389,9 +2377,7 @@ async def rollout_release(
             # Opt-in L0 re-netboot: send reboot AFTER the image nudge so the box comes up on the new
             # guest images too. target_l0_version makes an already-updated host skip the reboot.
             if reboot_l0 and (getattr(host, "l0_version", None) != l0_version):
-                assert_gpu_external_work_allowed(
-                    db, "release rollout reboot dispatch"
-                )
+                assert_gpu_external_work_allowed(db, "release rollout reboot dispatch")
                 rid = await send_agent_command(
                     host.host_id, "reboot", {"target_l0_version": l0_version}
                 )
@@ -2711,8 +2697,8 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
         from api.host.reservations import observe_gpu_storage_liveness
 
         for host in hosts:
-            observed_storage_by_host[host.host_id] = (
-                await observe_gpu_storage_liveness(db, host.host_id)
+            observed_storage_by_host[host.host_id] = await observe_gpu_storage_liveness(
+                db, host.host_id
             )
         for server_id in sorted(
             {
@@ -2721,9 +2707,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 if reservation.server_id is not None
             }
         ):
-            assert_gpu_external_work_allowed(
-                db, "release-status guest liveness lookup"
-            )
+            assert_gpu_external_work_allowed(db, "release-status guest liveness lookup")
             online_by_server[server_id] = await is_agent_online(server_id)
     host_rows = []
     gpu_storage_siblings = []
@@ -2744,9 +2728,7 @@ async def release_status(db: AsyncSession, release_id: str) -> Dict:
                 readiness = await gpu_host_storage_readiness(
                     db,
                     host,
-                    observed_live_storage_ids=observed_storage_by_host.get(
-                        host.host_id, set()
-                    ),
+                    observed_live_storage_ids=observed_storage_by_host.get(host.host_id, set()),
                 )
                 gpu_storage_siblings.append(readiness.model_dump(mode="json"))
             except ReleaseError:

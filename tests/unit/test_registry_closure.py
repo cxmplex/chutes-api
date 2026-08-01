@@ -601,9 +601,7 @@ def test_registry_scope_down_migration_refuses_ambiguous_server_sessions():
     down = migration.split("-- migrate:down", maxsplit=1)[1]
     guard_end = down.index("$$;", down.index("DO $$"))
     lock_targets = [
-        line.split()[2]
-        for line in down[:guard_end].splitlines()
-        if line.startswith("LOCK TABLE ")
+        line.split()[2] for line in down[:guard_end].splitlines() if line.startswith("LOCK TABLE ")
     ]
     assert lock_targets == [
         "instances",

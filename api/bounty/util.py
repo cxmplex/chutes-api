@@ -126,9 +126,7 @@ def _parse_activation_claim_envelope(data, attempt_id: str, chute_id: str) -> di
             data = data.decode()
         envelope = json.loads(data)
     except (TypeError, ValueError, UnicodeDecodeError) as exc:
-        raise RuntimeError(
-            "Activation bounty claim returned an invalid envelope"
-        ) from exc
+        raise RuntimeError("Activation bounty claim returned an invalid envelope") from exc
     if (
         not isinstance(envelope, dict)
         or envelope.get("schema") != "chutes.activation-bounty-result.v1"
@@ -203,9 +201,7 @@ async def bounty_lifetime_for(chute: Chute) -> int:
         and chute.user_id != await chutes_user_id()
     ):
         return (
-            BOUNTY_LIFETIME_AFFINE
-            if "/affine" in chute.name.lower()
-            else BOUNTY_LIFETIME_PRIVATE
+            BOUNTY_LIFETIME_AFFINE if "/affine" in chute.name.lower() else BOUNTY_LIFETIME_PRIVATE
         )
     return BOUNTY_LIFETIME_PUBLIC
 
@@ -242,9 +238,7 @@ async def create_bounty_if_not_exists(chute_id: str, lifetime: int = 86400) -> b
         )
         if result:
             # Set cooldown to prevent rapid bounty recreation
-            await settings.lite_redis_client.set(
-                cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS
-            )
+            await settings.lite_redis_client.set(cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS)
             # Record the demand signal (a newly created bounty means the chute is wanted hot).
             # The bounty's creation timestamp (stored above) is the request->hot start time, read
             # back at activation via claim_bounty()'s age_seconds.
@@ -296,9 +290,7 @@ async def claim_bounty(
         # where a new bounty gets created while instances are still spinning up
         cooldown_key = f"bounty_cooldown:{chute_id}"
         try:
-            await settings.lite_redis_client.set(
-                cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS
-            )
+            await settings.lite_redis_client.set(cooldown_key, "1", ex=BOUNTY_COOLDOWN_SECONDS)
             # Extra delete in case there was a brief race condition
             await settings.lite_redis_client.delete(key)
         except Exception as exc:

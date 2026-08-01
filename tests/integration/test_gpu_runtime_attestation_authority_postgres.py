@@ -172,10 +172,7 @@ async def test_registration_a_operational_b_mint_validate_and_gpu_infra(
             operational_b,
             server,
         )
-        assert (
-            authority.registration_attestation.attestation_id
-            == registration_a.attestation_id
-        )
+        assert authority.registration_attestation.attestation_id == registration_a.attestation_id
         assert authority.gpu_uuids == tuple(request.gpu_uuids)
         assert completed.registration_replay_until < datetime.now(timezone.utc)
 
@@ -222,10 +219,7 @@ async def test_registration_a_operational_b_mint_validate_and_gpu_infra(
                 spki,
             )
         assert locked_server.server_id == registration_a.server_id
-        assert (
-            locked_reservation.registration_attestation_id
-            == registration_a.attestation_id
-        )
+        assert locked_reservation.registration_attestation_id == registration_a.attestation_id
         await session.rollback()
 
 
@@ -308,9 +302,7 @@ async def test_miner_operational_selection_must_equal_registered_subset(
         registered = list(registration_a.gpu_evidence_certificate_sha256s)
         replacement = reservation.gpu_attestation_certificate_sha256s[2]
         certificates = (
-            [*registered, replacement]
-            if selection == "added"
-            else [registered[0], replacement]
+            [*registered, replacement] if selection == "added" else [registered[0], replacement]
         )
         operational_b = await _add_operational_b(
             session,
@@ -360,6 +352,4 @@ async def test_platform_operational_subset_is_rejected(postgres_schema):
                 operational_b,
                 server,
             )
-        assert len(registration_a.gpu_evidence_certificate_sha256s) == len(
-            reservation.gpu_uuids
-        )
+        assert len(registration_a.gpu_evidence_certificate_sha256s) == len(reservation.gpu_uuids)

@@ -836,9 +836,7 @@ async def test_delete_server_success(mock_db_session, sample_server):
 
 
 @pytest.mark.asyncio
-async def test_delete_gpu_server_requires_explicit_decommission(
-    mock_db_session, sample_server
-):
+async def test_delete_gpu_server_requires_explicit_decommission(mock_db_session, sample_server):
     sample_server.compute_type = "gpu"
     with (
         patch("api.server.service.check_server_ownership", return_value=sample_server),
