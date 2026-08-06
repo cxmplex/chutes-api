@@ -8,12 +8,15 @@ import jwt
 import pytest
 from fastapi import HTTPException
 
-from api.config import settings
+from api.config import Settings, settings
 from api.server.schemas import GpuRuntimeSessionResponse, GpuServerDecommission
 from api.gpu_hotplug_service import GpuHotplugError
 from api.server.gpu_sessions import (
     GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS,
-    GPU_RUNTIME_SESSION_PURPOSES,
+    GPU_RUNTIME_SESSION_PURPOSES_V1,
+    GPU_RUNTIME_SESSION_PURPOSES_V2,
+    GPU_RUNTIME_SESSION_VERSION_V1,
+    GPU_RUNTIME_SESSION_VERSION_V2,
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
     _current_attestation,
     _current_attestation_identity,
@@ -152,14 +155,92 @@ def test_miner_registration_mints_short_scoped_attested_session():
         issuer="chutes",
     )
     assert payload["purpose"] == "gpu_runtime_session"
+    assert payload["version"] == GPU_RUNTIME_SESSION_VERSION_V1
     assert payload["owner_hotkey"] == "5Owner"
-    assert payload["allowed_purposes"] == list(GPU_RUNTIME_SESSION_PURPOSES)
+    assert payload["allowed_purposes"] == list(GPU_RUNTIME_SESSION_PURPOSES_V1)
+    assert "gpu-decommission" not in payload["allowed_purposes"]
     assert payload["exp"] - payload["iat"] == 900
     assert int(expires_at.timestamp()) == payload["exp"]
 
 
+def test_upgraded_miner_explicitly_mints_version_two_decommission_scope():
+    token, _expires_at = mint_gpu_runtime_session(
+        _server(),
+        _attestation(),
+        version=GPU_RUNTIME_SESSION_VERSION_V2,
+    )
+    payload = jwt.decode(
+        token,
+        settings.launch_config_key,
+        algorithms=["HS256"],
+        issuer="chutes",
+    )
+    assert payload["version"] == GPU_RUNTIME_SESSION_VERSION_V2
+    assert payload["allowed_purposes"] == list(GPU_RUNTIME_SESSION_PURPOSES_V2)
+    assert "gpu-decommission" in payload["allowed_purposes"]
+
+
 @pytest.mark.asyncio
-async def test_runtime_session_iat_accepts_explicit_bounded_future_skew():
+async def test_version_one_token_never_authorizes_gpu_decommission():
+    token, _expires_at = mint_gpu_runtime_session(_server(), _attestation())
+    db = AsyncMock()
+
+    with pytest.raises(HTTPException, match="scope is invalid") as exc:
+        await validate_gpu_runtime_session(
+            db,
+            token,
+            required_purpose="gpu-decommission",
+        )
+
+    assert exc.value.status_code == 401
+    db.get.assert_not_awaited()
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version", "purposes"),
+    [
+        (GPU_RUNTIME_SESSION_VERSION_V1, GPU_RUNTIME_SESSION_PURPOSES_V2),
+        (GPU_RUNTIME_SESSION_VERSION_V2, GPU_RUNTIME_SESSION_PURPOSES_V1),
+        (3, GPU_RUNTIME_SESSION_PURPOSES_V2),
+        (True, GPU_RUNTIME_SESSION_PURPOSES_V1),
+    ],
+)
+async def test_runtime_session_version_and_purposes_must_match_exactly(
+    version,
+    purposes,
+):
+    token, _expires_at = mint_gpu_runtime_session(_server(), _attestation())
+    payload = jwt.decode(
+        token,
+        settings.launch_config_key,
+        algorithms=["HS256"],
+        issuer="chutes",
+    )
+    payload["version"] = version
+    payload["allowed_purposes"] = list(purposes)
+    malformed = jwt.encode(payload, settings.launch_config_key, algorithm="HS256")
+    db = AsyncMock()
+
+    with pytest.raises(HTTPException, match="scope is invalid") as exc:
+        await validate_gpu_runtime_session(
+            db,
+            malformed,
+            required_purpose="miner",
+        )
+
+    assert exc.value.status_code == 401
+    db.get.assert_not_awaited()
+    db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "version",
+    [GPU_RUNTIME_SESSION_VERSION_V1, GPU_RUNTIME_SESSION_VERSION_V2],
+)
+async def test_runtime_session_iat_accepts_explicit_bounded_future_skew(version):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     server = _server()
     attestation = _attestation()
@@ -185,7 +266,11 @@ async def test_runtime_session_iat_accepts_explicit_bounded_future_skew():
             AsyncMock(),
         ),
     ):
-        token, expires_at = mint_gpu_runtime_session(server, attestation)
+        token, expires_at = mint_gpu_runtime_session(
+            server,
+            attestation,
+            version=version,
+        )
         server.gpu_runtime_session_expires_at = expires_at
         current, payload = await validate_gpu_runtime_session(
             db,
@@ -194,6 +279,7 @@ async def test_runtime_session_iat_accepts_explicit_bounded_future_skew():
         )
 
     assert current is server
+    assert payload["version"] == version
     assert payload["iat"] == (int(now.timestamp()) + GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS)
 
 
@@ -210,7 +296,11 @@ async def test_runtime_session_iat_rejects_future_time_beyond_explicit_skew():
             now,
         ],
     ):
-        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+        token, _expires_at = mint_gpu_runtime_session(
+            server,
+            attestation,
+            version=GPU_RUNTIME_SESSION_VERSION_V2,
+        )
         with pytest.raises(HTTPException, match="invalid or expired") as exc:
             await validate_gpu_runtime_session(
                 db,
@@ -231,7 +321,11 @@ async def test_runtime_session_time_claims_require_exact_integers(claim, value):
     server = _server()
     attestation = _attestation()
     with patch("api.server.gpu_sessions._runtime_session_now", return_value=now):
-        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+        token, _expires_at = mint_gpu_runtime_session(
+            server,
+            attestation,
+            version=GPU_RUNTIME_SESSION_VERSION_V2,
+        )
     payload = jwt.decode(
         token,
         settings.launch_config_key,
@@ -304,7 +398,11 @@ async def test_expired_runtime_session_only_replays_cert_bound_decommission_audi
     server = _server()
     attestation = _attestation()
     with patch("api.server.gpu_sessions._runtime_session_now", return_value=issued_at):
-        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+        token, _expires_at = mint_gpu_runtime_session(
+            server,
+            attestation,
+            version=GPU_RUNTIME_SESSION_VERSION_V2,
+        )
 
     server.gpu_management_mode = None
     server.gpu_launch_reservation_id = None
@@ -373,7 +471,11 @@ async def test_expired_session_still_authorizes_exact_initial_terminal_decommiss
     server = _server()
     attestation = _attestation()
     with patch("api.server.gpu_sessions._runtime_session_now", return_value=issued_at):
-        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+        token, _expires_at = mint_gpu_runtime_session(
+            server,
+            attestation,
+            version=GPU_RUNTIME_SESSION_VERSION_V2,
+        )
 
     terminal_db = _runtime_session_authority_db(
         server,
@@ -478,20 +580,49 @@ def test_explicit_nonfailure_revocation_status_remains_accepted(value):
 
 
 @pytest.mark.asyncio
-async def test_runtime_session_route_response_model_accepts_exact_gpu_infra_purpose():
+@pytest.mark.parametrize(
+    (
+        "requested_version",
+        "v2_enabled",
+        "expected_version",
+        "expected_purposes",
+    ),
+    [
+        (None, False, GPU_RUNTIME_SESSION_VERSION_V1, GPU_RUNTIME_SESSION_PURPOSES_V1),
+        (None, True, GPU_RUNTIME_SESSION_VERSION_V1, GPU_RUNTIME_SESSION_PURPOSES_V1),
+        ("1", False, GPU_RUNTIME_SESSION_VERSION_V1, GPU_RUNTIME_SESSION_PURPOSES_V1),
+        ("1", True, GPU_RUNTIME_SESSION_VERSION_V1, GPU_RUNTIME_SESSION_PURPOSES_V1),
+        ("2", False, GPU_RUNTIME_SESSION_VERSION_V1, GPU_RUNTIME_SESSION_PURPOSES_V1),
+        ("2", True, GPU_RUNTIME_SESSION_VERSION_V2, GPU_RUNTIME_SESSION_PURPOSES_V2),
+    ],
+)
+async def test_runtime_session_route_negotiates_compatible_response(
+    requested_version,
+    v2_enabled,
+    expected_version,
+    expected_purposes,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "gpu_runtime_session_v2_enabled", v2_enabled)
     server = _server()
     db = AsyncMock()
     db.get.return_value = server
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    token, expires_at = mint_gpu_runtime_session(
+        server,
+        _attestation(),
+        version=expected_version,
+    )
+    latest = AsyncMock(return_value=(token, expires_at, "attestation"))
     with patch.object(
         server_router,
         "latest_gpu_runtime_session",
-        AsyncMock(return_value=("runtime-token", expires_at, "attestation")),
+        latest,
     ):
         response = await server_router.refresh_gpu_runtime_session(
             "gpu-server",
             db,
             expected_cert_hash="a" * 64,
+            requested_session_version=requested_version,
         )
     route = next(
         item
@@ -499,9 +630,73 @@ async def test_runtime_session_route_response_model_accepts_exact_gpu_infra_purp
         if getattr(item, "path", None) == "/gpu/{server_id}/session"
     )
     assert route.response_model is GpuRuntimeSessionResponse
-    validated = route.response_model.model_validate(response.model_dump())
-    assert validated.allowed_purposes == list(GPU_RUNTIME_SESSION_PURPOSES)
+    assert route.response_model_exclude_none is True
+    document = response.model_dump(exclude_none=True)
+    validated = route.response_model.model_validate(document)
+    expected_keys = {
+        "server_id",
+        "owner_hotkey",
+        "runtime_session",
+        "runtime_session_expires_at",
+        "allowed_purposes",
+    }
+    if expected_version == GPU_RUNTIME_SESSION_VERSION_V2:
+        expected_keys.add("session_version")
+    assert set(document) == expected_keys
+    token_payload = jwt.decode(
+        document["runtime_session"],
+        settings.launch_config_key,
+        algorithms=["HS256"],
+        issuer="chutes",
+    )
+    assert token_payload["version"] == expected_version
+    assert token_payload["allowed_purposes"] == document["allowed_purposes"]
+    assert validated.allowed_purposes == list(expected_purposes)
     assert "gpu-infra" in validated.allowed_purposes
+    assert document.get("session_version") == (
+        GPU_RUNTIME_SESSION_VERSION_V2
+        if expected_version == GPU_RUNTIME_SESSION_VERSION_V2
+        else None
+    )
+    latest.assert_awaited_once_with(db, server, version=expected_version)
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_route_rejects_unknown_negotiated_version_before_mint():
+    server = _server()
+    db = AsyncMock()
+    db.get.return_value = server
+    latest = AsyncMock()
+    with (
+        patch.object(server_router, "latest_gpu_runtime_session", latest),
+        pytest.raises(
+            HTTPException, match="Unsupported GPU runtime session version"
+        ) as exc,
+    ):
+        await server_router.refresh_gpu_runtime_session(
+            "gpu-server",
+            db,
+            expected_cert_hash="a" * 64,
+            requested_session_version="3",
+        )
+    assert exc.value.status_code == 400
+    latest.assert_not_awaited()
+    db.get.assert_not_awaited()
+
+
+def test_gpu_runtime_session_v2_setting_is_explicit_boolean_and_defaults_off():
+    field = Settings.model_fields["gpu_runtime_session_v2_enabled"]
+
+    assert field.annotation is bool
+    assert field.default is False
+    assert (
+        Settings(gpu_runtime_session_v2_enabled=False).gpu_runtime_session_v2_enabled
+        is False
+    )
+    assert (
+        Settings(gpu_runtime_session_v2_enabled=True).gpu_runtime_session_v2_enabled
+        is True
+    )
 
 
 def test_platform_registration_mints_only_exact_registry_scope():

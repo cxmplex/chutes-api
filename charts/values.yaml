@@ -100,6 +100,12 @@ api:
   # Fixed ChuteFS token-key activation quorum for this stable API serving cohort.
   # Production overlays must set this to the intended minimum serving replica target.
   chutefsTokenRequiredAckCount: 1
+  # Fixed Registration V2 recovery-key activation quorum for the stable API cohort.
+  # Production overlays must set this to the intended minimum serving replica target.
+  gpuRegistrationRecoveryRequiredAckCount: 1
+  # Preserve the immutable v1 GPU runtime-session contract during API/miner/agent
+  # rollout. Enable only after every durable miner consumer accepts v2.
+  gpuRuntimeSessionV2Enabled: false
   image: validator:latest
   imagePullPolicy: Always
   limitConcurrency: 1024

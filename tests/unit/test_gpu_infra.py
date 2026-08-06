@@ -14,7 +14,8 @@ from api.host import router as host_router
 from api.server import gpu_infra
 from api.server.gpu_sessions import (
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
-    GPU_RUNTIME_SESSION_PURPOSES,
+    GPU_RUNTIME_SESSION_PURPOSES_V1,
+    GPU_RUNTIME_SESSION_PURPOSES_V2,
 )
 from api.server.schemas import (
     GpuInfraCloseRequestV1,
@@ -143,16 +144,27 @@ async def test_legacy_gpu_start_waits_for_exact_async_command_ack():
     )
 
 
-def test_gpu_runtime_purposes_match_cross_repo_fixture():
-    fixture = Path(__file__).resolve().parents[1] / "fixtures/gpu_runtime_purposes_v1.json"
+@pytest.mark.parametrize(
+    ("version", "purposes"),
+    [
+        (1, GPU_RUNTIME_SESSION_PURPOSES_V1),
+        (2, GPU_RUNTIME_SESSION_PURPOSES_V2),
+    ],
+)
+def test_gpu_runtime_purposes_match_cross_repo_fixture(version, purposes):
+    fixture = (
+        Path(__file__).resolve().parents[1]
+        / f"fixtures/gpu_runtime_purposes_v{version}.json"
+    )
     document = json.loads(fixture.read_text(encoding="ascii"))
     assert document == {
         "schema": "chutes.gpu-runtime-purposes",
-        "version": 1,
-        "miner": list(GPU_RUNTIME_SESSION_PURPOSES),
+        "version": version,
+        "miner": list(purposes),
         "platform": list(GPU_PLATFORM_RUNTIME_SESSION_PURPOSES),
     }
     assert "gpu-infra" in document["miner"]
+    assert ("gpu-decommission" in document["miner"]) is (version == 2)
 
 
 def test_awaiting_ack_retains_pending_key_without_advancing_floor():

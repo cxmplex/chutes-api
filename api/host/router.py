@@ -1183,7 +1183,8 @@ async def stage_gpu_registration_recovery_key_endpoint(
                 administrator_id=str(administrator.user_id),
                 request_id=body.request_id,
                 key_id=body.key_id,
-                required_replica_ids=body.required_replica_ids,
+                cohort_id=body.cohort_id,
+                required_ack_count=body.required_ack_count,
             )
         )
     )

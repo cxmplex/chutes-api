@@ -90,6 +90,10 @@ from api.server.gpu_sessions import (
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
     GPU_RUNTIME_SESSION_HEADER,
     GPU_RUNTIME_SESSION_PURPOSES,
+    GPU_RUNTIME_SESSION_PURPOSES_V2,
+    GPU_RUNTIME_SESSION_VERSION_HEADER,
+    GPU_RUNTIME_SESSION_VERSION_V1,
+    GPU_RUNTIME_SESSION_VERSION_V2,
     latest_gpu_runtime_session,
     validate_gpu_runtime_session,
 )
@@ -500,12 +504,22 @@ async def get_gpu_registration_attempt_endpoint(
 @router.post(
     "/gpu/{server_id}/session",
     response_model=GpuRuntimeSessionResponse,
+    response_model_exclude_none=True,
 )
 async def refresh_gpu_runtime_session(
     server_id: str,
     db: AsyncSession = Depends(get_db_session),
     expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
+    requested_session_version: str | None = Header(
+        None,
+        alias=GPU_RUNTIME_SESSION_VERSION_HEADER,
+    ),
 ):
+    if requested_session_version not in {None, "1", "2"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unsupported GPU runtime session version.",
+        )
     server = await db.get(Server, server_id)
     if (
         server is None
@@ -519,7 +533,16 @@ async def refresh_gpu_runtime_session(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Presented attested identity is not the current GPU server.",
         )
-    token, expires_at, attestation_id = await latest_gpu_runtime_session(db, server)
+    session_version = (
+        GPU_RUNTIME_SESSION_VERSION_V2
+        if requested_session_version == "2" and settings.gpu_runtime_session_v2_enabled
+        else GPU_RUNTIME_SESSION_VERSION_V1
+    )
+    token, expires_at, attestation_id = await latest_gpu_runtime_session(
+        db,
+        server,
+        version=session_version,
+    )
     server.gpu_runtime_session_attestation_id = attestation_id
     server.gpu_runtime_session_expires_at = expires_at
     await db.commit()
@@ -528,8 +551,17 @@ async def refresh_gpu_runtime_session(
         owner_hotkey=server.miner_hotkey,
         runtime_session=token,
         runtime_session_expires_at=expires_at.isoformat(),
+        session_version=(
+            GPU_RUNTIME_SESSION_VERSION_V2
+            if session_version == GPU_RUNTIME_SESSION_VERSION_V2
+            else None
+        ),
         allowed_purposes=list(
-            GPU_RUNTIME_SESSION_PURPOSES
+            (
+                GPU_RUNTIME_SESSION_PURPOSES_V2
+                if session_version == GPU_RUNTIME_SESSION_VERSION_V2
+                else GPU_RUNTIME_SESSION_PURPOSES
+            )
             if server.gpu_management_mode == "miner"
             else GPU_PLATFORM_RUNTIME_SESSION_PURPOSES
         ),

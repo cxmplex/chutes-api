@@ -205,6 +205,44 @@ def test_explicit_operator_endpoint_cidrs_render_unchanged(helm_binary, tmp_path
     assert "--no-proxy-headers" in _container(deployment, "api")["command"]
 
 
+def test_gpu_runtime_session_v2_chart_gate_defaults_off():
+    configured_values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
+    deployment = (CHART_DIR / "templates" / "api-deployment.yaml").read_text()
+    helpers = (CHART_DIR / "templates" / "_helpers.tpl").read_text()
+
+    assert configured_values["api"]["gpuRuntimeSessionV2Enabled"] is False
+    assert deployment.count("- name: GPU_RUNTIME_SESSION_V2_ENABLED") == 1
+    assert ".Values.api.gpuRuntimeSessionV2Enabled | quote" in deployment
+    assert helpers.count('{{- define "chutes.fullname" -}}') == 1
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        (None, "false"),
+        ({"api": {"gpuRuntimeSessionV2Enabled": True}}, "true"),
+    ],
+    ids=["default-off", "explicitly-enabled"],
+)
+def test_gpu_runtime_session_v2_emission_gate_renders_explicitly(
+    helm_binary,
+    tmp_path,
+    values,
+    expected,
+):
+    rendered = _render_chart(
+        helm_binary,
+        tmp_path,
+        values=values,
+        show_only="api-deployment.yaml",
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    deployment = _document(_documents(rendered), "Deployment", "api")
+    environment = _environment(_container(deployment, "api"))
+
+    assert environment["GPU_RUNTIME_SESSION_V2_ENABLED"]["value"] == expected
+
+
 @pytest.mark.parametrize(
     "network_policy_values",
     [

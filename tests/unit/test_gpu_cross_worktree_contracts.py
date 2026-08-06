@@ -30,7 +30,8 @@ from api.releases.schemas import (
 )
 from api.server.gpu_sessions import (
     GPU_PLATFORM_RUNTIME_SESSION_PURPOSES,
-    GPU_RUNTIME_SESSION_PURPOSES,
+    GPU_RUNTIME_SESSION_PURPOSES_V1,
+    GPU_RUNTIME_SESSION_PURPOSES_V2,
 )
 from api.storage.schemas import (
     LaunchStorageContext,
@@ -247,19 +248,30 @@ def test_api_registry_response_is_accepted_and_bound_by_sek8s_consumer():
 
 
 def test_runtime_purposes_and_launch_storage_context_match_consumers(monkeypatch):
-    purposes = json.loads(
-        (_repository("api") / "tests/fixtures/gpu_runtime_purposes_v1.json").read_text(
+    purposes_v1_path = _repository("api") / "tests/fixtures/gpu_runtime_purposes_v1.json"
+    purposes_v1_bytes = purposes_v1_path.read_bytes()
+    # This is the exact production-base contract consumed by the v1-only miner.
+    # The default-off API rollout gate is safe only while these bytes stay frozen.
+    assert hashlib.sha256(purposes_v1_bytes).hexdigest() == (
+        "6166e3504f2d4c4e101f3f64daad63691bb2b134981babada3f8b27a740e88f1"
+    )
+    purposes_v1 = json.loads(purposes_v1_bytes.decode("ascii"))
+    purposes_v2 = json.loads(
+        (_repository("api") / "tests/fixtures/gpu_runtime_purposes_v2.json").read_text(
             encoding="ascii"
         )
     )
-    assert purposes["miner"] == list(GPU_RUNTIME_SESSION_PURPOSES)
-    assert purposes["platform"] == list(GPU_PLATFORM_RUNTIME_SESSION_PURPOSES)
+    assert purposes_v1["miner"] == list(GPU_RUNTIME_SESSION_PURPOSES_V1)
+    assert purposes_v2["miner"] == list(GPU_RUNTIME_SESSION_PURPOSES_V2)
+    assert purposes_v1["platform"] == list(GPU_PLATFORM_RUNTIME_SESSION_PURPOSES)
+    assert purposes_v2["platform"] == list(GPU_PLATFORM_RUNTIME_SESSION_PURPOSES)
     monkeypatch.setenv("MINER_OWNER_SS58", "5CrossWorktreeOwner")
     miner_settings = _import_from_path(
         "cross_worktree_miner_settings",
         _repository("miner") / "src/chutes-common/chutes_common/settings.py",
     )
-    assert miner_settings.GPU_MINER_RUNTIME_PURPOSES == purposes["miner"]
+    assert miner_settings.GPU_MINER_RUNTIME_PURPOSES_V1 == purposes_v1["miner"]
+    assert miner_settings.GPU_MINER_RUNTIME_PURPOSES_V2 == purposes_v2["miner"]
 
     context = LaunchStorageContext(
         user_id="user-1",

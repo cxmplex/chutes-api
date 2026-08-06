@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from cryptography.fernet import Fernet
 from fastapi import HTTPException, status
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import settings
@@ -26,6 +26,7 @@ from api.key_authority_types import KeyAuthorityRefreshResult
 
 RECOVERY_KEY_EPOCH_ADVISORY_LOCK = "chutes.gpu-registration-recovery-key-epochs.v1"
 RECOVERY_KEY_ACK_MAX_AGE_SECONDS = 120
+RECOVERY_KEY_OPERATION_REPLAY_SECONDS = 24 * 60 * 60
 _RECOVERY_KEY_ACK_REFRESH_SECONDS = 30
 _RECOVERY_KEY_RETRY_AFTER_SECONDS = 5
 _KEY_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -87,7 +88,8 @@ def _operation_request(
     request_id: str,
     key_id: str,
     administrator_id: str,
-    required_replica_ids: list[str] | None = None,
+    cohort_id: str | None = None,
+    required_ack_count: int | None = None,
     reason: str | None = None,
 ) -> dict[str, Any]:
     document: dict[str, Any] = {
@@ -97,8 +99,10 @@ def _operation_request(
         "key_id": key_id,
         "administrator_id": administrator_id,
     }
-    if required_replica_ids is not None:
-        document["required_replica_ids"] = sorted(required_replica_ids)
+    if cohort_id is not None:
+        document["cohort_id"] = cohort_id
+    if required_ack_count is not None:
+        document["required_ack_count"] = required_ack_count
     if reason is not None:
         document["reason"] = reason
     return document
@@ -126,6 +130,13 @@ async def _replay_operation(
                 "GPU registration recovery-key request ID is already bound to different input."
             ),
         )
+    if operation.replay_expires_at <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "GPU registration recovery-key operation replay window expired; use a new request ID."
+            ),
+        )
     response = dict(operation.response_json)
     if operation.response_sha256 != _canonical_sha256(response):
         raise GpuRegistrationRecoveryKeyUnavailable(
@@ -144,7 +155,8 @@ def _record_operation(
     key_id: str,
     predecessor_key_id: str | None,
     administrator_id: str,
-    required_replica_ids: list[str] | None,
+    cohort_id: str | None,
+    required_ack_count: int | None,
     reason: str | None,
     response: dict[str, Any],
 ) -> None:
@@ -156,10 +168,13 @@ def _record_operation(
             key_id=key_id,
             predecessor_key_id=predecessor_key_id,
             requested_by_user_id=administrator_id,
-            required_replica_ids=required_replica_ids,
+            cohort_id=cohort_id,
+            required_ack_count=required_ack_count,
             reason=reason,
             response_json=response,
             response_sha256=_canonical_sha256(response),
+            replay_expires_at=datetime.now(timezone.utc)
+            + timedelta(seconds=RECOVERY_KEY_OPERATION_REPLAY_SECONDS),
         )
     )
 
@@ -208,7 +223,25 @@ def _active_epoch(
     return active[0]
 
 
-def _configured_keyring() -> tuple[dict[str, str], dict[str, Fernet], dict[str, str], str, str]:
+async def _prune_departed_replica_acks(db: AsyncSession, *, now: datetime) -> None:
+    """Bound ACK history after replicas have departed the stable rollout cohort."""
+
+    await db.execute(
+        delete(GpuRegistrationRecoveryKeyReplicaAck).where(
+            GpuRegistrationRecoveryKeyReplicaAck.acknowledged_at
+            < now - timedelta(seconds=5 * RECOVERY_KEY_ACK_MAX_AGE_SECONDS)
+        )
+    )
+
+
+def _configured_keyring() -> tuple[
+    dict[str, str],
+    dict[str, Fernet],
+    dict[str, str],
+    str,
+    str,
+    str,
+]:
     materials = settings.gpu_registration_recovery_key_materials
     ciphers = settings.gpu_registration_recovery_keys
     fingerprints = registration_recovery_key_fingerprints(materials)
@@ -218,6 +251,7 @@ def _configured_keyring() -> tuple[dict[str, str], dict[str, Fernet], dict[str, 
         fingerprints,
         registration_recovery_keyset_sha256(materials),
         settings.gpu_registration_recovery_replica_id,
+        settings.gpu_registration_recovery_replica_cohort,
     )
 
 
@@ -229,6 +263,7 @@ async def _acknowledge_configured_epochs(
     fingerprints: dict[str, str],
     keyring_sha256: str,
     replica_id: str,
+    cohort_id: str,
     now: datetime,
 ) -> None:
     refresh_before = now - timedelta(seconds=_RECOVERY_KEY_ACK_REFRESH_SECONDS)
@@ -271,6 +306,7 @@ async def _acknowledge_configured_epochs(
             db.add(
                 GpuRegistrationRecoveryKeyReplicaAck(
                     replica_id=replica_id,
+                    cohort_id=cohort_id,
                     key_id=epoch.key_id,
                     key_ids=configured_key_ids,
                     key_fingerprints=fingerprints,
@@ -279,11 +315,13 @@ async def _acknowledge_configured_epochs(
                 )
             )
         elif (
-            acknowledgement.key_ids != configured_key_ids
+            acknowledgement.cohort_id != cohort_id
+            or acknowledgement.key_ids != configured_key_ids
             or acknowledgement.key_fingerprints != fingerprints
             or acknowledgement.keyring_sha256 != keyring_sha256
             or acknowledgement.acknowledged_at <= refresh_before
         ):
+            acknowledgement.cohort_id = cohort_id
             acknowledgement.key_ids = configured_key_ids
             acknowledgement.key_fingerprints = fingerprints
             acknowledgement.keyring_sha256 = keyring_sha256
@@ -320,8 +358,10 @@ async def _ensure_authority_locked(
         fingerprints,
         keyring_sha256,
         replica_id,
+        cohort_id,
     ) = _configured_keyring()
     now = datetime.now(timezone.utc)
+    await _prune_departed_replica_acks(db, now=now)
     epochs = await _locked_epochs(db)
     if not epochs:
         key_id = settings.gpu_registration_recovery_key_id
@@ -330,7 +370,8 @@ async def _ensure_authority_locked(
             key_sha256=fingerprints[key_id],
             predecessor_key_id=None,
             state="staged",
-            required_replica_ids=[replica_id],
+            cohort_id=cohort_id,
+            required_ack_count=settings.gpu_registration_recovery_required_ack_count,
             created_at=now,
         )
         db.add(epoch)
@@ -343,6 +384,7 @@ async def _ensure_authority_locked(
             fingerprints=fingerprints,
             keyring_sha256=keyring_sha256,
             replica_id=replica_id,
+            cohort_id=cohort_id,
             now=now,
         )
         epoch.state = "active"
@@ -373,6 +415,7 @@ async def _ensure_authority_locked(
         fingerprints=fingerprints,
         keyring_sha256=keyring_sha256,
         replica_id=replica_id,
+        cohort_id=cohort_id,
         now=now,
     )
     return active, ciphers[active.key_id]
@@ -493,26 +536,50 @@ async def stage_gpu_registration_recovery_key_epoch(
     administrator_id: str,
     request_id: str,
     key_id: str,
-    required_replica_ids: list[str],
+    cohort_id: str | None = None,
+    required_ack_count: int | None = None,
 ) -> dict[str, Any]:
-    """Stage a fingerprint-bound successor for an exact serving replica cohort."""
+    """Stage a fingerprint-bound successor for a stable serving cohort."""
 
-    required = sorted(set(required_replica_ids))
+    cohort_id = cohort_id or settings.gpu_registration_recovery_replica_cohort
+    configured_ack_count = settings.gpu_registration_recovery_required_ack_count
+    if required_ack_count is None:
+        required_ack_count = configured_ack_count
     if (
-        _KEY_ID_PATTERN.fullmatch(key_id) is None
-        or not required
-        or any(_REPLICA_ID_PATTERN.fullmatch(item) is None for item in required)
+        not isinstance(key_id, str)
+        or _KEY_ID_PATTERN.fullmatch(key_id) is None
+        or not isinstance(cohort_id, str)
+        or _REPLICA_ID_PATTERN.fullmatch(cohort_id) is None
     ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="GPU registration recovery-key stage input is malformed.",
+        )
+    if not isinstance(required_ack_count, int) or isinstance(required_ack_count, bool):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="GPU registration recovery-key required ACK count is malformed.",
+        )
+    if not 1 <= required_ack_count <= 256:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="GPU registration recovery-key required ACK count is malformed.",
+        )
+    if required_ack_count != configured_ack_count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "GPU registration recovery-key required ACK count must exactly match "
+                "the configured serving-cohort quorum."
+            ),
         )
     request_document = _operation_request(
         operation="stage",
         request_id=request_id,
         key_id=key_id,
         administrator_id=administrator_id,
-        required_replica_ids=required,
+        cohort_id=cohort_id,
+        required_ack_count=required_ack_count,
     )
     request_sha256 = _canonical_sha256(request_document)
     await _lock_epoch_stream(db)
@@ -524,15 +591,17 @@ async def stage_gpu_registration_recovery_key_epoch(
     if replay is not None:
         return replay
     active, _ = await _ensure_authority_locked(db)
-    materials, _, fingerprints, keyring_sha256, replica_id = _configured_keyring()
+    materials, _, fingerprints, keyring_sha256, replica_id, configured_cohort = (
+        _configured_keyring()
+    )
     if key_id not in materials:
         raise GpuRegistrationRecoveryKeyUnavailable(
             "The handling replica does not hold the proposed GPU registration recovery key."
         )
-    if replica_id not in required:
+    if cohort_id != configured_cohort:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="The required replica set must include the handling API replica.",
+            detail="The handling API replica is not a member of the requested rollout cohort.",
         )
     existing = await db.get(GpuRegistrationRecoveryKeyEpoch, key_id)
     if existing is not None:
@@ -563,7 +632,8 @@ async def stage_gpu_registration_recovery_key_epoch(
         key_sha256=fingerprints[key_id],
         predecessor_key_id=active.key_id,
         state="staged",
-        required_replica_ids=required,
+        cohort_id=cohort_id,
+        required_ack_count=required_ack_count,
     )
     db.add(epoch)
     await db.flush()
@@ -574,6 +644,7 @@ async def stage_gpu_registration_recovery_key_epoch(
         fingerprints=fingerprints,
         keyring_sha256=keyring_sha256,
         replica_id=replica_id,
+        cohort_id=configured_cohort,
         now=datetime.now(timezone.utc),
     )
     response = {
@@ -583,7 +654,9 @@ async def stage_gpu_registration_recovery_key_epoch(
         "predecessor_key_id": active.key_id,
         "state": "staged",
         "active_key_id": active.key_id,
-        "required_replica_ids": required,
+        "cohort_id": cohort_id,
+        "required_ack_count": required_ack_count,
+        "retired_key_ids": [],
     }
     _record_operation(
         db,
@@ -593,7 +666,8 @@ async def stage_gpu_registration_recovery_key_epoch(
         key_id=epoch.key_id,
         predecessor_key_id=active.key_id,
         administrator_id=administrator_id,
-        required_replica_ids=required,
+        cohort_id=cohort_id,
+        required_ack_count=required_ack_count,
         reason=None,
         response=response,
     )
@@ -608,7 +682,7 @@ async def activate_gpu_registration_recovery_key_epoch(
     request_id: str,
     key_id: str,
 ) -> dict[str, Any]:
-    """Activate only after every required replica ACKs one identical key set."""
+    """Activate after a stable cohort reaches its configured keyring quorum."""
 
     request_document = _operation_request(
         operation="activate",
@@ -645,6 +719,8 @@ async def activate_gpu_registration_recovery_key_epoch(
         raise GpuRegistrationRecoveryKeyUnavailable(
             "The handling replica does not hold the exact staged GPU registration recovery key."
         )
+    now = datetime.now(timezone.utc)
+    await _prune_departed_replica_acks(db, now=now)
     acknowledgements = list(
         (
             await db.execute(
@@ -657,13 +733,19 @@ async def activate_gpu_registration_recovery_key_epoch(
         .scalars()
         .all()
     )
-    by_replica = {ack.replica_id: ack for ack in acknowledgements}
-    required_acks = [by_replica.get(item) for item in target.required_replica_ids]
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=RECOVERY_KEY_ACK_MAX_AGE_SECONDS)
-    if any(ack is None or ack.acknowledged_at < cutoff for ack in required_acks):
+    cutoff = now - timedelta(seconds=RECOVERY_KEY_ACK_MAX_AGE_SECONDS)
+    required_acks = [
+        ack
+        for ack in acknowledgements
+        if ack.cohort_id == target.cohort_id and ack.acknowledged_at >= cutoff
+    ]
+    if len(required_acks) < int(target.required_ack_count):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Not every required replica has a fresh recovery-key acknowledgement.",
+            detail=(
+                "The stable serving cohort does not have the required number of fresh "
+                "GPU registration recovery-key acknowledgements."
+            ),
         )
     first = required_acks[0]
     assert first is not None
@@ -682,7 +764,6 @@ async def activate_gpu_registration_recovery_key_epoch(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Serving replicas did not acknowledge one identical recovery keyring.",
             )
-    now = datetime.now(timezone.utc)
     active.state = "retiring"
     active.retiring_at = now
     await db.flush()
@@ -696,7 +777,9 @@ async def activate_gpu_registration_recovery_key_epoch(
         "predecessor_key_id": active.key_id,
         "state": "active",
         "active_key_id": target.key_id,
-        "required_replica_ids": list(target.required_replica_ids),
+        "cohort_id": target.cohort_id,
+        "required_ack_count": target.required_ack_count,
+        "retired_key_ids": [],
     }
     _record_operation(
         db,
@@ -706,7 +789,8 @@ async def activate_gpu_registration_recovery_key_epoch(
         key_id=target.key_id,
         predecessor_key_id=active.key_id,
         administrator_id=administrator_id,
-        required_replica_ids=None,
+        cohort_id=None,
+        required_ack_count=None,
         reason=None,
         response=response,
     )
@@ -721,7 +805,7 @@ async def retire_gpu_registration_recovery_key_epoch(
     request_id: str,
     key_id: str,
 ) -> dict[str, Any]:
-    """Retire an old key only after no recoverable request references it."""
+    """Retire all unreferenced retiring ancestors through the requested key."""
 
     request_document = _operation_request(
         operation="retire",
@@ -739,45 +823,75 @@ async def retire_gpu_registration_recovery_key_epoch(
     if replay is not None:
         return replay
     active, _ = await _ensure_authority_locked(db)
-    target = (
-        await db.execute(
-            select(GpuRegistrationRecoveryKeyEpoch)
-            .where(GpuRegistrationRecoveryKeyEpoch.key_id == key_id)
-            .with_for_update()
-        )
-    ).scalar_one_or_none()
-    if target is None or target.state != "retiring" or active.predecessor_key_id != target.key_id:
+    epochs = await _locked_epochs(db)
+    by_key = {epoch.key_id: epoch for epoch in epochs}
+    ancestors: list[GpuRegistrationRecoveryKeyEpoch] = []
+    predecessor_id = active.predecessor_key_id
+    while predecessor_id is not None:
+        ancestor = by_key.get(predecessor_id)
+        if ancestor is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="GPU registration recovery-key predecessor chain is incomplete.",
+            )
+        ancestors.append(ancestor)
+        predecessor_id = ancestor.predecessor_key_id
+    target = by_key.get(key_id)
+    if target is None or target.state != "retiring" or target not in ancestors:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="GPU registration recovery key is not the retiring predecessor.",
+            detail="GPU registration recovery key is not a retiring ancestor of the active key.",
         )
-    referenced_attempt = (
-        await db.execute(
-            select(GpuRegistrationAttempt.attempt_id)
-            .where(
-                GpuRegistrationAttempt.state == "processing",
-                GpuRegistrationAttempt.request_payload_key_id == key_id,
+
+    retiring_ids = [epoch.key_id for epoch in ancestors if epoch.state == "retiring"]
+    attempts = list(
+        (
+            await db.execute(
+                select(GpuRegistrationAttempt)
+                .where(
+                    GpuRegistrationAttempt.state == "processing",
+                    GpuRegistrationAttempt.request_payload_key_id.in_(retiring_ids),
+                )
+                .order_by(GpuRegistrationAttempt.attempt_id)
+                .with_for_update()
             )
-            .limit(1)
         )
-    ).scalar_one_or_none()
-    referenced_conflict = (
-        await db.execute(
-            select(GpuRegistrationConflict.conflict_id)
-            .where(
-                GpuRegistrationConflict.state.in_(("recorded", "verifying")),
-                GpuRegistrationConflict.request_payload_key_id == key_id,
+        .scalars()
+        .all()
+    )
+    conflicts = list(
+        (
+            await db.execute(
+                select(GpuRegistrationConflict)
+                .where(
+                    GpuRegistrationConflict.state.in_(("recorded", "verifying")),
+                    GpuRegistrationConflict.request_payload_key_id.in_(retiring_ids),
+                )
+                .order_by(GpuRegistrationConflict.conflict_id)
+                .with_for_update()
             )
-            .limit(1)
         )
-    ).scalar_one_or_none()
-    if referenced_attempt is not None or referenced_conflict is not None:
+        .scalars()
+        .all()
+    )
+    referenced_ids = {
+        reference.request_payload_key_id
+        for reference in (*attempts, *conflicts)
+        if reference.request_payload_key_id is not None
+    }
+    if target.key_id in referenced_ids:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="GPU registration recovery key still has a nonterminal reference.",
         )
-    target.state = "retired"
-    target.retired_at = datetime.now(timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    retired_key_ids: list[str] = []
+    for ancestor in reversed(ancestors):
+        if ancestor.state == "retiring" and ancestor.key_id not in referenced_ids:
+            ancestor.state = "retired"
+            ancestor.retired_at = now
+            retired_key_ids.append(ancestor.key_id)
     await db.flush()
     response = {
         "request_id": request_id,
@@ -786,7 +900,9 @@ async def retire_gpu_registration_recovery_key_epoch(
         "predecessor_key_id": target.predecessor_key_id,
         "state": "retired",
         "active_key_id": active.key_id,
-        "required_replica_ids": list(target.required_replica_ids),
+        "cohort_id": target.cohort_id,
+        "required_ack_count": target.required_ack_count,
+        "retired_key_ids": retired_key_ids,
     }
     _record_operation(
         db,
@@ -796,7 +912,8 @@ async def retire_gpu_registration_recovery_key_epoch(
         key_id=target.key_id,
         predecessor_key_id=target.predecessor_key_id,
         administrator_id=administrator_id,
-        required_replica_ids=None,
+        cohort_id=None,
+        required_ack_count=None,
         reason=None,
         response=response,
     )
@@ -873,7 +990,9 @@ async def cancel_gpu_registration_recovery_key_epoch(
         "predecessor_key_id": target.predecessor_key_id,
         "state": "cancelled",
         "active_key_id": active.key_id,
-        "required_replica_ids": list(target.required_replica_ids),
+        "cohort_id": target.cohort_id,
+        "required_ack_count": target.required_ack_count,
+        "retired_key_ids": [],
         "reason": reason,
     }
     _record_operation(
@@ -884,7 +1003,8 @@ async def cancel_gpu_registration_recovery_key_epoch(
         key_id=target.key_id,
         predecessor_key_id=target.predecessor_key_id,
         administrator_id=administrator_id,
-        required_replica_ids=None,
+        cohort_id=None,
+        required_ack_count=None,
         reason=reason,
         response=response,
     )

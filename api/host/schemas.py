@@ -1690,13 +1690,14 @@ class GpuHostLossFinalizeRequestV1(FrozenWireModel):
 
 
 class GpuRegistrationRecoveryKeyStageRequest(BaseModel):
-    """Administrator request to stage a key for an exact serving cohort."""
+    """Administrator request to stage a key for a stable serving cohort."""
 
     model_config = ConfigDict(extra="forbid")
 
     request_id: str
     key_id: str
-    required_replica_ids: List[str] = Field(..., min_length=1, max_length=256)
+    cohort_id: Optional[str] = Field(None, min_length=1, max_length=128)
+    required_ack_count: Optional[int] = Field(None, ge=1, le=256)
 
     @field_validator("request_id")
     @classmethod
@@ -1716,16 +1717,12 @@ class GpuRegistrationRecoveryKeyStageRequest(BaseModel):
             raise ValueError("key_id is malformed")
         return value
 
-    @field_validator("required_replica_ids")
+    @field_validator("cohort_id")
     @classmethod
-    def _valid_replica_ids(cls, values: List[str]) -> List[str]:
-        if len(set(values)) != len(values):
-            raise ValueError("required_replica_ids must be unique")
-        if any(
-            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None for value in values
-        ):
-            raise ValueError("required_replica_ids contains a malformed identity")
-        return sorted(values)
+    def _valid_cohort_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None:
+            raise ValueError("cohort_id is malformed")
+        return value
 
 
 class GpuRegistrationRecoveryKeyTransitionRequest(BaseModel):
@@ -1772,7 +1769,9 @@ class GpuRegistrationRecoveryKeyEpochResponse(BaseModel):
     predecessor_key_id: Optional[str] = None
     state: Literal["staged", "active", "retired", "cancelled"]
     active_key_id: Optional[str] = None
-    required_replica_ids: List[str] = Field(default_factory=list)
+    cohort_id: Optional[str] = None
+    required_ack_count: Optional[int] = None
+    retired_key_ids: List[str] = Field(default_factory=list)
     reason: Optional[str] = None
 
 

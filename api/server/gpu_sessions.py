@@ -32,7 +32,20 @@ from api.node.schemas import Node
 from api.server.schemas import GpuServerDecommission, Host, Server, ServerAttestation
 
 GPU_RUNTIME_SESSION_HEADER = "X-Chutes-Attested-Session"
-GPU_RUNTIME_SESSION_PURPOSES = (
+GPU_RUNTIME_SESSION_VERSION_HEADER = "X-Chutes-GPU-Runtime-Session-Version"
+GPU_RUNTIME_SESSION_VERSION_V1 = 1
+GPU_RUNTIME_SESSION_VERSION_V2 = 2
+GPU_RUNTIME_SESSION_PURPOSES_V1 = (
+    "cache",
+    "gpu-infra",
+    "instances",
+    "launch",
+    "miner",
+    "nodes",
+    "registry",
+    "sockets",
+)
+GPU_RUNTIME_SESSION_PURPOSES_V2 = (
     "cache",
     "gpu-decommission",
     "gpu-infra",
@@ -43,9 +56,33 @@ GPU_RUNTIME_SESSION_PURPOSES = (
     "registry",
     "sockets",
 )
+# The unqualified name remains the immutable production v1 contract. Callers
+# that opt into v2 must do so explicitly so an API-first rollout keeps serving
+# byte-compatible responses to old agents.
+GPU_RUNTIME_SESSION_PURPOSES = GPU_RUNTIME_SESSION_PURPOSES_V1
 GPU_PLATFORM_RUNTIME_SESSION_PURPOSES = ("registry",)
 GPU_RUNTIME_SESSION_LIFETIME_SECONDS = 900
 GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS = 5
+
+
+def _gpu_runtime_session_purposes(
+    management_mode: str,
+    version: int,
+) -> tuple[str, ...]:
+    if type(version) is not int or version not in {
+        GPU_RUNTIME_SESSION_VERSION_V1,
+        GPU_RUNTIME_SESSION_VERSION_V2,
+    }:
+        raise ValueError("Unsupported GPU runtime session version")
+    if management_mode == "platform":
+        return GPU_PLATFORM_RUNTIME_SESSION_PURPOSES
+    if management_mode == "miner":
+        return (
+            GPU_RUNTIME_SESSION_PURPOSES_V1
+            if version == GPU_RUNTIME_SESSION_VERSION_V1
+            else GPU_RUNTIME_SESSION_PURPOSES_V2
+        )
+    raise ValueError("Unsupported GPU runtime session management mode")
 
 
 def _gpu_decommission_reservation_is_terminal(reservation: GpuLaunchReservation) -> bool:
@@ -621,6 +658,8 @@ async def require_completed_gpu_registration(
 def mint_gpu_runtime_session(
     server: Server,
     attestation: ServerAttestation,
+    *,
+    version: int = GPU_RUNTIME_SESSION_VERSION_V1,
 ) -> tuple[str, datetime]:
     mode = server.gpu_management_mode
     if (
@@ -634,12 +673,13 @@ def mint_gpu_runtime_session(
         raise ValueError(
             "GPU runtime sessions require a current attested server and exact mode scope"
         )
+    allowed_purposes = _gpu_runtime_session_purposes(mode, version)
     _current_attestation(server, attestation)
     now = _runtime_session_now()
     expires_at = now + timedelta(seconds=GPU_RUNTIME_SESSION_LIFETIME_SECONDS)
     payload = {
         "schema": "chutes.gpu-runtime-session",
-        "version": 1,
+        "version": version,
         "iss": "chutes",
         "purpose": "gpu_runtime_session",
         "jti": generate_uuid(),
@@ -649,11 +689,7 @@ def mint_gpu_runtime_session(
         "attestation_id": attestation.attestation_id,
         "attested_spki_sha256": server.attested_cert_pubkey_hash.lower(),
         "management_mode": mode,
-        "allowed_purposes": list(
-            GPU_RUNTIME_SESSION_PURPOSES
-            if mode == "miner"
-            else GPU_PLATFORM_RUNTIME_SESSION_PURPOSES
-        ),
+        "allowed_purposes": list(allowed_purposes),
         "iat": int(now.timestamp()),
         "exp": int(expires_at.timestamp()),
     }
@@ -722,18 +758,16 @@ async def validate_gpu_runtime_session(
         "exp",
     }
     mode = payload.get("management_mode") if isinstance(payload, dict) else None
-    expected_purposes = (
-        GPU_RUNTIME_SESSION_PURPOSES
-        if mode == "miner"
-        else GPU_PLATFORM_RUNTIME_SESSION_PURPOSES
-        if mode == "platform"
-        else ()
-    )
+    version = payload.get("version") if isinstance(payload, dict) else None
+    try:
+        expected_purposes = _gpu_runtime_session_purposes(mode, version)
+    except ValueError:
+        expected_purposes = ()
     if (
         not isinstance(payload, dict)
         or set(payload) != required_keys
         or payload["schema"] != "chutes.gpu-runtime-session"
-        or payload["version"] != 1
+        or type(version) is not int
         or payload["purpose"] != "gpu_runtime_session"
         or payload["allowed_purposes"] != list(expected_purposes)
         or required_purpose not in expected_purposes
@@ -919,6 +953,8 @@ async def validate_gpu_runtime_session(
 async def latest_gpu_runtime_session(
     db: AsyncSession,
     server: Server,
+    *,
+    version: int = GPU_RUNTIME_SESSION_VERSION_V1,
 ) -> tuple[str, datetime, str]:
     await acquire_gpu_lifecycle_lock(db)
     server = (
@@ -960,7 +996,11 @@ async def latest_gpu_runtime_session(
             status_code=status.HTTP_409_CONFLICT,
             detail="Legacy GPU hotplug custody is not ready for runtime access.",
         ) from exc
-    token, expires_at = mint_gpu_runtime_session(server, attestation)
+    token, expires_at = mint_gpu_runtime_session(
+        server,
+        attestation,
+        version=version,
+    )
     return token, expires_at, attestation.attestation_id
 
 

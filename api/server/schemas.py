@@ -1088,6 +1088,9 @@ class GpuRuntimeSessionResponse(BaseModel):
     owner_hotkey: str
     runtime_session: str
     runtime_session_expires_at: str
+    # Omitted for the immutable production v1 body. It is emitted only after an
+    # upgraded agent explicitly negotiates v2.
+    session_version: Optional[Literal[2]] = None
     allowed_purposes: List[
         Literal[
             "cache",

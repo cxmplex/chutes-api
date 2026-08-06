@@ -19,9 +19,11 @@ from api.gpu_models import (
     GpuRegistrationAttempt,
     GpuRegistrationConflict,
     GpuRegistrationRecoveryKeyEpoch,
+    GpuRegistrationRecoveryKeyEpochOperation,
     GpuRegistrationRecoveryKeyReplicaAck,
 )
 from api.gpu_registration_keys import (
+    RECOVERY_KEY_ACK_MAX_AGE_SECONDS,
     GpuRegistrationRecoveryKeyUnavailable,
     activate_gpu_registration_recovery_key_epoch,
     cancel_gpu_registration_recovery_key_epoch,
@@ -102,7 +104,249 @@ async def test_readiness_bootstrap_is_idempotent_and_acknowledges_this_replica(
             (settings.gpu_registration_recovery_replica_id, key_id),
         )
         assert acknowledgement is not None
+        assert acknowledgement.cohort_id == settings.gpu_registration_recovery_replica_cohort
         assert acknowledgement.key_fingerprints[key_id] == epochs[0].key_sha256
+
+
+async def test_pod_replacement_can_complete_staged_cohort_quorum(
+    postgres_schema,
+    monkeypatch,
+):
+    sessions, _ = postgres_schema
+    materials = settings.gpu_registration_recovery_key_materials
+    successor_id = "gpu-recovery-pod-replacement-v2"
+    _configure_keyring(
+        monkeypatch,
+        {**materials, successor_id: _new_key()},
+        successor_id,
+    )
+    monkeypatch.setattr(settings, "gpu_registration_recovery_required_ack_count", 2)
+
+    async with sessions() as session:
+        staged = await stage_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-pod-replacement",
+            request_id=str(uuid4()),
+            key_id=successor_id,
+            cohort_id=settings.gpu_registration_recovery_replica_cohort,
+            required_ack_count=2,
+        )
+        assert staged["required_ack_count"] == 2
+
+    now = datetime.now(timezone.utc)
+    async with sessions() as session:
+        local_ack = await session.get(
+            GpuRegistrationRecoveryKeyReplicaAck,
+            (settings.gpu_registration_recovery_replica_id, successor_id),
+        )
+        assert local_ack is not None
+        session.add(
+            GpuRegistrationRecoveryKeyReplicaAck(
+                replica_id="departed-pod",
+                cohort_id=local_ack.cohort_id,
+                key_id=successor_id,
+                key_ids=list(local_ack.key_ids),
+                key_fingerprints=dict(local_ack.key_fingerprints),
+                keyring_sha256=local_ack.keyring_sha256,
+                acknowledged_at=now - timedelta(seconds=RECOVERY_KEY_ACK_MAX_AGE_SECONDS + 1),
+            )
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        with pytest.raises(HTTPException, match="required number of fresh") as shortfall:
+            await activate_gpu_registration_recovery_key_epoch(
+                session,
+                administrator_id="admin-pod-replacement",
+                request_id=str(uuid4()),
+                key_id=successor_id,
+            )
+        assert shortfall.value.status_code == 409
+        await session.rollback()
+
+    async with sessions() as session:
+        local_ack = await session.get(
+            GpuRegistrationRecoveryKeyReplicaAck,
+            (settings.gpu_registration_recovery_replica_id, successor_id),
+        )
+        assert local_ack is not None
+        session.add(
+            GpuRegistrationRecoveryKeyReplicaAck(
+                replica_id="replacement-pod",
+                cohort_id=local_ack.cohort_id,
+                key_id=successor_id,
+                key_ids=list(local_ack.key_ids),
+                key_fingerprints=dict(local_ack.key_fingerprints),
+                keyring_sha256=local_ack.keyring_sha256,
+                acknowledged_at=datetime.now(timezone.utc),
+            )
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        activated = await activate_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-pod-replacement",
+            request_id=str(uuid4()),
+            key_id=successor_id,
+        )
+        assert activated["active_key_id"] == successor_id
+        assert activated["cohort_id"] == settings.gpu_registration_recovery_replica_cohort
+
+
+async def test_departed_replica_ack_history_is_pruned(postgres_schema):
+    sessions, _ = postgres_schema
+    async with sessions() as session:
+        active = await _active_epoch(session)
+        local_ack = await session.get(
+            GpuRegistrationRecoveryKeyReplicaAck,
+            (settings.gpu_registration_recovery_replica_id, active.key_id),
+        )
+        assert local_ack is not None
+        session.add(
+            GpuRegistrationRecoveryKeyReplicaAck(
+                replica_id="long-departed-pod",
+                cohort_id=local_ack.cohort_id,
+                key_id=active.key_id,
+                key_ids=list(local_ack.key_ids),
+                key_fingerprints=dict(local_ack.key_fingerprints),
+                keyring_sha256=local_ack.keyring_sha256,
+                acknowledged_at=datetime.now(timezone.utc)
+                - timedelta(seconds=5 * RECOVERY_KEY_ACK_MAX_AGE_SECONDS + 1),
+            )
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        await ensure_gpu_registration_recovery_key_authority(session)
+        await session.commit()
+        assert (
+            await session.get(
+                GpuRegistrationRecoveryKeyReplicaAck,
+                ("long-departed-pod", active.key_id),
+            )
+            is None
+        )
+
+
+async def test_operation_replay_expires_and_requires_a_new_request_id(
+    postgres_schema,
+    monkeypatch,
+):
+    sessions, _ = postgres_schema
+    materials = settings.gpu_registration_recovery_key_materials
+    successor_id = "gpu-recovery-expired-replay-v2"
+    _configure_keyring(
+        monkeypatch,
+        {**materials, successor_id: _new_key()},
+        successor_id,
+    )
+    request_id = str(uuid4())
+    async with sessions() as session:
+        await stage_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-expired-replay",
+            request_id=request_id,
+            key_id=successor_id,
+        )
+        await session.execute(
+            text(
+                "ALTER TABLE gpu_registration_recovery_key_epoch_operations "
+                "DISABLE TRIGGER trg_gpu_registration_recovery_key_operation_immutable"
+            )
+        )
+        await session.execute(
+            text(
+                "UPDATE gpu_registration_recovery_key_epoch_operations "
+                "SET created_at = NOW() - INTERVAL '2 days', "
+                "replay_expires_at = NOW() - INTERVAL '1 day' "
+                "WHERE request_id = :request_id"
+            ),
+            {"request_id": request_id},
+        )
+        await session.execute(
+            text(
+                "ALTER TABLE gpu_registration_recovery_key_epoch_operations "
+                "ENABLE TRIGGER trg_gpu_registration_recovery_key_operation_immutable"
+            )
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        operation = await session.get(GpuRegistrationRecoveryKeyEpochOperation, request_id)
+        assert operation is not None
+        assert operation.replay_expires_at < datetime.now(timezone.utc)
+        with pytest.raises(HTTPException, match="replay window expired") as expired:
+            await stage_gpu_registration_recovery_key_epoch(
+                session,
+                administrator_id="admin-expired-replay",
+                request_id=request_id,
+                key_id=successor_id,
+            )
+        assert expired.value.status_code == 409
+        await session.rollback()
+
+
+async def test_retire_oldest_epoch_completes_all_unreferenced_ancestors(
+    postgres_schema,
+    monkeypatch,
+):
+    sessions, _ = postgres_schema
+    materials = settings.gpu_registration_recovery_key_materials
+    async with sessions() as session:
+        first = await _active_epoch(session)
+    second_id = "gpu-recovery-chain-v2"
+    third_id = "gpu-recovery-chain-v3"
+    _configure_keyring(
+        monkeypatch,
+        {
+            **materials,
+            second_id: _new_key(),
+            third_id: _new_key(),
+        },
+        third_id,
+    )
+
+    async with sessions() as session:
+        await stage_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-chain",
+            request_id=str(uuid4()),
+            key_id=second_id,
+        )
+        await activate_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-chain",
+            request_id=str(uuid4()),
+            key_id=second_id,
+        )
+        await stage_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-chain",
+            request_id=str(uuid4()),
+            key_id=third_id,
+        )
+        await activate_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-chain",
+            request_id=str(uuid4()),
+            key_id=third_id,
+        )
+        retired = await retire_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-chain",
+            request_id=str(uuid4()),
+            key_id=first.key_id,
+        )
+        assert retired["retired_key_ids"] == [first.key_id, second_id]
+
+    async with sessions() as session:
+        first_persisted = await session.get(GpuRegistrationRecoveryKeyEpoch, first.key_id)
+        second_persisted = await session.get(GpuRegistrationRecoveryKeyEpoch, second_id)
+        third_persisted = await session.get(GpuRegistrationRecoveryKeyEpoch, third_id)
+        assert first_persisted is not None and first_persisted.state == "retired"
+        assert second_persisted is not None and second_persisted.state == "retired"
+        assert third_persisted is not None and third_persisted.state == "active"
 
 
 async def test_stale_stage_requires_audited_cancellation_and_cannot_poison_activation(
@@ -129,7 +373,6 @@ async def test_stale_stage_requires_audited_cancellation_and_cannot_poison_activ
             administrator_id="admin-1",
             request_id=str(uuid4()),
             key_id=abandoned_id,
-            required_replica_ids=[settings.gpu_registration_recovery_replica_id],
         )
         assert staged["active_key_id"] == old.key_id
 
@@ -154,7 +397,6 @@ async def test_stale_stage_requires_audited_cancellation_and_cannot_poison_activ
                 administrator_id="admin-1",
                 request_id=str(uuid4()),
                 key_id=replacement_id,
-                required_replica_ids=[settings.gpu_registration_recovery_replica_id],
             )
         assert blocked.value.status_code == 409
         await session.rollback()
@@ -205,6 +447,7 @@ async def test_stale_stage_requires_audited_cancellation_and_cannot_poison_activ
             session.add(
                 GpuRegistrationRecoveryKeyReplicaAck(
                     replica_id=settings.gpu_registration_recovery_replica_id,
+                    cohort_id=settings.gpu_registration_recovery_replica_cohort,
                     key_id=abandoned_id,
                     key_ids=sorted(settings.gpu_registration_recovery_key_materials),
                     key_fingerprints={
@@ -222,7 +465,6 @@ async def test_stale_stage_requires_audited_cancellation_and_cannot_poison_activ
             administrator_id="admin-1",
             request_id=str(uuid4()),
             key_id=replacement_id,
-            required_replica_ids=[settings.gpu_registration_recovery_replica_id],
         )
         assert replacement["state"] == "staged"
     async with sessions() as session:
@@ -264,7 +506,6 @@ async def test_readiness_rejects_active_and_configured_staged_fingerprint_mismat
             administrator_id="admin-mismatch",
             request_id=str(uuid4()),
             key_id=staged_id,
-            required_replica_ids=[settings.gpu_registration_recovery_replica_id],
         )
     _configure_keyring(
         monkeypatch,
@@ -309,7 +550,6 @@ async def test_direct_sql_requires_successor_ack_and_rejects_epoch_delete(
             administrator_id="admin-2",
             request_id=str(uuid4()),
             key_id=successor_id,
-            required_replica_ids=[settings.gpu_registration_recovery_replica_id],
         )
         acknowledgement = await session.get(
             GpuRegistrationRecoveryKeyReplicaAck,
@@ -489,7 +729,6 @@ async def test_retirement_blocks_attempt_then_conflict_and_exact_replay_is_stabl
             administrator_id="admin-3",
             request_id=str(uuid4()),
             key_id=successor_id,
-            required_replica_ids=[settings.gpu_registration_recovery_replica_id],
         )
         activate_request_id = str(uuid4())
         activated = await activate_gpu_registration_recovery_key_epoch(
@@ -637,7 +876,6 @@ async def test_mint_shared_lock_serializes_activation_without_deadlock(
             administrator_id="admin-4",
             request_id=str(uuid4()),
             key_id=successor_id,
-            required_replica_ids=[settings.gpu_registration_recovery_replica_id],
         )
 
     first = sessions()
@@ -684,7 +922,6 @@ async def test_failed_down_preserves_recovery_key_catalog(
             administrator_id="admin-5",
             request_id=str(uuid4()),
             key_id=staged_id,
-            required_replica_ids=[settings.gpu_registration_recovery_replica_id],
         )
     with pytest.raises(AssertionError, match="cannot roll back durable GPU lifecycle"):
         await gpu_pg._apply_migration(
@@ -704,6 +941,7 @@ async def test_failed_down_preserves_recovery_key_catalog(
 
 async def test_singleton_bootstrap_authority_allows_down_and_clean_up_rebootstrap(
     postgres_schema,
+    monkeypatch,
 ):
     sessions, schema = postgres_schema
     await gpu_pg._apply_migration(
@@ -727,6 +965,50 @@ async def test_singleton_bootstrap_authority_allows_down_and_clean_up_rebootstra
         await session.commit()
         active = await _active_epoch(session)
         assert active.key_id == key_id
+
+    successor_id = "gpu-recovery-migration-quorum-v2"
+    _configure_keyring(
+        monkeypatch,
+        {
+            **settings.gpu_registration_recovery_key_materials,
+            successor_id: _new_key(),
+        },
+        successor_id,
+    )
+    monkeypatch.setattr(settings, "gpu_registration_recovery_required_ack_count", 2)
+    async with sessions() as session:
+        await stage_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-migration-quorum",
+            request_id=str(uuid4()),
+            key_id=successor_id,
+            required_ack_count=2,
+        )
+    async with sessions() as session:
+        local_ack = await session.get(
+            GpuRegistrationRecoveryKeyReplicaAck,
+            (settings.gpu_registration_recovery_replica_id, successor_id),
+        )
+        assert local_ack is not None
+        session.add(
+            GpuRegistrationRecoveryKeyReplicaAck(
+                replica_id="migration-replacement-pod",
+                cohort_id=local_ack.cohort_id,
+                key_id=successor_id,
+                key_ids=list(local_ack.key_ids),
+                key_fingerprints=dict(local_ack.key_fingerprints),
+                keyring_sha256=local_ack.keyring_sha256,
+            )
+        )
+        await session.commit()
+    async with sessions() as session:
+        activated = await activate_gpu_registration_recovery_key_epoch(
+            session,
+            administrator_id="admin-migration-quorum",
+            request_id=str(uuid4()),
+            key_id=successor_id,
+        )
+        assert activated["active_key_id"] == successor_id
 
 
 async def test_create_all_first_unresolved_ciphertext_preflight_preserves_catalog(

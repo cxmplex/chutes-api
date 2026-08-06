@@ -142,7 +142,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_epochs (
     key_sha256 VARCHAR(64) NOT NULL,
     predecessor_key_id VARCHAR(64) REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT,
     state VARCHAR NOT NULL,
-    required_replica_ids JSONB NOT NULL,
+    cohort_id VARCHAR(128) NOT NULL,
+    required_ack_count INTEGER NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     activated_at TIMESTAMPTZ,
     retiring_at TIMESTAMPTZ,
@@ -156,8 +157,8 @@ CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_epochs (
         state IN ('staged', 'active', 'retiring', 'retired', 'cancelled')
     ),
     CONSTRAINT ck_gpu_registration_recovery_key_epoch_replicas CHECK (
-        jsonb_typeof(required_replica_ids) = 'array'
-        AND jsonb_array_length(required_replica_ids) > 0
+        cohort_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        AND required_ack_count BETWEEN 1 AND 256
     ),
     CONSTRAINT ck_gpu_registration_recovery_key_epoch_timestamps CHECK (
         (state = 'staged' AND activated_at IS NULL
@@ -179,9 +180,12 @@ CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_epochs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_registration_recovery_key_active
     ON gpu_registration_recovery_key_epochs(state) WHERE state = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_gpu_registration_recovery_key_staged_successor
+    ON gpu_registration_recovery_key_epochs(predecessor_key_id) WHERE state = 'staged';
 
 CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_replica_acks (
     replica_id VARCHAR(128) NOT NULL,
+    cohort_id VARCHAR(128) NOT NULL,
     key_id VARCHAR(64) NOT NULL REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE CASCADE,
     key_ids JSONB NOT NULL,
     key_fingerprints JSONB NOT NULL,
@@ -190,6 +194,7 @@ CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_replica_acks (
     PRIMARY KEY (replica_id, key_id),
     CONSTRAINT ck_gpu_registration_recovery_key_replica_ack CHECK (
         replica_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+        AND cohort_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
         AND jsonb_typeof(key_ids) = 'array' AND key_ids ? key_id
         AND jsonb_typeof(key_fingerprints) = 'object'
         AND key_fingerprints ? key_id
@@ -204,24 +209,27 @@ CREATE TABLE IF NOT EXISTS gpu_registration_recovery_key_epoch_operations (
     key_id VARCHAR(64) NOT NULL REFERENCES gpu_registration_recovery_key_epochs(key_id) ON DELETE RESTRICT,
     predecessor_key_id VARCHAR(64),
     requested_by_user_id VARCHAR NOT NULL,
-    required_replica_ids JSONB,
+    cohort_id VARCHAR(128),
+    required_ack_count INTEGER,
     reason VARCHAR,
     response_json JSONB NOT NULL,
     response_sha256 VARCHAR(64) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    replay_expires_at TIMESTAMPTZ NOT NULL,
     CONSTRAINT ck_gpu_registration_recovery_key_epoch_operation CHECK (
         request_sha256 ~ '^[0-9a-f]{64}$'
         AND response_sha256 ~ '^[0-9a-f]{64}$'
         AND operation_type IN ('stage', 'activate', 'retire', 'cancel')
+        AND replay_expires_at > created_at
         AND (
             (operation_type = 'stage'
-             AND jsonb_typeof(required_replica_ids) = 'array'
-             AND jsonb_array_length(required_replica_ids) > 0
+             AND cohort_id IS NOT NULL
+             AND required_ack_count BETWEEN 1 AND 256
              AND reason IS NULL)
             OR (operation_type IN ('activate', 'retire')
-                AND required_replica_ids IS NULL AND reason IS NULL)
+                AND cohort_id IS NULL AND required_ack_count IS NULL AND reason IS NULL)
             OR (operation_type = 'cancel'
-                AND required_replica_ids IS NULL
+                AND cohort_id IS NULL AND required_ack_count IS NULL
                 AND length(reason) BETWEEN 1 AND 2000)
         )
     )
@@ -267,7 +275,8 @@ BEGIN
     IF NEW.key_id IS DISTINCT FROM OLD.key_id
        OR NEW.key_sha256 IS DISTINCT FROM OLD.key_sha256
        OR NEW.predecessor_key_id IS DISTINCT FROM OLD.predecessor_key_id
-       OR NEW.required_replica_ids IS DISTINCT FROM OLD.required_replica_ids
+       OR NEW.cohort_id IS DISTINCT FROM OLD.cohort_id
+       OR NEW.required_ack_count IS DISTINCT FROM OLD.required_ack_count
        OR NEW.created_at IS DISTINCT FROM OLD.created_at
     THEN
         RAISE EXCEPTION 'GPU registration recovery-key epoch identity is immutable';
@@ -307,40 +316,50 @@ BEGIN
         ) THEN
             RAISE EXCEPTION 'GPU registration recovery-key activation has no exact retiring predecessor';
         END IF;
-        IF EXISTS (
-            SELECT 1
-              FROM jsonb_array_elements_text(NEW.required_replica_ids) required(replica_id)
-             WHERE NOT EXISTS (
-                 SELECT 1
-                   FROM gpu_registration_recovery_key_replica_acks ack
-                  WHERE ack.key_id = NEW.key_id
-                    AND ack.replica_id = required.replica_id
-                    AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
-                    AND ack.key_ids ? NEW.key_id
-                    AND ack.key_fingerprints ->> NEW.key_id = NEW.key_sha256
-                    AND (
-                        NEW.predecessor_key_id IS NULL
-                        OR (
-                            ack.key_ids ? NEW.predecessor_key_id
-                            AND ack.key_fingerprints ->> NEW.predecessor_key_id = (
-                                SELECT predecessor.key_sha256
-                                  FROM gpu_registration_recovery_key_epochs predecessor
-                                 WHERE predecessor.key_id = NEW.predecessor_key_id
-                            )
-                        )
-                    )
-             )
-        ) OR (
-            SELECT COUNT(DISTINCT (
-                ack.key_ids::text || E'\n' || ack.key_fingerprints::text
-                || E'\n' || ack.keyring_sha256
-            ))
-              FROM gpu_registration_recovery_key_replica_acks ack
-             WHERE ack.key_id = NEW.key_id
-               AND ack.replica_id IN (
-                   SELECT jsonb_array_elements_text(NEW.required_replica_ids)
-               )
-        ) <> 1 THEN
+        IF NEW.predecessor_key_id IS NOT NULL AND (
+            (
+                SELECT COUNT(*)
+                  FROM gpu_registration_recovery_key_replica_acks ack
+                 WHERE ack.key_id = NEW.key_id
+                   AND ack.cohort_id = NEW.cohort_id
+                   AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
+                   AND ack.key_ids ? NEW.key_id
+                   AND ack.key_ids ? NEW.predecessor_key_id
+                   AND ack.key_fingerprints ->> NEW.key_id = NEW.key_sha256
+                   AND ack.key_fingerprints ->> NEW.predecessor_key_id = (
+                       SELECT predecessor.key_sha256
+                         FROM gpu_registration_recovery_key_epochs predecessor
+                        WHERE predecessor.key_id = NEW.predecessor_key_id
+                   )
+            ) < NEW.required_ack_count
+            OR EXISTS (
+                SELECT 1
+                  FROM gpu_registration_recovery_key_replica_acks ack
+                 WHERE ack.key_id = NEW.key_id
+                   AND ack.cohort_id = NEW.cohort_id
+                   AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
+                   AND (
+                       NOT (ack.key_ids ? NEW.key_id)
+                       OR NOT (ack.key_ids ? NEW.predecessor_key_id)
+                       OR ack.key_fingerprints ->> NEW.key_id IS DISTINCT FROM NEW.key_sha256
+                       OR ack.key_fingerprints ->> NEW.predecessor_key_id IS DISTINCT FROM (
+                           SELECT predecessor.key_sha256
+                             FROM gpu_registration_recovery_key_epochs predecessor
+                            WHERE predecessor.key_id = NEW.predecessor_key_id
+                       )
+                   )
+            )
+            OR (
+                SELECT COUNT(DISTINCT (
+                    ack.key_ids::text || E'\n' || ack.key_fingerprints::text
+                    || E'\n' || ack.keyring_sha256
+                ))
+                  FROM gpu_registration_recovery_key_replica_acks ack
+                 WHERE ack.key_id = NEW.key_id
+                   AND ack.cohort_id = NEW.cohort_id
+                   AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
+            ) <> 1
+        ) THEN
             RAISE EXCEPTION 'GPU registration recovery-key activation lacks exact fresh replica ACKs';
         END IF;
         RETURN NEW;
@@ -355,20 +374,31 @@ BEGIN
               FROM gpu_registration_recovery_key_epochs successor
              WHERE successor.state = 'staged'
                AND successor.predecessor_key_id = OLD.key_id
+               AND (
+                   SELECT COUNT(*)
+                     FROM gpu_registration_recovery_key_replica_acks ack
+                    WHERE ack.key_id = successor.key_id
+                      AND ack.cohort_id = successor.cohort_id
+                      AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
+                      AND ack.key_ids ? successor.key_id
+                      AND ack.key_ids ? OLD.key_id
+                      AND ack.key_fingerprints ->> successor.key_id = successor.key_sha256
+                      AND ack.key_fingerprints ->> OLD.key_id = OLD.key_sha256
+               ) >= successor.required_ack_count
                AND NOT EXISTS (
                    SELECT 1
-                     FROM jsonb_array_elements_text(successor.required_replica_ids) required(replica_id)
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                          FROM gpu_registration_recovery_key_replica_acks ack
-                         WHERE ack.key_id = successor.key_id
-                           AND ack.replica_id = required.replica_id
-                           AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
-                           AND ack.key_ids ? successor.key_id
-                           AND ack.key_ids ? OLD.key_id
-                           AND ack.key_fingerprints ->> successor.key_id = successor.key_sha256
-                           AND ack.key_fingerprints ->> OLD.key_id = OLD.key_sha256
-                    )
+                     FROM gpu_registration_recovery_key_replica_acks ack
+                    WHERE ack.key_id = successor.key_id
+                      AND ack.cohort_id = successor.cohort_id
+                      AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
+                      AND (
+                          NOT (ack.key_ids ? successor.key_id)
+                          OR NOT (ack.key_ids ? OLD.key_id)
+                          OR ack.key_fingerprints ->> successor.key_id
+                              IS DISTINCT FROM successor.key_sha256
+                          OR ack.key_fingerprints ->> OLD.key_id
+                              IS DISTINCT FROM OLD.key_sha256
+                      )
                )
                AND (
                    SELECT COUNT(DISTINCT (
@@ -377,9 +407,8 @@ BEGIN
                    ))
                      FROM gpu_registration_recovery_key_replica_acks ack
                     WHERE ack.key_id = successor.key_id
-                      AND ack.replica_id IN (
-                          SELECT jsonb_array_elements_text(successor.required_replica_ids)
-                      )
+                      AND ack.cohort_id = successor.cohort_id
+                      AND ack.acknowledged_at >= NOW() - INTERVAL '120 seconds'
                ) = 1
         ) <> 1 THEN
             RAISE EXCEPTION 'GPU registration recovery-key retirement lacks one exact ACKed successor';

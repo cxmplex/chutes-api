@@ -1,3 +1,16 @@
+{{- define "chutes.fullname" -}}
+{{- if .Values.fullnameOverride -}}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default .Chart.Name .Values.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "api.labels" -}}
 app.kubernetes.io/name: api
 {{- end }}
@@ -263,7 +276,11 @@ nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
 - name: GPU_REGISTRATION_RECOVERY_REPLICA_ID
   valueFrom:
     fieldRef:
-      fieldPath: metadata.uid
+      fieldPath: metadata.name
+- name: GPU_REGISTRATION_RECOVERY_REPLICA_COHORT
+  value: {{ printf "%s-api" (include "chutes.fullname" .) | quote }}
+- name: GPU_REGISTRATION_RECOVERY_REQUIRED_ACK_COUNT
+  value: {{ required "api.gpuRegistrationRecoveryRequiredAckCount is required" .Values.api.gpuRegistrationRecoveryRequiredAckCount | quote }}
 - name: ENVDUMP_UNLOCK
   valueFrom:
     secretKeyRef:

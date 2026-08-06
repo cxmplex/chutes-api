@@ -116,6 +116,8 @@ spec:
             {{- include "chutes.loggingEnv" . | nindent 12 }}
             - name: OPERATOR_ENDPOINT_CIDRS
               value: {{ .Values.operatorEndpointCidrs | quote }}
+            - name: GPU_RUNTIME_SESSION_V2_ENABLED
+              value: {{ .Values.api.gpuRuntimeSessionV2Enabled | quote }}
             - name: TEE_MEASUREMENT_CONFIG_REQUIRED
               value: "true"
             - name: TRUSTED_PROVENANCE_PUBLIC_KEY_PATH

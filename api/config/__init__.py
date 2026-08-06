@@ -1160,6 +1160,19 @@ class Settings(BaseSettings):
         "GPU_REGISTRATION_RECOVERY_REPLICA_ID",
         os.getenv("HOSTNAME", "local-dev"),
     )
+    gpu_registration_recovery_replica_cohort: str = os.getenv(
+        "GPU_REGISTRATION_RECOVERY_REPLICA_COHORT",
+        "api",
+    )
+    gpu_registration_recovery_required_ack_count: int = int(
+        os.getenv("GPU_REGISTRATION_RECOVERY_REQUIRED_ACK_COUNT", "1")
+    )
+    # Keep the production v1 runtime-session wire contract until every durable
+    # miner consumer can read v2. Upgraded agents may negotiate early, but the
+    # API remains the operator-controlled emission gate.
+    gpu_runtime_session_v2_enabled: bool = (
+        os.getenv("GPU_RUNTIME_SESSION_V2_ENABLED", "false").lower() == "true"
+    )
     gpu_launch_key_epoch: int = int(os.getenv("GPU_LAUNCH_KEY_EPOCH", "1"))
 
     @property
@@ -1305,6 +1318,19 @@ class Settings(BaseSettings):
             is None
         ):
             raise ValueError("GPU_REGISTRATION_RECOVERY_REPLICA_ID is malformed")
+        if (
+            not isinstance(self.gpu_registration_recovery_replica_cohort, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                self.gpu_registration_recovery_replica_cohort,
+            )
+            is None
+        ):
+            raise ValueError("GPU_REGISTRATION_RECOVERY_REPLICA_COHORT is malformed")
+        if not 1 <= self.gpu_registration_recovery_required_ack_count <= 256:
+            raise ValueError(
+                "GPU_REGISTRATION_RECOVERY_REQUIRED_ACK_COUNT must be between 1 and 256"
+            )
         return dict(keys)
 
     @property

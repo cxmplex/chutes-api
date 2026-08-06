@@ -55,6 +55,45 @@ def test_registration_recovery_keyring_requires_valid_replica_id(monkeypatch):
         _ = settings.gpu_registration_recovery_keys
 
 
+@pytest.mark.parametrize(
+    ("attribute", "value", "error"),
+    [
+        (
+            "gpu_registration_recovery_replica_cohort",
+            "not a cohort",
+            "GPU_REGISTRATION_RECOVERY_REPLICA_COHORT",
+        ),
+        (
+            "gpu_registration_recovery_required_ack_count",
+            0,
+            "GPU_REGISTRATION_RECOVERY_REQUIRED_ACK_COUNT",
+        ),
+        (
+            "gpu_registration_recovery_required_ack_count",
+            257,
+            "GPU_REGISTRATION_RECOVERY_REQUIRED_ACK_COUNT",
+        ),
+    ],
+)
+def test_registration_recovery_keyring_requires_valid_cohort_quorum(
+    monkeypatch,
+    attribute,
+    value,
+    error,
+):
+    key = Fernet.generate_key().decode("ascii")
+    monkeypatch.setattr(settings, "gpu_registration_recovery_key_id", "active")
+    monkeypatch.setattr(
+        settings,
+        "gpu_registration_recovery_keys_json",
+        json.dumps({"active": key}),
+    )
+    monkeypatch.setattr(settings, attribute, value)
+
+    with pytest.raises(ValueError, match=error):
+        _ = settings.gpu_registration_recovery_keys
+
+
 def test_registration_recovery_keyring_rejects_cache_key_reuse(monkeypatch):
     key = Fernet.generate_key().decode("ascii")
     monkeypatch.setattr(settings, "gpu_registration_recovery_key_id", "active")
@@ -147,6 +186,11 @@ def test_registration_recovery_keys_use_external_secret_and_explicit_dev_opt_in(
     assert "name: GPU_REGISTRATION_RECOVERY_KEY_ID" in helpers
     assert "name: GPU_REGISTRATION_RECOVERY_KEYS_JSON" in helpers
     assert "name: GPU_REGISTRATION_RECOVERY_REPLICA_ID" in helpers
+    assert "name: GPU_REGISTRATION_RECOVERY_REPLICA_COHORT" in helpers
+    assert "name: GPU_REGISTRATION_RECOVERY_REQUIRED_ACK_COUNT" in helpers
+    assert helpers.count("fieldPath: metadata.name") >= 2
+    assert "fieldPath: metadata.uid" not in helpers
+    assert "gpuRegistrationRecoveryRequiredAckCount" in (root / "charts/values.yaml").read_text()
     assert helpers.count("name: gpu-registration-recovery-keys") == 2
     assert "GPU_REGISTRATION_ALLOW_INSECURE_DEV_KEY" not in helpers
 
