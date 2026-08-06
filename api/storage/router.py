@@ -1325,8 +1325,7 @@ async def release_volume_key(
         key = await service.release_volume_key(
             db,
             volume_id,
-            caller.miner_hotkey,
-            body.server_id,
+            caller,
             body.quote,
             body.tee_type,
             body.snp_cert_chain,

@@ -113,6 +113,26 @@ def _migration_down_sql(filename: str) -> str:
     return migration.split("-- migrate:down", 1)[1]
 
 
+async def _wait_for_postgres_blocker(engine, blocked_pid: int, blocker_pid: int) -> None:
+    for _ in range(500):
+        async with engine.connect() as observer:
+            blocked = await observer.scalar(
+                text(
+                    "SELECT CAST(:blocker_pid AS integer) = ANY(pg_blocking_pids(:blocked_pid))"
+                ),
+                {
+                    "blocked_pid": blocked_pid,
+                    "blocker_pid": blocker_pid,
+                },
+            )
+        if blocked:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(
+        f"backend {blocked_pid} was not blocked by expected backend {blocker_pid}"
+    )
+
+
 PRE_MIGRATION_DDL = """
     ALTER TABLE vm_cache_configs
         DROP COLUMN IF EXISTS volume_generation_leases;
@@ -138,6 +158,11 @@ PRE_MIGRATION_DDL = """
     ALTER TABLE users DROP CONSTRAINT IF EXISTS ck_users_storage_volume_quota;
     ALTER TABLE users DROP COLUMN IF EXISTS storage_aggregate_quota_bytes;
     ALTER TABLE users DROP COLUMN IF EXISTS storage_volume_quota_bytes;
+    DROP TRIGGER IF EXISTS trg_storage_volume_grant_epoch_monotonic ON storage_volumes;
+    DROP FUNCTION IF EXISTS enforce_storage_volume_grant_epoch_monotonic();
+    ALTER TABLE storage_volumes
+        DROP CONSTRAINT IF EXISTS ck_storage_volume_grant_revocation_epoch;
+    ALTER TABLE storage_volumes DROP COLUMN IF EXISTS grant_revocation_epoch;
     ALTER TABLE storage_volumes DROP COLUMN IF EXISTS purged_at;
     ALTER TABLE storage_volumes DROP COLUMN IF EXISTS key_shredded_at;
     ALTER TABLE storage_volumes DROP COLUMN IF EXISTS delete_requested_at;
@@ -167,6 +192,12 @@ PRE_MIGRATION_DDL = """
     DROP INDEX IF EXISTS uq_storage_object_current;
     DROP INDEX IF EXISTS idx_storage_objects_volume;
     DROP INDEX IF EXISTS idx_storage_objects_reconcile;
+    DROP TRIGGER IF EXISTS trg_storage_object_generation_immutable ON storage_objects;
+    DROP FUNCTION IF EXISTS prevent_storage_object_generation_mutation();
+    ALTER TABLE storage_objects
+        DROP CONSTRAINT IF EXISTS uq_storage_object_volume_generation,
+        DROP CONSTRAINT IF EXISTS ck_storage_object_generation;
+    ALTER TABLE storage_objects DROP COLUMN IF EXISTS generation;
     ALTER TABLE storage_objects DROP CONSTRAINT IF EXISTS ck_storage_object_lifecycle_state;
     ALTER TABLE storage_objects DROP CONSTRAINT IF EXISTS fk_storage_object_expected_predecessor;
     ALTER TABLE storage_objects DROP CONSTRAINT IF EXISTS uq_storage_object_key;
@@ -383,6 +414,23 @@ async def _server(
     if live:
         await redis.setex(f"storage:online:{server_id}", 180, "1")
     return server
+
+
+async def _commit_failed_attestation(
+    db: AsyncSession,
+    server_id: str,
+    *,
+    detail: str = "injected latest attestation failure",
+) -> None:
+    db.add(
+        ServerAttestation(
+            server_id=server_id,
+            quote_data="failed-quote",
+            verification_error=detail,
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    await db.commit()
 
 
 def _attested_identity(common_name: str):
@@ -666,6 +714,7 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
             assert good.status == bad.status == wiped.status == "evicted"
             assert good.storage_incarnation is None
             assert good.target_cert_pubkey_hash is None
+            assert good.last_error == "secure_replication_requires_new_receipt"
             assert good_obj.durability_state == "irrecoverable"
 
             incarnation = str(uuid.uuid4())
@@ -2021,6 +2070,8 @@ async def test_precommit_target_receipt_promotes_only_after_exact_hash_commit(
 ):
     db, redis = pg_session
     target = await _server(db, redis, "target", "host-target")
+    target_id = target.server_id
+    original_incarnation = target.storage_incarnation
     volume = await _volume(db, 1)
     obj = await _object(db, volume, "obj-precommit", size_bytes=2048)
     placement = await _placement(db, obj, target, status="pending")
@@ -2137,7 +2188,7 @@ async def test_precommit_target_receipt_promotes_only_after_exact_hash_commit(
     assert attestation is not None
     attestation.verified_at = datetime.now(timezone.utc) - timedelta(hours=2)
     await db.commit()
-    assert (
+    with pytest.raises(HTTPException) as stale_attestation:
         await service.announce_replicas(
             db,
             MINER,
@@ -2146,19 +2197,51 @@ async def test_precommit_target_receipt_promotes_only_after_exact_hash_commit(
             target.storage_incarnation,
             [direct_receipt],
         )
-        == 0
-    )
+    assert stale_attestation.value.status_code == 403
+    await db.rollback()
     await db.refresh(placement)
     assert placement.status == "present"
     assert placement.proof_at == proof_at
 
     changed_incarnation = str(uuid.uuid4())
+    with pytest.raises(HTTPException) as stale_identity_transition:
+        await service.announce_replicas(
+            db,
+            MINER,
+            target_id,
+            target_id,
+            changed_incarnation,
+            [direct_receipt],
+        )
+    assert stale_identity_transition.value.status_code == 403
+    await db.rollback()
+    await db.refresh(target)
+    assert target.storage_incarnation == original_incarnation
+
+    measurement = _storage_measurement()
+    config_fingerprint = measurement.config_fingerprint or measurement_config_fingerprint(
+        measurement
+    )
+    verified_at = datetime.now(timezone.utc)
+    db.add(
+        ServerAttestation(
+            server_id=target_id,
+            quote_data="fresh-replacement-quote",
+            measurement_version=measurement.version,
+            measurement_name=measurement.name,
+            measurement_config_fingerprint=config_fingerprint,
+            trust_set_fingerprint=measurement_trust_set_fingerprint(settings.tee_measurements),
+            created_at=verified_at,
+            verified_at=verified_at,
+        )
+    )
+    await db.commit()
     assert (
         await service.announce_replicas(
             db,
             MINER,
-            target.server_id,
-            target.server_id,
+            target_id,
+            target_id,
             changed_incarnation,
             [direct_receipt],
         )
@@ -2783,23 +2866,6 @@ async def test_capability_rejects_wrong_source_cert_incarnation_target_cert_and_
         )
     assert wrong_source.value.status_code == 409
 
-    source_incarnation_lease = await service.issue_replication_capability(
-        db, source, obj.object_id, target.server_id, digest, ciphertext_size
-    )
-    source_incarnation = source.storage_incarnation
-    source.storage_incarnation = str(uuid.uuid4())
-    await db.commit()
-    with pytest.raises(HTTPException) as stale_source_incarnation:
-        await service.consume_replication_capability(
-            db,
-            target,
-            source_incarnation_lease["capability"],
-            _sign_capability(source_identity, source_incarnation_lease["capability"]),
-        )
-    assert stale_source_incarnation.value.status_code == 409
-    source.storage_incarnation = source_incarnation
-    await db.commit()
-
     source_cert_lease = await service.issue_replication_capability(
         db, source, obj.object_id, target.server_id, digest, ciphertext_size
     )
@@ -2843,8 +2909,13 @@ async def test_capability_rejects_wrong_source_cert_incarnation_target_cert_and_
         target_cert_lease["capability"],
         "target_identity_rejected",
     )
+    await db.refresh(target_placement)
+    assert target_placement.status == "evicted"
+    assert target_placement.last_error == "stale_storage_identity"
     target.attested_cert_pubkey_hash = target_cert_hash
+    await service._upsert_pending_placement(db, obj, target)
     await db.commit()
+    db.expire(target_placement)
 
     wrong_attempt_lease = await service.issue_replication_capability(
         db, source, obj.object_id, target.server_id, digest, ciphertext_size
@@ -2861,6 +2932,153 @@ async def test_capability_rejects_wrong_source_cert_incarnation_target_cert_and_
     assert wrong_attempt.value.status_code == 409
     await db.refresh(source_placement)
     assert source_placement.proof_sha256 == digest
+
+    source_incarnation_lease = await service.issue_replication_capability(
+        db, source, obj.object_id, target.server_id, digest, ciphertext_size
+    )
+    old_source_incarnation = source.storage_incarnation
+    new_source_incarnation = str(uuid.uuid4())
+    await service._bind_storage_identity(db, source, new_source_incarnation)
+    await db.commit()
+    with pytest.raises(HTTPException) as stale_source_incarnation:
+        await service.consume_replication_capability(
+            db,
+            target,
+            source_incarnation_lease["capability"],
+            _sign_capability(source_identity, source_incarnation_lease["capability"]),
+        )
+    assert stale_source_incarnation.value.status_code == 409
+    capability = await db.get(
+        StorageReplicationCapability,
+        source_incarnation_lease["capability_id"],
+    )
+    assert capability.source_storage_incarnation == old_source_incarnation
+    assert capability.failed_at is not None
+    assert capability.last_error == "capability_binding_stale"
+
+
+async def test_replication_issue_and_fail_preserve_presented_identity_across_refresh(
+    pg_session,
+):
+    db, redis = pg_session
+    source_identity = _attested_identity("presented-replication-source")
+    source = await _server(
+        db,
+        redis,
+        "presented-replication-source",
+        "presented-replication-source-host",
+        attested_identity=source_identity,
+    )
+    target = await _server(
+        db,
+        redis,
+        "presented-replication-target",
+        "presented-replication-target-host",
+    )
+    source_id = source.server_id
+    target_id = target.server_id
+    old_source_incarnation = source.storage_incarnation
+    replacement_incarnation = str(uuid.uuid4())
+    digest = "e" * 64
+    ciphertext_size = 80
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with (
+        factory() as stale_issuer,
+        factory() as stale_reporter,
+        factory() as replacement,
+    ):
+        presented_issuer = await stale_issuer.get(Server, source_id)
+        presented_reporter = await stale_reporter.get(Server, source_id)
+        assert presented_issuer.storage_incarnation == old_source_incarnation
+        assert presented_reporter.storage_incarnation == old_source_incarnation
+
+        current_source = await replacement.get(Server, source_id)
+        await service._bind_storage_identity(
+            replacement,
+            current_source,
+            replacement_incarnation,
+        )
+        await replacement.commit()
+
+        # Build the transfer from a genuinely fresh post-rotation generation. A receipt on the
+        # retired incarnation is immutable audit evidence and must never be cleared merely to
+        # manufacture a retry fixture.
+        replacement.expire_all()
+        current_source = await replacement.get(Server, source_id)
+        current_target = await replacement.get(Server, target_id)
+        volume = await _volume(replacement, 2)
+        obj = await _object(
+            replacement,
+            volume,
+            "presented-replication-object",
+            size_bytes=32,
+        )
+        object_id = obj.object_id
+        await _placement(replacement, obj, current_source, status="pending")
+        target_placement = await _placement(replacement, obj, current_target, status="pending")
+        target_placement_id = target_placement.placement_id
+        direct_receipt = {
+            "object_id": object_id,
+            "status": "stored",
+            "ciphertext_sha256": digest,
+            "ciphertext_size_bytes": ciphertext_size,
+            "plaintext_size_bytes": 32,
+            "plaintext_sha256": "f" * 64,
+        }
+        assert (
+            await service.announce_replicas(
+                replacement,
+                MINER,
+                source_id,
+                source_id,
+                replacement_incarnation,
+                [direct_receipt],
+            )
+            == 1
+        )
+        replacement.expire_all()
+        current_source = await replacement.get(Server, source_id)
+        lease = await service.issue_replication_capability(
+            replacement,
+            current_source,
+            object_id,
+            target_id,
+            digest,
+            ciphertext_size,
+        )
+
+        with pytest.raises(HTTPException) as stale_issue:
+            await service.issue_replication_capability(
+                stale_issuer,
+                presented_issuer,
+                object_id,
+                target_id,
+                digest,
+                ciphertext_size,
+            )
+        assert stale_issue.value.status_code == 403
+        assert "source identity is stale" in stale_issue.value.detail
+        await stale_issuer.rollback()
+
+        with pytest.raises(HTTPException) as stale_failure_report:
+            await service.fail_replication_capability(
+                stale_reporter,
+                presented_reporter,
+                lease["capability"],
+                "stale_presenter_must_not_terminalize",
+            )
+        assert stale_failure_report.value.status_code == 403
+        assert "current bound source or target identity" in stale_failure_report.value.detail
+        await stale_reporter.rollback()
+
+    db.expire_all()
+    capability = await db.get(StorageReplicationCapability, lease["capability_id"])
+    unchanged_target = await db.get(ReplicaPlacement, target_placement_id)
+    assert capability.failed_at is None
+    assert capability.last_error is None
+    assert unchanged_target.status == "pending"
+    assert unchanged_target.last_error is None
 
 
 async def test_concurrent_capability_issuance_has_one_active_attempt(pg_session):
@@ -3066,6 +3284,7 @@ async def test_certificate_rebind_mixed_journal_is_atomic_ordered_and_replayable
     new_identity = _attested_identity("cert-rebind-new")
     holder.attested_cert = new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
     holder.attested_cert_pubkey_hash = get_public_key_hash(new_identity[1])
+    assert await service._refresh_object_durability(db, rebound, volume=volume) == 0
     await db.commit()
     new_cert_hash = holder.attested_cert_pubkey_hash
 
@@ -3149,7 +3368,11 @@ async def test_certificate_rebind_mixed_journal_is_atomic_ordered_and_replayable
         ],
     }
     await db.refresh(rebound_placement)
+    await db.refresh(rebound)
     assert rebound_placement.target_cert_pubkey_hash == new_cert_hash
+    assert rebound.durable_replica_count == 1
+    assert rebound.durability_state == "healthy"
+    assert rebound.durability_updated_at is not None
     audit = await db.get(StorageReplicaCertRebindAudit, request_id)
     assert audit.object_bindings == [
         {
@@ -3366,7 +3589,7 @@ async def test_certificate_rebind_recovers_reconcile_winner_and_rejects_near_mis
     )
     with pytest.raises(
         DBAPIError,
-        match="exact present rebind or stale-identity recovery",
+        match="lacks exact inactive binding or audited active rebind",
     ):
         await db.execute(
             update(ReplicaPlacement)
@@ -3803,6 +4026,648 @@ async def test_incarnation_retirement_and_mixed_volume_enqueue_serialize_both_or
         assert existing_result.erased_file_was_present is None
     assert all(task.reason == "volume_deleted" for task in tasks)
     assert all(task.completed_at is not None for task in tasks)
+
+
+@pytest.mark.parametrize(
+    "identity_wins",
+    [False, True],
+    ids=["enqueue-wins", "identity-wins"],
+)
+async def test_bind_and_multigeneration_enqueue_share_server_publication_fence(
+    pg_session,
+    identity_wins,
+):
+    db, redis = pg_session
+    suffix = "identity" if identity_wins else "enqueue"
+    holder = await _server(
+        db,
+        redis,
+        f"placement-order-{suffix}",
+        f"placement-order-host-{suffix}",
+    )
+    holder_id = holder.server_id
+    old_incarnation = holder.storage_incarnation
+    volume = await _volume(db, 1)
+    # Object lexical order is intentionally the inverse of placement UUID order. Placement order
+    # remains a secondary defense; the server-wide publication fence keeps bind out of the placement
+    # graph regardless of which operation wins.
+    high_object = await _object(
+        db,
+        volume,
+        f"a-object-high-placement-{suffix}",
+        sha256="a" * 64,
+        size_bytes=41,
+    )
+    low_object = await _object(
+        db,
+        volume,
+        f"z-object-low-placement-{suffix}",
+        sha256="b" * 64,
+        size_bytes=43,
+    )
+    high_placement = await _placement(db, high_object, holder, status="present")
+    low_placement = await _placement(db, low_object, holder, status="present")
+    high_placement_id = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    low_placement_id = "00000000-0000-0000-0000-000000000001"
+    high_placement.placement_id = high_placement_id
+    low_placement.placement_id = low_placement_id
+    await db.commit()
+    object_ids = [high_object.object_id, low_object.object_id]
+    assert object_ids[0] < object_ids[1]
+    assert low_placement_id < high_placement_id
+    new_incarnation = str(uuid.uuid4())
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as identity_worker, factory() as enqueue_worker:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(
+            gate,
+            [holder_id],
+            shared=False,
+        )
+        identity_holder = await identity_worker.get(Server, holder_id)
+        enqueue_generations = list(
+            (
+                await enqueue_worker.execute(
+                    select(StorageObject)
+                    .where(StorageObject.object_id.in_(object_ids))
+                    .order_by(StorageObject.object_id)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        identity_pid = await identity_worker.scalar(text("SELECT pg_backend_pid()"))
+        enqueue_pid = await enqueue_worker.scalar(text("SELECT pg_backend_pid()"))
+
+        if identity_wins:
+            identity_retirement = asyncio.create_task(
+                service._bind_storage_identity(
+                    identity_worker,
+                    identity_holder,
+                    new_incarnation,
+                )
+            )
+            await _wait_for_postgres_blocker(db.bind, identity_pid, gate_pid)
+            erase_enqueue = asyncio.create_task(
+                service._enqueue_erase_tasks_for_generations(
+                    enqueue_worker,
+                    enqueue_generations,
+                    reason="object_deleted",
+                )
+            )
+            await _wait_for_postgres_blocker(db.bind, enqueue_pid, identity_pid)
+            await gate.commit()
+            await asyncio.wait_for(identity_retirement, timeout=10)
+            await _wait_for_postgres_blocker(db.bind, enqueue_pid, identity_pid)
+            await identity_worker.commit()
+            enqueued = await asyncio.wait_for(erase_enqueue, timeout=10)
+            await enqueue_worker.commit()
+        else:
+            erase_enqueue = asyncio.create_task(
+                service._enqueue_erase_tasks_for_generations(
+                    enqueue_worker,
+                    enqueue_generations,
+                    reason="object_deleted",
+                )
+            )
+            await _wait_for_postgres_blocker(db.bind, enqueue_pid, gate_pid)
+            identity_retirement = asyncio.create_task(
+                service._bind_storage_identity(
+                    identity_worker,
+                    identity_holder,
+                    new_incarnation,
+                )
+            )
+            await _wait_for_postgres_blocker(db.bind, identity_pid, enqueue_pid)
+            await gate.commit()
+            enqueued = await asyncio.wait_for(erase_enqueue, timeout=10)
+            await _wait_for_postgres_blocker(db.bind, identity_pid, enqueue_pid)
+            await enqueue_worker.commit()
+            await asyncio.wait_for(identity_retirement, timeout=10)
+            await identity_worker.commit()
+
+    assert enqueued == (0 if identity_wins else 2)
+    with pytest.raises(
+        RuntimeError,
+        match="authority changed, retired, or failed attestation",
+    ):
+        await service._upsert_pending_placement(db, high_object, holder)
+    await db.rollback()
+    db.expire_all()
+    rebound_holder = await db.get(Server, holder_id)
+    assert rebound_holder.storage_incarnation == new_incarnation
+    audit = (
+        await db.execute(
+            select(StorageIncarnationRetirementAudit).where(
+                StorageIncarnationRetirementAudit.server_id == holder_id,
+                StorageIncarnationRetirementAudit.previous_storage_incarnation == old_incarnation,
+            )
+        )
+    ).scalar_one()
+    tasks = list(
+        (
+            await db.execute(
+                select(StorageEraseTask)
+                .where(StorageEraseTask.object_id.in_(object_ids))
+                .order_by(StorageEraseTask.object_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [task.object_id for task in tasks] == object_ids
+    assert all(task.state == "retired" for task in tasks)
+    assert all(task.retirement_audit_id == audit.audit_id for task in tasks)
+    assert all(task.completed_at is not None for task in tasks)
+    assert all(task.last_error == "attested_incarnation_retired_unreachable" for task in tasks)
+    assert all(task.claimed_at is None for task in tasks)
+    assert all(task.lease_expires_at is None for task in tasks)
+    assert all(task.erased_file_was_present is None for task in tasks)
+
+
+@pytest.mark.parametrize(
+    "identity_wins",
+    [False, True],
+    ids=["replication-wins", "identity-wins"],
+)
+async def test_replication_identity_reads_share_server_publication_fence(
+    pg_session,
+    identity_wins,
+):
+    db, redis = pg_session
+    holder = await _server(
+        db,
+        redis,
+        f"replication-fence-{'identity' if identity_wins else 'transfer'}",
+        f"replication-fence-host-{'identity' if identity_wins else 'transfer'}",
+    )
+    holder_id = holder.server_id
+    replacement_incarnation = str(uuid.uuid4())
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as identity_worker, factory() as transfer_worker:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        identity_holder = await identity_worker.get(Server, holder_id)
+        identity_pid = await identity_worker.scalar(text("SELECT pg_backend_pid()"))
+        transfer_pid = await transfer_worker.scalar(text("SELECT pg_backend_pid()"))
+
+        if identity_wins:
+            binding = asyncio.create_task(
+                service._bind_storage_identity(
+                    identity_worker,
+                    identity_holder,
+                    replacement_incarnation,
+                )
+            )
+            await _wait_for_postgres_blocker(db.bind, identity_pid, gate_pid)
+            reading = asyncio.create_task(
+                service._locked_replication_servers(transfer_worker, holder_id, holder_id)
+            )
+            await _wait_for_postgres_blocker(db.bind, transfer_pid, identity_pid)
+            await gate.commit()
+            await asyncio.wait_for(binding, timeout=10)
+            await _wait_for_postgres_blocker(db.bind, transfer_pid, identity_pid)
+            await identity_worker.commit()
+            locked = await asyncio.wait_for(reading, timeout=10)
+            await transfer_worker.commit()
+        else:
+            reading = asyncio.create_task(
+                service._locked_replication_servers(transfer_worker, holder_id, holder_id)
+            )
+            await _wait_for_postgres_blocker(db.bind, transfer_pid, gate_pid)
+            binding = asyncio.create_task(
+                service._bind_storage_identity(
+                    identity_worker,
+                    identity_holder,
+                    replacement_incarnation,
+                )
+            )
+            await _wait_for_postgres_blocker(db.bind, identity_pid, transfer_pid)
+            await gate.commit()
+            locked = await asyncio.wait_for(reading, timeout=10)
+            await _wait_for_postgres_blocker(db.bind, identity_pid, transfer_pid)
+            await transfer_worker.commit()
+            await asyncio.wait_for(binding, timeout=10)
+            await identity_worker.commit()
+
+    assert locked[holder_id].server_id == holder_id
+    db.expire_all()
+    holder = await db.get(Server, holder_id)
+    assert holder.storage_incarnation == replacement_incarnation
+
+
+@pytest.mark.parametrize(
+    "identity_wins",
+    [False, True],
+    ids=["reconcile-wins", "identity-wins"],
+)
+async def test_reconcile_reassignment_and_bind_use_fence_before_server(
+    pg_session,
+    monkeypatch,
+    identity_wins,
+):
+    db, redis = pg_session
+    suffix = "identity" if identity_wins else "reconcile"
+    source = await _server(db, redis, f"reconcile-source-{suffix}", f"source-host-{suffix}")
+    target = await _server(db, redis, f"reconcile-target-{suffix}", f"target-host-{suffix}")
+    target_id = target.server_id
+    old_incarnation = target.storage_incarnation
+    replacement_incarnation = str(uuid.uuid4())
+    volume = await _volume(db, 2)
+    obj = await _object(db, volume, f"reconcile-object-{suffix}", sha256="6" * 64)
+    object_id = obj.object_id
+    await _placement(db, obj, source, status="present")
+    await service._refresh_object_durability(db, obj, volume=volume)
+    await db.commit()
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as identity_worker, factory() as reconcile_worker:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [target_id], shared=False)
+        identity_target = await identity_worker.get(Server, target_id)
+        identity_pid = await identity_worker.scalar(text("SELECT pg_backend_pid()"))
+        reconcile_publication_entered = asyncio.Event()
+        reconcile_pid = {}
+        original_locked_server_rows = service._locked_storage_publication_server_rows
+
+        async def observed_locked_server_rows(lock_db, server_ids):
+            normalized = {str(server_id) for server_id in server_ids}
+            if (
+                lock_db is reconcile_worker
+                and target_id in normalized
+                and not reconcile_publication_entered.is_set()
+            ):
+                # reconcile_storage commits between phases and may therefore reconnect. Capture
+                # the backend that actually joins this publication frontier, not an earlier PID.
+                reconcile_pid["value"] = await lock_db.scalar(text("SELECT pg_backend_pid()"))
+                reconcile_publication_entered.set()
+            return await original_locked_server_rows(lock_db, server_ids)
+
+        monkeypatch.setattr(
+            service,
+            "_locked_storage_publication_server_rows",
+            observed_locked_server_rows,
+        )
+
+        binding = None
+        reconciling = None
+        try:
+            if identity_wins:
+                binding = asyncio.create_task(
+                    service._bind_storage_identity(
+                        identity_worker,
+                        identity_target,
+                        replacement_incarnation,
+                    )
+                )
+                await _wait_for_postgres_blocker(db.bind, identity_pid, gate_pid)
+                reconciling = asyncio.create_task(
+                    service.reconcile_storage(reconcile_worker, 10)
+                )
+                await asyncio.wait_for(reconcile_publication_entered.wait(), timeout=10)
+                await _wait_for_postgres_blocker(
+                    db.bind,
+                    reconcile_pid["value"],
+                    identity_pid,
+                )
+                await gate.commit()
+                await asyncio.wait_for(binding, timeout=10)
+                await _wait_for_postgres_blocker(
+                    db.bind,
+                    reconcile_pid["value"],
+                    identity_pid,
+                )
+                await identity_worker.commit()
+                summary = await asyncio.wait_for(reconciling, timeout=20)
+            else:
+                reconciling = asyncio.create_task(
+                    service.reconcile_storage(reconcile_worker, 10)
+                )
+                await asyncio.wait_for(reconcile_publication_entered.wait(), timeout=10)
+                await _wait_for_postgres_blocker(
+                    db.bind,
+                    reconcile_pid["value"],
+                    gate_pid,
+                )
+                binding = asyncio.create_task(
+                    service._bind_storage_identity(
+                        identity_worker,
+                        identity_target,
+                        replacement_incarnation,
+                    )
+                )
+                await _wait_for_postgres_blocker(
+                    db.bind,
+                    identity_pid,
+                    reconcile_pid["value"],
+                )
+                await gate.commit()
+                summary = await asyncio.wait_for(reconciling, timeout=20)
+                await asyncio.wait_for(binding, timeout=10)
+                await identity_worker.commit()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            for task in (binding, reconciling):
+                if task is not None and not task.done():
+                    task.cancel()
+            pending_tasks = [task for task in (binding, reconciling) if task is not None]
+            if pending_tasks:
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending_tasks, return_exceptions=True),
+                        timeout=10,
+                    )
+            if identity_worker.in_transaction():
+                await identity_worker.rollback()
+            if reconcile_worker.in_transaction():
+                await reconcile_worker.rollback()
+
+    db.expire_all()
+    target = await db.get(Server, target_id)
+    placement = (
+        await db.execute(
+            select(ReplicaPlacement).where(
+                ReplicaPlacement.object_id == object_id,
+                ReplicaPlacement.server_id == target_id,
+            )
+        )
+    ).scalar_one_or_none()
+    assert target.storage_incarnation == replacement_incarnation
+    assert summary["object_failures"] == 0
+    assert summary["reassigned"] == 1
+    assert placement is not None
+    assert placement.status == "pending"
+    assert placement.storage_incarnation == (
+        replacement_incarnation if identity_wins else old_incarnation
+    )
+
+
+async def test_bind_revalidates_authority_after_waiting_for_publication_fence(pg_session):
+    db, redis = pg_session
+    holder = await _server(db, redis, "bind-authority-holder", "bind-authority-host")
+    holder_id = holder.server_id
+    incarnation = holder.storage_incarnation
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as binder, factory() as mutator:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        stale_authority = await binder.get(Server, holder_id)
+        binder_pid = await binder.scalar(text("SELECT pg_backend_pid()"))
+        binding = asyncio.create_task(
+            service._bind_storage_identity(binder, stale_authority, incarnation)
+        )
+        await _wait_for_postgres_blocker(db.bind, binder_pid, gate_pid)
+        await mutator.execute(
+            update(Server)
+            .where(Server.server_id == holder_id)
+            .values(attested_cert_pubkey_hash="f" * 64)
+        )
+        await mutator.commit()
+        await gate.commit()
+        with pytest.raises(HTTPException) as rejected:
+            await asyncio.wait_for(binding, timeout=10)
+        assert rejected.value.status_code == 403
+        assert "attested certificate changed" in rejected.value.detail
+        await binder.rollback()
+
+
+async def test_bind_rejects_newer_failed_attestation_after_publication_wait(pg_session):
+    db, redis = pg_session
+    holder = await _server(db, redis, "bind-attestation-holder", "bind-attestation-host")
+    holder_id = holder.server_id
+    old_incarnation = holder.storage_incarnation
+    replacement_incarnation = str(uuid.uuid4())
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as binder, factory() as attestor:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        stale_authority = await binder.get(Server, holder_id)
+        binder_pid = await binder.scalar(text("SELECT pg_backend_pid()"))
+        binding = asyncio.create_task(
+            service._bind_storage_identity(
+                binder,
+                stale_authority,
+                replacement_incarnation,
+            )
+        )
+        await _wait_for_postgres_blocker(db.bind, binder_pid, gate_pid)
+        await _commit_failed_attestation(attestor, holder_id)
+        await gate.commit()
+        with pytest.raises(HTTPException) as rejected:
+            await asyncio.wait_for(binding, timeout=10)
+        assert rejected.value.status_code == 403
+        assert "latest attestation" in rejected.value.detail
+        await binder.rollback()
+
+    db.expire_all()
+    holder = await db.get(Server, holder_id)
+    assert holder.storage_incarnation == old_incarnation
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(StorageIncarnationRetirementAudit)
+            .where(StorageIncarnationRetirementAudit.server_id == holder_id)
+        )
+        == 0
+    )
+
+
+async def test_erase_claim_rejects_newer_failed_attestation_after_publication_wait(pg_session):
+    db, redis = pg_session
+    holder = await _server(db, redis, "claim-attestation-holder", "claim-attestation-host")
+    holder_id = holder.server_id
+    volume = await _volume(db, 1)
+    generation = await _object(
+        db,
+        volume,
+        "claim-attestation-generation",
+        sha256="7" * 64,
+        size_bytes=29,
+    )
+    await _placement(db, generation, holder, status="present")
+    await service.delete_object(db, volume, generation.object_key)
+    task = (
+        await db.execute(
+            select(StorageEraseTask).where(StorageEraseTask.object_id == generation.object_id)
+        )
+    ).scalar_one()
+    task_id = task.task_id
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as claimant, factory() as attestor:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        stale_caller = await claimant.get(Server, holder_id)
+        claimant_pid = await claimant.scalar(text("SELECT pg_backend_pid()"))
+        claiming = asyncio.create_task(service.claim_erase_tasks(claimant, stale_caller, 10))
+        await _wait_for_postgres_blocker(db.bind, claimant_pid, gate_pid)
+        await _commit_failed_attestation(attestor, holder_id)
+        await gate.commit()
+        assert await asyncio.wait_for(claiming, timeout=10) == []
+
+    db.expire_all()
+    task = await db.get(StorageEraseTask, task_id)
+    assert task.state == "pending"
+    assert task.claimed_at is None
+    assert task.claim_cert_pubkey_hash is None
+    assert task.attempt_count == 0
+
+
+async def test_certificate_rebind_rejects_newer_failed_attestation_after_wait(pg_session):
+    db, redis = pg_session
+    old_identity = _attested_identity("rebind-attestation-old")
+    holder = await _server(
+        db,
+        redis,
+        "rebind-attestation-holder",
+        "rebind-attestation-host",
+        attested_identity=old_identity,
+    )
+    holder_id = holder.server_id
+    incarnation = holder.storage_incarnation
+    old_cert_hash = holder.attested_cert_pubkey_hash
+    volume = await _volume(db, 1)
+    obj = await _object(db, volume, "rebind-attestation-object", sha256="8" * 64, size_bytes=31)
+    placement = await _placement(db, obj, holder, status="present")
+    object_id = obj.object_id
+    object_sha256 = obj.sha256
+    object_size = obj.ciphertext_size_bytes
+    placement_id = placement.placement_id
+    await service._refresh_object_durability(db, obj, volume=volume)
+    await db.commit()
+
+    new_identity = _attested_identity("rebind-attestation-new")
+    holder.attested_cert = new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    holder.attested_cert_pubkey_hash = get_public_key_hash(new_identity[1])
+    assert await service._refresh_object_durability(db, obj, volume=volume) == 0
+    await db.commit()
+    new_cert_hash = holder.attested_cert_pubkey_hash
+    request_id = str(uuid.uuid4())
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as rebinder, factory() as attestor:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        caller = await rebinder.get(Server, holder_id)
+        rebinder_pid = await rebinder.scalar(text("SELECT pg_backend_pid()"))
+        rebinding = asyncio.create_task(
+            service.rebind_replica_certificates(
+                rebinder,
+                caller,
+                request_id=request_id,
+                storage_incarnation=incarnation,
+                old_cert_pubkey_hash=old_cert_hash,
+                placements=[
+                    {
+                        "object_id": object_id,
+                        "ciphertext_sha256": object_sha256,
+                        "ciphertext_size_bytes": object_size,
+                    }
+                ],
+            )
+        )
+        await _wait_for_postgres_blocker(db.bind, rebinder_pid, gate_pid)
+        await _commit_failed_attestation(attestor, holder_id)
+        await gate.commit()
+        with pytest.raises(HTTPException) as rejected:
+            await asyncio.wait_for(rebinding, timeout=10)
+        assert rejected.value.status_code == 409
+        assert "latest-successfully-attested" in rejected.value.detail
+        await rebinder.rollback()
+
+    db.expire_all()
+    placement = await db.get(ReplicaPlacement, placement_id)
+    obj = await db.get(StorageObject, object_id)
+    assert placement.target_cert_pubkey_hash == old_cert_hash
+    assert obj.durable_replica_count == 0
+    assert obj.durability_state != "healthy"
+    assert await db.get(StorageReplicaCertRebindAudit, request_id) is None
+    assert new_cert_hash != old_cert_hash
+
+
+async def test_deferred_active_placement_guard_validates_final_committed_identity(pg_session):
+    db, redis = pg_session
+    trigger_flags = (
+        await db.execute(
+            text(
+                """
+                SELECT tgconstraint <> 0, tgdeferrable, tginitdeferred
+                  FROM pg_trigger
+                 WHERE tgrelid = 'replica_placement'::regclass
+                   AND tgname = 'trg_active_replica_storage_identity_at_commit'
+                """
+            )
+        )
+    ).one()
+    assert tuple(trigger_flags) == (True, True, True)
+
+    holder = await _server(db, redis, "deferred-placement-holder", "deferred-placement-host")
+    holder_id = holder.server_id
+    old_incarnation = holder.storage_incarnation
+    old_cert_hash = holder.attested_cert_pubkey_hash
+    volume = await _volume(db, 1)
+    rejected_object = await _object(db, volume, "deferred-stale-active", size_bytes=13)
+    evicted_object = await _object(db, volume, "deferred-final-evicted", size_bytes=17)
+    pre_retirement_object = await _object(db, volume, "deferred-pre-retirement", size_bytes=19)
+    rejected_object_id = rejected_object.object_id
+    evicted_object_id = evicted_object.object_id
+    pre_retirement_object_id = pre_retirement_object.object_id
+
+    await service._bind_storage_identity(db, holder, str(uuid.uuid4()))
+    await db.commit()
+
+    def pending_placement(
+        object_id: str,
+        incarnation: str,
+        cert_hash: str,
+    ) -> ReplicaPlacement:
+        now = datetime.now(timezone.utc)
+        return ReplicaPlacement(
+            object_id=object_id,
+            server_id=holder_id,
+            status="pending",
+            storage_incarnation=incarnation,
+            target_cert_pubkey_hash=cert_hash,
+            pending_since=now,
+            pending_deadline=now + timedelta(hours=1),
+            attempt_count=1,
+        )
+
+    stale_active = pending_placement(rejected_object_id, old_incarnation, old_cert_hash)
+    db.add(stale_active)
+    await db.flush()
+    with pytest.raises(DBAPIError):
+        await db.commit()
+    await db.rollback()
+
+    # The deferred event from the active INSERT must inspect the row's final state. An inactive
+    # final row is valid even though its intermediate pending identity has since been retired.
+    final_evicted = pending_placement(evicted_object_id, old_incarnation, old_cert_hash)
+    db.add(final_evicted)
+    await db.flush()
+    final_evicted.status = "evicted"
+    await db.flush()
+    await db.commit()
+    assert final_evicted.status == "evicted"
+
+    db.expire_all()
+    current_holder = await db.get(Server, holder_id)
+    publisher_first = pending_placement(
+        pre_retirement_object_id,
+        current_holder.storage_incarnation,
+        current_holder.attested_cert_pubkey_hash,
+    )
+    db.add(publisher_first)
+    await db.commit()
+    published_incarnation = current_holder.storage_incarnation
+    await service._bind_storage_identity(db, current_holder, str(uuid.uuid4()))
+    await db.commit()
+    await db.refresh(publisher_first)
+    assert publisher_first.status == "pending"
+    assert publisher_first.storage_incarnation == published_incarnation
 
 
 async def test_placement_skips_full_nodes_and_never_duplicates_hosts(pg_session):
@@ -4244,6 +5109,14 @@ async def test_delete_object_uses_bounded_fence_pages(pg_session, monkeypatch):
         )
         pending.append(generation)
 
+    class SkewedApiDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) - timedelta(days=1)
+
+    # StorageObject.created_at is assigned by PostgreSQL. A skewed API host clock must not place
+    # generations that already exist before this owner-delete outside the durable cutoff.
+    monkeypatch.setattr(service, "datetime", SkewedApiDateTime)
     await service.delete_object(db, volume, "bounded-delete")
     fence = (
         await db.execute(
@@ -4674,6 +5547,373 @@ async def test_volume_delete_shreds_key_only_after_all_holder_tasks_terminal(
     repeated = await service.delete_volume(db, volume.volume_id, USER_ID)
     assert repeated["deleted"]
     assert repeated["key_shredded"]
+
+
+async def _volume_key_release_fixture(db, redis, prefix: str, placement_status: str = "pending"):
+    holder = await _server(db, redis, f"{prefix}-holder", f"{prefix}-host")
+    volume = await _volume(db, 1)
+    if placement_status == "present":
+        obj = await _object(
+            db,
+            volume,
+            f"{prefix}-object",
+            sha256="a" * 64,
+            size_bytes=41,
+        )
+    else:
+        obj = await _object(db, volume, f"{prefix}-object", size_bytes=41)
+    placement = await _placement(db, obj, holder, status=placement_status)
+    db.add(StorageVolumeKey(volume_id=volume.volume_id, encrypted_key="encrypted-volume-key"))
+    await db.commit()
+    return holder, volume, obj, placement
+
+
+def _mock_volume_key_release_attestation(
+    monkeypatch,
+    release_db: AsyncSession,
+    *,
+    paused: bool,
+):
+    quote_entered = asyncio.Event()
+    resume_quote = asyncio.Event()
+    if not paused:
+        resume_quote.set()
+    state = {
+        "quote_verified": False,
+        "object_lock_entered": False,
+        "server_lock_entered": False,
+        "decrypt_calls": [],
+    }
+    original_object_lock = service._lock_storage_object_transactions
+    original_server_lock = service._locked_storage_publication_server_rows
+    runtime_quote = object()
+
+    monkeypatch.setattr(service, "build_runtime_quote", lambda *args, **kwargs: runtime_quote)
+
+    async def verify_without_database_locks(quote, expected_nonce, expected_cert_hash):
+        assert quote is runtime_quote
+        assert expected_nonce == "key-release-nonce"
+        assert len(expected_cert_hash) == 64
+        assert not release_db.in_transaction()
+        assert not state["object_lock_entered"]
+        assert not state["server_lock_entered"]
+        quote_entered.set()
+        await resume_quote.wait()
+        state["quote_verified"] = True
+
+    async def object_lock_after_quote(lock_db, object_ids):
+        assert state["quote_verified"]
+        state["object_lock_entered"] = True
+        return await original_object_lock(lock_db, object_ids)
+
+    async def server_lock_after_quote(lock_db, server_ids):
+        assert state["quote_verified"]
+        assert state["object_lock_entered"]
+        state["server_lock_entered"] = True
+        return await original_server_lock(lock_db, server_ids)
+
+    def record_decryption(encrypted_key):
+        assert state["server_lock_entered"]
+        state["decrypt_calls"].append(encrypted_key)
+        return "decrypted-volume-key"
+
+    monkeypatch.setattr(service, "verify_quote", verify_without_database_locks)
+    monkeypatch.setattr(
+        service,
+        "get_matching_measurement_config",
+        lambda quote: _storage_measurement(),
+    )
+    monkeypatch.setattr(service, "_lock_storage_object_transactions", object_lock_after_quote)
+    monkeypatch.setattr(
+        service,
+        "_locked_storage_publication_server_rows",
+        server_lock_after_quote,
+    )
+    monkeypatch.setattr(service, "decrypt_passphrase", record_decryption)
+    return quote_entered, resume_quote, state
+
+
+def _release_fixture_volume_key(
+    db: AsyncSession,
+    volume_id: str,
+    caller: Server,
+    expected_cert_hash: str,
+):
+    return service.release_volume_key(
+        db,
+        volume_id,
+        caller,
+        "mock-runtime-quote",
+        "sev-snp",
+        None,
+        None,
+        "key-release-nonce",
+        expected_cert_hash,
+    )
+
+
+@pytest.mark.parametrize("placement_status", ("pending", "present"))
+async def test_volume_key_release_verifies_quote_before_locks_and_returns_exact_key(
+    pg_session,
+    monkeypatch,
+    placement_status,
+):
+    db, redis = pg_session
+    holder, volume, _obj, _placement_row = await _volume_key_release_fixture(
+        db,
+        redis,
+        f"key-release-success-{placement_status}",
+        placement_status,
+    )
+    _quote_entered, _resume_quote, state = _mock_volume_key_release_attestation(
+        monkeypatch,
+        db,
+        paused=False,
+    )
+
+    released = await _release_fixture_volume_key(
+        db,
+        volume.volume_id,
+        holder,
+        holder.attested_cert_pubkey_hash,
+    )
+    assert released == "decrypted-volume-key"
+    assert state == {
+        "quote_verified": True,
+        "object_lock_entered": True,
+        "server_lock_entered": True,
+        "decrypt_calls": ["encrypted-volume-key"],
+    }
+
+
+@pytest.mark.parametrize(
+    "authority_change",
+    ("certificate", "incarnation", "failed_attestation"),
+    ids=("certificate-replaced", "incarnation-replaced", "newest-attestation-failed"),
+)
+async def test_volume_key_release_revalidates_authority_after_quote(
+    pg_session,
+    monkeypatch,
+    authority_change,
+):
+    db, redis = pg_session
+    holder, volume, _obj, _placement_row = await _volume_key_release_fixture(
+        db,
+        redis,
+        f"key-release-authority-{authority_change}",
+    )
+    holder_id = holder.server_id
+    volume_id = volume.volume_id
+    presented_cert_hash = holder.attested_cert_pubkey_hash
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as releaser, factory() as authority_writer:
+        caller = await releaser.get(Server, holder_id)
+        quote_entered, resume_quote, state = _mock_volume_key_release_attestation(
+            monkeypatch,
+            releaser,
+            paused=True,
+        )
+        releasing = asyncio.create_task(
+            _release_fixture_volume_key(
+                releaser,
+                volume_id,
+                caller,
+                presented_cert_hash,
+            )
+        )
+        try:
+            await asyncio.wait_for(quote_entered.wait(), timeout=10)
+            assert not releaser.in_transaction()
+            if authority_change == "certificate":
+                await authority_writer.execute(
+                    update(Server)
+                    .where(Server.server_id == holder_id)
+                    .values(attested_cert_pubkey_hash="f" * 64)
+                )
+                await asyncio.wait_for(authority_writer.commit(), timeout=5)
+            elif authority_change == "incarnation":
+                current_holder = await authority_writer.get(Server, holder_id)
+                await service._bind_storage_identity(
+                    authority_writer,
+                    current_holder,
+                    str(uuid.uuid4()),
+                )
+                await asyncio.wait_for(authority_writer.commit(), timeout=5)
+            else:
+                await asyncio.wait_for(
+                    _commit_failed_attestation(authority_writer, holder_id),
+                    timeout=5,
+                )
+            resume_quote.set()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(releasing, timeout=10)
+            assert rejected.value.status_code == 403
+            assert "storage authority changed" in rejected.value.detail
+            await releaser.rollback()
+        finally:
+            resume_quote.set()
+            if not releasing.done():
+                releasing.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await releasing
+            if releaser.in_transaction():
+                await releaser.rollback()
+
+    assert state["quote_verified"]
+    assert state["decrypt_calls"] == []
+    db.expire_all()
+    assert await db.get(StorageVolumeKey, volume_id) is not None
+
+
+@pytest.mark.parametrize(
+    "authority_loss",
+    ("volume_deleted", "placement_lost"),
+    ids=("volume-deleted", "qualifying-placement-lost"),
+)
+async def test_volume_key_release_revalidates_volume_and_placement_after_quote(
+    pg_session,
+    monkeypatch,
+    authority_loss,
+):
+    db, redis = pg_session
+    holder, volume, _obj, placement = await _volume_key_release_fixture(
+        db,
+        redis,
+        f"key-release-loss-{authority_loss}",
+    )
+    holder_id = holder.server_id
+    volume_id = volume.volume_id
+    placement_id = placement.placement_id
+    presented_cert_hash = holder.attested_cert_pubkey_hash
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as releaser, factory() as authority_writer:
+        caller = await releaser.get(Server, holder_id)
+        quote_entered, resume_quote, state = _mock_volume_key_release_attestation(
+            monkeypatch,
+            releaser,
+            paused=True,
+        )
+        releasing = asyncio.create_task(
+            _release_fixture_volume_key(
+                releaser,
+                volume_id,
+                caller,
+                presented_cert_hash,
+            )
+        )
+        try:
+            await asyncio.wait_for(quote_entered.wait(), timeout=10)
+            assert not releaser.in_transaction()
+            if authority_loss == "volume_deleted":
+                current_volume = await authority_writer.get(StorageVolume, volume_id)
+                current_volume.deleted = True
+                current_volume.delete_requested_at = datetime.now(timezone.utc)
+            else:
+                current_placement = await authority_writer.get(
+                    ReplicaPlacement,
+                    placement_id,
+                    with_for_update=True,
+                )
+                current_placement.status = "evicted"
+                current_placement.last_error = "placement_lost_while_quote_verified"
+            await asyncio.wait_for(authority_writer.commit(), timeout=5)
+            resume_quote.set()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(releasing, timeout=10)
+            assert rejected.value.status_code == (
+                404 if authority_loss == "volume_deleted" else 403
+            )
+            await releaser.rollback()
+        finally:
+            resume_quote.set()
+            if not releasing.done():
+                releasing.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await releasing
+            if releaser.in_transaction():
+                await releaser.rollback()
+
+    assert state["quote_verified"]
+    assert state["decrypt_calls"] == []
+    db.expire_all()
+    assert await db.get(StorageVolumeKey, volume_id) is not None
+
+
+async def test_volume_key_release_rechecks_pending_deadline_after_server_lock_wait(
+    pg_session,
+    monkeypatch,
+):
+    db, redis = pg_session
+    holder, volume, _obj, placement = await _volume_key_release_fixture(
+        db,
+        redis,
+        "key-release-deadline",
+    )
+    holder_id = holder.server_id
+    volume_id = volume.volume_id
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=2)
+    placement.pending_deadline = deadline
+    await db.commit()
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as releaser:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        caller = await releaser.get(Server, holder_id)
+        _quote_entered, _resume_quote, state = _mock_volume_key_release_attestation(
+            monkeypatch,
+            releaser,
+            paused=False,
+        )
+        publication_entered = asyncio.Event()
+        release_pid = {}
+        observed_server_lock = service._locked_storage_publication_server_rows
+
+        async def capture_release_backend(lock_db, server_ids):
+            if lock_db is releaser and not publication_entered.is_set():
+                release_pid["value"] = await lock_db.scalar(text("SELECT pg_backend_pid()"))
+                publication_entered.set()
+            return await observed_server_lock(lock_db, server_ids)
+
+        monkeypatch.setattr(
+            service,
+            "_locked_storage_publication_server_rows",
+            capture_release_backend,
+        )
+        releasing = asyncio.create_task(
+            _release_fixture_volume_key(
+                releaser,
+                volume_id,
+                caller,
+                holder.attested_cert_pubkey_hash,
+            )
+        )
+        try:
+            await asyncio.wait_for(publication_entered.wait(), timeout=10)
+            await _wait_for_postgres_blocker(db.bind, release_pid["value"], gate_pid)
+
+            async def wait_for_deadline():
+                while datetime.now(timezone.utc) <= deadline:
+                    await asyncio.sleep(0.02)
+
+            await asyncio.wait_for(wait_for_deadline(), timeout=5)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(releasing, timeout=10)
+            assert rejected.value.status_code == 403
+            assert "replica authority changed" in rejected.value.detail
+            await releaser.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not releasing.done():
+                releasing.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await releasing
+            if releaser.in_transaction():
+                await releaser.rollback()
+
+    assert state["decrypt_calls"] == []
 
 
 async def test_inventory_is_authoritative_only_after_complete_snapshot(pg_session):
@@ -5389,6 +6629,10 @@ async def test_model_inventory_replacement_identity_remains_fail_closed(
     replacement_incarnation = holder.storage_incarnation
     if replacement == "certificate":
         replacement_at = datetime.now(timezone.utc)
+        measurement = _storage_measurement()
+        config_fingerprint = measurement.config_fingerprint or measurement_config_fingerprint(
+            measurement
+        )
         holder.attested_cert_pubkey_hash = hashlib.sha256(
             b"replacement-attested-certificate"
         ).hexdigest()
@@ -5396,7 +6640,12 @@ async def test_model_inventory_replacement_identity_remains_fail_closed(
             ServerAttestation(
                 server_id=holder_id,
                 quote_data="replacement-quote",
-                measurement_version=_storage_version(),
+                measurement_version=measurement.version,
+                measurement_name=measurement.name,
+                measurement_config_fingerprint=config_fingerprint,
+                trust_set_fingerprint=measurement_trust_set_fingerprint(
+                    settings.tee_measurements
+                ),
                 created_at=replacement_at,
                 verified_at=replacement_at,
             )
@@ -6095,3 +7344,1822 @@ async def test_reconcile_advisory_lock_survives_work_commits(pg_session, monkeyp
             ).scalar_one()
     finally:
         await lock_engine.dispose()
+
+
+async def _replication_fence_fixture(db, redis, prefix: str):
+    source_identity = _attested_identity(f"{prefix}-source")
+    source = await _server(
+        db,
+        redis,
+        f"{prefix}-source",
+        f"{prefix}-source-host",
+        attested_identity=source_identity,
+    )
+    target = await _server(
+        db,
+        redis,
+        f"{prefix}-target",
+        f"{prefix}-target-host",
+    )
+    volume = await _volume(db, 2)
+    obj = await _object(
+        db,
+        volume,
+        f"{prefix}-object",
+        sha256="a" * 64,
+        size_bytes=41,
+    )
+    source_placement = await _placement(db, obj, source, status="present")
+    target_placement = await _placement(db, obj, target, status="pending")
+    await service._refresh_object_durability(db, obj, volume=volume)
+    await db.commit()
+    return (
+        source_identity,
+        source,
+        target,
+        volume,
+        obj,
+        source_placement,
+        target_placement,
+    )
+
+
+def _pending_placement_mutation_snapshot(placement: ReplicaPlacement) -> tuple:
+    return (
+        placement.status,
+        placement.attempt_count,
+        placement.pending_since,
+        placement.pending_deadline,
+        placement.last_attempt_at,
+        placement.last_error,
+        placement.proof_sha256,
+        placement.proof_size_bytes,
+        placement.proof_capability_id,
+        placement.proof_mode,
+        placement.proof_at,
+        placement.confirmed_at,
+    )
+
+
+@pytest.mark.parametrize(
+    "announce_wins",
+    [False, True],
+    ids=["reconcile-wins", "unassigned-announce-wins"],
+)
+async def test_reconcile_new_candidate_and_unassigned_announce_share_object_frontier(
+    pg_session,
+    monkeypatch,
+    announce_wins,
+):
+    db, redis = pg_session
+    suffix = "announce" if announce_wins else "reconcile"
+    source = await _server(
+        db,
+        redis,
+        f"new-candidate-{suffix}-source",
+        f"new-candidate-{suffix}-source-host",
+    )
+    target = await _server(
+        db,
+        redis,
+        f"new-candidate-{suffix}-target",
+        f"new-candidate-{suffix}-target-host",
+    )
+    volume = await _volume(db, 2)
+    obj = await _object(
+        db,
+        volume,
+        f"new-candidate-{suffix}-object",
+        sha256="b" * 64,
+        size_bytes=43,
+    )
+    await _placement(db, obj, source, status="present")
+    await service._refresh_object_durability(db, obj, volume=volume)
+    await db.commit()
+    object_id = obj.object_id
+    target_id = target.server_id
+    target_incarnation = target.storage_incarnation
+
+    announcement = [
+        {
+            "object_id": object_id,
+            "status": "stored",
+            "ciphertext_sha256": obj.sha256,
+            "ciphertext_size_bytes": obj.ciphertext_size_bytes,
+            "plaintext_size_bytes": obj.size_bytes,
+            "plaintext_sha256": "c" * 64,
+        }
+    ]
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as announcer, factory() as reconciler:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        announce_pid = await announcer.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [target_id], shared=False)
+        reconcile_object_frontier_entered = asyncio.Event()
+        reconcile_pid = {}
+        original_lock_objects = service._lock_storage_object_transactions
+
+        async def observe_reconcile_object_frontier(lock_db, object_ids):
+            if lock_db is reconciler and object_id in {str(value) for value in object_ids}:
+                reconcile_pid["value"] = await lock_db.scalar(text("SELECT pg_backend_pid()"))
+                reconcile_object_frontier_entered.set()
+            return await original_lock_objects(lock_db, object_ids)
+
+        monkeypatch.setattr(
+            service,
+            "_lock_storage_object_transactions",
+            observe_reconcile_object_frontier,
+        )
+
+        async def announce():
+            return await service.announce_replicas(
+                announcer,
+                MINER,
+                target_id,
+                target_id,
+                target_incarnation,
+                announcement,
+            )
+
+        announcing = None
+        reconciling = None
+        try:
+            if announce_wins:
+                announcing = asyncio.create_task(announce())
+                await _wait_for_postgres_blocker(db.bind, announce_pid, gate_pid)
+                reconciling = asyncio.create_task(service.reconcile_storage(reconciler, 10))
+                await asyncio.wait_for(reconcile_object_frontier_entered.wait(), timeout=10)
+                await _wait_for_postgres_blocker(
+                    db.bind,
+                    reconcile_pid["value"],
+                    announce_pid,
+                )
+            else:
+                reconciling = asyncio.create_task(service.reconcile_storage(reconciler, 10))
+                await asyncio.wait_for(reconcile_object_frontier_entered.wait(), timeout=10)
+                await _wait_for_postgres_blocker(
+                    db.bind,
+                    reconcile_pid["value"],
+                    gate_pid,
+                )
+                announcing = asyncio.create_task(announce())
+                await _wait_for_postgres_blocker(
+                    db.bind,
+                    announce_pid,
+                    reconcile_pid["value"],
+                )
+
+            await gate.commit()
+            announce_result, summary = await asyncio.wait_for(
+                asyncio.gather(announcing, reconciling),
+                timeout=20,
+            )
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            for task in (announcing, reconciling):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (announcing, reconciling):
+                if task is not None:
+                    with suppress(asyncio.CancelledError, HTTPException):
+                        await task
+
+    assert announce_result == 0
+    assert summary["reassigned"] == 1
+    db.expire_all()
+    placement = (
+        await db.execute(
+            select(ReplicaPlacement).where(
+                ReplicaPlacement.object_id == object_id,
+                ReplicaPlacement.server_id == target_id,
+            )
+        )
+    ).scalar_one()
+    assert placement.status == "pending"
+    assert placement.storage_incarnation == target_incarnation
+
+
+@pytest.mark.parametrize(
+    "finalizer_wins",
+    [False, True],
+    ids=["failure-report-wins", "erasure-finalizer-wins"],
+)
+async def test_erasure_finalizer_and_replication_failure_share_object_frontier(
+    pg_session,
+    monkeypatch,
+    finalizer_wins,
+):
+    db, redis = pg_session
+    (
+        _source_identity,
+        source,
+        target,
+        volume,
+        obj,
+        _source_placement,
+        _target_placement,
+    ) = await _replication_fence_fixture(
+        db,
+        redis,
+        f"finalizer-failure-{'finalizer' if finalizer_wins else 'failure'}",
+    )
+    object_id = obj.object_id
+    source_id = source.server_id
+    target_id = target.server_id
+    lease = await service.issue_replication_capability(
+        db,
+        source,
+        object_id,
+        target_id,
+        obj.sha256,
+        obj.ciphertext_size_bytes,
+    )
+    await service.delete_object(db, volume, obj.object_key)
+    for holder_id in (source_id, target_id):
+        db.expire_all()
+        holder = await db.get(Server, holder_id)
+        claimed = await service.claim_erase_tasks(db, holder, 10)
+        object_tasks = [task for task in claimed if task["object_id"] == object_id]
+        assert len(object_tasks) == 1
+        await service.record_erase_task_result(
+            db,
+            holder,
+            object_tasks[0]["task_id"],
+            "erased",
+            True,
+            None,
+        )
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(StorageEraseTask)
+            .where(
+                StorageEraseTask.object_id == object_id,
+                StorageEraseTask.state.not_in(service.ERASE_TERMINAL_STATES),
+            )
+        )
+        == 0
+    )
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as finalizer, factory() as reporter:
+        finalizer_pid = await finalizer.scalar(text("SELECT pg_backend_pid()"))
+        reporter_pid = await reporter.scalar(text("SELECT pg_backend_pid()"))
+        reporter_source = await reporter.get(Server, source_id)
+        winner_pid = finalizer_pid if finalizer_wins else reporter_pid
+        loser_pid = reporter_pid if finalizer_wins else finalizer_pid
+        winner_entered = asyncio.Event()
+        release_winner = asyncio.Event()
+        original_lock_objects = service._lock_storage_object_transactions
+
+        async def pause_winner_after_object_frontier(lock_db, object_ids):
+            locked = await original_lock_objects(lock_db, object_ids)
+            backend_pid = await lock_db.scalar(text("SELECT pg_backend_pid()"))
+            if backend_pid == winner_pid and not winner_entered.is_set():
+                winner_entered.set()
+                await release_winner.wait()
+            return locked
+
+        monkeypatch.setattr(
+            service,
+            "_lock_storage_object_transactions",
+            pause_winner_after_object_frontier,
+        )
+
+        async def report_failure():
+            return await service.fail_replication_capability(
+                reporter,
+                reporter_source,
+                lease["capability"],
+                "failure_reported_at_erasure_boundary",
+            )
+
+        finalizing = None
+        reporting = None
+        try:
+            if finalizer_wins:
+                finalizing = asyncio.create_task(
+                    service._finalize_erasure_batch(finalizer, limit=100)
+                )
+                await asyncio.wait_for(winner_entered.wait(), timeout=10)
+                reporting = asyncio.create_task(report_failure())
+            else:
+                reporting = asyncio.create_task(report_failure())
+                await asyncio.wait_for(winner_entered.wait(), timeout=10)
+                finalizing = asyncio.create_task(
+                    service._finalize_erasure_batch(finalizer, limit=100)
+                )
+            await _wait_for_postgres_blocker(db.bind, loser_pid, winner_pid)
+            release_winner.set()
+
+            if finalizer_wins:
+                purged, _shredded = await asyncio.wait_for(finalizing, timeout=20)
+                with pytest.raises(HTTPException) as rejected:
+                    await asyncio.wait_for(reporting, timeout=20)
+                assert rejected.value.status_code == 403
+                await reporter.rollback()
+            else:
+                failure = await asyncio.wait_for(reporting, timeout=20)
+                purged, _shredded = await asyncio.wait_for(finalizing, timeout=20)
+                assert failure == {
+                    "recorded": True,
+                    "capability_id": lease["capability_id"],
+                }
+        finally:
+            release_winner.set()
+            for task in (finalizing, reporting):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (finalizing, reporting):
+                if task is not None:
+                    with suppress(asyncio.CancelledError, HTTPException):
+                        await task
+            if finalizer.in_transaction():
+                await finalizer.rollback()
+            if reporter.in_transaction():
+                await reporter.rollback()
+
+    assert purged == 1
+    db.expire_all()
+    assert await db.get(StorageObject, object_id) is None
+    assert await db.get(StorageReplicationCapability, lease["capability_id"]) is None
+
+
+async def test_replication_issue_rejects_failed_attestation_committed_during_fence_wait(
+    pg_session,
+    monkeypatch,
+):
+    db, redis = pg_session
+    (
+        _source_identity,
+        source,
+        target,
+        _volume_row,
+        obj,
+        _source_placement,
+        target_placement,
+    ) = await _replication_fence_fixture(db, redis, "issue-attestation-fence")
+    source_id = source.server_id
+    target_id = target.server_id
+    object_id = obj.object_id
+    target_placement_id = target_placement.placement_id
+    target_before = _pending_placement_mutation_snapshot(target_placement)
+    capability_count_before = await db.scalar(
+        select(func.count())
+        .select_from(StorageReplicationCapability)
+        .where(StorageReplicationCapability.object_id == object_id)
+    )
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as issuer, factory() as attestor:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [source_id], shared=False)
+        presented_source = await issuer.get(Server, source_id)
+        original_locked_servers = service._locked_storage_publication_server_rows
+        issuer_frontier_entered = asyncio.Event()
+        issuer_pid = {}
+
+        async def observed_locked_servers(current_db, server_ids):
+            if current_db is issuer:
+                issuer_pid["value"] = await current_db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
+                issuer_frontier_entered.set()
+            return await original_locked_servers(current_db, server_ids)
+
+        monkeypatch.setattr(
+            service,
+            "_locked_storage_publication_server_rows",
+            observed_locked_servers,
+        )
+        issuing = asyncio.create_task(
+            service.issue_replication_capability(
+                issuer,
+                presented_source,
+                object_id,
+                target_id,
+                obj.sha256,
+                obj.ciphertext_size_bytes,
+            )
+        )
+        try:
+            await asyncio.wait_for(issuer_frontier_entered.wait(), timeout=10)
+            await _wait_for_postgres_blocker(
+                db.bind,
+                issuer_pid["value"],
+                gate_pid,
+            )
+            await _commit_failed_attestation(attestor, source_id)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(issuing, timeout=10)
+            assert rejected.value.status_code == 403
+            assert "source identity is stale" in rejected.value.detail
+            await issuer.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not issuing.done():
+                issuing.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await issuing
+
+    db.expire_all()
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(StorageReplicationCapability)
+            .where(StorageReplicationCapability.object_id == object_id)
+        )
+        == capability_count_before
+    )
+    target_after = await db.get(ReplicaPlacement, target_placement_id)
+    assert _pending_placement_mutation_snapshot(target_after) == target_before
+
+
+@pytest.mark.parametrize(
+    "authority_change",
+    ("certificate", "failed_attestation"),
+    ids=("certificate-replaced", "newest-attestation-failed"),
+)
+async def test_inventory_page_revalidates_presented_authority_after_publication_wait(
+    pg_session,
+    authority_change,
+):
+    db, redis = pg_session
+    holder = await _server(
+        db,
+        redis,
+        f"inventory-authority-{authority_change}",
+        f"inventory-authority-host-{authority_change}",
+    )
+    holder_id = holder.server_id
+    holder_incarnation = holder.storage_incarnation
+    volume = await _volume(db, 1)
+    obj = await _object(
+        db,
+        volume,
+        f"inventory-authority-object-{authority_change}",
+        sha256="7" * 64,
+        size_bytes=37,
+    )
+    placement = await _placement(db, obj, holder, status="present")
+    object_id = obj.object_id
+    placement_id = placement.placement_id
+    snapshot_id = str(uuid.uuid4())
+    entry = {
+        "volume_id": volume.volume_id,
+        "object_id": object_id,
+        "ciphertext_sha256": obj.sha256,
+        "ciphertext_size_bytes": obj.ciphertext_size_bytes,
+    }
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as recorder, factory() as authority_writer:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        recorder_pid = await recorder.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        presented_holder = await recorder.get(Server, holder_id)
+        recording = asyncio.create_task(
+            service.record_inventory_page(
+                recorder,
+                presented_holder,
+                snapshot_id,
+                holder_incarnation,
+                [entry],
+                True,
+            )
+        )
+        try:
+            await _wait_for_postgres_blocker(db.bind, recorder_pid, gate_pid)
+            if authority_change == "certificate":
+                replacement_hash = hashlib.sha256(
+                    f"inventory-replacement:{holder_id}".encode()
+                ).hexdigest()
+                await authority_writer.execute(
+                    update(Server)
+                    .where(Server.server_id == holder_id)
+                    .values(attested_cert_pubkey_hash=replacement_hash)
+                )
+                await authority_writer.commit()
+            else:
+                await _commit_failed_attestation(authority_writer, holder_id)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(recording, timeout=10)
+            assert rejected.value.status_code == 403
+            assert "current storage certificate and incarnation" in rejected.value.detail
+            await recorder.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not recording.done():
+                recording.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await recording
+
+    db.expire_all()
+    assert await db.get(StorageInventorySnapshot, snapshot_id) is None
+    placement = await db.get(ReplicaPlacement, placement_id)
+    assert placement.status == "present"
+    assert placement.last_inventory_snapshot_id is None
+    assert placement.last_inventory_seen_at is None
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(StorageEraseTask)
+            .where(StorageEraseTask.object_id == object_id)
+        )
+        == 0
+    )
+
+
+async def _claimed_authority_erase_task_fixture(db, redis, suffix):
+    holder = await _server(
+        db,
+        redis,
+        f"erase-result-authority-{suffix}",
+        f"erase-result-authority-host-{suffix}",
+    )
+    volume = await _volume(db, 1)
+    obj = await _object(
+        db,
+        volume,
+        f"erase-result-authority-object-{suffix}",
+        sha256="8" * 64,
+        size_bytes=41,
+    )
+    await _placement(db, obj, holder, status="present")
+    await service.delete_object(db, volume, obj.object_key)
+    holder_id = holder.server_id
+    object_id = obj.object_id
+    task = (
+        await db.execute(
+            select(StorageEraseTask).where(StorageEraseTask.object_id == object_id)
+        )
+    ).scalar_one()
+    task_id = task.task_id
+    claimed = await service.claim_erase_tasks(db, holder, 10)
+    assert [item["task_id"] for item in claimed if item["object_id"] == object_id] == [task_id]
+    db.expire_all()
+    return holder_id, object_id, task_id
+
+
+@pytest.mark.parametrize(
+    "authority_change",
+    ("certificate", "failed_attestation"),
+    ids=("certificate-replaced", "newest-attestation-failed"),
+)
+async def test_erase_result_revalidates_presented_authority_after_publication_wait(
+    pg_session,
+    authority_change,
+):
+    db, redis = pg_session
+    holder_id, _object_id, task_id = await _claimed_authority_erase_task_fixture(
+        db,
+        redis,
+        authority_change,
+    )
+    task = await db.get(StorageEraseTask, task_id)
+    task_before = (
+        task.state,
+        task.completed_at,
+        task.erased_file_was_present,
+        task.claimed_at,
+        task.lease_expires_at,
+        task.claim_cert_pubkey_hash,
+        task.attempt_count,
+        task.last_error,
+    )
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as recorder, factory() as authority_writer:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        recorder_pid = await recorder.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        presented_holder = await recorder.get(Server, holder_id)
+        recording = asyncio.create_task(
+            service.record_erase_task_result(
+                recorder,
+                presented_holder,
+                task_id,
+                "erased",
+                True,
+                None,
+            )
+        )
+        try:
+            await _wait_for_postgres_blocker(db.bind, recorder_pid, gate_pid)
+            if authority_change == "certificate":
+                replacement_hash = hashlib.sha256(
+                    f"erase-result-replacement:{holder_id}".encode()
+                ).hexdigest()
+                await authority_writer.execute(
+                    update(Server)
+                    .where(Server.server_id == holder_id)
+                    .values(attested_cert_pubkey_hash=replacement_hash)
+                )
+                await authority_writer.commit()
+            else:
+                await _commit_failed_attestation(authority_writer, holder_id)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(recording, timeout=10)
+            assert rejected.value.status_code == 403
+            assert "current attested storage identity" in rejected.value.detail
+            await recorder.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not recording.done():
+                recording.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await recording
+
+    db.expire_all()
+    task = await db.get(StorageEraseTask, task_id)
+    assert (
+        task.state,
+        task.completed_at,
+        task.erased_file_was_present,
+        task.claimed_at,
+        task.lease_expires_at,
+        task.claim_cert_pubkey_hash,
+        task.attempt_count,
+        task.last_error,
+    ) == task_before
+
+
+async def test_erase_result_terminal_replay_requires_exact_current_holder(pg_session):
+    db, redis = pg_session
+    holder_id, _object_id, task_id = await _claimed_authority_erase_task_fixture(
+        db,
+        redis,
+        "terminal-replay",
+    )
+    holder = await db.get(Server, holder_id)
+    first = await service.record_erase_task_result(
+        db,
+        holder,
+        task_id,
+        "erased",
+        True,
+        None,
+    )
+    assert first["terminal"]
+    db.expire_all()
+    holder = await db.get(Server, holder_id)
+    replay = await service.record_erase_task_result(
+        db,
+        holder,
+        task_id,
+        "erased",
+        True,
+        None,
+    )
+    assert replay["terminal"]
+
+    other = await _server(
+        db,
+        redis,
+        "erase-result-terminal-other",
+        "erase-result-terminal-other-host",
+    )
+    with pytest.raises(HTTPException) as rejected:
+        await service.record_erase_task_result(
+            db,
+            other,
+            task_id,
+            "erased",
+            True,
+            None,
+        )
+    assert rejected.value.status_code == 403
+    await db.rollback()
+
+
+async def test_replication_fail_rejects_failed_attestation_committed_during_fence_wait(
+    pg_session,
+):
+    db, redis = pg_session
+    (
+        _source_identity,
+        source,
+        target,
+        _volume_row,
+        obj,
+        _source_placement,
+        target_placement,
+    ) = await _replication_fence_fixture(db, redis, "fail-attestation-fence")
+    lease = await service.issue_replication_capability(
+        db,
+        source,
+        obj.object_id,
+        target.server_id,
+        obj.sha256,
+        obj.ciphertext_size_bytes,
+    )
+    source_id = source.server_id
+    target_placement_id = target_placement.placement_id
+    db.expire_all()
+    capability_before = await db.get(
+        StorageReplicationCapability,
+        lease["capability_id"],
+    )
+    capability_mutation_before = (
+        capability_before.failed_at,
+        capability_before.last_error,
+        capability_before.completed_at,
+        capability_before.consumed_at,
+    )
+    target_placement = await db.get(ReplicaPlacement, target_placement_id)
+    target_before = _pending_placement_mutation_snapshot(target_placement)
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as reporter, factory() as attestor:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        reporter_pid = await reporter.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [source_id], shared=False)
+        presented_source = await reporter.get(Server, source_id)
+        reporting = asyncio.create_task(
+            service.fail_replication_capability(
+                reporter,
+                presented_source,
+                lease["capability"],
+                "latest_attestation_must_win",
+            )
+        )
+        try:
+            await _wait_for_postgres_blocker(db.bind, reporter_pid, gate_pid)
+            await _commit_failed_attestation(attestor, source_id)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(reporting, timeout=10)
+            assert rejected.value.status_code == 403
+            assert "current bound source or target identity" in rejected.value.detail
+            await reporter.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not reporting.done():
+                reporting.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await reporting
+
+    db.expire_all()
+    capability_after = await db.get(
+        StorageReplicationCapability,
+        lease["capability_id"],
+    )
+    assert (
+        capability_after.failed_at,
+        capability_after.last_error,
+        capability_after.completed_at,
+        capability_after.consumed_at,
+    ) == capability_mutation_before
+    target_after = await db.get(ReplicaPlacement, target_placement_id)
+    assert _pending_placement_mutation_snapshot(target_after) == target_before
+
+
+# --- final publication-frontier regressions ---------------------------------------------------
+
+
+async def test_replication_complete_rejects_failed_target_attestation_during_fence_wait(
+    pg_session,
+):
+    db, redis = pg_session
+    (
+        source_identity,
+        source,
+        target,
+        _volume_row,
+        obj,
+        _source_placement,
+        target_placement,
+    ) = await _replication_fence_fixture(db, redis, "complete-attestation-fence")
+    digest = obj.sha256
+    ciphertext_size = obj.ciphertext_size_bytes
+    lease = await service.issue_replication_capability(
+        db,
+        source,
+        obj.object_id,
+        target.server_id,
+        digest,
+        ciphertext_size,
+    )
+    await service.consume_replication_capability(
+        db,
+        target,
+        lease["capability"],
+        _sign_capability(source_identity, lease["capability"]),
+    )
+    target_id = target.server_id
+    target_placement_id = target_placement.placement_id
+    db.expire_all()
+    capability = await db.get(StorageReplicationCapability, lease["capability_id"])
+    capability_before = (
+        capability.consumed_at,
+        capability.completed_at,
+        capability.failed_at,
+        capability.last_error,
+    )
+    target_placement = await db.get(ReplicaPlacement, target_placement_id)
+    target_before = _pending_placement_mutation_snapshot(target_placement)
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as completer, factory() as attestor:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        completer_pid = await completer.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [target_id], shared=False)
+        presented_target = await completer.get(Server, target_id)
+        completing = asyncio.create_task(
+            service.complete_replication_capability(
+                completer,
+                presented_target,
+                lease["capability"],
+                digest,
+                ciphertext_size,
+            )
+        )
+        try:
+            await _wait_for_postgres_blocker(db.bind, completer_pid, gate_pid)
+            await _commit_failed_attestation(attestor, target_id)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(completing, timeout=10)
+            assert rejected.value.status_code == 403
+            assert "latest attestation" in rejected.value.detail
+            await completer.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not completing.done():
+                completing.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await completing
+
+    db.expire_all()
+    capability = await db.get(StorageReplicationCapability, lease["capability_id"])
+    assert (
+        capability.consumed_at,
+        capability.completed_at,
+        capability.failed_at,
+        capability.last_error,
+    ) == capability_before
+    target_placement = await db.get(ReplicaPlacement, target_placement_id)
+    assert _pending_placement_mutation_snapshot(target_placement) == target_before
+
+
+@pytest.mark.parametrize(
+    "authority_change",
+    ("failed_attestation", "storage_role_disabled"),
+    ids=("newest-attestation-failed", "storage-role-disabled"),
+)
+async def test_plan_revalidates_selected_peer_under_server_lock(
+    pg_session,
+    monkeypatch,
+    authority_change,
+):
+    db, redis = pg_session
+    holder = await _server(
+        db,
+        redis,
+        f"plan-authority-{authority_change}",
+        f"plan-authority-host-{authority_change}",
+    )
+    holder_id = holder.server_id
+    volume = await _volume(db, 1)
+    volume_id = volume.volume_id
+    request_id = str(uuid.uuid4())
+    upsert_entered = asyncio.Event()
+    release_upsert = asyncio.Event()
+    original_upsert = service._upsert_pending_placement
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as planner, factory() as authority_writer:
+        async def pause_after_peer_selection(upsert_db, candidate_obj, candidate_server):
+            if upsert_db is planner and candidate_server.server_id == holder_id:
+                upsert_entered.set()
+                await release_upsert.wait()
+            return await original_upsert(upsert_db, candidate_obj, candidate_server)
+
+        monkeypatch.setattr(
+            service,
+            "_upsert_pending_placement",
+            pause_after_peer_selection,
+        )
+        planner_volume = await planner.get(StorageVolume, volume_id)
+        planning = asyncio.create_task(
+            service.plan_object_placement(
+                planner,
+                planner_volume,
+                request_id,
+                f"plan-authority-key-{authority_change}",
+                1024,
+                observed_live_storage_ids={holder_id},
+            )
+        )
+        try:
+            await asyncio.wait_for(upsert_entered.wait(), timeout=10)
+            if authority_change == "failed_attestation":
+                await _commit_failed_attestation(authority_writer, holder_id)
+            else:
+                current_holder = (
+                    await authority_writer.execute(
+                        select(Server)
+                        .where(Server.server_id == holder_id)
+                        .with_for_update()
+                    )
+                ).scalar_one()
+                current_holder.storage_role = False
+                await authority_writer.commit()
+            release_upsert.set()
+            with pytest.raises(RuntimeError, match="Storage authority changed"):
+                await asyncio.wait_for(planning, timeout=10)
+            await planner.rollback()
+        finally:
+            release_upsert.set()
+            if not planning.done():
+                planning.cancel()
+            with suppress(asyncio.CancelledError, RuntimeError):
+                await planning
+            if planner.in_transaction():
+                await planner.rollback()
+
+    db.expire_all()
+    assert (
+        await db.scalar(
+            select(func.count())
+            .select_from(StorageObject)
+            .where(StorageObject.placement_request_id == request_id)
+        )
+        == 0
+    )
+
+
+async def test_commit_rechecks_latest_attestation_after_waiting_for_server_row(pg_session):
+    db, redis = pg_session
+    holder = await _server(db, redis, "commit-attestation-holder", "commit-attestation-host")
+    holder_id = holder.server_id
+    volume = await _volume(db, 1)
+    volume_id = volume.volume_id
+    obj = await _object(db, volume, "commit-attestation-object", size_bytes=41)
+    object_id = obj.object_id
+    object_key = obj.object_key
+    salt = obj.salt
+    placement = await _placement(db, obj, holder, status="pending")
+    placement_id = placement.placement_id
+    assert (
+        await service.announce_replicas(
+            db,
+            MINER,
+            holder_id,
+            holder_id,
+            holder.storage_incarnation,
+            [
+                {
+                    "object_id": object_id,
+                    "status": "stored",
+                    "ciphertext_sha256": "9" * 64,
+                    "ciphertext_size_bytes": 73,
+                    "plaintext_size_bytes": 41,
+                    "plaintext_sha256": "8" * 64,
+                }
+            ],
+        )
+        == 1
+    )
+    db.expire_all()
+    placement = await db.get(ReplicaPlacement, placement_id)
+    placement_before = _pending_placement_mutation_snapshot(placement)
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as committer, factory() as attestation_writer:
+        committer_pid = await committer.scalar(text("SELECT pg_backend_pid()"))
+        writer_pid = await attestation_writer.scalar(text("SELECT pg_backend_pid()"))
+        committer_volume = await committer.get(StorageVolume, volume_id)
+        attestation_writer.add(
+            ServerAttestation(
+                server_id=holder_id,
+                quote_data="commit-barrier-failed-quote",
+                verification_error="newer failed attempt before receipt publication",
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        await attestation_writer.flush()
+        await attestation_writer.execute(
+            select(Server).where(Server.server_id == holder_id).with_for_update()
+        )
+        committing = asyncio.create_task(
+            service.commit_object(
+                committer,
+                committer_volume,
+                object_id,
+                object_key,
+                salt,
+                observed_live_storage_ids={holder_id},
+            )
+        )
+        try:
+            await _wait_for_postgres_blocker(db.bind, committer_pid, writer_pid)
+            await attestation_writer.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(committing, timeout=10)
+            assert rejected.value.status_code == 409
+            assert "No assigned target supplied" in rejected.value.detail
+            await committer.rollback()
+        finally:
+            if attestation_writer.in_transaction():
+                await attestation_writer.rollback()
+            if not committing.done():
+                committing.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await committing
+            if committer.in_transaction():
+                await committer.rollback()
+
+    db.expire_all()
+    obj = await db.get(StorageObject, object_id)
+    placement = await db.get(ReplicaPlacement, placement_id)
+    volume = await db.get(StorageVolume, volume_id)
+    assert obj.lifecycle_state == "pending"
+    assert _pending_placement_mutation_snapshot(placement) == placement_before
+    assert volume.used_bytes == 0
+
+
+async def test_concurrent_plans_serialize_final_capacity_in_server_order(
+    pg_session,
+    monkeypatch,
+):
+    db, redis = pg_session
+    first_holder = await _server(db, redis, "capacity-lock-a", "capacity-lock-host-a", disk_free_gb=11)
+    second_holder = await _server(
+        db,
+        redis,
+        "capacity-lock-b",
+        "capacity-lock-host-b",
+        disk_free_gb=11,
+    )
+    holder_ids = sorted([first_holder.server_id, second_holder.server_id])
+    second_user_id = f"capacity-user-{uuid.uuid4().hex}"
+    await db.execute(
+        User.__table__.insert().values(
+            user_id=second_user_id,
+            username=f"cap{uuid.uuid4().hex[:8]}",
+            coldkey="capacity-coldkey",
+            fingerprint_hash=uuid.uuid4().hex,
+            storage_volume_quota_bytes=500 * 1024**3,
+            storage_aggregate_quota_bytes=2 * 1024**4,
+        )
+    )
+    first_volume = StorageVolume(
+        user_id=USER_ID,
+        name=f"capacity-first-{uuid.uuid4().hex}",
+        replication_factor=2,
+        quota_bytes=500 * 1024**3,
+        used_bytes=0,
+    )
+    second_volume = StorageVolume(
+        user_id=second_user_id,
+        name=f"capacity-second-{uuid.uuid4().hex}",
+        replication_factor=2,
+        quota_bytes=500 * 1024**3,
+        used_bytes=0,
+    )
+    db.add_all([first_volume, second_volume])
+    await db.commit()
+    volume_ids = [first_volume.volume_id, second_volume.volume_id]
+    object_size = 700 * 1024**2
+
+    original_pick = service._pick_replicas
+    original_upsert = service._upsert_pending_placement
+    both_selected = asyncio.Event()
+    selection_count = 0
+    selected_ids: dict[int, list[str]] = {}
+    upsert_order: dict[int, list[str]] = {}
+
+    async def synchronize_initial_selection(pick_db, *args, **kwargs):
+        nonlocal selection_count
+        peers = await original_pick(pick_db, *args, **kwargs)
+        selected_ids[id(pick_db)] = [peer.server_id for peer in peers]
+        selection_count += 1
+        if selection_count == 2:
+            both_selected.set()
+        await both_selected.wait()
+        return peers
+
+    async def record_upsert_order(upsert_db, candidate_obj, candidate_server):
+        upsert_order.setdefault(id(upsert_db), []).append(candidate_server.server_id)
+        return await original_upsert(upsert_db, candidate_obj, candidate_server)
+
+    monkeypatch.setattr(service, "_pick_replicas", synchronize_initial_selection)
+    monkeypatch.setattr(service, "_upsert_pending_placement", record_upsert_order)
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as first_planner, factory() as second_planner:
+        async def run_plan(planner, volume_id, suffix):
+            planner_volume = await planner.get(StorageVolume, volume_id)
+            try:
+                return await service.plan_object_placement(
+                    planner,
+                    planner_volume,
+                    str(uuid.uuid4()),
+                    f"capacity-race-{suffix}",
+                    object_size,
+                    observed_live_storage_ids=set(holder_ids),
+                )
+            except Exception as exc:  # noqa: BLE001 - the losing reservation must fail closed
+                await planner.rollback()
+                return exc
+
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                run_plan(first_planner, volume_ids[0], "first"),
+                run_plan(second_planner, volume_ids[1], "second"),
+            ),
+            timeout=20,
+        )
+
+        assert sorted(selected_ids[id(first_planner)]) == holder_ids
+        assert sorted(selected_ids[id(second_planner)]) == holder_ids
+        assert upsert_order[id(first_planner)] == sorted(upsert_order[id(first_planner)])
+        assert upsert_order[id(second_planner)] == sorted(upsert_order[id(second_planner)])
+
+    successes = [result for result in results if isinstance(result, tuple)]
+    failures = [result for result in results if isinstance(result, Exception)]
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert isinstance(failures[0], RuntimeError)
+    assert "Storage capacity changed" in str(failures[0])
+
+    db.expire_all()
+    reserved_by_server = dict(
+        (
+            await db.execute(
+                select(
+                    ReplicaPlacement.server_id,
+                    func.sum(StorageObject.projected_size_bytes),
+                )
+                .join(StorageObject, StorageObject.object_id == ReplicaPlacement.object_id)
+                .where(ReplicaPlacement.status == "pending")
+                .group_by(ReplicaPlacement.server_id)
+            )
+        ).all()
+    )
+    assert reserved_by_server == {holder_id: object_size for holder_id in holder_ids}
+
+
+@pytest.mark.parametrize("operation", ("plan", "commit", "issue", "consume"))
+async def test_storage_liveness_is_observed_before_authority_locks(
+    pg_session,
+    monkeypatch,
+    operation,
+):
+    db, redis = pg_session
+    suffix = f"liveness-order-{operation}"
+    if operation in {"issue", "consume"}:
+        (
+            source_identity,
+            source,
+            target,
+            _volume_row,
+            obj,
+            _source_placement,
+            _target_placement,
+        ) = await _replication_fence_fixture(db, redis, suffix)
+        if operation == "issue":
+            async def invocation():
+                return await service.issue_replication_capability(
+                    db,
+                    source,
+                    obj.object_id,
+                    target.server_id,
+                    obj.sha256,
+                    obj.ciphertext_size_bytes,
+                )
+        else:
+            lease = await service.issue_replication_capability(
+                db,
+                source,
+                obj.object_id,
+                target.server_id,
+                obj.sha256,
+                obj.ciphertext_size_bytes,
+            )
+
+            async def invocation():
+                return await service.consume_replication_capability(
+                    db,
+                    target,
+                    lease["capability"],
+                    _sign_capability(source_identity, lease["capability"]),
+                )
+        first_lock_name = "_lock_storage_object_transactions"
+    else:
+        holder = await _server(db, redis, f"{suffix}-holder", f"{suffix}-host")
+        volume = await _volume(db, 1)
+        if operation == "plan":
+            async def invocation():
+                return await service.plan_object_placement(
+                    db,
+                    volume,
+                    str(uuid.uuid4()),
+                    f"{suffix}-key",
+                    37,
+                )
+        else:
+            obj = await _object(db, volume, f"{suffix}-object", size_bytes=37)
+            await _placement(db, obj, holder, status="pending")
+            assert (
+                await service.announce_replicas(
+                    db,
+                    MINER,
+                    holder.server_id,
+                    holder.server_id,
+                    holder.storage_incarnation,
+                    [
+                        {
+                            "object_id": obj.object_id,
+                            "status": "stored",
+                            "ciphertext_sha256": "7" * 64,
+                            "ciphertext_size_bytes": 69,
+                            "plaintext_size_bytes": 37,
+                            "plaintext_sha256": "6" * 64,
+                        }
+                    ],
+                )
+                == 1
+            )
+
+            async def invocation():
+                return await service.commit_object(
+                    db,
+                    volume,
+                    obj.object_id,
+                    obj.object_key,
+                    obj.salt,
+                )
+        first_lock_name = "_lock_storage_user"
+
+    observed = False
+    first_lock_entered = False
+    original_observe = service.observe_storage_liveness
+    original_first_lock = getattr(service, first_lock_name)
+
+    async def record_observation(observe_db):
+        nonlocal observed
+        assert not first_lock_entered
+        live_ids = await original_observe(observe_db)
+        observed = True
+        return live_ids
+
+    async def require_prior_observation(lock_db, *args, **kwargs):
+        nonlocal first_lock_entered
+        assert observed
+        first_lock_entered = True
+        return await original_first_lock(lock_db, *args, **kwargs)
+
+    monkeypatch.setattr(service, "observe_storage_liveness", record_observation)
+    monkeypatch.setattr(service, first_lock_name, require_prior_observation)
+    await invocation()
+    assert observed
+    assert first_lock_entered
+
+
+async def test_consume_rejects_stale_presented_target_after_identity_rebind(pg_session):
+    db, redis = pg_session
+    (
+        source_identity,
+        source,
+        target,
+        _volume_row,
+        obj,
+        _source_placement,
+        target_placement,
+    ) = await _replication_fence_fixture(db, redis, "consume-target-rebind")
+    lease = await service.issue_replication_capability(
+        db,
+        source,
+        obj.object_id,
+        target.server_id,
+        obj.sha256,
+        obj.ciphertext_size_bytes,
+    )
+    target_id = target.server_id
+    target_placement_id = target_placement.placement_id
+    replacement_incarnation = str(uuid.uuid4())
+    db.expire_all()
+    target_placement = await db.get(ReplicaPlacement, target_placement_id)
+    target_before = _pending_placement_mutation_snapshot(target_placement)
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as stale_consumer, factory() as binder:
+        presented_target = await stale_consumer.get(Server, target_id)
+        old_incarnation = presented_target.storage_incarnation
+        current_target = await binder.get(Server, target_id)
+        await service._bind_storage_identity(binder, current_target, replacement_incarnation)
+        await binder.commit()
+        assert presented_target.storage_incarnation == old_incarnation
+
+        with pytest.raises(HTTPException) as rejected:
+            await service.consume_replication_capability(
+                stale_consumer,
+                presented_target,
+                lease["capability"],
+                _sign_capability(source_identity, lease["capability"]),
+            )
+        assert rejected.value.status_code == 403
+        assert "target identity changed" in rejected.value.detail
+        await stale_consumer.rollback()
+
+    db.expire_all()
+    capability = await db.get(StorageReplicationCapability, lease["capability_id"])
+    target_placement = await db.get(ReplicaPlacement, target_placement_id)
+    assert capability.consumed_at is None
+    assert capability.failed_at is None
+    assert capability.last_error is None
+    assert _pending_placement_mutation_snapshot(target_placement) == target_before
+
+
+# --- Final storage lock/frontier regressions ---------------------------------------------------
+
+
+async def _explicit_storage_volume(
+    db: AsyncSession,
+    volume_id: str,
+) -> StorageVolume:
+    volume = StorageVolume(
+        volume_id=volume_id,
+        user_id=USER_ID,
+        name=f"volume-{volume_id}",
+        replication_factor=1,
+        quota_bytes=500 * 1024**3,
+        used_bytes=0,
+    )
+    db.add(volume)
+    await db.commit()
+    return volume
+
+
+async def test_user_erasure_prelocks_cross_volume_object_frontier_globally(
+    pg_session,
+    monkeypatch,
+):
+    db, _redis = pg_session
+    first_volume = await _explicit_storage_volume(db, "00-user-erasure-volume")
+    second_volume = await _explicit_storage_volume(db, "50-user-erasure-volume")
+    empty_page_volume = await _explicit_storage_volume(db, "99-user-erasure-volume")
+    # Per-volume iteration would discover z first and a second. The transaction must instead join
+    # one globally sorted a -> z object frontier before either volume-retirement helper runs. A
+    # third volume proves the single global page budget has already reached zero.
+    z_object = await _object(db, first_volume, "z-user-erasure-object", size_bytes=17)
+    a_object = await _object(db, second_volume, "a-user-erasure-object", size_bytes=19)
+    deferred_object = await _object(
+        db,
+        empty_page_volume,
+        "m-user-erasure-deferred-object",
+        size_bytes=23,
+    )
+    a_object_id = a_object.object_id
+    z_object_id = z_object.object_id
+    deferred_object_id = deferred_object.object_id
+    volume_ids = {
+        first_volume.volume_id,
+        second_volume.volume_id,
+        empty_page_volume.volume_id,
+    }
+    hint_pages = []
+    object_frontiers = []
+    original_hints = service._deleted_volume_retirement_hints
+    original_lock_objects = service._lock_storage_object_transactions
+
+    async def capture_hints(hint_db, volume_id, *, limit):
+        hints = await original_hints(hint_db, volume_id, limit=limit)
+        hint_pages.append((volume_id, limit, list(hints[2]), list(hints[3])))
+        return hints
+
+    async def capture_object_frontier(lock_db, object_ids):
+        object_frontiers.append(list(object_ids))
+        return await original_lock_objects(lock_db, object_ids)
+
+    monkeypatch.setattr(settings, "storage_reconcile_batch_size", 2)
+    monkeypatch.setattr(service, "_deleted_volume_retirement_hints", capture_hints)
+    monkeypatch.setattr(service, "_lock_storage_object_transactions", capture_object_frontier)
+    outcome = await service.prepare_user_storage_erasure(db, USER_ID)
+
+    assert [(volume_id, limit) for volume_id, limit, _objects, _history in hint_pages] == [
+        (first_volume.volume_id, 2),
+        (second_volume.volume_id, 1),
+        (empty_page_volume.volume_id, 0),
+    ]
+    assert [objects for _volume_id, _limit, objects, _history in hint_pages] == [
+        [z_object_id],
+        [a_object_id],
+        [],
+    ]
+    assert object_frontiers == [[a_object_id, z_object_id]]
+    assert outcome["ready"] is False
+    assert set(outcome["purge_pending"]) == volume_ids
+    db.expire_all()
+    assert (await db.get(StorageObject, deferred_object_id)).lifecycle_state == "pending"
+
+
+async def test_reconcile_skip_releases_outer_locks_before_next_liveness_observation(
+    pg_session,
+    monkeypatch,
+):
+    db, redis = pg_session
+    holder = await _server(db, redis, "reconcile-skip-holder", "reconcile-skip-host")
+    holder_id = holder.server_id
+    volume = await _volume(db, 1)
+    first = await _object(
+        db,
+        volume,
+        "a-reconcile-skip-object",
+        sha256="1" * 64,
+        size_bytes=23,
+    )
+    second = await _object(
+        db,
+        volume,
+        "b-reconcile-next-object",
+        sha256="2" * 64,
+        size_bytes=29,
+    )
+    await _placement(db, first, holder, status="present")
+    await _placement(db, second, holder, status="present")
+    first_object_id = first.object_id
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    observation_count = 0
+    released_before_next_observation = {
+        "advisory": False,
+        "server": False,
+    }
+    original_observe = service.observe_storage_liveness
+
+    async def observe_and_probe(observe_db):
+        nonlocal observation_count
+        observation_count += 1
+        if observation_count == 2:
+            async with factory() as probe:
+                released_before_next_observation["advisory"] = bool(
+                    await probe.scalar(
+                        text(
+                            "SELECT pg_try_advisory_xact_lock("
+                            "hashtextextended(:lock_key, 0))"
+                        ),
+                        {
+                            "lock_key": (
+                                f"{service._STORAGE_OBJECT_TRANSACTION_FENCE_PREFIX}:"
+                                f"{first_object_id}"
+                            )
+                        },
+                    )
+                )
+                try:
+                    locked_server_id = await probe.scalar(
+                        select(Server.server_id)
+                        .where(Server.server_id == holder_id)
+                        .with_for_update(nowait=True)
+                    )
+                    released_before_next_observation["server"] = (
+                        locked_server_id == holder_id
+                    )
+                except DBAPIError:
+                    released_before_next_observation["server"] = False
+                finally:
+                    await probe.rollback()
+        return await original_observe(observe_db)
+
+    monkeypatch.setattr(service, "observe_storage_liveness", observe_and_probe)
+    async with factory() as gate, factory() as reconciler:
+        await gate.execute(
+            select(StorageObject)
+            .where(StorageObject.object_id == first_object_id)
+            .with_for_update()
+        )
+        reconciling = asyncio.create_task(service.reconcile_storage(reconciler, max_objects=2))
+        try:
+            summary = await asyncio.wait_for(reconciling, timeout=20)
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not reconciling.done():
+                reconciling.cancel()
+            with suppress(asyncio.CancelledError):
+                await reconciling
+
+    assert observation_count == 2
+    assert released_before_next_observation == {"advisory": True, "server": True}
+    assert summary["object_failures"] == 0
+
+
+async def test_erasure_finalizer_pages_large_dependent_frontier_with_bounded_queries(
+    pg_session,
+    monkeypatch,
+):
+    db, _redis = pg_session
+    volume = await _explicit_storage_volume(db, "bounded-finalizer-volume")
+    predecessor_id = "bounded-finalizer-predecessor"
+    dependent_ids = [f"bounded-finalizer-dependent-{index:02d}" for index in range(7)]
+    now = datetime.now(timezone.utc)
+    await db.execute(text("SET LOCAL session_replication_role = replica"))
+    await db.execute(
+        StorageObject.__table__.insert().values(
+            object_id=predecessor_id,
+            generation=f"generation-{predecessor_id}",
+            volume_id=volume.volume_id,
+            object_key="bounded-finalizer-predecessor-key",
+            lifecycle_state="tombstoned",
+            size_bytes=0,
+            projected_size_bytes=0,
+            salt=base64.b64encode(hashlib.sha256(predecessor_id.encode()).digest()).decode(),
+            durability_state="irrecoverable",
+            durable_replica_count=0,
+            tombstoned_at=now,
+            erase_enqueued_at=now,
+        )
+    )
+    for dependent_id in dependent_ids:
+        await db.execute(
+            StorageObject.__table__.insert().values(
+                object_id=dependent_id,
+                generation=f"generation-{dependent_id}",
+                volume_id=volume.volume_id,
+                object_key=f"key-{dependent_id}",
+                lifecycle_state="tombstoned",
+                expected_predecessor_id=predecessor_id,
+                size_bytes=0,
+                projected_size_bytes=0,
+                salt=base64.b64encode(
+                    hashlib.sha256(dependent_id.encode()).digest()
+                ).decode(),
+                durability_state="irrecoverable",
+                durable_replica_count=0,
+                tombstoned_at=now,
+            )
+        )
+    await db.execute(text("SET LOCAL session_replication_role = origin"))
+    await db.commit()
+
+    captured_frontiers = []
+    dependent_page_limits = []
+    original_lock_objects = service._lock_storage_object_transactions
+    original_execute = db.execute
+
+    async def capture_frontier(lock_db, object_ids):
+        captured_frontiers.append(list(object_ids))
+        return await original_lock_objects(lock_db, object_ids)
+
+    async def capture_dependency_limits(statement, *args, **kwargs):
+        normalized = " ".join(str(statement).split())
+        limit_clause = getattr(statement, "_limit_clause", None)
+        if (
+            "WHERE storage_objects.expected_predecessor_id" in normalized
+            and limit_clause is not None
+        ):
+            dependent_page_limits.append(int(limit_clause.value))
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(service, "_lock_storage_object_transactions", capture_frontier)
+    monkeypatch.setattr(db, "execute", capture_dependency_limits)
+
+    remaining_references = []
+    purged_by_page = []
+    for _ in range(3):
+        purged, _shredded = await service._finalize_erasure_batch(db, limit=3)
+        purged_by_page.append(purged)
+        remaining_references.append(
+            int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(StorageObject)
+                    .where(StorageObject.expected_predecessor_id == predecessor_id)
+                )
+            )
+        )
+
+    assert remaining_references == [4, 1, 0]
+    assert purged_by_page == [0, 0, 1]
+    assert dependent_page_limits == [4, 4, 4, 4, 4, 4]
+    assert [len(frontier) for frontier in captured_frontiers] == [5, 5, 2]
+    assert all(frontier[0] == predecessor_id for frontier in captured_frontiers)
+    assert await db.get(StorageObject, predecessor_id) is None
+    detached = list(
+        (
+            await db.execute(
+                select(StorageObject)
+                .where(StorageObject.object_id.in_(dependent_ids))
+                .order_by(StorageObject.object_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [item.object_id for item in detached] == dependent_ids
+    assert all(item.expected_predecessor_id is None for item in detached)
+    assert all(item.detached_predecessor_id == predecessor_id for item in detached)
+
+
+async def test_deleted_volume_finalizer_uses_user_erasure_volume_lock_order(
+    pg_session,
+    monkeypatch,
+):
+    db, _redis = pg_session
+    a_volume = await _explicit_storage_volume(db, "a-finalizer-volume")
+    z_volume = await _explicit_storage_volume(db, "z-finalizer-volume")
+    a_volume_id = a_volume.volume_id
+    z_volume_id = z_volume.volume_id
+
+    volume_lock_statements = []
+    original_execute = db.execute
+
+    async def capture_volume_locks(statement, *args, **kwargs):
+        normalized = " ".join(
+            str(statement.compile(dialect=db.bind.sync_engine.dialect)).lower().split()
+        )
+        if "from storage_volumes" in normalized and "for update" in normalized:
+            volume_lock_statements.append(normalized)
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db, "execute", capture_volume_locks)
+    prepared = await service.prepare_user_storage_erasure(db, USER_ID)
+    assert prepared["ready"] is False
+
+    db.expire_all()
+    a_volume = await db.get(StorageVolume, a_volume_id)
+    z_volume = await db.get(StorageVolume, z_volume_id)
+    # Make chronological order the inverse of ID order so the finalizer cannot accidentally pass
+    # by retaining a delete_requested_at-first scan.
+    a_volume.delete_requested_at = NOW
+    z_volume.delete_requested_at = NOW - timedelta(minutes=1)
+    await db.commit()
+
+    _purged, shredded = await service._finalize_erasure_batch(db, limit=2)
+    assert shredded == 2
+
+    user_erasure_locks = [
+        statement
+        for statement in volume_lock_statements
+        if "where storage_volumes.user_id =" in statement
+    ]
+    finalizer_locks = [
+        statement
+        for statement in volume_lock_statements
+        if "storage_volumes.deleted is true" in statement and "skip locked" in statement
+    ]
+    assert len(user_erasure_locks) == 1
+    assert len(finalizer_locks) == 1
+    user_erasure_lock = user_erasure_locks[0]
+    finalizer_lock = finalizer_locks[0]
+    assert "order by storage_volumes.volume_id" in user_erasure_lock
+    assert "order by storage_volumes.volume_id" in finalizer_lock
+    assert "order by storage_volumes.delete_requested_at" not in finalizer_lock
+
+    db.expire_all()
+    finalized = [
+        await db.get(StorageVolume, volume_id)
+        for volume_id in (a_volume_id, z_volume_id)
+    ]
+    assert all(volume.key_shredded_at is not None for volume in finalized)
+    assert all(volume.purged_at is not None for volume in finalized)
+
+
+async def test_legacy_metadata_rejects_newest_failed_attestation_after_publication_wait(
+    pg_session,
+):
+    db, redis = pg_session
+    holder = await _server(db, redis, "legacy-metadata-holder", "legacy-metadata-host")
+    holder_id = holder.server_id
+    volume = await _volume(db, 1)
+    object_id = "legacy-metadata-object"
+    placement_id = "legacy-metadata-placement"
+    sensitive_hash = "d" * 64
+    sensitive_salt = base64.b64encode(b"legacy-metadata-sensitive-salt!!").decode()
+    await db.execute(text("SET LOCAL session_replication_role = replica"))
+    await db.execute(
+        StorageObject.__table__.insert().values(
+            object_id=object_id,
+            generation=f"generation-{object_id}",
+            volume_id=volume.volume_id,
+            object_key="legacy-metadata-key",
+            lifecycle_state="committed",
+            size_bytes=31,
+            projected_size_bytes=31,
+            ciphertext_size_bytes=None,
+            sha256=sensitive_hash,
+            salt=sensitive_salt,
+            durability_state="irrecoverable",
+            durable_replica_count=0,
+            committed_at=NOW,
+        )
+    )
+    await db.execute(
+        ReplicaPlacement.__table__.insert().values(
+            placement_id=placement_id,
+            object_id=object_id,
+            server_id=holder_id,
+            status="evicted",
+            storage_incarnation=None,
+            target_cert_pubkey_hash=None,
+            attempt_count=0,
+            last_error="legacy_adoption_required",
+        )
+    )
+    await db.execute(text("SET LOCAL session_replication_role = origin"))
+    await db.commit()
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as reader, factory() as attestor:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        reader_pid = await reader.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        presented_holder = await reader.get(Server, holder_id)
+        reading = asyncio.create_task(
+            service.legacy_adoption_metadata(reader, presented_holder, object_id)
+        )
+        try:
+            await _wait_for_postgres_blocker(db.bind, reader_pid, gate_pid)
+            await _commit_failed_attestation(attestor, holder_id)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(reading, timeout=10)
+            assert rejected.value.status_code == 403
+            assert sensitive_hash not in str(rejected.value.detail)
+            assert sensitive_salt not in str(rejected.value.detail)
+            await reader.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not reading.done():
+                reading.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await reading
+
+
+@pytest.mark.parametrize(
+    "authority_change",
+    ("certificate", "failed_attestation"),
+    ids=("certificate-replaced", "newest-attestation-failed"),
+)
+async def test_replica_authorization_rejects_stale_authority_after_publication_wait(
+    pg_session,
+    authority_change,
+):
+    db, redis = pg_session
+    holder = await _server(
+        db,
+        redis,
+        f"replica-authorization-{authority_change}",
+        f"replica-authorization-host-{authority_change}",
+    )
+    holder_id = holder.server_id
+    volume = await _volume(db, 1)
+    obj = await _object(
+        db,
+        volume,
+        f"replica-authorization-object-{authority_change}",
+        size_bytes=43,
+    )
+    await _placement(db, obj, holder, status="pending")
+    object_id = obj.object_id
+    sensitive_salt = obj.salt
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as gate, factory() as reader, factory() as authority_writer:
+        gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
+        reader_pid = await reader.scalar(text("SELECT pg_backend_pid()"))
+        await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
+        presented_holder = await reader.get(Server, holder_id)
+        authorizing = asyncio.create_task(
+            service.replica_authorization(reader, object_id, presented_holder)
+        )
+        try:
+            await _wait_for_postgres_blocker(db.bind, reader_pid, gate_pid)
+            if authority_change == "certificate":
+                replacement_hash = hashlib.sha256(
+                    f"replica-authorization-replacement:{holder_id}".encode()
+                ).hexdigest()
+                await authority_writer.execute(
+                    update(Server)
+                    .where(Server.server_id == holder_id)
+                    .values(attested_cert_pubkey_hash=replacement_hash)
+                )
+                await authority_writer.commit()
+            else:
+                await _commit_failed_attestation(authority_writer, holder_id)
+            await gate.commit()
+            with pytest.raises(HTTPException) as rejected:
+                await asyncio.wait_for(authorizing, timeout=10)
+            assert rejected.value.status_code == 403
+            assert sensitive_salt not in str(rejected.value.detail)
+            await reader.rollback()
+        finally:
+            if gate.in_transaction():
+                await gate.rollback()
+            if not authorizing.done():
+                authorizing.cancel()
+            with suppress(asyncio.CancelledError, HTTPException):
+                await authorizing

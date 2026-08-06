@@ -219,6 +219,65 @@ CREATE TRIGGER trg_server_retired_storage_incarnation_fence
 BEFORE UPDATE OF storage_incarnation ON servers
 FOR EACH ROW EXECUTE FUNCTION prevent_retired_storage_incarnation_rebind();
 
+-- Validate only the final committed active-placement image. Service writers serialize with the
+-- server-wide publication advisory fence; this deferred guard independently rejects raw SQL that
+-- attempts to commit a stale or permanently retired holder identity.
+CREATE OR REPLACE FUNCTION enforce_active_replica_storage_identity_at_commit()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    final_server_id VARCHAR;
+    final_storage_incarnation VARCHAR;
+    final_cert_pubkey_hash VARCHAR;
+    final_status VARCHAR;
+    current_storage_incarnation VARCHAR;
+    current_cert_pubkey_hash VARCHAR;
+BEGIN
+    SELECT placement.server_id,
+           placement.storage_incarnation,
+           placement.target_cert_pubkey_hash,
+           placement.status
+      INTO final_server_id,
+           final_storage_incarnation,
+           final_cert_pubkey_hash,
+           final_status
+      FROM replica_placement placement
+     WHERE placement.placement_id = NEW.placement_id;
+
+    IF NOT FOUND OR final_status NOT IN ('pending', 'present') THEN
+        RETURN NEW;
+    END IF;
+    IF final_storage_incarnation IS NULL OR final_cert_pubkey_hash IS NULL THEN
+        RAISE EXCEPTION 'active replica placement requires exact storage identity'
+            USING ERRCODE = '23514';
+    END IF;
+    SELECT server.storage_incarnation,
+           server.attested_cert_pubkey_hash
+      INTO current_storage_incarnation,
+           current_cert_pubkey_hash
+      FROM servers server
+     WHERE server.server_id = final_server_id;
+    IF NOT FOUND
+       OR current_storage_incarnation IS DISTINCT FROM final_storage_incarnation
+       OR lower(current_cert_pubkey_hash) IS DISTINCT FROM lower(final_cert_pubkey_hash)
+       OR EXISTS (
+        SELECT 1
+          FROM storage_incarnation_retirement_audits audit
+         WHERE audit.server_id = final_server_id
+           AND audit.previous_storage_incarnation = final_storage_incarnation
+    ) THEN
+        RAISE EXCEPTION
+            'active replica placement does not match the current non-retired storage identity'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS trg_active_replica_storage_identity_at_commit ON replica_placement;
+CREATE CONSTRAINT TRIGGER trg_active_replica_storage_identity_at_commit
+AFTER INSERT OR UPDATE ON replica_placement
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION enforce_active_replica_storage_identity_at_commit();
+
 ALTER TABLE storage_erase_tasks
     ADD COLUMN IF NOT EXISTS retirement_audit_id VARCHAR;
 ALTER TABLE storage_erase_tasks
@@ -298,10 +357,112 @@ RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     authority_request_id VARCHAR;
     authorized BOOLEAN;
+    current_inactive_identity BOOLEAN;
+    ordinary_pending_retry BOOLEAN;
+    legacy_initial_quarantine BOOLEAN;
+    legacy_initial_adoption BOOLEAN;
     present_rebind BOOLEAN;
     stale_identity_recovery BOOLEAN;
 BEGIN
     IF OLD.target_cert_pubkey_hash IS NOT DISTINCT FROM NEW.target_cert_pubkey_hash THEN
+        RETURN NEW;
+    END IF;
+    SELECT EXISTS (
+        SELECT 1
+          FROM servers server
+         WHERE server.server_id = NEW.server_id
+           AND server.storage_role
+           AND server.storage_incarnation = NEW.storage_incarnation
+           AND lower(server.attested_cert_pubkey_hash) = lower(NEW.target_cert_pubkey_hash)
+           AND NEW.target_cert_pubkey_hash ~ '^[0-9a-f]{64}$'
+           AND NOT EXISTS (
+                SELECT 1
+                  FROM storage_incarnation_retirement_audits audit
+                 WHERE audit.server_id = NEW.server_id
+                   AND audit.previous_storage_incarnation = NEW.storage_incarnation
+           )
+    ) INTO current_inactive_identity;
+    ordinary_pending_retry := current_inactive_identity
+        AND OLD.status = 'evicted'
+        AND NEW.status = 'pending'
+        AND NEW.confirmed_at IS NULL
+        AND NEW.proof_sha256 IS NULL
+        AND NEW.proof_size_bytes IS NULL
+        AND NEW.proof_plaintext_size_bytes IS NULL
+        AND NEW.proof_plaintext_sha256 IS NULL
+        AND NEW.proof_capability_id IS NULL
+        AND NEW.proof_mode IS NULL
+        AND NEW.proof_at IS NULL
+        AND NEW.legacy_adoption_started_at IS NULL
+        AND NEW.pending_since IS NOT NULL
+        AND NEW.pending_deadline = NEW.pending_since + INTERVAL '2 hours'
+        AND NEW.attempt_count = OLD.attempt_count + 1
+        AND NEW.last_attempt_at IS NULL
+        AND NEW.last_error IS NULL
+        AND (to_jsonb(NEW)
+             - 'status' - 'confirmed_at' - 'storage_incarnation' - 'target_cert_pubkey_hash'
+             - 'proof_sha256' - 'proof_size_bytes' - 'proof_plaintext_size_bytes'
+             - 'proof_plaintext_sha256' - 'proof_capability_id' - 'proof_mode' - 'proof_at'
+             - 'legacy_adoption_started_at' - 'pending_since' - 'pending_deadline'
+             - 'attempt_count' - 'last_attempt_at' - 'last_error')
+            = (to_jsonb(OLD)
+             - 'status' - 'confirmed_at' - 'storage_incarnation' - 'target_cert_pubkey_hash'
+             - 'proof_sha256' - 'proof_size_bytes' - 'proof_plaintext_size_bytes'
+             - 'proof_plaintext_sha256' - 'proof_capability_id' - 'proof_mode' - 'proof_at'
+             - 'legacy_adoption_started_at' - 'pending_since' - 'pending_deadline'
+             - 'attempt_count' - 'last_attempt_at' - 'last_error');
+    legacy_initial_quarantine := current_inactive_identity
+        AND OLD.status = 'evicted'
+        AND OLD.storage_incarnation IS NULL
+        AND OLD.target_cert_pubkey_hash IS NULL
+        AND OLD.last_error = 'secure_replication_requires_new_receipt'
+        AND OLD.confirmed_at IS NULL
+        AND OLD.proof_at IS NULL
+        AND OLD.pending_since IS NULL
+        AND OLD.pending_deadline IS NULL
+        AND OLD.legacy_adoption_started_at IS NULL
+        AND OLD.attempt_count = 0
+        AND NEW.status = 'evicted'
+        AND NEW.last_attempt_at IS NOT NULL
+        AND left(NEW.last_error, length('legacy_adoption_quarantined:'))
+            = 'legacy_adoption_quarantined:'
+        AND (to_jsonb(NEW)
+             - 'storage_incarnation' - 'target_cert_pubkey_hash'
+             - 'last_attempt_at' - 'last_error')
+            = (to_jsonb(OLD)
+             - 'storage_incarnation' - 'target_cert_pubkey_hash'
+             - 'last_attempt_at' - 'last_error');
+    legacy_initial_adoption := current_inactive_identity
+        AND OLD.status = 'evicted'
+        AND OLD.storage_incarnation IS NULL
+        AND OLD.target_cert_pubkey_hash IS NULL
+        AND OLD.last_error = 'secure_replication_requires_new_receipt'
+        AND OLD.confirmed_at IS NULL
+        AND OLD.proof_at IS NULL
+        AND OLD.pending_since IS NULL
+        AND OLD.pending_deadline IS NULL
+        AND OLD.legacy_adoption_started_at IS NULL
+        AND OLD.attempt_count = 0
+        AND NEW.status = 'pending'
+        AND NEW.confirmed_at IS NULL
+        AND NEW.proof_at IS NULL
+        AND NEW.legacy_adoption_started_at IS NOT NULL
+        AND NEW.pending_since = NEW.legacy_adoption_started_at
+        AND NEW.last_attempt_at = NEW.legacy_adoption_started_at
+        AND NEW.pending_deadline = NEW.legacy_adoption_started_at + INTERVAL '2 hours'
+        AND NEW.attempt_count = 1
+        AND NEW.last_error IS NULL
+        AND (to_jsonb(NEW)
+             - 'status' - 'storage_incarnation' - 'target_cert_pubkey_hash'
+             - 'legacy_adoption_started_at' - 'pending_since' - 'pending_deadline'
+             - 'attempt_count' - 'last_attempt_at' - 'last_error')
+            = (to_jsonb(OLD)
+             - 'status' - 'storage_incarnation' - 'target_cert_pubkey_hash'
+             - 'legacy_adoption_started_at' - 'pending_since' - 'pending_deadline'
+             - 'attempt_count' - 'last_attempt_at' - 'last_error');
+    IF ordinary_pending_retry OR legacy_initial_quarantine OR legacy_initial_adoption THEN
+        -- The ordinary placement-transition trigger still validates these inactive transitions;
+        -- the deferred active guard validates the final pending identity at commit.
         RETURN NEW;
     END IF;
     present_rebind := OLD.status = 'present' AND NEW.status = 'present'
@@ -315,7 +476,7 @@ BEGIN
             = (to_jsonb(OLD) - 'target_cert_pubkey_hash' - 'status' - 'last_error');
     IF NOT (present_rebind OR stale_identity_recovery) THEN
         RAISE EXCEPTION
-            'replica certificate rebind must be exact present rebind or stale-identity recovery'
+            'replica certificate change lacks exact inactive binding or audited active rebind'
             USING ERRCODE = '23514';
     END IF;
     authority_request_id := current_setting('chutes.storage_cert_rebind_request_id', true);
@@ -804,6 +965,8 @@ DROP FUNCTION IF EXISTS enforce_storage_erase_retirement_audit();
 ALTER TABLE storage_erase_tasks DROP CONSTRAINT fk_storage_erase_task_retirement_audit;
 DROP INDEX IF EXISTS idx_storage_erase_retirement_audit;
 ALTER TABLE storage_erase_tasks DROP COLUMN retirement_audit_id;
+DROP TRIGGER IF EXISTS trg_active_replica_storage_identity_at_commit ON replica_placement;
+DROP FUNCTION IF EXISTS enforce_active_replica_storage_identity_at_commit();
 DROP TRIGGER IF EXISTS trg_storage_incarnation_retirement_audit_immutable
     ON storage_incarnation_retirement_audits;
 DROP TRIGGER IF EXISTS trg_storage_replica_cert_rebind_audit_immutable

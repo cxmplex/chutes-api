@@ -101,6 +101,12 @@ OBJECT_COMMITTED = "committed"
 OBJECT_SUPERSEDED = "superseded"
 OBJECT_TOMBSTONED = "tombstoned"
 ERASE_TERMINAL_STATES = ("erased", "retired")
+_STORAGE_PUBLICATION_FENCE_PREFIX = "chutes:storage-publication:v1"
+_STORAGE_OBJECT_TRANSACTION_FENCE_PREFIX = "chutes:storage-object:v1"
+
+
+class _StorageReconcileItemSkipped(Exception):
+    """Internal control flow used to release an unprocessable item's outer transaction."""
 
 
 # --- liveness ----------------------------------------------------------------------------------
@@ -519,6 +525,88 @@ async def _refresh_object_durability(
     return len(durable)
 
 
+def _storage_publication_fence_key(server_id: str) -> str:
+    return f"{_STORAGE_PUBLICATION_FENCE_PREFIX}:{server_id}"
+
+
+async def _lock_storage_object_transactions(
+    db: AsyncSession,
+    object_ids: Sequence[str],
+) -> Set[str]:
+    """Serialize every lock graph that can mutate one storage generation.
+
+    This transaction-scoped frontier is acquired in sorted order before replication capabilities,
+    publication fences, Servers, StorageObjects, or Placements. It prevents otherwise independent
+    lifecycle paths from inverting those row graphs during reconciliation and erasure finalization.
+    """
+    normalized = {str(object_id) for object_id in object_ids if object_id}
+    statement = text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))")
+    for object_id in sorted(normalized):
+        await db.execute(
+            statement,
+            {
+                "lock_key": (
+                    f"{_STORAGE_OBJECT_TRANSACTION_FENCE_PREFIX}:{object_id}"
+                )
+            },
+        )
+    return normalized
+
+
+async def _lock_storage_publication_servers(
+    db: AsyncSession,
+    server_ids: Sequence[str],
+    *,
+    shared: bool,
+) -> Set[str]:
+    """Fence all active publication/retirement work for each storage server.
+
+    Normal publication and erase work takes compatible shared locks. Identity replacement takes
+    an exclusive lock before the Server row and never joins the Placement lock graph. Sorted
+    acquisition prevents distinct multi-server frontiers from inverting.
+    """
+    normalized = {str(server_id) for server_id in server_ids if server_id}
+    statement = text(
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended(:lock_key, 0))"
+        if shared
+        else "SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"
+    )
+    for server_id in sorted(normalized):
+        await db.execute(
+            statement,
+            {"lock_key": _storage_publication_fence_key(server_id)},
+        )
+    return normalized
+
+
+async def _locked_storage_publication_server_rows(
+    db: AsyncSession,
+    server_ids: Sequence[str],
+) -> Dict[str, Server]:
+    """Take shared publication fences, then lock current Server rows in the same stable order."""
+    normalized = await _lock_storage_publication_servers(
+        db,
+        server_ids,
+        shared=True,
+    )
+    if not normalized:
+        return {}
+    rows = list(
+        (
+            await db.execute(
+                select(Server)
+                .where(Server.server_id.in_(sorted(normalized)))
+                .order_by(Server.server_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {server.server_id: server for server in rows}
+
+
 async def _bind_storage_identity(
     db: AsyncSession,
     server: Server,
@@ -532,10 +620,33 @@ async def _bind_storage_identity(
     measured storage-node code could produce that receipt.
     """
     storage_incarnation = _normalize_incarnation(storage_incarnation)
+    server_id = server.server_id
+    expected_miner_hotkey = server.miner_hotkey
+    expected_storage_role = bool(server.storage_role)
+    expected_cert_hash = (_server_pubkey_hash(server) or "").lower()
+    previous_identity_hint = (
+        await db.execute(
+            select(Server.storage_incarnation).where(Server.server_id == server_id)
+        )
+    ).one_or_none()
+    if previous_identity_hint is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Storage TD no longer exists.",
+        )
+    previous_incarnation_hint = previous_identity_hint[0]
+    # Every bind joins the server-wide publication fence before the Server row. A same-identity
+    # replay needs only a shared fence; an identity transition needs exclusive authority. If the
+    # unlocked hint changes, fail after locking instead of attempting an unsafe lock upgrade.
+    await _lock_storage_publication_servers(
+        db,
+        [server_id],
+        shared=previous_incarnation_hint == storage_incarnation,
+    )
     server = (
         await db.execute(
             select(Server)
-            .where(Server.server_id == server.server_id)
+            .where(Server.server_id == server_id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
@@ -545,12 +656,37 @@ async def _bind_storage_identity(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Storage TD no longer exists.",
         )
+    if server.storage_incarnation != previous_incarnation_hint:
+        # The hint is used only to select the exact fence. Never switch to a second identity after
+        # holding the Server row because that would reintroduce Server -> fence lock ordering.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Storage identity changed concurrently; retry the announcement.",
+        )
+    attestation_is_fresh = await is_freshly_attested_storage_server(db, server)
+    if (
+        not expected_storage_role
+        or not server.storage_role
+        or server.miner_hotkey != expected_miner_hotkey
+        or (_server_pubkey_hash(server) or "").lower() != expected_cert_hash
+        or not attestation_is_fresh
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Storage ownership/role changed, the attested certificate changed, or the latest "
+                "attestation is no longer fresh while binding identity."
+            ),
+        )
     cert_hash = _server_pubkey_hash(server)
     if not cert_hash:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Storage TD has no registered attestation-bound certificate.",
         )
+
+    previous_incarnation = server.storage_incarnation
+    incarnation_changed = previous_incarnation != storage_incarnation
 
     retired_incarnation = (
         await db.execute(
@@ -572,33 +708,15 @@ async def _bind_storage_identity(
             ),
         )
 
-    previous_incarnation = server.storage_incarnation
-    incarnation_changed = previous_incarnation != storage_incarnation
     if incarnation_changed and previous_incarnation:
         # A current measured storage agent can only announce a new mounted-volume
         # incarnation after the old volume is no longer mounted.  That is positive
         # unreachability evidence, not proof that individual files were erased.
         # Terminalize only the exact old incarnation and preserve an immutable audit.
         now = datetime.now(timezone.utc)
-        # Lock order is Server -> sorted old-incarnation placements -> sorted erase tasks. Enqueue
-        # paths take Placement -> Task and never reach back for Server, so either their task is
-        # included below or they observe the committed retirement audit after the placement wait.
-        list(
-            (
-                await db.execute(
-                    select(ReplicaPlacement.placement_id)
-                    .where(
-                        ReplicaPlacement.server_id == server.server_id,
-                        ReplicaPlacement.storage_incarnation == previous_incarnation,
-                    )
-                    .order_by(ReplicaPlacement.placement_id)
-                    .with_for_update()
-                )
-            )
-            .scalars()
-            .all()
-        )
-        # Lock terminal rows too because deleted-volume retirement may reset erased work to pending.
+        # The exclusive publication fence serializes every conforming enqueue/claim/reset path.
+        # Terminal tasks need no lock: their only reset path holds the shared fence, and avoiding
+        # terminal rows keeps identity bind out of the finalizer's terminal-task graph.
         locked_tasks = list(
             (
                 await db.execute(
@@ -606,6 +724,7 @@ async def _bind_storage_identity(
                     .where(
                         StorageEraseTask.server_id == server.server_id,
                         StorageEraseTask.storage_incarnation == previous_incarnation,
+                        StorageEraseTask.state.not_in(ERASE_TERMINAL_STATES),
                     )
                     .order_by(StorageEraseTask.task_id)
                     .with_for_update()
@@ -614,7 +733,7 @@ async def _bind_storage_identity(
             .scalars()
             .all()
         )
-        tasks = [task for task in locked_tasks if task.state not in ERASE_TERMINAL_STATES]
+        tasks = locked_tasks
         audit = StorageIncarnationRetirementAudit(
             server_id=server.server_id,
             previous_storage_incarnation=previous_incarnation,
@@ -1573,7 +1692,7 @@ async def announce_model_holdings(
         server_id,
         miner_hotkey,
         caller_server_id=caller_server_id,
-        lock=True,
+        lock=False,
     )
     await _bind_storage_identity(db, server, storage_incarnation)
     if disk_free_gb is not None:
@@ -2035,13 +2154,29 @@ async def _enqueue_erase_tasks_for_generations(
         return 0
     now = now or datetime.now(timezone.utc)
     generation_by_id = {generation.object_id: generation for generation in generations}
+    generation_ids = list(generation_by_id)
     existing_erase_task = StorageEraseTask.__table__.alias("existing_erase_task")
+    holder_server_ids = list(
+        (
+            await db.execute(
+                select(ReplicaPlacement.server_id)
+                .where(ReplicaPlacement.object_id.in_(generation_ids))
+                .distinct()
+                .order_by(ReplicaPlacement.server_id)
+            )
+        ).scalars()
+    )
+    fenced_server_ids = await _lock_storage_publication_servers(
+        db,
+        holder_server_ids,
+        shared=True,
+    )
     placements = list(
         (
             await db.execute(
                 select(ReplicaPlacement)
                 .where(
-                    ReplicaPlacement.object_id.in_(list(generation_by_id)),
+                    ReplicaPlacement.object_id.in_(generation_ids),
                     ~exists(
                         select(1)
                         .select_from(existing_erase_task)
@@ -2053,10 +2188,7 @@ async def _enqueue_erase_tasks_for_generations(
                         )
                     ),
                 )
-                .order_by(
-                    ReplicaPlacement.object_id,
-                    ReplicaPlacement.placement_id,
-                )
+                .order_by(ReplicaPlacement.placement_id)
                 .limit(settings.storage_reconcile_batch_size)
                 .with_for_update()
             )
@@ -2064,11 +2196,17 @@ async def _enqueue_erase_tasks_for_generations(
         .scalars()
         .all()
     )
+    locked_server_ids = {placement.server_id for placement in placements}
+    if not locked_server_ids.issubset(fenced_server_ids):
+        raise RuntimeError(
+            "Replica holder changed while acquiring erase publication fences."
+        )
     enqueued = 0
     retention_deadline = now + timedelta(seconds=settings.storage_erase_retention_seconds)
     for placement in placements:
         generation = generation_by_id[placement.object_id]
-        # Placement is the serialization point with identity replacement. Never acquire Server here.
+        # The shared server publication fence serializes this task with identity replacement.
+        # Never acquire Server after the Placement frontier.
         retirement_audit = await _storage_incarnation_retirement_audit(
             db,
             server_id=placement.server_id,
@@ -2177,16 +2315,13 @@ async def _enqueue_erase_tasks_for_generations(
     return enqueued
 
 
-async def _retire_deleted_volume_batch(
+async def _deleted_volume_retirement_hints(
     db: AsyncSession,
-    volume: StorageVolume,
+    volume_id: str,
     *,
     limit: int,
-) -> tuple[int, int]:
-    now = datetime.now(timezone.utc)
-    # Candidate identities are unlocked hints. Lock every candidate/selected-generation placement
-    # first, then revalidate and lock tasks: Volume/Generation -> Placement -> Task never inverts
-    # identity bind's Server -> Placement -> Task order.
+) -> tuple[List[Any], int, List[str], List[str]]:
+    """Return one bounded, unlocked retirement page used only to establish lock frontiers."""
     historical_candidates = list(
         (
             await db.execute(
@@ -2194,9 +2329,11 @@ async def _retire_deleted_volume_batch(
                     StorageEraseTask.task_id,
                     StorageEraseTask.placement_id,
                     StorageEraseTask.state,
+                    StorageEraseTask.server_id,
+                    StorageEraseTask.storage_incarnation,
                 )
                 .where(
-                    StorageEraseTask.volume_id == volume.volume_id,
+                    StorageEraseTask.volume_id == volume_id,
                     StorageEraseTask.reason != "volume_deleted",
                 )
                 .order_by(StorageEraseTask.task_id)
@@ -2205,11 +2342,98 @@ async def _retire_deleted_volume_batch(
         ).all()
     )
     generation_limit = max(0, limit - len(historical_candidates))
+    generation_hint_ids = list(
+        (
+            await db.execute(
+                select(StorageObject.object_id)
+                .where(
+                    StorageObject.volume_id == volume_id,
+                    StorageObject.lifecycle_state.in_(
+                        (OBJECT_PENDING, OBJECT_COMMITTED, OBJECT_SUPERSEDED)
+                    ),
+                )
+                .order_by(StorageObject.object_id)
+                .limit(generation_limit)
+            )
+        ).scalars()
+    )
+    candidate_placement_ids = [
+        placement_id
+        for (
+            _task_id,
+            placement_id,
+            _state,
+            _server_id,
+            _storage_incarnation,
+        ) in historical_candidates
+        if placement_id is not None
+    ]
+    historical_object_ids: List[str] = []
+    if candidate_placement_ids:
+        historical_object_ids = list(
+            (
+                await db.execute(
+                    select(ReplicaPlacement.object_id)
+                    .where(ReplicaPlacement.placement_id.in_(candidate_placement_ids))
+                    .distinct()
+                    .order_by(ReplicaPlacement.object_id)
+                )
+            ).scalars()
+        )
+    return (
+        historical_candidates,
+        generation_limit,
+        generation_hint_ids,
+        historical_object_ids,
+    )
+
+
+async def _retire_deleted_volume_batch(
+    db: AsyncSession,
+    volume: StorageVolume,
+    *,
+    limit: int,
+    retirement_hints: Optional[tuple[List[Any], int, List[str], List[str]]] = None,
+    prelocked_object_frontier: Optional[Set[str]] = None,
+) -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    # Candidate identities are unlocked hints. Take their shared publication fences before the
+    # sorted Placement -> Task frontier; identity bind takes the server-wide exclusive fence and
+    # no placement lock, so neither winner can enter a cross-frontier cycle.
+    if retirement_hints is None:
+        retirement_hints = await _deleted_volume_retirement_hints(
+            db,
+            volume.volume_id,
+            limit=limit,
+        )
+    (
+        historical_candidates,
+        generation_limit,
+        generation_hint_ids,
+        historical_object_ids,
+    ) = retirement_hints
+    candidate_placement_ids = [
+        placement_id
+        for (
+            _task_id,
+            placement_id,
+            _state,
+            _server_id,
+            _storage_incarnation,
+        ) in historical_candidates
+        if placement_id is not None
+    ]
+    required_object_frontier = set(generation_hint_ids + historical_object_ids)
+    if prelocked_object_frontier is None:
+        await _lock_storage_object_transactions(db, sorted(required_object_frontier))
+    elif not required_object_frontier.issubset(prelocked_object_frontier):
+        raise RuntimeError("Volume retirement object frontier changed after global prelocking.")
     generations = list(
         (
             await db.execute(
                 select(StorageObject)
                 .where(
+                    StorageObject.object_id.in_(generation_hint_ids),
                     StorageObject.volume_id == volume.volume_id,
                     StorageObject.lifecycle_state.in_(
                         (OBJECT_PENDING, OBJECT_COMMITTED, OBJECT_SUPERSEDED)
@@ -2223,17 +2447,51 @@ async def _retire_deleted_volume_batch(
         .scalars()
         .all()
     )
+    if [generation.object_id for generation in generations] != generation_hint_ids:
+        raise RuntimeError("Volume retirement frontier changed before object locking.")
     generation_ids = [generation.object_id for generation in generations]
-    candidate_placement_ids = [
-        placement_id
-        for _task_id, placement_id, _state in historical_candidates
-        if placement_id is not None
-    ]
+    placement_server_ids = []
     if generation_ids or candidate_placement_ids:
-        list(
+        placement_server_ids = list(
             (
                 await db.execute(
-                    select(ReplicaPlacement.placement_id)
+                    select(ReplicaPlacement.server_id)
+                    .where(
+                        or_(
+                            ReplicaPlacement.object_id.in_(generation_ids or [""]),
+                            ReplicaPlacement.placement_id.in_(candidate_placement_ids or [""]),
+                        )
+                    )
+                    .distinct()
+                    .order_by(ReplicaPlacement.server_id)
+                )
+            ).scalars()
+        )
+    fenced_server_ids = await _lock_storage_publication_servers(
+        db,
+        placement_server_ids
+        + [
+            server_id
+            for (
+                _task_id,
+                _placement_id,
+                _state,
+                server_id,
+                _storage_incarnation,
+            ) in historical_candidates
+        ],
+        shared=True,
+    )
+    locked_placement_rows = []
+    if generation_ids or candidate_placement_ids:
+        locked_placement_rows = list(
+            (
+                await db.execute(
+                    select(
+                        ReplicaPlacement.placement_id,
+                        ReplicaPlacement.server_id,
+                        ReplicaPlacement.storage_incarnation,
+                    )
                     .where(
                         or_(
                             ReplicaPlacement.object_id.in_(generation_ids or [""]),
@@ -2243,12 +2501,19 @@ async def _retire_deleted_volume_batch(
                     .order_by(ReplicaPlacement.placement_id)
                     .with_for_update()
                 )
-            ).scalars()
+            ).all()
+        )
+    locked_placement_server_ids = {
+        server_id for _placement_id, server_id, _storage_incarnation in locked_placement_rows
+    }
+    if not locked_placement_server_ids.issubset(fenced_server_ids):
+        raise RuntimeError(
+            "Replica holder changed while acquiring volume-retirement publication fences."
         )
 
     candidate_by_task_id = {
-        task_id: (placement_id, state)
-        for task_id, placement_id, state in historical_candidates
+        task_id: (placement_id, state, server_id, storage_incarnation)
+        for task_id, placement_id, state, server_id, storage_incarnation in historical_candidates
     }
     historical_tasks = []
     if candidate_by_task_id:
@@ -2268,10 +2533,21 @@ async def _retire_deleted_volume_batch(
             .scalars()
             .all()
         )
+        locked_task_server_ids = {task.server_id for task in historical_tasks}
+        if not locked_task_server_ids.issubset(fenced_server_ids):
+            raise RuntimeError(
+                "Erase-task holder changed while acquiring volume-retirement publication fences."
+            )
         historical_tasks = [
             task
             for task in historical_tasks
-            if candidate_by_task_id.get(task.task_id) == (task.placement_id, task.state)
+            if candidate_by_task_id.get(task.task_id)
+            == (
+                task.placement_id,
+                task.state,
+                task.server_id,
+                task.storage_incarnation,
+            )
         ]
     for task in historical_tasks:
         retirement_audit = await _storage_incarnation_retirement_audit(
@@ -2522,6 +2798,31 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
             else []
         )
     }
+    retirement_hints_by_volume: Dict[
+        str,
+        tuple[List[Any], int, List[str], List[str]],
+    ] = {}
+    user_erasure_object_frontier: Set[str] = set()
+    remaining_retirement_budget = settings.storage_reconcile_batch_size
+    for volume in volumes:
+        hints = await _deleted_volume_retirement_hints(
+            db,
+            volume.volume_id,
+            limit=remaining_retirement_budget,
+        )
+        retirement_hints_by_volume[volume.volume_id] = hints
+        user_erasure_object_frontier.update(hints[2])
+        user_erasure_object_frontier.update(hints[3])
+        remaining_retirement_budget = max(
+            0,
+            remaining_retirement_budget - len(hints[0]) - len(hints[2]),
+        )
+    # Preserve the existing launch authority -> reservation -> storage-object order. User erasure
+    # remains one atomic transition, so establish its bounded object union once before helpers.
+    await _lock_storage_object_transactions(
+        db,
+        sorted(user_erasure_object_frontier),
+    )
     active_reservation_states = {
         "reserved",
         "claimed",
@@ -2567,6 +2868,8 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
             db,
             volume,
             limit=settings.storage_reconcile_batch_size,
+            retirement_hints=retirement_hints_by_volume[volume.volume_id],
+            prelocked_object_frontier=user_erasure_object_frontier,
         )
 
     purge_pending = [
@@ -2714,14 +3017,91 @@ async def _upsert_pending_placement(
     cert_hash = _server_pubkey_hash(server)
     if not server.storage_incarnation or not cert_hash:
         raise ValueError(f"Storage server {server.server_id} has no current attested disk identity")
+    expected_incarnation = server.storage_incarnation
+    expected_cert_hash = cert_hash.lower()
+    expected_miner_hotkey = server.miner_hotkey
+    expected_storage_role = bool(server.storage_role)
+    await _lock_storage_publication_servers(db, [server.server_id], shared=True)
+    current_server = (
+        await db.execute(
+            select(Server)
+            .where(Server.server_id == server.server_id)
+            .order_by(Server.server_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    retired_identity = await db.scalar(
+        select(StorageIncarnationRetirementAudit.audit_id)
+        .where(
+            StorageIncarnationRetirementAudit.server_id == server.server_id,
+            StorageIncarnationRetirementAudit.previous_storage_incarnation
+            == expected_incarnation,
+        )
+        .limit(1)
+    )
+    if (
+        current_server is None
+        or not expected_storage_role
+        or not current_server.storage_role
+        or current_server.miner_hotkey != expected_miner_hotkey
+        or current_server.storage_incarnation != expected_incarnation
+        or (_server_pubkey_hash(current_server) or "").lower() != expected_cert_hash
+        or retired_identity is not None
+        or not await is_freshly_attested_storage_server(db, current_server)
+    ):
+        raise RuntimeError(
+            "Storage authority changed, retired, or failed attestation before placement "
+            f"assignment: {server.server_id}"
+        )
+    reserved_bytes = int(
+        (
+            await db.execute(
+                select(
+                    func.coalesce(
+                        func.sum(
+                            func.greatest(
+                                StorageObject.projected_size_bytes,
+                                StorageObject.size_bytes,
+                            )
+                        ),
+                        0,
+                    )
+                )
+                .select_from(ReplicaPlacement)
+                .join(
+                    StorageObject,
+                    StorageObject.object_id == ReplicaPlacement.object_id,
+                )
+                .where(
+                    ReplicaPlacement.server_id == current_server.server_id,
+                    ReplicaPlacement.status == "pending",
+                    ReplicaPlacement.pending_deadline > func.now(),
+                    StorageObject.lifecycle_state.in_((OBJECT_PENDING, OBJECT_COMMITTED)),
+                )
+            )
+        ).scalar_one()
+        or 0
+    )
+    required_bytes = max(int(obj.projected_size_bytes or 0), int(obj.size_bytes or 0))
+    if (
+        current_server.disk_free_gb is None
+        or int(current_server.disk_free_gb) * _GIB
+        - STORAGE_CAPACITY_HEADROOM_BYTES
+        - reserved_bytes
+        < required_bytes
+    ):
+        raise RuntimeError(
+            f"Storage capacity changed before placement assignment: {server.server_id}"
+        )
     now = datetime.now(timezone.utc)
     deadline = now + timedelta(seconds=PENDING_PLACEMENT_TTL_SECONDS)
     statement = pg_insert(ReplicaPlacement).values(
         object_id=obj.object_id,
         server_id=server.server_id,
         status="pending",
-        storage_incarnation=server.storage_incarnation,
-        target_cert_pubkey_hash=cert_hash.lower(),
+        storage_incarnation=expected_incarnation,
+        target_cert_pubkey_hash=expected_cert_hash,
         proof_sha256=None,
         proof_size_bytes=None,
         proof_plaintext_size_bytes=None,
@@ -2777,6 +3157,11 @@ async def plan_object_placement(
     observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> tuple[StorageObject, List[StoragePeer]]:
     """Create one immutable pending generation and assign its initial replica targets."""
+    if observed_live_storage_ids is None:
+        observed_live_storage_ids = await observe_storage_liveness(db)
+        # Redis must be observed before the User/Volume/object/publication lock graph. Close the
+        # read-only database transaction opened while enumerating eligible storage servers.
+        await db.commit()
     if size_bytes < 0 or size_bytes > settings.storage_max_object_bytes:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
@@ -2800,6 +3185,29 @@ async def plan_object_placement(
     if locked_volume is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume not found.")
 
+    existing_request_hint = (
+        await db.execute(
+            select(StorageObject.object_id).where(
+                StorageObject.volume_id == locked_volume.volume_id,
+                StorageObject.placement_request_id == request_id,
+            )
+        )
+    ).scalar_one_or_none()
+    predecessor_hint = (
+        await db.execute(
+            select(StorageObject.object_id).where(
+                StorageObject.volume_id == locked_volume.volume_id,
+                StorageObject.object_key == key,
+                StorageObject.lifecycle_state == OBJECT_COMMITTED,
+            )
+        )
+    ).scalar_one_or_none()
+    planned_object_id = existing_request_hint or str(uuid4())
+    await _lock_storage_object_transactions(
+        db,
+        [planned_object_id, predecessor_hint],
+    )
+
     existing_request = (
         await db.execute(
             select(StorageObject)
@@ -2810,6 +3218,8 @@ async def plan_object_placement(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if (existing_request.object_id if existing_request is not None else None) != existing_request_hint:
+        raise RuntimeError("Placement request changed before object serialization.")
     if existing_request is not None:
         if (
             existing_request.object_key != key
@@ -2862,6 +3272,8 @@ async def plan_object_placement(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if (predecessor.object_id if predecessor is not None else None) != predecessor_hint:
+        raise RuntimeError("Placement predecessor changed before object serialization.")
     pending_predecessor = aliased(StorageObject, name="quota_predecessor")
     active_pending_placement = exists(
         select(1).where(
@@ -2939,6 +3351,7 @@ async def plan_object_placement(
         )
 
     obj = StorageObject(
+        object_id=planned_object_id,
         volume_id=locked_volume.volume_id,
         object_key=key,
         placement_request_id=request_id,
@@ -2970,7 +3383,10 @@ async def plan_object_placement(
         )
     servers = await _storage_servers_by_id(db, [peer.server_id for peer in peers])
     server_by_id = {server.server_id: server for server in servers}
-    for peer in peers:
+    # Every planner takes Server rows in one global order. _upsert_pending_placement rechecks both
+    # latest attestation and capacity while holding each row, so concurrent accounts cannot
+    # over-reserve the same final bytes or deadlock on inverse capacity ranking.
+    for peer in sorted(peers, key=lambda item: item.server_id):
         await _upsert_pending_placement(db, obj, server_by_id[peer.server_id])
 
     await db.commit()
@@ -2988,6 +3404,9 @@ async def commit_object(
     observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> tuple[StorageObject, int]:
     """Atomically CAS using immutable receipts from current attested storage targets."""
+    if observed_live_storage_ids is None:
+        observed_live_storage_ids = await observe_storage_liveness(db)
+        await db.commit()
     try:
         decoded_salt = base64.b64decode(salt, validate=True)
     except (TypeError, ValueError) as exc:
@@ -3016,6 +3435,35 @@ async def commit_object(
     if locked_volume is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume not found.")
 
+    requested_hint = (
+        await db.execute(
+            select(
+                StorageObject.object_id,
+                StorageObject.expected_predecessor_id,
+            ).where(
+                StorageObject.object_id == object_id,
+                StorageObject.volume_id == locked_volume.volume_id,
+            )
+        )
+    ).one_or_none()
+    current_hint = (
+        await db.execute(
+            select(StorageObject.object_id).where(
+                StorageObject.volume_id == locked_volume.volume_id,
+                StorageObject.object_key == key,
+                StorageObject.lifecycle_state == OBJECT_COMMITTED,
+            )
+        )
+    ).scalar_one_or_none()
+    await _lock_storage_object_transactions(
+        db,
+        [
+            object_id,
+            requested_hint.expected_predecessor_id if requested_hint is not None else None,
+            current_hint,
+        ],
+    )
+
     obj = (
         await db.execute(
             select(StorageObject)
@@ -3026,6 +3474,19 @@ async def commit_object(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if (
+        obj is not None
+        and requested_hint is not None
+        and (
+            obj.object_id,
+            obj.expected_predecessor_id,
+        )
+        != (
+            requested_hint.object_id,
+            requested_hint.expected_predecessor_id,
+        )
+    ):
+        raise RuntimeError("Object generation changed before commit serialization.")
     if obj is None or obj.object_key != key:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Object not found.")
     if salt != obj.salt:
@@ -3092,6 +3553,8 @@ async def commit_object(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if (current.object_id if current is not None else None) != current_hint:
+        raise RuntimeError("Current object generation changed before commit serialization.")
     current_id = current.object_id if current is not None else None
     if current_id != obj.expected_predecessor_id:
         obj.lifecycle_state = OBJECT_TOMBSTONED
@@ -3112,18 +3575,54 @@ async def commit_object(
             ),
         )
 
+    target_server_ids = list(
+        (
+            await db.execute(
+                select(ReplicaPlacement.server_id)
+                .where(ReplicaPlacement.object_id == object_id)
+                .distinct()
+                .order_by(ReplicaPlacement.server_id)
+            )
+        ).scalars()
+    )
+    fenced_server_ids = await _lock_storage_publication_servers(
+        db,
+        target_server_ids,
+        shared=True,
+    )
+    # Runtime-attestation writers serialize their monotonic attempt publication on Server. Hold
+    # every current target row before asking which latest attempts are successful, then retain the
+    # rows through receipt publication so a newer failed attempt cannot race the commit.
+    servers = list(
+        (
+            await db.execute(
+                select(Server)
+                .where(Server.server_id.in_(target_server_ids or [""]))
+                .order_by(Server.server_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
     placements = list(
         (
             await db.execute(
                 select(ReplicaPlacement)
                 .where(ReplicaPlacement.object_id == object_id)
+                .order_by(ReplicaPlacement.placement_id)
                 .with_for_update()
             )
         )
         .scalars()
         .all()
     )
-    servers = await _storage_servers_by_id(db, [placement.server_id for placement in placements])
+    locked_server_ids = {placement.server_id for placement in placements}
+    if not locked_server_ids.issubset(fenced_server_ids):
+        raise RuntimeError(
+            "Replica target changed while acquiring commit publication fences."
+        )
     server_by_id = {server.server_id: server for server in servers}
     live_ids = await _live_attested_server_ids(
         db, observed_live_storage_ids=observed_live_storage_ids
@@ -3815,35 +4314,54 @@ async def record_inventory_page(
     complete: bool,
 ) -> Dict:
     """Reconcile one bounded finalized-file page without deleting on tracker uncertainty."""
+    # Preserve exactly what the mTLS dependency authenticated before object/publication waits can
+    # refresh this ORM identity in place. The final locked Server must still be this same authority.
+    presented_server_id = caller.server_id
+    presented_storage_incarnation = caller.storage_incarnation
+    presented_cert_pubkey_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_miner_hotkey = caller.miner_hotkey
+    presented_storage_role = bool(caller.storage_role)
     if len(entries) > settings.storage_inventory_page_size_max:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=(f"Inventory page exceeds {settings.storage_inventory_page_size_max} entries."),
         )
     storage_incarnation = _normalize_incarnation(storage_incarnation)
+    await _lock_storage_object_transactions(
+        db,
+        [str(entry["object_id"]) for entry in entries],
+    )
     await _lock_inventory_snapshot_stream(
         db,
-        caller.server_id,
+        presented_server_id,
         storage_incarnation,
+    )
+    await _lock_storage_publication_servers(
+        db,
+        [presented_server_id],
+        shared=True,
     )
     server = (
         await db.execute(
             select(Server)
-            .where(Server.server_id == caller.server_id)
+            .where(Server.server_id == presented_server_id)
             .with_for_update()
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    cert_hash = _server_pubkey_hash(server) if server is not None else None
-    caller_cert_hash = _server_pubkey_hash(caller)
+    cert_hash = (_server_pubkey_hash(server) or "").lower() if server is not None else ""
     if (
-        server is None
+        not presented_storage_role
+        or not presented_storage_incarnation
+        or presented_storage_incarnation != storage_incarnation
+        or not presented_cert_pubkey_hash
+        or server is None
         or not server.storage_role
-        or not server.storage_incarnation
-        or server.storage_incarnation != storage_incarnation
+        or server.miner_hotkey != presented_miner_hotkey
+        or server.storage_incarnation != presented_storage_incarnation
         or not cert_hash
-        or not caller_cert_hash
-        or cert_hash.lower() != caller_cert_hash.lower()
+        or cert_hash != presented_cert_pubkey_hash
+        or not await is_freshly_attested_storage_server(db, server)
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -3868,7 +4386,7 @@ async def record_inventory_page(
             snapshot_id=snapshot_id,
             server_id=server.server_id,
             storage_incarnation=storage_incarnation,
-            cert_pubkey_hash=cert_hash.lower(),
+            cert_pubkey_hash=cert_hash,
             state="scanning",
             eligibility_cutoff_at=now,
         )
@@ -3877,7 +4395,7 @@ async def record_inventory_page(
     elif (
         snapshot.server_id != server.server_id
         or snapshot.storage_incarnation != storage_incarnation
-        or snapshot.cert_pubkey_hash.lower() != cert_hash.lower()
+        or snapshot.cert_pubkey_hash.lower() != cert_hash
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -3907,6 +4425,7 @@ async def record_inventory_page(
                     ReplicaPlacement.object_id == object_id,
                     ReplicaPlacement.server_id == server.server_id,
                 )
+                .order_by(ReplicaPlacement.placement_id)
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -3977,8 +4496,30 @@ async def claim_erase_tasks(
     limit: int,
 ) -> List[Dict]:
     """Lease durable erase work only to the exact current holder incarnation."""
-    cert_hash = _server_pubkey_hash(caller)
-    if not caller.storage_incarnation or not cert_hash:
+    server_id = caller.server_id
+    expected_incarnation = caller.storage_incarnation
+    expected_cert_hash = (_server_pubkey_hash(caller) or "").lower()
+    if not expected_incarnation or not expected_cert_hash:
+        return []
+    await _lock_storage_publication_servers(db, [server_id], shared=True)
+    caller = (
+        await db.execute(
+            select(Server)
+            .where(Server.server_id == server_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    cert_hash = (_server_pubkey_hash(caller) or "").lower() if caller is not None else ""
+    if (
+        caller is None
+        or not caller.storage_role
+        or caller.storage_incarnation != expected_incarnation
+        or cert_hash != expected_cert_hash
+        or not await is_freshly_attested_storage_server(db, caller)
+    ):
+        # Release the publication and row locks before returning a fail-closed empty lease batch.
+        await db.rollback()
         return []
     now = datetime.now(timezone.utc)
     await db.execute(
@@ -4020,7 +4561,7 @@ async def claim_erase_tasks(
         task.state = "claimed"
         task.claimed_at = now
         task.lease_expires_at = lease_expires_at
-        task.claim_cert_pubkey_hash = cert_hash.lower()
+        task.claim_cert_pubkey_hash = cert_hash
         task.attempt_count = int(task.attempt_count or 0) + 1
         result.append(
             {
@@ -4044,6 +4585,42 @@ async def record_erase_task_result(
     file_was_present: Optional[bool],
     error: Optional[str],
 ) -> Dict:
+    # Snapshot the mTLS-presented authority before publication/row-lock waits. Reloading the same
+    # Server with populate_existing must not launder an old caller into a replacement identity.
+    presented_server_id = caller.server_id
+    presented_storage_incarnation = caller.storage_incarnation
+    presented_cert_pubkey_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_miner_hotkey = caller.miner_hotkey
+    presented_storage_role = bool(caller.storage_role)
+    await _lock_storage_publication_servers(
+        db,
+        [presented_server_id],
+        shared=True,
+    )
+    current_server = (
+        await db.execute(
+            select(Server)
+            .where(Server.server_id == presented_server_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    current_cert_pubkey_hash = (
+        (_server_pubkey_hash(current_server) or "").lower()
+        if current_server is not None
+        else ""
+    )
+    current_authority_is_exact = bool(
+        presented_storage_role
+        and presented_storage_incarnation
+        and presented_cert_pubkey_hash
+        and current_server is not None
+        and current_server.storage_role
+        and current_server.miner_hotkey == presented_miner_hotkey
+        and current_server.storage_incarnation == presented_storage_incarnation
+        and current_cert_pubkey_hash == presented_cert_pubkey_hash
+        and await is_freshly_attested_storage_server(db, current_server)
+    )
     task = (
         await db.execute(
             select(StorageEraseTask).where(StorageEraseTask.task_id == task_id).with_for_update()
@@ -4051,18 +4628,21 @@ async def record_erase_task_result(
     ).scalar_one_or_none()
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Erase task not found.")
+    task_holder_is_exact = bool(
+        current_authority_is_exact
+        and task.server_id == presented_server_id
+        and task.storage_incarnation == presented_storage_incarnation
+        and task.claim_cert_pubkey_hash == presented_cert_pubkey_hash
+    )
+    if not task_holder_is_exact:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Erase task is not leased to this current attested storage identity.",
+        )
     if task.state in ERASE_TERMINAL_STATES:
         await db.commit()
         return {"recorded": True, "task_id": task.task_id, "terminal": True}
-    cert_hash = _server_pubkey_hash(caller)
-    if (
-        task.server_id != caller.server_id
-        or not caller.storage_incarnation
-        or task.storage_incarnation != caller.storage_incarnation
-        or not cert_hash
-        or task.claim_cert_pubkey_hash != cert_hash.lower()
-        or task.state != "claimed"
-    ):
+    if task.state != "claimed":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Erase task is not leased to this current attested storage identity.",
@@ -4172,21 +4752,53 @@ async def _reconcile_inventory_omissions(
     for snapshot_id in snapshot_ids:
         if remaining <= 0:
             break
-        snapshot_identity = (
+        page_limit = remaining
+        snapshot_hint = (
             await db.execute(
                 select(
                     StorageInventorySnapshot.server_id,
                     StorageInventorySnapshot.storage_incarnation,
-                ).where(StorageInventorySnapshot.snapshot_id == snapshot_id)
+                    StorageInventorySnapshot.eligibility_cutoff_at,
+                    StorageInventorySnapshot.reconcile_cursor,
+                ).where(
+                    StorageInventorySnapshot.snapshot_id == snapshot_id,
+                    StorageInventorySnapshot.state == "complete",
+                )
             )
         ).first()
-        if snapshot_identity is None:
+        if snapshot_hint is None:
             await db.commit()
             continue
+        placement_hint_query = select(
+            ReplicaPlacement.placement_id,
+            ReplicaPlacement.object_id,
+        ).where(
+            ReplicaPlacement.server_id == snapshot_hint.server_id,
+            ReplicaPlacement.storage_incarnation == snapshot_hint.storage_incarnation,
+            ReplicaPlacement.status == "present",
+            ReplicaPlacement.created_at <= snapshot_hint.eligibility_cutoff_at,
+            ReplicaPlacement.proof_at.is_not(None),
+            ReplicaPlacement.proof_at <= snapshot_hint.eligibility_cutoff_at,
+        )
+        if snapshot_hint.reconcile_cursor:
+            placement_hint_query = placement_hint_query.where(
+                ReplicaPlacement.placement_id > snapshot_hint.reconcile_cursor
+            )
+        placement_hints = list(
+            (
+                await db.execute(
+                    placement_hint_query.order_by(ReplicaPlacement.placement_id).limit(page_limit)
+                )
+            ).all()
+        )
+        await _lock_storage_object_transactions(
+            db,
+            [row.object_id for row in placement_hints],
+        )
         await _lock_inventory_snapshot_stream(
             db,
-            snapshot_identity.server_id,
-            snapshot_identity.storage_incarnation,
+            snapshot_hint.server_id,
+            snapshot_hint.storage_incarnation,
         )
         # The snapshot row is the serialization point. Placement rows are deliberately not read
         # with SKIP LOCKED: skipping one and advancing the keyset cursor would permanently lose it.
@@ -4203,6 +4815,12 @@ async def _reconcile_inventory_omissions(
         if snapshot is None:
             await db.commit()
             continue
+        if (
+            snapshot.eligibility_cutoff_at != snapshot_hint.eligibility_cutoff_at
+            or snapshot.reconcile_cursor != snapshot_hint.reconcile_cursor
+        ):
+            await db.commit()
+            continue
         snapshot_omitted = 0
         query = select(ReplicaPlacement).where(
             ReplicaPlacement.server_id == snapshot.server_id,
@@ -4214,7 +4832,6 @@ async def _reconcile_inventory_omissions(
         )
         if snapshot.reconcile_cursor:
             query = query.where(ReplicaPlacement.placement_id > snapshot.reconcile_cursor)
-        page_limit = remaining
         placements = list(
             (
                 await db.execute(
@@ -4226,6 +4843,10 @@ async def _reconcile_inventory_omissions(
             .scalars()
             .all()
         )
+        if [
+            (placement.placement_id, placement.object_id) for placement in placements
+        ] != [(row.placement_id, row.object_id) for row in placement_hints]:
+            raise RuntimeError("Inventory omission frontier changed before placement locking.")
         for placement in placements:
             snapshot.reconcile_cursor = placement.placement_id
             if placement.last_inventory_snapshot_id == snapshot.snapshot_id or (
@@ -4261,12 +4882,66 @@ async def _finalize_erasure_batch(
     shredded_keys = 0
     remaining = max(1, limit)
     dependent_generation = StorageObject.__table__.alias("dependent_generation")
+    retired_hint_ids = list(
+        (
+            await db.execute(
+                select(StorageObject.object_id)
+                .where(
+                    StorageObject.lifecycle_state.in_((OBJECT_SUPERSEDED, OBJECT_TOMBSTONED)),
+                    StorageObject.erase_enqueued_at.is_not(None),
+                    ~exists(
+                        select(1).where(
+                            StorageEraseTask.object_id == StorageObject.object_id,
+                            StorageEraseTask.state.not_in(ERASE_TERMINAL_STATES),
+                        )
+                    ),
+                    ~exists(
+                        select(1)
+                        .select_from(dependent_generation)
+                        .where(
+                            dependent_generation.c.expected_predecessor_id
+                            == StorageObject.object_id,
+                            dependent_generation.c.lifecycle_state == OBJECT_PENDING,
+                        )
+                    ),
+                )
+                .order_by(
+                    func.coalesce(
+                        StorageObject.tombstoned_at,
+                        StorageObject.superseded_at,
+                        StorageObject.created_at,
+                    ),
+                    StorageObject.object_id,
+                )
+                # One predecessor per transaction keeps the dependent frontier genuinely bounded
+                # while still spending the remaining page budget on its dependents/placements.
+                .limit(1)
+            )
+        ).scalars()
+    )
+    dependent_hint_ids: List[str] = []
+    if retired_hint_ids:
+        dependent_hint_ids = list(
+            (
+                await db.execute(
+                    select(StorageObject.object_id)
+                    .where(StorageObject.expected_predecessor_id.in_(retired_hint_ids))
+                    .order_by(StorageObject.object_id)
+                    .limit(remaining + 1)
+                )
+            ).scalars()
+        )
+    locked_object_frontier = await _lock_storage_object_transactions(
+        db,
+        retired_hint_ids + dependent_hint_ids,
+    )
     retired = list(
         (
             await db.execute(
                 select(StorageObject)
                 .where(
                     StorageObject.lifecycle_state.in_((OBJECT_SUPERSEDED, OBJECT_TOMBSTONED)),
+                    StorageObject.object_id.in_(retired_hint_ids),
                     StorageObject.erase_enqueued_at.is_not(None),
                     ~exists(
                         select(1).where(
@@ -4320,6 +4995,10 @@ async def _finalize_erasure_batch(
             .scalars()
             .all()
         )
+        if not {dependent.object_id for dependent in dependents}.issubset(
+            locked_object_frontier
+        ):
+            raise RuntimeError("Erasure dependency frontier changed before object locking.")
         if any(dependent.lifecycle_state == OBJECT_PENDING for dependent in dependents):
             continue
         for dependent in dependents[:dependent_budget]:
@@ -4423,6 +5102,10 @@ async def _finalize_erasure_batch(
             )
             remaining -= len(orphan_task_ids)
 
+    # Object-level serialization must not cross into the Volume lock graph. Volume deletion owns
+    # the parent row before it joins object frontiers, so release this transaction before shredding.
+    await db.commit()
+
     deleted_volumes = list(
         (
             await db.execute(
@@ -4431,7 +5114,8 @@ async def _finalize_erasure_batch(
                     StorageVolume.deleted.is_(True),
                     StorageVolume.purged_at.is_(None),
                 )
-                .order_by(StorageVolume.delete_requested_at, StorageVolume.volume_id)
+                # User erasure locks every Volume in this same canonical order.
+                .order_by(StorageVolume.volume_id)
                 .limit(limit)
                 .with_for_update(skip_locked=True)
             )
@@ -4502,26 +5186,39 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
 
     # Deleted volumes and abandoned uploads are retired in keyset-sized batches. Holder rows remain
     # until their durable erase tasks reach a terminal state.
-    deleted_volumes = list(
+    deleted_volume_ids = list(
         (
             await db.execute(
-                select(StorageVolume)
+                select(StorageVolume.volume_id)
                 .where(
                     StorageVolume.deleted.is_(True),
                     StorageVolume.purged_at.is_(None),
                 )
                 .order_by(StorageVolume.delete_requested_at, StorageVolume.volume_id)
                 .limit(max_objects)
-                .with_for_update(skip_locked=True)
             )
         )
         .scalars()
         .all()
     )
     remaining_generation_budget = max_objects
-    for deleted_volume in deleted_volumes:
+    for deleted_volume_id in deleted_volume_ids:
         if remaining_generation_budget <= 0:
             break
+        deleted_volume = (
+            await db.execute(
+                select(StorageVolume)
+                .where(
+                    StorageVolume.volume_id == deleted_volume_id,
+                    StorageVolume.deleted.is_(True),
+                    StorageVolume.purged_at.is_(None),
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if deleted_volume is None:
+            await db.commit()
+            continue
         retired_count, requeued_count = await _retire_deleted_volume_batch(
             db,
             deleted_volume,
@@ -4530,27 +5227,55 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
         summary["retired_volume_generations"] += retired_count
         summary["volume_key_cache_tasks_requeued"] += requeued_count
         remaining_generation_budget -= retired_count + requeued_count
+        # Object advisory locks are transaction-scoped. Release each volume's globally sorted page
+        # before discovering another page, rather than accumulating z->a across helper calls.
+        await db.commit()
 
-    delete_fences = list(
+    delete_fence_hints = list(
         (
             await db.execute(
-                select(StorageObjectDeleteFence)
+                select(
+                    StorageObjectDeleteFence.fence_id,
+                    StorageObjectDeleteFence.volume_id,
+                )
                 .where(StorageObjectDeleteFence.completed_at.is_(None))
                 .order_by(
                     StorageObjectDeleteFence.cutoff_at,
                     StorageObjectDeleteFence.fence_id,
                 )
                 .limit(max_objects)
-                .with_for_update(skip_locked=True)
             )
-        )
-        .scalars()
-        .all()
+        ).all()
     )
     remaining_delete_budget = max_objects
-    for fence in delete_fences:
+    for fence_hint in delete_fence_hints:
         if remaining_delete_budget <= 0:
             break
+        # Preserve the global Volume -> delete-fence -> object order, but keep one independently
+        # bounded object advisory page per transaction.
+        locked_volume_id = (
+            await db.execute(
+                select(StorageVolume.volume_id)
+                .where(StorageVolume.volume_id == fence_hint.volume_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if locked_volume_id is None:
+            await db.commit()
+            continue
+        fence = (
+            await db.execute(
+                select(StorageObjectDeleteFence)
+                .where(
+                    StorageObjectDeleteFence.fence_id == fence_hint.fence_id,
+                    StorageObjectDeleteFence.completed_at.is_(None),
+                )
+                .with_for_update(skip_locked=True)
+            )
+        ).scalar_one_or_none()
+        if fence is None:
+            await db.commit()
+            continue
         generations, completed = await _retire_object_delete_fence_batch(
             db,
             fence,
@@ -4560,6 +5285,7 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
         if completed:
             summary["object_delete_fences_completed"] += 1
         remaining_delete_budget -= len(generations)
+        await db.commit()
 
     reservation_expiry_now = datetime.now(timezone.utc)
     active_reservation_placement = exists(
@@ -4569,11 +5295,63 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
             ReplicaPlacement.pending_deadline > reservation_expiry_now,
         )
     ).correlate(StorageObject)
+    abandon_cutoff = datetime.now(timezone.utc) - timedelta(seconds=_ABANDONED_OBJECT_TTL_SECONDS)
+    expired_reservation_hint_ids = list(
+        (
+            await db.execute(
+                select(StorageObject.object_id)
+                .where(
+                    StorageObject.lifecycle_state == OBJECT_PENDING,
+                    ~active_reservation_placement,
+                )
+                .order_by(StorageObject.created_at, StorageObject.object_id)
+                .limit(max_objects)
+            )
+        ).scalars()
+    )
+    abandoned_hint_ids = list(
+        (
+            await db.execute(
+                select(StorageObject.object_id)
+                .where(
+                    StorageObject.lifecycle_state == OBJECT_PENDING,
+                    StorageObject.created_at < abandon_cutoff,
+                )
+                .order_by(StorageObject.created_at, StorageObject.object_id)
+                .limit(max_objects)
+            )
+        ).scalars()
+    )
+    retired_hint_ids = list(
+        (
+            await db.execute(
+                select(StorageObject.object_id)
+                .where(
+                    StorageObject.lifecycle_state.in_((OBJECT_SUPERSEDED, OBJECT_TOMBSTONED)),
+                    StorageObject.erase_enqueued_at.is_(None),
+                )
+                .order_by(
+                    func.coalesce(
+                        StorageObject.tombstoned_at,
+                        StorageObject.superseded_at,
+                        StorageObject.created_at,
+                    ),
+                    StorageObject.object_id,
+                )
+                .limit(max_objects)
+            )
+        ).scalars()
+    )
+    await _lock_storage_object_transactions(
+        db,
+        expired_reservation_hint_ids + abandoned_hint_ids + retired_hint_ids,
+    )
     expired_reservations = list(
         (
             await db.execute(
                 select(StorageObject)
                 .where(
+                    StorageObject.object_id.in_(expired_reservation_hint_ids),
                     StorageObject.lifecycle_state == OBJECT_PENDING,
                     ~active_reservation_placement,
                 )
@@ -4598,12 +5376,12 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
             now=reservation_expiry_now,
         )
 
-    abandon_cutoff = datetime.now(timezone.utc) - timedelta(seconds=_ABANDONED_OBJECT_TTL_SECONDS)
     abandoned = list(
         (
             await db.execute(
                 select(StorageObject)
                 .where(
+                    StorageObject.object_id.in_(abandoned_hint_ids),
                     StorageObject.lifecycle_state == OBJECT_PENDING,
                     StorageObject.created_at < abandon_cutoff,
                 )
@@ -4635,6 +5413,7 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
             await db.execute(
                 select(StorageObject)
                 .where(
+                    StorageObject.object_id.in_(retired_hint_ids),
                     StorageObject.lifecycle_state.in_((OBJECT_SUPERSEDED, OBJECT_TOMBSTONED)),
                     StorageObject.erase_enqueued_at.is_(None),
                 )
@@ -4840,6 +5619,26 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
         processed = False
         try:
             async with db.begin_nested():
+                # Redis is an external liveness hint: observe it before trust-bearing row locks.
+                # Existing holder IDs are unlocked hints used only to establish Server-before-
+                # Object/Placement order. A placement added outside the hinted frontier makes this
+                # item fail closed and retry on the next pass instead of acquiring Server late.
+                observed_live_storage_ids = await observe_storage_liveness(db)
+                await _lock_storage_object_transactions(db, [object_id])
+                placement_server_hints = list(
+                    (
+                        await db.execute(
+                            select(ReplicaPlacement.server_id)
+                            .where(ReplicaPlacement.object_id == object_id)
+                            .distinct()
+                            .order_by(ReplicaPlacement.server_id)
+                        )
+                    ).scalars()
+                )
+                locked_frontier_servers = await _locked_storage_publication_server_rows(
+                    db,
+                    list(set(placement_server_hints) | observed_live_storage_ids),
+                )
                 row = (
                     await db.execute(
                         select(StorageObject, StorageVolume)
@@ -4856,7 +5655,7 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
                     )
                 ).first()
                 if row is None:
-                    continue
+                    raise _StorageReconcileItemSkipped()
                 processed = True
                 obj, volume = row
                 placements = list(
@@ -4864,19 +5663,26 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
                         await db.execute(
                             select(ReplicaPlacement)
                             .where(ReplicaPlacement.object_id == object_id)
+                            .order_by(ReplicaPlacement.placement_id)
                             .with_for_update()
                         )
                     )
                     .scalars()
                     .all()
                 )
+                actual_holder_ids = {placement.server_id for placement in placements}
+                if not actual_holder_ids.issubset(locked_frontier_servers):
+                    raise RuntimeError(
+                        "Replica holder frontier changed before reconciliation locks."
+                    )
                 servers = list(
                     (await db.execute(select(Server).where(Server.storage_role.is_(True))))
                     .scalars()
                     .all()
                 )
                 server_by_id = {server.server_id: server for server in servers}
-                live_ids = await _live_attested_server_ids(db)
+                live_ids = await _verified_storage_ids(db, list(server_by_id))
+                live_ids &= observed_live_storage_ids
                 now = datetime.now(timezone.utc)
 
                 for placement in placements:
@@ -4992,7 +5798,12 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
                         int(obj.projected_size_bytes or 0),
                         int(obj.size_bytes or 0),
                     )
-                    candidates = await _capacity_ranked_peers(db, servers, projected_size)
+                    candidates = await _capacity_ranked_peers(
+                        db,
+                        servers,
+                        projected_size,
+                        observed_live_storage_ids=observed_live_storage_ids,
+                    )
                     for peer in candidates:
                         if needed <= 0:
                             break
@@ -5005,21 +5816,16 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
                             or (prior is not None and prior.attempt_count >= MAX_PLACEMENT_ATTEMPTS)
                         ):
                             continue
-                        # Re-read and lock the target identity used by the upsert. If it changes
-                        # concurrently, this object's savepoint fails without affecting any other.
-                        candidate = (
-                            await db.execute(
-                                select(Server)
-                                .where(Server.server_id == candidate.server_id)
-                                .with_for_update()
-                            )
-                        ).scalar_one()
                         if (
                             candidate.server_id not in live_ids
                             or not candidate.storage_incarnation
                             or not _server_pubkey_hash(candidate)
                         ):
                             continue
+                        if candidate.server_id not in locked_frontier_servers:
+                            raise RuntimeError(
+                                "Replica candidate frontier changed before reconciliation locks."
+                            )
                         await _upsert_pending_placement(db, obj, candidate)
                         assigned_servers.add(candidate.server_id)
                         used_hosts.add(host)
@@ -5042,6 +5848,11 @@ async def reconcile_storage(db: AsyncSession, max_objects: int = 500) -> Dict[st
                 summary["unfulfillable_pending"] += local_unfulfillable
                 summary["under_replicated"] += local_under_replicated
                 summary["irrecoverable"] += local_irrecoverable
+        except _StorageReconcileItemSkipped:
+            # The savepoint has unwound, but transaction-scoped advisory and Server locks belong to
+            # the outer transaction. Always release them before the next Redis observation/item.
+            await db.commit()
+            continue
         except Exception as exc:  # noqa: BLE001 - one object cannot poison the fleet pass
             # begin_nested() already rolled back only this object's savepoint. Commit the otherwise
             # clean outer transaction to release locks without undoing or expiring prior objects.
@@ -5233,21 +6044,11 @@ async def _lock_replication_transfer(
 async def _locked_replication_servers(
     db: AsyncSession, source_server_id: str, target_server_id: str
 ) -> Dict[str, Server]:
-    """Lock both identity rows in stable order so opposite transfers cannot deadlock."""
-    rows = list(
-        (
-            await db.execute(
-                select(Server)
-                .where(Server.server_id.in_([source_server_id, target_server_id]))
-                .order_by(Server.server_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .all()
+    """Fence and lock both identities in stable order so transfers cannot race replacement."""
+    return await _locked_storage_publication_server_rows(
+        db,
+        [source_server_id, target_server_id],
     )
-    return {server.server_id: server for server in rows}
 
 
 def _require_capability_target_identity(
@@ -5295,6 +6096,7 @@ async def _record_replication_capability_failure(
     capability: StorageReplicationCapability,
     error: str,
     *,
+    target: Optional[Server],
     now: Optional[datetime] = None,
 ) -> None:
     """Persist one terminal capability error without overwriting a newer placement attempt."""
@@ -5314,8 +6116,24 @@ async def _record_replication_capability_failure(
         and placement.server_id == capability.target_server_id
         and int(placement.attempt_count or 0) == capability.target_placement_attempt
     ):
-        placement.last_error = bounded_error
-        if int(placement.attempt_count or 0) >= MAX_PLACEMENT_ATTEMPTS:
+        target_identity_is_current = bool(
+            target is not None
+            and target.server_id == capability.target_server_id
+            and _placement_identity_matches(placement, target)
+        )
+        if not target_identity_is_current:
+            # A certificate/incarnation transition can invalidate the pending target before the
+            # source reports failure. Do not mutate that stale row while leaving it active: the
+            # deferred identity guard correctly rejects such a commit. Evict it under the target's
+            # publication fence so reconcile can issue a fresh current-identity attempt.
+            placement.status = "evicted"
+            placement.last_error = "stale_storage_identity"
+        else:
+            placement.last_error = bounded_error
+        if (
+            target_identity_is_current
+            and int(placement.attempt_count or 0) >= MAX_PLACEMENT_ATTEMPTS
+        ):
             placement.status = "evicted"
 
 
@@ -5324,13 +6142,13 @@ async def _completed_capability_receipt_is_current(
     capability: StorageReplicationCapability,
 ) -> bool:
     """Whether exact bytes from a completed token still have an authoritative placement receipt."""
-    obj = await db.get(StorageObject, capability.object_id, with_for_update=True)
-    placement = await db.get(ReplicaPlacement, capability.target_placement_id, with_for_update=True)
     target = (
         await _locked_replication_servers(
             db, capability.target_server_id, capability.target_server_id
         )
     ).get(capability.target_server_id)
+    obj = await db.get(StorageObject, capability.object_id, with_for_update=True)
+    placement = await db.get(ReplicaPlacement, capability.target_placement_id, with_for_update=True)
     if obj is None or placement is None or target is None:
         return False
     expected_status = "pending" if obj.lifecycle_state == OBJECT_PENDING else "present"
@@ -5367,19 +6185,37 @@ async def issue_replication_capability(
     target_server_id: str,
     ciphertext_sha256: str,
     ciphertext_size_bytes: int,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> Dict:
     """Lease one exact transfer after proving the source's current local receipt."""
     ciphertext_sha256 = (ciphertext_sha256 or "").strip().lower()
-    if caller.server_id == target_server_id:
+    # Snapshot the mTLS-authenticated identity before any advisory/row-lock wait. The Server query
+    # below uses populate_existing and may refresh this same ORM object in place; comparisons made
+    # only afterwards would compare the replacement identity to itself and authorize an old caller.
+    presented_source_id = caller.server_id
+    presented_source_incarnation = caller.storage_incarnation
+    presented_source_cert_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_source_miner_hotkey = caller.miner_hotkey
+    presented_source_storage_role = bool(caller.storage_role)
+    if observed_live_storage_ids is None:
+        observed_live_storage_ids = await observe_storage_liveness(db)
+        await db.commit()
+    if presented_source_id == target_server_id:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Replication source and target must be different storage servers.",
         )
 
+    await _lock_storage_object_transactions(db, [object_id])
     await _lock_replication_transfer(db, object_id, target_server_id)
     now = datetime.now(timezone.utc)
-    locked_servers = await _locked_replication_servers(db, caller.server_id, target_server_id)
-    source = locked_servers.get(caller.server_id)
+    locked_servers = await _locked_replication_servers(
+        db,
+        presented_source_id,
+        target_server_id,
+    )
+    source = locked_servers.get(presented_source_id)
     target = locked_servers.get(target_server_id)
     obj = (
         await db.execute(
@@ -5401,12 +6237,17 @@ async def issue_replication_capability(
             detail="Replication source, target, and object generation are not active.",
         )
     if (
-        not _server_pubkey_hash(source)
+        not presented_source_storage_role
+        or not presented_source_incarnation
+        or not presented_source_cert_hash
+        or not _server_pubkey_hash(source)
         or not source.storage_incarnation
         or not source.attested_cert
-        or source.server_id != caller.server_id
-        or _server_pubkey_hash(source).lower() != (_server_pubkey_hash(caller) or "").lower()
-        or source.storage_incarnation != caller.storage_incarnation
+        or source.server_id != presented_source_id
+        or source.miner_hotkey != presented_source_miner_hotkey
+        or _server_pubkey_hash(source).lower() != presented_source_cert_hash
+        or source.storage_incarnation != presented_source_incarnation
+        or not await is_freshly_attested_storage_server(db, source)
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -5421,6 +6262,7 @@ async def issue_replication_capability(
                     ReplicaPlacement.object_id == object_id,
                     ReplicaPlacement.server_id.in_([source.server_id, target.server_id]),
                 )
+                .order_by(ReplicaPlacement.placement_id)
                 .with_for_update()
             )
         )
@@ -5492,7 +6334,10 @@ async def issue_replication_capability(
             detail="Target placement carries conflicting or stale possession evidence.",
         )
 
-    live_ids = await _live_attested_server_ids(db)
+    live_ids = await _live_attested_server_ids(
+        db,
+        observed_live_storage_ids=observed_live_storage_ids,
+    )
     if source.server_id not in live_ids or target.server_id not in live_ids:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -5587,20 +6432,39 @@ async def consume_replication_capability(
     caller: Server,
     capability_token: str,
     source_signature: str,
+    *,
+    observed_live_storage_ids: Optional[Set[str]] = None,
 ) -> Dict:
     """Atomically consume a capability as its exact current target before any body is read."""
+    presented_target_id = caller.server_id
+    presented_target_incarnation = caller.storage_incarnation
+    presented_target_cert_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_target_miner_hotkey = caller.miner_hotkey
+    presented_target_storage_role = bool(caller.storage_role)
+    if observed_live_storage_ids is None:
+        observed_live_storage_ids = await observe_storage_liveness(db)
+        await db.commit()
     discovered = await _replication_capability_without_lock(db, capability_token)
     if discovered is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Replication capability is invalid.",
         )
+    await _lock_storage_object_transactions(db, [discovered.object_id])
     await _lock_replication_transfer(db, discovered.object_id, discovered.target_server_id)
     capability = await _locked_replication_capability(db, capability_token)
     if capability is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Replication capability is invalid.",
+        )
+    if (
+        capability.object_id != discovered.object_id
+        or capability.target_server_id != discovered.target_server_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Replication capability binding changed during authorization.",
         )
     _require_capability_target_identity(capability, caller)
     now = datetime.now(timezone.utc)
@@ -5614,19 +6478,42 @@ async def consume_replication_capability(
             status_code=status.HTTP_409_CONFLICT,
             detail="Replication capability has already been consumed.",
         )
-    if capability.expires_at <= now or capability.transfer_deadline <= now:
-        await _record_replication_capability_failure(db, capability, "capability_expired", now=now)
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="Replication capability expired before consumption.",
-        )
-
     locked_servers = await _locked_replication_servers(
         db, capability.source_server_id, capability.target_server_id
     )
     source = locked_servers.get(capability.source_server_id)
     target = locked_servers.get(capability.target_server_id)
+    if (
+        not presented_target_storage_role
+        or not presented_target_incarnation
+        or not presented_target_cert_hash
+        or target is None
+        or target.server_id != presented_target_id
+        or not target.storage_role
+        or target.miner_hotkey != presented_target_miner_hotkey
+        or target.storage_incarnation != presented_target_incarnation
+        or (_server_pubkey_hash(target) or "").lower() != presented_target_cert_hash
+        or target.storage_incarnation != capability.target_storage_incarnation
+        or (_server_pubkey_hash(target) or "").lower()
+        != capability.target_cert_pubkey_hash.lower()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Replication target identity changed during capability authorization.",
+        )
+    if capability.expires_at <= now or capability.transfer_deadline <= now:
+        await _record_replication_capability_failure(
+            db,
+            capability,
+            "capability_expired",
+            target=target,
+            now=now,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Replication capability expired before consumption.",
+        )
     obj = await db.get(StorageObject, capability.object_id, with_for_update=True)
     source_placement = await db.get(
         ReplicaPlacement, capability.source_placement_id, with_for_update=True
@@ -5671,7 +6558,11 @@ async def consume_replication_capability(
         or target_placement.pending_deadline <= now
     ):
         await _record_replication_capability_failure(
-            db, capability, "capability_binding_stale", now=now
+            db,
+            capability,
+            "capability_binding_stale",
+            target=target,
+            now=now,
         )
         await db.commit()
         raise HTTPException(
@@ -5684,7 +6575,11 @@ async def consume_replication_capability(
         or int(obj.ciphertext_size_bytes) != int(capability.expected_ciphertext_size_bytes)
     ):
         await _record_replication_capability_failure(
-            db, capability, "committed_metadata_changed", now=now
+            db,
+            capability,
+            "committed_metadata_changed",
+            target=target,
+            now=now,
         )
         await db.commit()
         raise HTTPException(
@@ -5696,6 +6591,7 @@ async def consume_replication_capability(
             db,
             capability,
             "source_attested_key_signature_invalid",
+            target=target,
             now=now,
         )
         await db.commit()
@@ -5704,10 +6600,17 @@ async def consume_replication_capability(
             detail="Replication source did not prove its bound attested certificate key.",
         )
 
-    live_ids = await _live_attested_server_ids(db)
+    live_ids = await _live_attested_server_ids(
+        db,
+        observed_live_storage_ids=observed_live_storage_ids,
+    )
     if source.server_id not in live_ids or target.server_id not in live_ids:
         await _record_replication_capability_failure(
-            db, capability, "source_or_target_not_live", now=now
+            db,
+            capability,
+            "source_or_target_not_live",
+            target=target,
+            now=now,
         )
         await db.commit()
         raise HTTPException(
@@ -5728,12 +6631,18 @@ async def complete_replication_capability(
     ciphertext_size_bytes: int,
 ) -> Dict:
     """Accept exact target possession only for a consumed capability and current lease."""
+    presented_target_id = caller.server_id
+    presented_target_incarnation = caller.storage_incarnation
+    presented_target_cert_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_target_miner_hotkey = caller.miner_hotkey
+    presented_target_storage_role = bool(caller.storage_role)
     discovered = await _replication_capability_without_lock(db, capability_token)
     if discovered is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Replication capability is invalid.",
         )
+    await _lock_storage_object_transactions(db, [discovered.object_id])
     await _lock_replication_transfer(db, discovered.object_id, discovered.target_server_id)
     capability = await _locked_replication_capability(db, capability_token)
     if capability is None:
@@ -5741,7 +6650,39 @@ async def complete_replication_capability(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Replication capability is invalid.",
         )
+    if (
+        capability.object_id != discovered.object_id
+        or capability.target_server_id != discovered.target_server_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Replication capability binding changed during authorization.",
+        )
     _require_capability_target_identity(capability, caller)
+    locked_servers = await _locked_replication_servers(
+        db, capability.source_server_id, capability.target_server_id
+    )
+    source = locked_servers.get(capability.source_server_id)
+    target = locked_servers.get(capability.target_server_id)
+    if (
+        not presented_target_storage_role
+        or not presented_target_incarnation
+        or not presented_target_cert_hash
+        or target is None
+        or target.server_id != presented_target_id
+        or not target.storage_role
+        or target.miner_hotkey != presented_target_miner_hotkey
+        or target.storage_incarnation != presented_target_incarnation
+        or (_server_pubkey_hash(target) or "").lower() != presented_target_cert_hash
+        or target.storage_incarnation != capability.target_storage_incarnation
+        or (_server_pubkey_hash(target) or "").lower()
+        != capability.target_cert_pubkey_hash.lower()
+        or not await is_freshly_attested_storage_server(db, target)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Replication target identity or latest attestation is no longer current.",
+        )
     if (
         capability.completed_at is not None
         and capability.expected_ciphertext_sha256 == ciphertext_sha256
@@ -5773,11 +6714,6 @@ async def complete_replication_capability(
             detail="Replication capability was not consumed or is already failed.",
         )
 
-    locked_servers = await _locked_replication_servers(
-        db, capability.source_server_id, capability.target_server_id
-    )
-    source = locked_servers.get(capability.source_server_id)
-    target = locked_servers.get(capability.target_server_id)
     obj = await db.get(StorageObject, capability.object_id, with_for_update=True)
     placement = await db.get(ReplicaPlacement, capability.target_placement_id, with_for_update=True)
     # Sample both clocks only after every authority row is locked. Capability and placement
@@ -5797,6 +6733,9 @@ async def complete_replication_capability(
     if (
         source is None
         or target is None
+        or not source.storage_role
+        or not target.storage_role
+        or not await is_freshly_attested_storage_server(db, source)
         or placement is None
         or obj is None
         or obj.volume_id != capability.volume_id
@@ -5851,12 +6790,20 @@ async def fail_replication_capability(
     error: str,
 ) -> Dict:
     """Record one bound source/target transfer failure and preserve bounded retry accounting."""
+    # Preserve exactly what the mTLS dependency authenticated. populate_existing in the locked
+    # Server read may otherwise refresh this same object to a replacement identity while waiting.
+    presented_server_id = caller.server_id
+    presented_storage_incarnation = caller.storage_incarnation
+    presented_cert_pubkey_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_miner_hotkey = caller.miner_hotkey
+    presented_storage_role = bool(caller.storage_role)
     discovered = await _replication_capability_without_lock(db, capability_token)
     if discovered is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Replication capability is invalid.",
         )
+    await _lock_storage_object_transactions(db, [discovered.object_id])
     await _lock_replication_transfer(db, discovered.object_id, discovered.target_server_id)
     capability = await _locked_replication_capability(db, capability_token)
     if capability is None:
@@ -5864,11 +6811,36 @@ async def fail_replication_capability(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Replication capability is invalid.",
         )
-    current_caller = (
-        await _locked_replication_servers(db, caller.server_id, caller.server_id)
-    ).get(caller.server_id)
-    if current_caller is None or not _capability_failure_caller_is_bound(
-        capability, current_caller
+    if (
+        capability.object_id != discovered.object_id
+        or capability.target_server_id != discovered.target_server_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Replication capability binding changed during authorization.",
+        )
+    locked_servers = await _locked_replication_servers(
+        db,
+        capability.source_server_id,
+        capability.target_server_id,
+    )
+    current_caller = locked_servers.get(presented_server_id)
+    current_caller_cert_hash = (
+        (_server_pubkey_hash(current_caller) or "").lower()
+        if current_caller is not None
+        else ""
+    )
+    if (
+        not presented_storage_role
+        or not presented_storage_incarnation
+        or not presented_cert_pubkey_hash
+        or current_caller is None
+        or not current_caller.storage_role
+        or current_caller.miner_hotkey != presented_miner_hotkey
+        or current_caller.storage_incarnation != presented_storage_incarnation
+        or current_caller_cert_hash != presented_cert_pubkey_hash
+        or not await is_freshly_attested_storage_server(db, current_caller)
+        or not _capability_failure_caller_is_bound(capability, current_caller)
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -5883,7 +6855,12 @@ async def fail_replication_capability(
             detail="Completed replication capability cannot be failed.",
         )
     bounded_error = (error or "replication_failed")[:256]
-    await _record_replication_capability_failure(db, capability, bounded_error)
+    await _record_replication_capability_failure(
+        db,
+        capability,
+        bounded_error,
+        target=locked_servers.get(capability.target_server_id),
+    )
     effective_error = capability.last_error or bounded_error
     placement = await db.get(ReplicaPlacement, capability.target_placement_id, with_for_update=True)
     if (
@@ -5949,12 +6926,37 @@ async def replica_authorization(
     caller: Server,
 ) -> Dict:
     """Authorize an incoming write only for this exact attested target/disk assignment."""
+    presented_server_id = caller.server_id
+    presented_storage_incarnation = caller.storage_incarnation
+    presented_cert_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_miner_hotkey = caller.miner_hotkey
+    presented_storage_role = bool(caller.storage_role)
+    await _lock_storage_object_transactions(db, [object_id])
+    current_server = (
+        await _locked_storage_publication_server_rows(db, [presented_server_id])
+    ).get(presented_server_id)
+    if (
+        not settings.require_mtls_client_verify
+        or not presented_storage_role
+        or not presented_storage_incarnation
+        or not presented_cert_hash
+        or current_server is None
+        or not current_server.storage_role
+        or current_server.miner_hotkey != presented_miner_hotkey
+        or current_server.storage_incarnation != presented_storage_incarnation
+        or (_server_pubkey_hash(current_server) or "").lower() != presented_cert_hash
+        or not await is_freshly_attested_storage_server(db, current_server)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Replica authorization caller identity is no longer current.",
+        )
     obj = (
         await db.execute(
             select(StorageObject).where(
                 StorageObject.object_id == object_id,
                 StorageObject.lifecycle_state.in_((OBJECT_PENDING, OBJECT_COMMITTED)),
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     if obj is None:
@@ -5963,15 +6965,15 @@ async def replica_authorization(
         await db.execute(
             select(ReplicaPlacement).where(
                 ReplicaPlacement.object_id == object_id,
-                ReplicaPlacement.server_id == caller.server_id,
+                ReplicaPlacement.server_id == current_server.server_id,
                 ReplicaPlacement.status == "pending",
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     now = datetime.now(timezone.utc)
     if (
         placement is None
-        or not _placement_identity_matches(placement, caller)
+        or not _placement_identity_matches(placement, current_server)
         or (
             placement.status == "pending"
             and (placement.pending_deadline is None or placement.pending_deadline <= now)
@@ -6088,6 +7090,13 @@ async def _retire_object_delete_fence_batch(
     """Retire one key's pre-cutoff generations in a bounded, serialized keyset page."""
     if fence.completed_at is not None or limit <= 0:
         return [], fence.completed_at is not None
+    locked_volume = (
+        await db.execute(
+            select(StorageVolume)
+            .where(StorageVolume.volume_id == fence.volume_id)
+            .with_for_update()
+        )
+    ).scalar_one()
     query = select(StorageObject).where(
         StorageObject.volume_id == fence.volume_id,
         StorageObject.object_key == fence.object_key,
@@ -6095,11 +7104,30 @@ async def _retire_object_delete_fence_batch(
     )
     if fence.scan_cursor is not None:
         query = query.where(StorageObject.object_id > fence.scan_cursor)
+    generation_hint_ids = list(
+        (
+            await db.execute(
+                query.with_only_columns(StorageObject.object_id)
+                .order_by(StorageObject.object_id)
+                .limit(limit)
+            )
+        ).scalars()
+    )
+    await _lock_storage_object_transactions(db, generation_hint_ids)
     generations = list(
-        (await db.execute(query.order_by(StorageObject.object_id).limit(limit).with_for_update()))
+        (
+            await db.execute(
+                query.where(StorageObject.object_id.in_(generation_hint_ids))
+                .order_by(StorageObject.object_id)
+                .limit(limit)
+                .with_for_update()
+            )
+        )
         .scalars()
         .all()
     )
+    if [generation.object_id for generation in generations] != generation_hint_ids:
+        raise RuntimeError("Object deletion frontier changed before object locking.")
     now = datetime.now(timezone.utc)
     retired_generations: List[StorageObject] = []
     for generation in generations:
@@ -6109,14 +7137,7 @@ async def _retire_object_delete_fence_batch(
             generation.tombstoned_at = now
             retired_generations.append(generation)
     if retired_generations and advance_revocation_epoch:
-        volume = (
-            await db.execute(
-                select(StorageVolume)
-                .where(StorageVolume.volume_id == fence.volume_id)
-                .with_for_update()
-            )
-        ).scalar_one()
-        volume.grant_revocation_epoch = int(volume.grant_revocation_epoch) + 1
+        locked_volume.grant_revocation_epoch = int(locked_volume.grant_revocation_epoch) + 1
     if retired_generations:
         await db.flush()
         await _enqueue_erase_tasks_for_generations(
@@ -6147,7 +7168,12 @@ async def delete_object(
     ).scalar_one_or_none()
     if locked_volume is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume not found.")
-    now = datetime.now(timezone.utc)
+    # Object creation is ordered by PostgreSQL's server-side timestamp. Sample the same wall clock
+    # after the volume lock so clock skew between the API host and database cannot leave an object
+    # that already existed at the owner-delete boundary outside this durable fence.
+    now = await db.scalar(select(func.clock_timestamp()))
+    if now is None:
+        raise RuntimeError("Database did not return an object deletion timestamp.")
     fence = (
         await db.execute(
             select(StorageObjectDeleteFence)
@@ -6171,6 +7197,34 @@ async def delete_object(
         fence.scan_cursor = None
         fence.completed_at = None
 
+    current_hint = (
+        await db.execute(
+            select(StorageObject.object_id).where(
+                StorageObject.volume_id == locked_volume.volume_id,
+                StorageObject.object_key == key,
+                StorageObject.lifecycle_state == OBJECT_COMMITTED,
+                StorageObject.created_at <= fence.cutoff_at,
+            )
+        )
+    ).scalar_one_or_none()
+    page_hint_ids = list(
+        (
+            await db.execute(
+                select(StorageObject.object_id)
+                .where(
+                    StorageObject.volume_id == locked_volume.volume_id,
+                    StorageObject.object_key == key,
+                    StorageObject.created_at <= fence.cutoff_at,
+                )
+                .order_by(StorageObject.object_id)
+                .limit(settings.storage_reconcile_batch_size)
+            )
+        ).scalars()
+    )
+    await _lock_storage_object_transactions(
+        db,
+        [current_hint] + page_hint_ids,
+    )
     current = (
         await db.execute(
             select(StorageObject)
@@ -6183,6 +7237,8 @@ async def delete_object(
             .with_for_update()
         )
     ).scalar_one_or_none()
+    if (current.object_id if current is not None else None) != current_hint:
+        raise RuntimeError("Current deletion target changed before object serialization.")
     immediate = []
     if current is not None:
         current.lifecycle_state = OBJECT_TOMBSTONED
@@ -6237,22 +7293,29 @@ async def legacy_adoption_metadata(
     object_id: str,
 ) -> Dict:
     """Return tracker salt/hash only for this current TD's quarantined legacy assignment."""
+    presented_server_id = caller.server_id
+    presented_storage_incarnation = caller.storage_incarnation
+    presented_cert_hash = (_server_pubkey_hash(caller) or "").lower()
+    presented_miner_hotkey = caller.miner_hotkey
+    presented_storage_role = bool(caller.storage_role)
+    await _lock_storage_object_transactions(db, [object_id])
     server = (
-        await db.execute(
-            select(Server)
-            .where(Server.server_id == caller.server_id)
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
-    caller_hash = _server_pubkey_hash(caller)
+        await _locked_storage_publication_server_rows(db, [presented_server_id])
+    ).get(presented_server_id)
     server_hash = _server_pubkey_hash(server) if server is not None else None
     if (
-        server is None
+        not settings.require_mtls_client_verify
+        or not presented_storage_role
+        or not presented_storage_incarnation
+        or not presented_cert_hash
+        or server is None
         or not server.storage_role
+        or server.miner_hotkey != presented_miner_hotkey
         or not server.storage_incarnation
-        or not caller_hash
+        or server.storage_incarnation != presented_storage_incarnation
         or not server_hash
-        or caller_hash.lower() != server_hash.lower()
+        or presented_cert_hash != server_hash.lower()
+        or not await is_freshly_attested_storage_server(db, server)
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -6362,6 +7425,14 @@ async def _require_legacy_adoption_server(
     """Return the current adoption identity, optionally holding its publication fence."""
     query = select(Server).where(Server.server_id == presented_server_id)
     if lock:
+        # Legacy adoption publishes an evicted placement back through pending/present. Join the
+        # shared publication fence before the Server row so identity replacement cannot invert
+        # Server -> fence against the canonical fence -> Server order.
+        await _lock_storage_publication_servers(
+            db,
+            [presented_server_id],
+            shared=True,
+        )
         query = query.with_for_update()
     server = (
         await db.execute(query.execution_options(populate_existing=True))
@@ -6431,6 +7502,29 @@ async def adopt_legacy_replicas(
     )
     for user_id in sorted(locked_user_ids):
         await _lock_storage_user(db, user_id)
+    submitted_volume_ids = sorted(
+        set(
+            (
+                await db.execute(
+                    select(StorageObject.volume_id)
+                    .where(StorageObject.object_id.in_(submitted_object_ids))
+                    .distinct()
+                    .order_by(StorageObject.volume_id)
+                )
+            ).scalars()
+        )
+    )
+    locked_volume_ids = set(
+        (
+            await db.execute(
+                select(StorageVolume.volume_id)
+                .where(StorageVolume.volume_id.in_(submitted_volume_ids))
+                .order_by(StorageVolume.volume_id)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    await _lock_storage_object_transactions(db, submitted_object_ids)
     if submissions:
         try:
             server, server_cert_hash = await _require_legacy_adoption_server(
@@ -6477,6 +7571,8 @@ async def adopt_legacy_replicas(
                     continue
                 if volume.user_id not in locked_user_ids:
                     raise RuntimeError("Legacy adoption owner changed before authority locking.")
+                if volume.volume_id not in locked_volume_ids:
+                    raise RuntimeError("Legacy adoption volume changed before authority locking.")
                 locked_volume = (
                     await db.execute(
                         select(StorageVolume)
@@ -6510,6 +7606,7 @@ async def adopt_legacy_replicas(
                             ReplicaPlacement.object_id == object_id,
                             ReplicaPlacement.server_id == server.server_id,
                         )
+                        .order_by(ReplicaPlacement.placement_id)
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
@@ -6754,12 +7851,14 @@ async def announce_replicas(
     placements: List[Dict],
 ) -> int:
     """Accept target-TD possession receipts; a miner signature alone cannot promote a row."""
+    announced_object_ids = sorted({str(placement["object_id"]) for placement in placements})
+    await _lock_storage_object_transactions(db, announced_object_ids)
     server = await _get_storage_server(
         db,
         server_id,
         miner_hotkey,
         caller_server_id=caller_server_id,
-        lock=True,
+        lock=False,
     )
     await _bind_storage_identity(db, server, storage_incarnation)
     server_is_fresh = await is_freshly_attested_storage_server(db, server)
@@ -6785,6 +7884,7 @@ async def announce_replicas(
                             ReplicaPlacement.object_id == object_id,
                             ReplicaPlacement.server_id == server_id,
                         )
+                        .order_by(ReplicaPlacement.placement_id)
                         .with_for_update()
                     )
                 ).scalar_one_or_none()
@@ -6961,17 +8061,36 @@ async def rebind_replica_certificates(
     otherwise-forbidden certificate-only identity update.
     """
 
-    # Observe Redis before row locks, then intersect with current attestation using DB-only work.
+    # Observe Redis before row locks, then intersect it with authority revalidated after the
+    # publication fence. Snapshot the presented identity before populate_existing can refresh the
+    # same identity-map object.
     observed_live_storage_ids = await observe_storage_liveness(db)
-    verified_live_storage_ids = await _live_attested_server_ids(
-        db,
-        observed_live_storage_ids=observed_live_storage_ids,
-    )
+    caller_server_id = caller.server_id
+    presented_cert_pubkey_hash = (_server_pubkey_hash(caller) or "").lower()
     storage_incarnation = _normalize_incarnation(storage_incarnation)
     old_cert_pubkey_hash = old_cert_pubkey_hash.lower()
+    bindings = sorted(
+        (
+            {
+                "object_id": str(item["object_id"]),
+                "ciphertext_sha256": str(item["ciphertext_sha256"]).lower(),
+                "ciphertext_size_bytes": int(item["ciphertext_size_bytes"]),
+            }
+            for item in placements
+        ),
+        key=lambda item: item["object_id"],
+    )
+    await _lock_storage_object_transactions(
+        db,
+        [item["object_id"] for item in bindings],
+    )
+    await _lock_storage_publication_servers(db, [caller_server_id], shared=True)
     locked_server = (
         await db.execute(
-            select(Server).where(Server.server_id == caller.server_id).with_for_update()
+            select(Server)
+            .where(Server.server_id == caller_server_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     new_cert_pubkey_hash = (
@@ -6984,6 +8103,7 @@ async def rebind_replica_certificates(
         or not locked_server.storage_role
         or locked_server.storage_incarnation != storage_incarnation
         or not new_cert_pubkey_hash
+        or new_cert_pubkey_hash != presented_cert_pubkey_hash
         or new_cert_pubkey_hash == old_cert_pubkey_hash
     ):
         raise HTTPException(
@@ -6993,18 +8113,16 @@ async def rebind_replica_certificates(
                 "same server and storage incarnation."
             ),
         )
-
-    bindings = sorted(
-        (
-            {
-                "object_id": str(item["object_id"]),
-                "ciphertext_sha256": str(item["ciphertext_sha256"]).lower(),
-                "ciphertext_size_bytes": int(item["ciphertext_size_bytes"]),
-            }
-            for item in placements
-        ),
-        key=lambda item: item["object_id"],
+    verified_live_storage_ids = await _live_attested_server_ids(
+        db,
+        observed_live_storage_ids=observed_live_storage_ids,
     )
+    if locked_server.server_id not in verified_live_storage_ids:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Certificate rebind requires a live, latest-successfully-attested storage TD.",
+        )
+
     request_document = {
         "schema": "chutes.storage-replica-cert-rebind.v1",
         "request_id": request_id,
@@ -7054,7 +8172,7 @@ async def rebind_replica_certificates(
                     ReplicaPlacement.server_id == locked_server.server_id,
                     ReplicaPlacement.object_id.in_(object_ids),
                 )
-                .order_by(ReplicaPlacement.object_id)
+                .order_by(ReplicaPlacement.placement_id)
                 .with_for_update()
             )
         )
@@ -7065,7 +8183,7 @@ async def rebind_replica_certificates(
     placement_by_id = {placement.object_id: placement for placement in placement_rows}
     rebound_bindings: List[Dict[str, Any]] = []
     rebound_placements: List[ReplicaPlacement] = []
-    recovered_objects: Dict[str, StorageObject] = {}
+    rebound_objects: Dict[str, StorageObject] = {}
     outcomes: List[Dict[str, str]] = []
     for binding in bindings:
         object_id = binding["object_id"]
@@ -7107,8 +8225,7 @@ async def rebind_replica_certificates(
             )
         rebound_bindings.append(binding)
         rebound_placements.append(placement)
-        if stale_identity_recovery:
-            recovered_objects[obj.object_id] = obj
+        rebound_objects[obj.object_id] = obj
         outcomes.append({"object_id": object_id, "outcome": "rebound"})
 
     response = {
@@ -7142,7 +8259,7 @@ async def rebind_replica_certificates(
             placement.status = "present"
             placement.last_error = None
     await db.flush()
-    for obj in recovered_objects.values():
+    for obj in rebound_objects.values():
         await _refresh_object_durability(
             db,
             obj,
@@ -7158,8 +8275,7 @@ async def rebind_replica_certificates(
 async def release_volume_key(
     db: AsyncSession,
     volume_id: str,
-    miner_hotkey: str,
-    server_id: str,
+    caller: Server,
     quote_b64: str,
     tee_type: str,
     snp_cert_chain: Optional[str],
@@ -7174,7 +8290,27 @@ async def release_volume_key(
     (3) the server holds (or is assigned) a replica of the volume. The key never leaves an attested
     TD: an operator with only the miner hotkey cannot complete the mTLS handshake nor pass the quote.
     """
-    server = await _get_storage_server(db, server_id, miner_hotkey)
+    presented_server_id = caller.server_id
+    presented_miner_hotkey = caller.miner_hotkey
+    presented_storage_role = bool(caller.storage_role)
+    presented_storage_incarnation = caller.storage_incarnation
+    presented_cert_hash = (_server_pubkey_hash(caller) or "").lower()
+    expected_cert_hash = (expected_cert_hash or "").lower()
+    if (
+        not settings.require_mtls_client_verify
+        or not presented_storage_role
+        or not presented_storage_incarnation
+        or not presented_cert_hash
+        or presented_cert_hash != expected_cert_hash
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Volume key request lacks an exact presented storage identity.",
+        )
+
+    # Dependency authentication may have opened a read transaction. Release it before quote and
+    # provider verification; the complete current authority is reacquired afterwards.
+    await db.commit()
 
     # Verify a fresh attestation bound to the nonce + the serving-cert pubkey hash.
     quote = build_runtime_quote(
@@ -7195,38 +8331,27 @@ async def release_volume_key(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Volume key release requires the pinned storage-TD measurement (name 'storage-*').",
         )
-    # The pinned serving cert must match the attested cert the TD presented at mTLS time.
-    if _server_pubkey_hash(server) != expected_cert_hash:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Presented attested cert does not match the registered storage TD cert.",
-        )
-    if not server.storage_incarnation:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Storage TD has not announced a mounted encrypted-volume incarnation.",
-        )
-
     volume = (
         await db.execute(
             select(StorageVolume).where(
                 StorageVolume.volume_id == volume_id, StorageVolume.deleted.is_(False)
-            )
+            ).with_for_update()
         )
     ).scalar_one_or_none()
     if volume is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume not found.")
 
-    # The TD must hold (or be assigned) a replica of an object in this volume to receive the key.
-    holds_replica = (
+    # Use an unlocked generation hint only to establish the canonical Volume -> object advisory ->
+    # publication/Server frontier. Every authority predicate is repeated under those locks.
+    eligible_object_hint = (
         await db.execute(
-            select(func.count())
+            select(StorageObject.object_id)
             .select_from(ReplicaPlacement)
             .join(StorageObject, StorageObject.object_id == ReplicaPlacement.object_id)
             .where(
                 StorageObject.volume_id == volume_id,
                 StorageObject.lifecycle_state.in_((OBJECT_PENDING, OBJECT_COMMITTED)),
-                ReplicaPlacement.server_id == server_id,
+                ReplicaPlacement.server_id == presented_server_id,
                 or_(
                     (
                         (
@@ -7236,7 +8361,10 @@ async def release_volume_key(
                                 & (ReplicaPlacement.pending_deadline > func.now())
                             )
                         )
-                        & (ReplicaPlacement.storage_incarnation == server.storage_incarnation)
+                        & (
+                            ReplicaPlacement.storage_incarnation
+                            == presented_storage_incarnation
+                        )
                         & (
                             func.lower(ReplicaPlacement.target_cert_pubkey_hash)
                             == expected_cert_hash.lower()
@@ -7252,21 +8380,85 @@ async def release_volume_key(
                     ),
                 ),
             )
+            .order_by(StorageObject.object_id)
+            .limit(1)
         )
-    ).scalar() or 0
-    if holds_replica == 0:
+    ).scalar_one_or_none()
+    if eligible_object_hint is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Storage TD does not hold a replica of this volume; key not released.",
         )
+    await _lock_storage_object_transactions(db, [eligible_object_hint])
+    current_server = (
+        await _locked_storage_publication_server_rows(db, [presented_server_id])
+    ).get(presented_server_id)
+    if (
+        current_server is None
+        or not current_server.storage_role
+        or current_server.miner_hotkey != presented_miner_hotkey
+        or current_server.storage_incarnation != presented_storage_incarnation
+        or (_server_pubkey_hash(current_server) or "").lower() != presented_cert_hash
+        or not await is_freshly_attested_storage_server(db, current_server)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Volume key request storage authority changed during attestation.",
+        )
+    authority_now = await db.scalar(select(func.clock_timestamp()))
+    if authority_now is None:
+        raise RuntimeError("Database did not return a volume-key authority timestamp.")
+    qualifying_replica = (
+        await db.execute(
+            select(StorageObject, ReplicaPlacement)
+            .join(ReplicaPlacement, ReplicaPlacement.object_id == StorageObject.object_id)
+            .where(
+                StorageObject.object_id == eligible_object_hint,
+                StorageObject.volume_id == volume_id,
+                StorageObject.lifecycle_state.in_((OBJECT_PENDING, OBJECT_COMMITTED)),
+                ReplicaPlacement.server_id == current_server.server_id,
+                or_(
+                    and_(
+                        ReplicaPlacement.status.in_(("present", "pending")),
+                        or_(
+                            ReplicaPlacement.status == "present",
+                            ReplicaPlacement.pending_deadline > authority_now,
+                        ),
+                        ReplicaPlacement.storage_incarnation
+                        == current_server.storage_incarnation,
+                        func.lower(ReplicaPlacement.target_cert_pubkey_hash)
+                        == presented_cert_hash,
+                    ),
+                    and_(
+                        ReplicaPlacement.status == "evicted",
+                        StorageObject.lifecycle_state == OBJECT_COMMITTED,
+                        StorageObject.ciphertext_size_bytes.is_(None),
+                        StorageObject.legacy_adopted_at.is_(None),
+                        ReplicaPlacement.proof_at.is_(None),
+                        ReplicaPlacement.last_error
+                        == "secure_replication_requires_new_receipt",
+                    ),
+                ),
+            )
+            .with_for_update()
+        )
+    ).first()
+    if qualifying_replica is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Storage TD replica authority changed before key release.",
+        )
 
-    key_row = await db.get(StorageVolumeKey, volume_id)
+    key_row = await db.get(StorageVolumeKey, volume_id, with_for_update=True)
     if key_row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume key not found.")
     logger.success(
-        f"Released ChuteFS volume key {volume_id} to attested storage TD {server_id} (miner {miner_hotkey})"
+        f"Released ChuteFS volume key {volume_id} to attested storage TD "
+        f"{presented_server_id} (miner {presented_miner_hotkey})"
     )
-    return decrypt_passphrase(key_row.encrypted_key)
+    decrypted_key = decrypt_passphrase(key_row.encrypted_key)
+    await db.commit()
+    return decrypted_key
 
 
 # --- object-op grants --------------------------------------------------------------------------

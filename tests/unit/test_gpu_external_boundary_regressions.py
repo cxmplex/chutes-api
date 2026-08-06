@@ -157,9 +157,10 @@ async def test_default_object_commit_uses_only_preobserved_storage_liveness(
         assert (object_id, key, salt) == ("object-1", "model.bin", "salt-1")
         assert observed_live_storage_ids is observed
         return (
-            SimpleNamespace(
-                object_id=object_id,
-                lifecycle_state="committed",
+                SimpleNamespace(
+                    object_id=object_id,
+                    generation="generation-1",
+                    lifecycle_state="committed",
                 size_bytes=7,
                 durability_state="healthy",
             ),
@@ -288,7 +289,14 @@ async def test_remaining_redis_adapters_trip_under_lifecycle_custody():
     with pytest.raises(RuntimeError, match="agent command Redis publish"):
         await agent_channel.send_agent_command("host-1", "reboot", db=db)
     with pytest.raises(RuntimeError, match="ChuteFS grant Redis GET"):
-        await storage_service.verify_grant("grant", "volume-1", "get", db=db)
+        await storage_service.verify_grant(
+            "grant",
+            "volume-1",
+            "get",
+            object_id="object-1",
+            generation="generation-1",
+            db=db,
+        )
 
 
 def test_host_control_dispatches_pass_the_guarded_database_context():
