@@ -1,1 +1,1 @@
-{"miner":["cache","gpu-infra","instances","launch","miner","nodes","registry","sockets"],"platform":["registry"],"schema":"chutes.gpu-runtime-purposes","version":1}
+{"miner":["cache","gpu-decommission","gpu-infra","instances","launch","miner","nodes","registry","sockets"],"platform":["registry"],"schema":"chutes.gpu-runtime-purposes","version":1}

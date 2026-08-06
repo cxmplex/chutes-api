@@ -1086,7 +1086,22 @@ async def _reconcile_reservation(reservation_id: str) -> None:
                     reason=f"quarantine reset: {failure_reason}",
                 )
             return
-        if management_mode == "platform":
+        active_gpu_release_id = (
+            await session.execute(
+                select(GuestRelease.release_id).where(
+                    GuestRelease.status == RELEASE_STATUS_ACTIVE,
+                    GuestRelease.channel
+                    == select(Host.release_channel)
+                    .where(Host.host_id == reservation.host_id)
+                    .scalar_subquery(),
+                    GuestRelease.tee_type == "tdx",
+                    GuestRelease.compute_type == "gpu",
+                )
+            )
+        ).scalar_one_or_none()
+        if active_gpu_release_id != reservation.gpu_release_id:
+            desired, reason = False, "GPU release rolled"
+        elif management_mode == "platform":
             desired, reason = await _reservation_still_desired(
                 session,
                 reservation,

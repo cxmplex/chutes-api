@@ -1792,6 +1792,8 @@ async def decommission_gpu_server(
     server_id: str,
     owner_hotkey: str,
     request: GpuDecommissionRequestV1,
+    *,
+    replay_attested_spki_sha256: str | None = None,
 ) -> GpuDecommissionResponseV1:
     """Irreversibly close a terminal GPU server without deleting its audit graph.
 
@@ -1800,6 +1802,20 @@ async def decommission_gpu_server(
     rows are then re-read under locks, so a concurrent launch/reset can only win
     before this transition or observe the immutable terminal record afterwards.
     """
+
+    replay_attested_spki_sha256 = (
+        replay_attested_spki_sha256.strip().lower()
+        if replay_attested_spki_sha256 is not None
+        else None
+    )
+    if replay_attested_spki_sha256 is not None and (
+        len(replay_attested_spki_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in replay_attested_spki_sha256)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GPU decommission replay certificate identity is malformed.",
+        )
 
     observed = (
         await db.execute(
@@ -1856,12 +1872,30 @@ async def decommission_gpu_server(
             or audit.request_id != request.request_id
             or audit.owner_hotkey != owner_hotkey
             or audit.reason != request.reason
+            or (
+                audit.replay_attested_spki_sha256 is not None
+                and (
+                    replay_attested_spki_sha256 is None
+                    or not secrets.compare_digest(
+                        audit.replay_attested_spki_sha256,
+                        replay_attested_spki_sha256,
+                    )
+                )
+            )
         ):
             _conflict("GPU decommission request identity was already consumed.")
         return _gpu_decommission_response(audit)
 
     if server.compute_type != "gpu":
         _conflict("Only GPU servers can use GPU decommissioning.")
+    if replay_attested_spki_sha256 is not None and not secrets.compare_digest(
+        (server.attested_cert_pubkey_hash or "").lower(),
+        replay_attested_spki_sha256,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GPU decommission replay certificate is not the current attested identity.",
+        )
 
     reservations = list(
         (
@@ -2126,6 +2160,7 @@ async def decommission_gpu_server(
             if reservation
             else None
         ),
+        replay_attested_spki_sha256=replay_attested_spki_sha256,
         migration_ids=[item.migration_id for item in migrations],
         response_json=response.model_dump(mode="json"),
         decommissioned_at=now,

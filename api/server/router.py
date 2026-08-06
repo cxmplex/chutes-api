@@ -2,6 +2,7 @@
 FastAPI routes for server management and TDX attestation.
 """
 
+import secrets
 from typing import Dict, Any, List
 from fastapi import (
     APIRouter,
@@ -693,21 +694,39 @@ async def decommission_gpu_server_endpoint(
     server_id: str,
     body: GpuDecommissionRequestV1,
     db: AsyncSession = Depends(get_db_session),
-    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
-    _: User = Depends(
-        get_current_user(
-            purpose="tee",
-            raise_not_found=False,
-            registered_to=settings.netuid,
-        )
-    ),
+    attested_session: str | None = Header(None, alias=GPU_RUNTIME_SESSION_HEADER),
+    expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
-    if not hotkey:
+    if not attested_session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GPU decommission requires a dedicated attested runtime session.",
+        )
+    runtime_server, payload = await validate_gpu_runtime_session(
+        db,
+        attested_session,
+        required_purpose="gpu-decommission",
+    )
+    if (
+        runtime_server.server_id != server_id
+        or payload.get("management_mode") != "miner"
+        or runtime_server.miner_hotkey != payload.get("owner_hotkey")
+        or not secrets.compare_digest(
+            expected_cert_hash.lower(),
+            str(payload.get("attested_spki_sha256") or "").lower(),
+        )
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Hotkey header required",
+            detail="GPU decommission path does not match the attested miner session.",
         )
-    result = await decommission_gpu_server(db, server_id, hotkey, body)
+    result = await decommission_gpu_server(
+        db,
+        server_id,
+        payload["owner_hotkey"],
+        body,
+        replay_attested_spki_sha256=payload["attested_spki_sha256"],
+    )
     await db.commit()
     return result
 

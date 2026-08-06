@@ -299,7 +299,8 @@ async def _ensure_test_token_key_epoch(db: AsyncSession) -> str:
         key_id=key_id,
         key_sha256=fingerprints[key_id],
         state="staged",
-        required_replica_ids=[replica_id],
+        cohort_id="test-api",
+        required_ack_count=1,
     )
     db.add(epoch)
     await db.flush()
@@ -307,6 +308,7 @@ async def _ensure_test_token_key_epoch(db: AsyncSession) -> str:
         ChuteFSTokenKeyReplicaAck(
             replica_id=replica_id,
             key_id=key_id,
+            cohort_id="test-api",
             key_ids=sorted(keys),
             key_fingerprints=token_key_fingerprints(keys),
             keyring_sha256=token_keyset_sha256(keys),
@@ -557,7 +559,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
     assert authorized.volume.volume_id == default_volume_id
     await db.commit()
     grant_response = await issue_default_volume_grant(
-        DefaultGrantRequest(op="put"),
+        DefaultGrantRequest(op="list"),
         request,
         db,
         f"Bearer {issued.access_token}",
@@ -573,7 +575,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         await service.verify_grant(
             launch_grant,
             authorized.volume.volume_id,
-            "put",
+            "list",
             db=db,
         )
     )["auth_kind"] == "launch_default"
@@ -592,7 +594,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         await service.verify_grant(
             launch_grant,
             default_volume_id,
-            "put",
+            "list",
             db=db,
         )
         is None
@@ -708,7 +710,7 @@ async def test_launch_session_rotates_once_and_revokes_on_disable(
         await service.verify_grant(
             launch_grant,
             default_volume_id,
-            "put",
+            "list",
             db=db,
         )
         is None
@@ -746,7 +748,7 @@ async def test_disable_between_preflight_and_lifecycle_lock_fences_authority(
     )
     grant = (
         await issue_default_volume_grant(
-            DefaultGrantRequest(op="put"),
+            DefaultGrantRequest(op="list"),
             request,
             db,
             f"Bearer {issued.access_token}",
@@ -819,7 +821,7 @@ async def test_disable_between_preflight_and_lifecycle_lock_fences_authority(
             await service.verify_grant(
                 grant,
                 config.default_volume_id,
-                "put",
+                "list",
                 db=verifier,
             )
             is None

@@ -384,6 +384,9 @@
         "allocation_group_id": "fixture-group",
         "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
         "created_at": "2026-07-25T12:00:00Z",
+        "current_gpu_release_id": "fixture-gpu-release-v1",
+        "desired_gpu_release_id": "fixture-gpu-release-v2",
+        "desired_release_target_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
         "gpu_bdfs": [
           "0000:01:00.0"
         ],
@@ -744,6 +747,49 @@
         "version": 1
       }
     ],
+    "release_rollover_envelope": {
+      "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+      "current_gpu_release_id": "fixture-gpu-release-v1",
+      "desired_gpu_release_id": "fixture-gpu-release-v2",
+      "desired_release_target_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "host_id": "fixture-host",
+      "operation": {
+        "allocation_group_generation": 4,
+        "allocation_group_id": "fixture-group",
+        "claims_sha256": "b3b0199bd6c87befdd682f9c847a196b19d44773d78ffd6bf131e15f77543197",
+        "created_at": "2026-07-25T12:00:00Z",
+        "current_gpu_release_id": "fixture-gpu-release-v1",
+        "desired_gpu_release_id": "fixture-gpu-release-v2",
+        "desired_release_target_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "gpu_bdfs": [
+          "0000:01:00.0"
+        ],
+        "gpu_uuids": [
+          "GPU-00000000-0000-0000-0000-000000000001"
+        ],
+        "group_state": "resetting",
+        "host_boot_generation": 3,
+        "host_id": "fixture-host",
+        "host_key_generation": 2,
+        "management_mode": "platform",
+        "operation_id": "10000000-0000-4000-8000-000000000003",
+        "operation_type": "release_rollover",
+        "owner_hotkey": "fixture-owner",
+        "phase": "intent",
+        "process_incarnation": "fixture-process",
+        "reservation_generation": 5,
+        "reservation_id": "fixture-reservation",
+        "schema": "chutes.gpu-lifecycle-operation.v1",
+        "stable_server_id": "fixture-server",
+        "topology_fingerprint": "2222222222222222222222222222222222222222222222222222222222222222",
+        "updated_at": "2026-07-25T12:00:00Z",
+        "version": 1
+      },
+      "reservation_generation": 5,
+      "reservation_id": "fixture-reservation",
+      "schema": "chutes.gpu-release-rollover.v1",
+      "version": 1
+    },
     "reset_receipt": {
       "accepted_at": "2026-07-25T12:01:00Z",
       "local_release_required": true,

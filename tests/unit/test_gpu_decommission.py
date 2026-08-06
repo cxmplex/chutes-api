@@ -251,6 +251,7 @@ async def test_terminal_gpu_decommission_shreds_authority_and_retains_audit():
             server.server_id,
             "owner",
             _request(),
+            replay_attested_spki_sha256="b" * 64,
         )
 
     assert response.status == "decommissioned"
@@ -284,6 +285,7 @@ async def test_terminal_gpu_decommission_shreds_authority_and_retains_audit():
     audit = db.add.call_args.args[0]
     assert isinstance(audit, GpuServerDecommission)
     assert audit.server_id == server.server_id
+    assert audit.replay_attested_spki_sha256 == "b" * 64
     assert audit.migration_ids == [migration.migration_id]
     assert audit.response_json == response.model_dump(mode="json")
     node_query = db.execute.await_args_list[5].args[0]
@@ -392,6 +394,7 @@ async def test_exact_decommission_retry_replays_audit_and_mismatch_fails_closed(
         request_id=request.request_id,
         owner_hotkey="owner",
         reason=request.reason,
+        replay_attested_spki_sha256="b" * 64,
         migration_ids=[],
         response_json={
             "schema": "chutes.gpu-decommissioned",
@@ -405,7 +408,13 @@ async def test_exact_decommission_retry_replays_audit_and_mismatch_fails_closed(
     )
     db = _Db([_Result(scalar=server), _Result(scalar=server), _Result(rows=[audit])])
     with patch.object(gpu_infra, "acquire_gpu_lifecycle_lock", AsyncMock()):
-        replay = await gpu_infra.decommission_gpu_server(db, server.server_id, "owner", request)
+        replay = await gpu_infra.decommission_gpu_server(
+            db,
+            server.server_id,
+            "owner",
+            request,
+            replay_attested_spki_sha256="b" * 64,
+        )
     assert replay.decommissioned_at == timestamp
     db.add.assert_not_called()
 
@@ -419,6 +428,7 @@ async def test_exact_decommission_retry_replays_audit_and_mismatch_fails_closed(
             server.server_id,
             "owner",
             _request(reason="different terminal reason"),
+            replay_attested_spki_sha256="b" * 64,
         )
     assert exc.value.status_code == 409
 

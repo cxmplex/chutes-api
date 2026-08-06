@@ -245,7 +245,11 @@ nginx.ingress.kubernetes.io/whitelist-source-range: {{ . | quote }}
 - name: CHUTEFS_TOKEN_REPLICA_ID
   valueFrom:
     fieldRef:
-      fieldPath: metadata.uid
+      fieldPath: metadata.name
+- name: CHUTEFS_TOKEN_REPLICA_COHORT
+  value: {{ printf "%s-api" (include "chutes.fullname" .) | quote }}
+- name: CHUTEFS_TOKEN_REQUIRED_ACK_COUNT
+  value: {{ required "api.chutefsTokenRequiredAckCount is required" .Values.api.chutefsTokenRequiredAckCount | quote }}
 - name: GPU_REGISTRATION_RECOVERY_KEY_ID
   valueFrom:
     secretKeyRef:

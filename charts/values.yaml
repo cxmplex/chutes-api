@@ -97,6 +97,9 @@ chuteDb:
 
 api:
   replicaCount: 1
+  # Fixed ChuteFS token-key activation quorum for this stable API serving cohort.
+  # Production overlays must set this to the intended minimum serving replica target.
+  chutefsTokenRequiredAckCount: 1
   image: validator:latest
   imagePullPolicy: Always
   limitConcurrency: 1024

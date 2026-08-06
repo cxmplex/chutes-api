@@ -29,11 +29,12 @@ from api.host.schemas import (
     canonical_sha256,
 )
 from api.node.schemas import Node
-from api.server.schemas import Host, Server, ServerAttestation
+from api.server.schemas import GpuServerDecommission, Host, Server, ServerAttestation
 
 GPU_RUNTIME_SESSION_HEADER = "X-Chutes-Attested-Session"
 GPU_RUNTIME_SESSION_PURPOSES = (
     "cache",
+    "gpu-decommission",
     "gpu-infra",
     "instances",
     "launch",
@@ -45,6 +46,19 @@ GPU_RUNTIME_SESSION_PURPOSES = (
 GPU_PLATFORM_RUNTIME_SESSION_PURPOSES = ("registry",)
 GPU_RUNTIME_SESSION_LIFETIME_SECONDS = 900
 GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS = 5
+
+
+def _gpu_decommission_reservation_is_terminal(reservation: GpuLaunchReservation) -> bool:
+    """Require positive pre-launch expiry or completed physical reset evidence."""
+
+    if reservation.state == "released":
+        return reservation.reset_completed_at is not None and reservation.released_at is not None
+    if reservation.state == "expired":
+        return all(
+            getattr(reservation, field) is None
+            for field in ("claimed_at", "launching_at", "running_at", "launch_dispatched_at")
+        )
+    return False
 
 
 def _runtime_session_now() -> datetime:
@@ -679,9 +693,14 @@ async def validate_gpu_runtime_session(
     if (
         type(iat) is not int
         or type(exp) is not int
-        or exp <= int(validation_now.timestamp())
         or iat > int(validation_now.timestamp()) + GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS
     ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GPU runtime session is invalid or expired.",
+        )
+    session_expired = exp <= int(validation_now.timestamp())
+    if session_expired and required_purpose != "gpu-decommission":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="GPU runtime session is invalid or expired.",
@@ -730,6 +749,107 @@ async def validate_gpu_runtime_session(
     latest_attestation = (
         await _latest_attestation_attempt(db, server.server_id) if server is not None else None
     )
+    if required_purpose == "gpu-decommission":
+        audit = (
+            await db.get(GpuServerDecommission, payload["server_id"])
+            if isinstance(payload.get("server_id"), str)
+            else None
+        )
+        if audit is not None:
+            # The service clears live server authority only after persisting this
+            # immutable terminal audit. The exact prior certificate is persisted
+            # for this one purpose, so its signed session plus live certificate
+            # possession (checked by the route) may recover the ACK even after JWT
+            # expiry without reviving any broader runtime purpose.
+            replay_attested_spki_sha256 = (
+                audit.replay_attested_spki_sha256 or ""
+            ).lower()
+            if (
+                server is None
+                or server.compute_type != "gpu"
+                or server.miner_hotkey != payload["owner_hotkey"]
+                or audit.owner_hotkey != payload["owner_hotkey"]
+                or (
+                    replay_attested_spki_sha256
+                    and not secrets.compare_digest(
+                        replay_attested_spki_sha256,
+                        str(payload["attested_spki_sha256"]).lower(),
+                    )
+                )
+                or (session_expired and not replay_attested_spki_sha256)
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="GPU decommission replay identity is invalid.",
+                )
+            await db.commit()
+            return server, payload
+
+        # Teardown/reset can legitimately outlive the 15-minute JWT. For this
+        # first decommission only, the route's live exact mTLS certificate plus
+        # current terminal custody and attestation replace token freshness.
+        terminal_reservation = bool(
+            server is not None
+            and attestation is not None
+            and reservation is not None
+            and latest_attestation is not None
+            and _gpu_decommission_reservation_is_terminal(reservation)
+        )
+        if terminal_reservation:
+            retirement_consistent = (
+                server.gpu_retired_at is None and attestation.gpu_retired_at is None
+            ) or (
+                server.gpu_retired_at is not None
+                and attestation.gpu_retired_at == server.gpu_retired_at
+            )
+            if (
+                server.compute_type != "gpu"
+                or server.tee_type != "tdx"
+                or server.gpu_management_mode != "miner"
+                or payload["management_mode"] != "miner"
+                or server.miner_hotkey != payload["owner_hotkey"]
+                or server.gpu_launch_reservation_id != payload["reservation_id"]
+                or server.attested_cert_pubkey_hash != payload["attested_spki_sha256"]
+                or reservation.reservation_id != payload["reservation_id"]
+                or reservation.server_id != server.server_id
+                or reservation.management_mode != "miner"
+                or reservation.allocation_group_id != server.gpu_allocation_group_id
+                or reservation.allocation_group_generation
+                != server.gpu_allocation_group_generation
+                or reservation.process_incarnation != server.gpu_process_incarnation
+                or reservation.topology_fingerprint != server.gpu_topology_fingerprint
+                or attestation.attestation_id != payload["attestation_id"]
+                or latest_attestation.attestation_id != attestation.attestation_id
+                or attestation.gpu_claims_sha256 != reservation.claims_sha256
+                or attestation.gpu_release_id != reservation.gpu_release_id
+                or attestation.gpu_profile_id != reservation.profile_id
+                or attestation.gpu_host_boot_generation != reservation.host_boot_generation
+                or attestation.gpu_reservation_generation
+                != reservation.reservation_generation
+                or not retirement_consistent
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="GPU decommission session identity is no longer exact.",
+                )
+            try:
+                _current_attestation_identity(
+                    server,
+                    latest_attestation,
+                    expected_id=payload["attestation_id"],
+                )
+            except HTTPException as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="GPU decommission attestation is not current.",
+                ) from exc
+            await db.commit()
+            return server, payload
+        if session_expired:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="GPU runtime session is invalid or expired.",
+            )
     if (
         server is None
         or attestation is None

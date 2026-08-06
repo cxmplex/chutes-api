@@ -51,6 +51,8 @@ from api.server.schemas import (
     StorageModelInventorySnapshot,
     StorageObject,
     StorageObjectDeleteFence,
+    StorageIncarnationRetirementAudit,
+    StorageReplicaCertRebindAudit,
     StorageReplicationCapability,
     StorageVolume,
     StorageVolumeKey,
@@ -530,6 +532,19 @@ async def _bind_storage_identity(
     measured storage-node code could produce that receipt.
     """
     storage_incarnation = _normalize_incarnation(storage_incarnation)
+    server = (
+        await db.execute(
+            select(Server)
+            .where(Server.server_id == server.server_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Storage TD no longer exists.",
+        )
     cert_hash = _server_pubkey_hash(server)
     if not cert_hash:
         raise HTTPException(
@@ -537,7 +552,75 @@ async def _bind_storage_identity(
             detail="Storage TD has no registered attestation-bound certificate.",
         )
 
-    incarnation_changed = server.storage_incarnation != storage_incarnation
+    retired_incarnation = (
+        await db.execute(
+            select(StorageIncarnationRetirementAudit.audit_id)
+            .where(
+                StorageIncarnationRetirementAudit.server_id == server.server_id,
+                StorageIncarnationRetirementAudit.previous_storage_incarnation
+                == storage_incarnation,
+            )
+            .order_by(StorageIncarnationRetirementAudit.created_at)
+            .with_for_update()
+        )
+    ).scalars().first()
+    if retired_incarnation is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Storage incarnation was permanently retired as unreachable and cannot be rebound."
+            ),
+        )
+
+    previous_incarnation = server.storage_incarnation
+    incarnation_changed = previous_incarnation != storage_incarnation
+    if incarnation_changed and previous_incarnation:
+        # A current measured storage agent can only announce a new mounted-volume
+        # incarnation after the old volume is no longer mounted.  That is positive
+        # unreachability evidence, not proof that individual files were erased.
+        # Terminalize only the exact old incarnation and preserve an immutable audit.
+        now = datetime.now(timezone.utc)
+        tasks = list(
+            (
+                await db.execute(
+                    select(StorageEraseTask)
+                    .where(
+                        StorageEraseTask.server_id == server.server_id,
+                        StorageEraseTask.storage_incarnation == previous_incarnation,
+                        StorageEraseTask.state.not_in(ERASE_TERMINAL_STATES),
+                    )
+                    .order_by(StorageEraseTask.task_id)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        audit = StorageIncarnationRetirementAudit(
+            server_id=server.server_id,
+            previous_storage_incarnation=previous_incarnation,
+            replacement_storage_incarnation=storage_incarnation,
+            replacement_cert_pubkey_hash=cert_hash.lower(),
+            retired_task_ids=[task.task_id for task in tasks],
+            retired_holder_cert_pubkey_hashes=sorted(
+                {
+                    task.holder_cert_pubkey_hash.lower()
+                    for task in tasks
+                    if task.holder_cert_pubkey_hash
+                }
+            ),
+        )
+        db.add(audit)
+        await db.flush([audit])
+        for task in tasks:
+            task.state = "retired"
+            task.completed_at = now
+            task.claimed_at = None
+            task.lease_expires_at = None
+            task.claim_cert_pubkey_hash = None
+            task.erased_file_was_present = None
+            task.retirement_audit_id = audit.audit_id
+            task.last_error = "attested_incarnation_retired_unreachable"
     server.storage_incarnation = storage_incarnation
     server.storage_incarnation_announced_at = func.now()
     marker_identity_changed = (
@@ -2114,6 +2197,7 @@ async def delete_volume(db: AsyncSession, volume_id: str, user_id: str) -> Dict:
     if volume is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume not found.")
     if not volume.deleted:
+        volume.grant_revocation_epoch = int(volume.grant_revocation_epoch) + 1
         volume.deleted = True
         volume.delete_requested_at = datetime.now(timezone.utc)
         volume.used_bytes = 0
@@ -2315,6 +2399,7 @@ async def prepare_user_storage_erasure(db: AsyncSession, user_id: str) -> Dict[s
 
     for volume in volumes:
         if not volume.deleted:
+            volume.grant_revocation_epoch = int(volume.grant_revocation_epoch) + 1
             volume.deleted = True
             volume.delete_requested_at = now
             volume.used_bytes = 0
@@ -3013,6 +3098,7 @@ async def commit_object(
     if current is not None:
         current.lifecycle_state = OBJECT_SUPERSEDED
         current.superseded_at = now
+        locked_volume.grant_revocation_epoch = int(locked_volume.grant_revocation_epoch) + 1
         await db.flush()
         await _enqueue_erase_tasks_for_generations(
             db,
@@ -5746,6 +5832,7 @@ async def replica_authorization(
         )
     return {
         "object_id": obj.object_id,
+        "generation": obj.generation,
         "volume_id": obj.volume_id,
         "placement_status": placement.status,
         "lifecycle_state": obj.lifecycle_state,
@@ -5845,6 +5932,7 @@ async def _retire_object_delete_fence_batch(
     fence: StorageObjectDeleteFence,
     *,
     limit: int,
+    advance_revocation_epoch: bool = True,
 ) -> tuple[List[StorageObject], bool]:
     """Retire one key's pre-cutoff generations in a bounded, serialized keyset page."""
     if fence.completed_at is not None or limit <= 0:
@@ -5862,22 +5950,33 @@ async def _retire_object_delete_fence_batch(
         .all()
     )
     now = datetime.now(timezone.utc)
+    retired_generations: List[StorageObject] = []
     for generation in generations:
         fence.scan_cursor = generation.object_id
         if generation.lifecycle_state != OBJECT_TOMBSTONED:
             generation.lifecycle_state = OBJECT_TOMBSTONED
             generation.tombstoned_at = now
-    if generations:
+            retired_generations.append(generation)
+    if retired_generations and advance_revocation_epoch:
+        volume = (
+            await db.execute(
+                select(StorageVolume)
+                .where(StorageVolume.volume_id == fence.volume_id)
+                .with_for_update()
+            )
+        ).scalar_one()
+        volume.grant_revocation_epoch = int(volume.grant_revocation_epoch) + 1
+    if retired_generations:
         await db.flush()
         await _enqueue_erase_tasks_for_generations(
             db,
-            generations,
+            retired_generations,
             reason="object_deleted",
             now=now,
         )
     if len(generations) < limit:
         fence.completed_at = now
-    return generations, fence.completed_at is not None
+    return retired_generations, fence.completed_at is not None
 
 
 async def delete_object(
@@ -5951,7 +6050,14 @@ async def delete_object(
         1,
         settings.storage_reconcile_batch_size - (1 if current is not None else 0),
     )
-    page, _complete = await _retire_object_delete_fence_batch(db, fence, limit=page_limit)
+    page, _complete = await _retire_object_delete_fence_batch(
+        db,
+        fence,
+        limit=page_limit,
+        advance_revocation_epoch=False,
+    )
+    if current is not None or page:
+        locked_volume.grant_revocation_epoch = int(locked_volume.grant_revocation_epoch) + 1
     generation_ids = list(
         dict.fromkeys(
             [generation.object_id for generation in immediate]
@@ -6687,6 +6793,190 @@ async def announce_replicas(
     return recorded
 
 
+async def rebind_replica_certificates(
+    db: AsyncSession,
+    caller: Server,
+    *,
+    request_id: str,
+    storage_incarnation: str,
+    old_cert_pubkey_hash: str,
+    placements: List[Dict],
+) -> Dict[str, Any]:
+    """Rebind exact present bytes after a same-server/incarnation cert rotation.
+
+    The current certificate is authenticated by the route's live mTLS dependency.
+    Every placement and committed object is locked and must independently match the
+    request's ciphertext hash and size before the immutable audit authorizes the
+    otherwise-forbidden certificate-only identity update.
+    """
+
+    storage_incarnation = _normalize_incarnation(storage_incarnation)
+    old_cert_pubkey_hash = old_cert_pubkey_hash.lower()
+    locked_server = (
+        await db.execute(
+            select(Server).where(Server.server_id == caller.server_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    new_cert_pubkey_hash = (
+        (_server_pubkey_hash(locked_server) or "").lower()
+        if locked_server is not None
+        else ""
+    )
+    if (
+        locked_server is None
+        or not locked_server.storage_role
+        or locked_server.storage_incarnation != storage_incarnation
+        or not new_cert_pubkey_hash
+        or new_cert_pubkey_hash == old_cert_pubkey_hash
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Certificate rebind requires a new current attested certificate on the "
+                "same server and storage incarnation."
+            ),
+        )
+
+    bindings = sorted(
+        (
+            {
+                "object_id": str(item["object_id"]),
+                "ciphertext_sha256": str(item["ciphertext_sha256"]).lower(),
+                "ciphertext_size_bytes": int(item["ciphertext_size_bytes"]),
+            }
+            for item in placements
+        ),
+        key=lambda item: item["object_id"],
+    )
+    request_document = {
+        "schema": "chutes.storage-replica-cert-rebind.v1",
+        "request_id": request_id,
+        "server_id": locked_server.server_id,
+        "storage_incarnation": storage_incarnation,
+        "old_cert_pubkey_hash": old_cert_pubkey_hash,
+        "new_cert_pubkey_hash": new_cert_pubkey_hash,
+        "placements": bindings,
+    }
+    request_sha256 = hashlib.sha256(
+        json.dumps(request_document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    existing_audit = (
+        await db.execute(
+            select(StorageReplicaCertRebindAudit)
+            .where(StorageReplicaCertRebindAudit.request_id == request_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if existing_audit is not None:
+        if not secrets.compare_digest(existing_audit.request_sha256, request_sha256):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Certificate rebind request ID is bound to different immutable input.",
+            )
+        await db.commit()
+        return dict(existing_audit.response_json)
+
+    object_ids = [item["object_id"] for item in bindings]
+    objects = list(
+        (
+            await db.execute(
+                select(StorageObject)
+                .where(StorageObject.object_id.in_(object_ids))
+                .order_by(StorageObject.object_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    placement_rows = list(
+        (
+            await db.execute(
+                select(ReplicaPlacement)
+                .where(
+                    ReplicaPlacement.server_id == locked_server.server_id,
+                    ReplicaPlacement.object_id.in_(object_ids),
+                )
+                .order_by(ReplicaPlacement.object_id)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    object_by_id = {obj.object_id: obj for obj in objects}
+    placement_by_id = {placement.object_id: placement for placement in placement_rows}
+    rebound_bindings: List[Dict[str, Any]] = []
+    rebound_placements: List[ReplicaPlacement] = []
+    outcomes: List[Dict[str, str]] = []
+    for binding in bindings:
+        object_id = binding["object_id"]
+        obj = object_by_id.get(object_id)
+        placement = placement_by_id.get(object_id)
+        if obj is None or obj.lifecycle_state != OBJECT_COMMITTED:
+            outcomes.append({"object_id": object_id, "outcome": "not_current"})
+            continue
+        if placement is None or placement.status != "present":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Certificate rebind requires one exact present placement on the "
+                    f"authenticated server for object {binding['object_id']}."
+                ),
+            )
+        if (
+            (obj.sha256 or "").lower() != binding["ciphertext_sha256"]
+            or obj.ciphertext_size_bytes is None
+            or int(obj.ciphertext_size_bytes) != binding["ciphertext_size_bytes"]
+            or placement.storage_incarnation != storage_incarnation
+            or (placement.target_cert_pubkey_hash or "").lower() != old_cert_pubkey_hash
+            or (placement.proof_sha256 or "").lower() != binding["ciphertext_sha256"]
+            or placement.proof_size_bytes is None
+            or int(placement.proof_size_bytes) != binding["ciphertext_size_bytes"]
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Certificate rebind proof does not match one exact committed placement "
+                    f"for object {binding['object_id']}."
+                ),
+            )
+        rebound_bindings.append(binding)
+        rebound_placements.append(placement)
+        outcomes.append({"object_id": object_id, "outcome": "rebound"})
+
+    response = {
+        "request_id": request_id,
+        "server_id": locked_server.server_id,
+        "storage_incarnation": storage_incarnation,
+        "old_cert_pubkey_hash": old_cert_pubkey_hash,
+        "new_cert_pubkey_hash": new_cert_pubkey_hash,
+        "rebound_object_ids": [binding["object_id"] for binding in rebound_bindings],
+        "outcomes": outcomes,
+    }
+    audit = StorageReplicaCertRebindAudit(
+        request_id=request_id,
+        request_sha256=request_sha256,
+        server_id=locked_server.server_id,
+        storage_incarnation=storage_incarnation,
+        old_cert_pubkey_hash=old_cert_pubkey_hash,
+        new_cert_pubkey_hash=new_cert_pubkey_hash,
+        object_bindings=rebound_bindings,
+        response_json=response,
+    )
+    db.add(audit)
+    await db.flush([audit])
+    await db.execute(
+        text("SELECT set_config('chutes.storage_cert_rebind_request_id', :request_id, true)"),
+        {"request_id": request_id},
+    )
+    for placement in rebound_placements:
+        placement.target_cert_pubkey_hash = new_cert_pubkey_hash
+    await db.flush()
+    await db.commit()
+    return response
+
+
 # --- per-volume key release (attested storage TD only) -----------------------------------------
 
 
@@ -6813,14 +7103,61 @@ async def issue_grant(
     volume_id: str,
     ops: List[str],
     *,
+    object_id: Optional[str] = None,
+    generation: Optional[str] = None,
     launch_session_id: Optional[str] = None,
     launch_session_generation: Optional[int] = None,
     ttl_seconds: int = GRANT_TTL_SECONDS,
 ) -> str:
-    """Mint a short-lived opaque grant a storage TD can verify to authorize object ops on a volume."""
-    await _get_owned_volume(db, volume_id, user_id)
+    """Mint a row-locked volume/object-generation grant for one exact operation."""
+    if len(ops) != 1 or ops[0] not in {"put", "get", "list"}:
+        raise ValueError("owner grants require exactly one supported operation")
+    op = ops[0]
+    if (op == "list" and (object_id is not None or generation is not None)) or (
+        op != "list" and (not object_id or not generation)
+    ):
+        raise ValueError("grant object scope does not match its operation")
+    volume = (
+        await db.execute(
+            select(StorageVolume)
+            .where(
+                StorageVolume.volume_id == volume_id,
+                StorageVolume.user_id == user_id,
+                StorageVolume.deleted.is_(False),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if volume is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume not found.")
+    if op != "list":
+        expected_state = OBJECT_PENDING if op == "put" else OBJECT_COMMITTED
+        scoped_object = (
+            await db.execute(
+                select(StorageObject)
+                .where(
+                    StorageObject.object_id == object_id,
+                    StorageObject.volume_id == volume_id,
+                    StorageObject.generation == generation,
+                    StorageObject.lifecycle_state == expected_state,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if scoped_object is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Grant scope is not the current eligible object generation.",
+            )
     token = secrets.token_urlsafe(32)
-    grant_context = {"user_id": user_id, "volume_id": volume_id, "ops": list(ops)}
+    grant_context = {
+        "user_id": user_id,
+        "volume_id": volume_id,
+        "ops": list(ops),
+        "object_id": object_id,
+        "generation": generation,
+        "revocation_epoch": int(volume.grant_revocation_epoch),
+    }
     if launch_session_id is not None:
         if (
             not isinstance(launch_session_generation, int)
@@ -6841,7 +7178,11 @@ async def issue_grant(
     grant_context["expires_at"] = (
         datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
     ).isoformat()
-    payload = json.dumps(grant_context)
+    payload = json.dumps(grant_context, sort_keys=True, separators=(",", ":"))
+    # The captured epoch and generation were read under row locks. Release the
+    # database transaction before external Redis work; any immediately following
+    # delete/revocation advances the epoch and makes this token unverifiable.
+    await db.commit()
     from api.host.locks import assert_gpu_external_work_allowed
 
     assert_gpu_external_work_allowed(db, "ChuteFS grant Redis SETEX")
@@ -6853,9 +7194,17 @@ async def verify_grant(
     grant: str,
     volume_id: str,
     op: str,
+    object_id: Optional[str] = None,
+    generation: Optional[str] = None,
     db: Optional[AsyncSession] = None,
 ) -> Optional[Dict]:
-    """Verify a grant authorizes `op` on `volume_id`; returns the grant payload or None."""
+    """Verify one exact volume epoch and, for put/get, immutable object generation."""
+    if op not in {"put", "get", "list"}:
+        return None
+    if (op == "list" and (object_id is not None or generation is not None)) or (
+        op != "list" and (not object_id or not generation)
+    ):
+        return None
     if db is not None:
         from api.host.locks import assert_gpu_external_work_allowed
 
@@ -6867,7 +7216,15 @@ async def verify_grant(
         payload = json.loads(raw.decode() if isinstance(raw, (bytes, bytearray)) else raw)
     except (ValueError, AttributeError):
         return None
-    if payload.get("volume_id") != volume_id or op not in (payload.get("ops") or []):
+    if (
+        payload.get("volume_id") != volume_id
+        or payload.get("ops") != [op]
+        or payload.get("object_id") != object_id
+        or payload.get("generation") != generation
+        or not isinstance(payload.get("revocation_epoch"), int)
+        or isinstance(payload.get("revocation_epoch"), bool)
+        or db is None
+    ):
         return None
     try:
         expires_at = datetime.fromisoformat(payload["expires_at"])
@@ -6882,7 +7239,6 @@ async def verify_grant(
             not isinstance(launch_session_id, str)
             or not isinstance(launch_session_generation, int)
             or isinstance(launch_session_generation, bool)
-            or db is None
         ):
             return None
         from api.storage.launch_sessions import validate_launch_bound_grant
@@ -6901,4 +7257,60 @@ async def verify_grant(
         or "auth_kind" in payload
     ):
         return None
+    volume = (
+        await db.execute(
+            select(StorageVolume)
+            .where(
+                StorageVolume.volume_id == volume_id,
+                StorageVolume.deleted.is_(False),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        volume is None
+        or int(volume.grant_revocation_epoch) != payload["revocation_epoch"]
+        or volume.user_id != payload.get("user_id")
+    ):
+        await db.commit()
+        return None
+    if op != "list":
+        expected_state = OBJECT_PENDING if op == "put" else OBJECT_COMMITTED
+        scoped_object = (
+            await db.execute(
+                select(StorageObject)
+                .where(
+                    StorageObject.object_id == object_id,
+                    StorageObject.volume_id == volume_id,
+                    StorageObject.generation == generation,
+                    StorageObject.lifecycle_state == expected_state,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if scoped_object is None:
+            await db.commit()
+            return None
+    await db.commit()
     return payload
+
+
+async def revoke_volume_grants(db: AsyncSession, volume_id: str, user_id: str) -> int:
+    """Advance a volume's durable grant epoch under its owner-row lock."""
+
+    volume = (
+        await db.execute(
+            select(StorageVolume)
+            .where(
+                StorageVolume.volume_id == volume_id,
+                StorageVolume.user_id == user_id,
+                StorageVolume.deleted.is_(False),
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if volume is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Volume not found.")
+    volume.grant_revocation_epoch = int(volume.grant_revocation_epoch) + 1
+    await db.commit()
+    return int(volume.grant_revocation_epoch)

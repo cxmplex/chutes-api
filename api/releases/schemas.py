@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 
 from api.database import Base, generate_uuid
+from api.gpu_contracts import GpuReleaseRolloverResponseV1
 from api.host.schemas import canonical_json_bytes, canonical_sha256
 
 RELEASE_CHANNEL_DEFAULT = "stable"
@@ -1067,6 +1068,7 @@ class ReleaseManifest(BaseModel):
     gpu: Optional[GpuReleaseImage] = None
     storage_sibling: Optional[GpuStorageSibling] = None
     l0: Optional[ReleaseL0] = None
+    gpu_release_rollovers: List[GpuReleaseRolloverResponseV1] = Field(default_factory=list)
 
 
 class ReleaseResponse(BaseModel):

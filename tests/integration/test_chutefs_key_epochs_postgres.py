@@ -55,6 +55,8 @@ def storage_crypto(monkeypatch):
         "api.server.util.settings.fernet_key",
         Fernet(Fernet.generate_key()),
     )
+    monkeypatch.setattr(settings, "chutefs_token_replica_cohort", "test-api")
+    monkeypatch.setattr(settings, "chutefs_token_required_ack_count", 1)
 
 
 async def _install_rotation_migration(db) -> None:
@@ -63,6 +65,9 @@ async def _install_rotation_migration(db) -> None:
         raw = await connection.get_raw_connection()
         await raw.driver_connection.execute(
             storage_pg._migration_up_sql("20260726121000_chutefs_session_rotation_replay.sql")
+        )
+        await raw.driver_connection.execute(
+            storage_pg._migration_up_sql("20260806120000_api_trust_boundary_hardening.sql")
         )
     await db.rollback()
 
@@ -91,6 +96,7 @@ async def test_rolling_replicas_ack_activate_retire_and_replay_lost_responses(
     db, _ = pg_session
     await _install_rotation_migration(db)
     monkeypatch.setattr(storage_startup, "engine", db.bind)
+    monkeypatch.setattr(settings, "chutefs_token_required_ack_count", 2)
 
     # Bootstrap before the successor is distributed.
     monkeypatch.setattr(settings, "chutefs_token_key_id", "old-key")
@@ -116,9 +122,10 @@ async def test_rolling_replicas_ack_activate_retire_and_replay_lost_responses(
         administrator_id="support-user",
         request_id=stage_request_id,
         key_id="new-key",
-        required_replica_ids=["pod-b", "pod-a"],
+        required_ack_count=2,
     )
-    assert staged["required_replica_ids"] == ["pod-a", "pod-b"]
+    assert staged["cohort_id"] == "test-api"
+    assert staged["required_ack_count"] == 2
     # Lost response: the exact request returns the persisted response.
     assert (
         await key_epochs.stage_token_key_epoch(
@@ -126,7 +133,7 @@ async def test_rolling_replicas_ack_activate_retire_and_replay_lost_responses(
             administrator_id="support-user",
             request_id=stage_request_id,
             key_id="new-key",
-            required_replica_ids=["pod-a", "pod-b"],
+            required_ack_count=2,
         )
         == staged
     )
@@ -142,6 +149,7 @@ async def test_rolling_replicas_ack_activate_retire_and_replay_lost_responses(
             key_id="new-key",
         )
     await db.rollback()
+
     _configure(monkeypatch, replica_id="pod-b")
     await storage_startup.require_chutefs_token_key_retention()
 
@@ -196,6 +204,7 @@ async def test_same_key_ids_with_different_secret_bytes_cannot_activate(
     db, _ = pg_session
     await _install_rotation_migration(db)
     monkeypatch.setattr(storage_startup, "engine", db.bind)
+    monkeypatch.setattr(settings, "chutefs_token_required_ack_count", 2)
 
     monkeypatch.setattr(settings, "chutefs_token_key_id", "old-key")
     monkeypatch.setattr(
@@ -217,7 +226,7 @@ async def test_same_key_ids_with_different_secret_bytes_cannot_activate(
         administrator_id="support-user",
         request_id=str(uuid.uuid4()),
         key_id="new-key",
-        required_replica_ids=["pod-a", "pod-b"],
+        required_ack_count=2,
     )
     await storage_startup.require_chutefs_token_key_retention()
     _configure(monkeypatch, replica_id="pod-b", new_secret="x" * 32)
@@ -246,6 +255,152 @@ async def test_same_key_ids_with_different_secret_bytes_cannot_activate(
     assert [ack.replica_id for ack in acknowledgements] == ["pod-a"]
 
 
+async def test_configured_quorum_and_cohort_cannot_be_weakened(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    await _install_rotation_migration(db)
+    monkeypatch.setattr(storage_startup, "engine", db.bind)
+    monkeypatch.setattr(settings, "chutefs_token_required_ack_count", 2)
+
+    _configure(monkeypatch, replica_id="bootstrap-pod", keys={"old-key": "o" * 32})
+    await storage_startup.require_chutefs_token_key_retention()
+    _configure(monkeypatch, replica_id="pod-a")
+
+    with pytest.raises(HTTPException, match="exactly match"):
+        await key_epochs.stage_token_key_epoch(
+            db,
+            administrator_id="support-user",
+            request_id=str(uuid.uuid4()),
+            key_id="new-key",
+            required_ack_count=1,
+        )
+    await db.rollback()
+
+    with pytest.raises(HTTPException, match="not a member"):
+        await key_epochs.stage_token_key_epoch(
+            db,
+            administrator_id="support-user",
+            request_id=str(uuid.uuid4()),
+            key_id="new-key",
+            cohort_id="different-api-cohort",
+            required_ack_count=2,
+        )
+    await db.rollback()
+
+
+async def test_stale_pod_ack_is_replaced_by_fresh_dynamic_cohort_member(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    await _install_rotation_migration(db)
+    monkeypatch.setattr(storage_startup, "engine", db.bind)
+
+    _configure(monkeypatch, replica_id="bootstrap-pod", keys={"old-key": "o" * 32})
+    await storage_startup.require_chutefs_token_key_retention()
+    _configure(monkeypatch, replica_id="pod-a")
+    await storage_startup.require_chutefs_token_key_retention()
+    await key_epochs.stage_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="new-key",
+    )
+    await storage_startup.require_chutefs_token_key_retention()
+    await db.execute(
+        update(ChuteFSTokenKeyReplicaAck)
+        .where(
+            ChuteFSTokenKeyReplicaAck.replica_id == "pod-a",
+            ChuteFSTokenKeyReplicaAck.key_id == "new-key",
+        )
+        .values(
+            acknowledged_at=datetime.now(timezone.utc)
+            - timedelta(seconds=storage_startup.TOKEN_KEY_ACK_MAX_AGE_SECONDS + 1)
+        )
+    )
+    await db.commit()
+
+    _configure(monkeypatch, replica_id="pod-b")
+    await storage_startup.require_chutefs_token_key_retention()
+    activated = await key_epochs.activate_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="new-key",
+    )
+
+    assert activated["active_key_id"] == "new-key"
+    acknowledgements = list(
+        (
+            await db.scalars(
+                select(ChuteFSTokenKeyReplicaAck)
+                .where(ChuteFSTokenKeyReplicaAck.key_id == "new-key")
+                .order_by(ChuteFSTokenKeyReplicaAck.replica_id)
+            )
+        ).all()
+    )
+    assert [ack.replica_id for ack in acknowledgements] == ["pod-a", "pod-b"]
+
+
+async def test_database_activation_fence_checks_every_fresh_cohort_ack(
+    pg_session,
+    monkeypatch,
+):
+    db, _ = pg_session
+    await _install_rotation_migration(db)
+    monkeypatch.setattr(storage_startup, "engine", db.bind)
+
+    _configure(monkeypatch, replica_id="bootstrap-pod", keys={"old-key": "o" * 32})
+    await storage_startup.require_chutefs_token_key_retention()
+    _configure(monkeypatch, replica_id="pod-a")
+    await storage_startup.require_chutefs_token_key_retention()
+    await key_epochs.stage_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="new-key",
+    )
+    await storage_startup.require_chutefs_token_key_retention()
+
+    fingerprints = storage_startup.token_key_fingerprints(settings.chutefs_token_keys)
+    divergent_ids = ["extra-key", "new-key", "old-key"]
+    divergent_fingerprints = {
+        "extra-key": "e" * 64,
+        "new-key": fingerprints["new-key"],
+        "old-key": fingerprints["old-key"],
+    }
+    db.add(
+        ChuteFSTokenKeyReplicaAck(
+            replica_id="pod-b",
+            key_id="new-key",
+            cohort_id="test-api",
+            key_ids=divergent_ids,
+            key_fingerprints=divergent_fingerprints,
+            keyring_sha256="f" * 64,
+        )
+    )
+    await db.commit()
+
+    now = datetime.now(timezone.utc)
+    await db.execute(
+        update(ChuteFSTokenKeyEpoch)
+        .where(ChuteFSTokenKeyEpoch.key_id == "old-key")
+        .values(state="retiring", retiring_at=now)
+    )
+    with pytest.raises(DBAPIError, match="disagree on the complete keyring"):
+        await db.execute(
+            update(ChuteFSTokenKeyEpoch)
+            .where(ChuteFSTokenKeyEpoch.key_id == "new-key")
+            .values(state="active", activated_at=now)
+        )
+        await db.commit()
+    await db.rollback()
+    assert (await db.get(ChuteFSTokenKeyEpoch, "old-key")).state == "active"
+    assert (await db.get(ChuteFSTokenKeyEpoch, "new-key")).state == "staged"
+
+
 async def test_stale_replica_ack_cannot_activate_and_replacement_cohort_can(
     pg_session,
     monkeypatch,
@@ -269,7 +424,6 @@ async def test_stale_replica_ack_cannot_activate_and_replacement_cohort_can(
         administrator_id="support-user",
         request_id=str(uuid.uuid4()),
         key_id="stale-key",
-        required_replica_ids=["pod-a"],
     )
     await storage_startup.require_chutefs_token_key_retention()
     await db.execute(
@@ -294,6 +448,15 @@ async def test_stale_replica_ack_cannot_activate_and_replacement_cohort_can(
         )
     await db.rollback()
 
+    cancelled = await key_epochs.cancel_token_key_epoch(
+        db,
+        administrator_id="support-user",
+        request_id=str(uuid.uuid4()),
+        key_id="stale-key",
+        reason="stale rollout pod was replaced",
+    )
+    assert cancelled["state"] == "cancelled"
+
     replacement_keys = {"old-key": "o" * 32, "replacement-key": "r" * 32}
     _configure(monkeypatch, replica_id="pod-b", keys=replacement_keys)
     await storage_startup.require_chutefs_token_key_retention()
@@ -302,7 +465,6 @@ async def test_stale_replica_ack_cannot_activate_and_replacement_cohort_can(
         administrator_id="support-user",
         request_id=str(uuid.uuid4()),
         key_id="replacement-key",
-        required_replica_ids=["pod-b"],
     )
     await storage_startup.require_chutefs_token_key_retention()
     activated = await key_epochs.activate_token_key_epoch(
@@ -313,7 +475,7 @@ async def test_stale_replica_ack_cannot_activate_and_replacement_cohort_can(
     )
 
     assert activated["active_key_id"] == "replacement-key"
-    assert (await db.get(ChuteFSTokenKeyEpoch, "stale-key")).state == "staged"
+    assert (await db.get(ChuteFSTokenKeyEpoch, "stale-key")).state == "cancelled"
     assert (await db.get(ChuteFSTokenKeyEpoch, "replacement-key")).state == "active"
 
 
@@ -397,7 +559,6 @@ async def test_retirement_requires_access_refresh_and_response_replay_expiry(
         administrator_id="support-user",
         request_id=str(uuid.uuid4()),
         key_id="new-key",
-        required_replica_ids=["pod-a"],
     )
     await storage_startup.require_chutefs_token_key_retention()
     await key_epochs.activate_token_key_epoch(
@@ -443,7 +604,7 @@ async def test_retirement_requires_access_refresh_and_response_replay_expiry(
     authority_health._mark_success("chutefs_token", wrong_material)
     wrong_health = authority_health.key_authority_health()["chutefs_token"]
     assert wrong_health["status"] == "degraded"
-    assert wrong_health["ready"] is False
+    assert wrong_health["ready"] is True
     with pytest.raises(HTTPException, match="token key is unavailable") as mismatch:
         launch_sessions._derived_token(
             referenced_session,
@@ -596,7 +757,6 @@ async def test_expired_active_session_reexchanges_after_old_key_removal(
         administrator_id="support-user",
         request_id=str(uuid.uuid4()),
         key_id="new-key",
-        required_replica_ids=["pod-a"],
     )
     await storage_startup.require_chutefs_token_key_retention()
     await key_epochs.activate_token_key_epoch(
@@ -666,7 +826,6 @@ async def test_paused_mint_fences_activation_retirement_and_stale_direct_insert(
         administrator_id="support-user",
         request_id=str(uuid.uuid4()),
         key_id="new-key",
-        required_replica_ids=["pod-a"],
     )
     await storage_startup.require_chutefs_token_key_retention()
 

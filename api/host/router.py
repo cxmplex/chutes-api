@@ -23,6 +23,8 @@ from api.gpu_contracts import (
     GpuPhysicalResultV1,
     GpuRecoveryAuthorizationEnvelopeV1,
     GpuRecoveryReclaimRequestV1,
+    GpuReleaseRolloverEnsureRequestV1,
+    GpuReleaseRolloverResponseV1,
     GpuResetReceiptV1,
 )
 from api.gpu_hotplug_service import (
@@ -41,6 +43,7 @@ from api.gpu_lifecycle_service import (
     GpuLifecycleError,
     authorize_gpu_recovery,
     create_gpu_lifecycle_operation,
+    ensure_gpu_release_rollover,
     get_gpu_lifecycle_operation,
     gpu_recovery_authorization_document,
     finalize_gpu_host_loss,
@@ -48,6 +51,7 @@ from api.gpu_lifecycle_service import (
     record_gpu_physical_result,
     start_gpu_recovery,
 )
+from api.releases.service import ReleaseError, preverify_active_gpu_release_for_host
 from api.host import service as host_service
 from api.host.locks import assert_gpu_external_work_allowed
 from api.host.reservations import (
@@ -881,6 +885,33 @@ async def quarantine_gpu_reservation_endpoint(
         )
         await db.commit()
     except GpuAllocationError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.post(
+    "/{host_id}/gpu/lifecycle/release-rollover/ensure",
+    response_model=GpuReleaseRolloverResponseV1,
+    response_model_exclude_none=True,
+)
+async def ensure_gpu_release_rollover_endpoint(
+    host_id: str,
+    body: GpuReleaseRolloverEnsureRequestV1,
+    db: AsyncSession = Depends(get_db_session),
+    current_host: Host = Depends(host_service.get_current_host),
+):
+    if current_host.host_id != host_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Authenticated host does not match the GPU release-rollover path.",
+        )
+    try:
+        # Prewarm signature verification before acquiring global lifecycle custody.
+        await preverify_active_gpu_release_for_host(db, host_id)
+        result = await ensure_gpu_release_rollover(db, current_host, body)
+        await db.commit()
+        return result
+    except (GpuLifecycleError, ReleaseError) as exc:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 

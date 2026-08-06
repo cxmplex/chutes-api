@@ -18,7 +18,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.x509.oid import NameOID
 from fastapi import HTTPException
-from sqlalchemy import exists, func, select, text
+from sqlalchemy import exists, func, select, text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -41,7 +42,9 @@ from api.server.schemas import (
     StorageObject,
     StorageEraseTask,
     StorageInventorySnapshot,
+    StorageIncarnationRetirementAudit,
     StorageModelInventorySnapshot,
+    StorageReplicaCertRebindAudit,
     StorageReplicationCapability,
     StorageObjectDeleteFence,
     StorageVolume,
@@ -240,6 +243,12 @@ async def _apply_restore_migration(engine) -> None:
             _migration_up_sql("20260713170000_secure_replication.sql")
         )
         await raw.driver_connection.execute(_migration_up_sql("20260713220000_storage_hygiene.sql"))
+        await raw.driver_connection.execute(
+            _migration_up_sql("20260726121000_chutefs_session_rotation_replay.sql")
+        )
+        await raw.driver_connection.execute(
+            _migration_up_sql("20260806120000_api_trust_boundary_hardening.sql")
+        )
 
 
 @pytest_asyncio.fixture
@@ -426,8 +435,9 @@ async def _object(
     size_bytes: int = 1024,
     deleted: bool = False,
     object_key: str | None = None,
+    generation: str | None = None,
 ) -> StorageObject:
-    obj = StorageObject(
+    values = dict(
         object_id=object_id,
         volume_id=volume.volume_id,
         object_key=object_key or f"key-{object_id}",
@@ -438,6 +448,9 @@ async def _object(
         durability_state="pending",
         durable_replica_count=0,
     )
+    if generation is not None:
+        values["generation"] = generation
+    obj = StorageObject(**values)
     db.add(obj)
     await db.flush()
     if sha256:
@@ -1099,7 +1112,13 @@ async def test_secure_replication_migration_down_up_round_trip(pg_session):
     db, redis = pg_session
     legacy_server = await _server(db, redis, "migration-storage", "migration-host")
     legacy_volume = await _volume(db, 1)
-    legacy_object = await _object(db, legacy_volume, "migration-object", sha256="a" * 64)
+    legacy_object = await _object(
+        db,
+        legacy_volume,
+        "migration-object",
+        sha256="a" * 64,
+        generation="migration-object",
+    )
     legacy_placement = await _placement(db, legacy_object, legacy_server, status="present")
     legacy_object_id = legacy_object.object_id
     legacy_placement_id = legacy_placement.placement_id
@@ -1107,6 +1126,12 @@ async def test_secure_replication_migration_down_up_round_trip(pg_session):
     raw = await connection.get_raw_connection()
     driver = raw.driver_connection
 
+    await driver.execute(
+        _migration_down_sql("20260806120000_api_trust_boundary_hardening.sql")
+    )
+    await driver.execute(
+        _migration_down_sql("20260726121000_chutefs_session_rotation_replay.sql")
+    )
     await driver.execute(_migration_down_sql("20260713220000_storage_hygiene.sql"))
     await driver.execute(_migration_down_sql("20260713170000_secure_replication.sql"))
     assert not await driver.fetchval(
@@ -1137,6 +1162,12 @@ async def test_secure_replication_migration_down_up_round_trip(pg_session):
     hygiene_up = _migration_up_sql("20260713220000_storage_hygiene.sql")
     await driver.execute(hygiene_up)
     await driver.execute(hygiene_up)
+    await driver.execute(
+        _migration_up_sql("20260726121000_chutefs_session_rotation_replay.sql")
+    )
+    await driver.execute(
+        _migration_up_sql("20260806120000_api_trust_boundary_hardening.sql")
+    )
     active_inventory_index = await driver.fetchrow(
         """
         SELECT pg_index.indisunique, pg_get_expr(pg_index.indpred, pg_index.indrelid) AS predicate
@@ -2994,6 +3025,314 @@ async def test_new_disk_incarnation_invalidates_old_present_receipts(pg_session)
     assert obj.durability_state == "irrecoverable"
 
 
+async def test_certificate_rebind_mixed_journal_is_atomic_ordered_and_replayable(pg_session):
+    db, redis = pg_session
+    old_identity = _attested_identity("cert-rebind-old")
+    holder = await _server(
+        db,
+        redis,
+        "cert-rebind-holder",
+        "cert-rebind-host",
+        attested_identity=old_identity,
+    )
+    old_cert_hash = holder.attested_cert_pubkey_hash
+    incarnation = holder.storage_incarnation
+    holder_id = holder.server_id
+    volume = await _volume(db, 1)
+    rebound = await _object(
+        db,
+        volume,
+        "a-rebound",
+        sha256="a" * 64,
+        size_bytes=11,
+    )
+    rebound_placement = await _placement(db, rebound, holder, status="present")
+    unassigned = await _object(
+        db,
+        volume,
+        "c-unassigned",
+        sha256="c" * 64,
+        size_bytes=13,
+    )
+    mismatched = await _object(
+        db,
+        volume,
+        "d-mismatch",
+        sha256="d" * 64,
+        size_bytes=17,
+    )
+    mismatch_placement = await _placement(db, mismatched, holder, status="present")
+
+    new_identity = _attested_identity("cert-rebind-new")
+    holder.attested_cert = new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    holder.attested_cert_pubkey_hash = get_public_key_hash(new_identity[1])
+    await db.commit()
+    new_cert_hash = holder.attested_cert_pubkey_hash
+
+    with pytest.raises(HTTPException) as rejected:
+        await service.rebind_replica_certificates(
+            db,
+            holder,
+            request_id=str(uuid.uuid4()),
+            storage_incarnation=incarnation,
+            old_cert_pubkey_hash=old_cert_hash,
+            placements=[
+                {
+                    "object_id": rebound.object_id,
+                    "ciphertext_sha256": rebound.sha256,
+                    "ciphertext_size_bytes": rebound.ciphertext_size_bytes,
+                },
+                {
+                    "object_id": mismatched.object_id,
+                    "ciphertext_sha256": mismatched.sha256,
+                    "ciphertext_size_bytes": mismatched.ciphertext_size_bytes + 1,
+                },
+            ],
+        )
+    assert rejected.value.status_code == 409
+    await db.commit()
+    await db.refresh(rebound_placement)
+    await db.refresh(mismatch_placement)
+    assert rebound_placement.target_cert_pubkey_hash == old_cert_hash
+    assert mismatch_placement.target_cert_pubkey_hash == old_cert_hash
+
+    holder = await db.get(Server, holder_id)
+    with pytest.raises(HTTPException, match="authenticated server") as changed_server:
+        await service.rebind_replica_certificates(
+            db,
+            holder,
+            request_id=str(uuid.uuid4()),
+            storage_incarnation=incarnation,
+            old_cert_pubkey_hash=old_cert_hash,
+            placements=[
+                {
+                    "object_id": unassigned.object_id,
+                    "ciphertext_sha256": unassigned.sha256,
+                    "ciphertext_size_bytes": unassigned.ciphertext_size_bytes,
+                }
+            ],
+        )
+    assert changed_server.value.status_code == 409
+    await db.commit()
+    holder = await db.get(Server, holder_id)
+
+    request_id = str(uuid.uuid4())
+    response = await service.rebind_replica_certificates(
+        db,
+        holder,
+        request_id=request_id,
+        storage_incarnation=incarnation,
+        old_cert_pubkey_hash=old_cert_hash,
+        placements=[
+            {
+                "object_id": "b-not-current",
+                "ciphertext_sha256": "b" * 64,
+                "ciphertext_size_bytes": 12,
+            },
+            {
+                "object_id": rebound.object_id,
+                "ciphertext_sha256": rebound.sha256,
+                "ciphertext_size_bytes": rebound.ciphertext_size_bytes,
+            },
+        ],
+    )
+    assert response == {
+        "request_id": request_id,
+        "server_id": holder.server_id,
+        "storage_incarnation": incarnation,
+        "old_cert_pubkey_hash": old_cert_hash,
+        "new_cert_pubkey_hash": new_cert_hash,
+        "rebound_object_ids": ["a-rebound"],
+        "outcomes": [
+            {"object_id": "a-rebound", "outcome": "rebound"},
+            {"object_id": "b-not-current", "outcome": "not_current"},
+        ],
+    }
+    await db.refresh(rebound_placement)
+    assert rebound_placement.target_cert_pubkey_hash == new_cert_hash
+    audit = await db.get(StorageReplicaCertRebindAudit, request_id)
+    assert audit.object_bindings == [
+        {
+            "object_id": "a-rebound",
+            "ciphertext_sha256": "a" * 64,
+            "ciphertext_size_bytes": 11,
+        }
+    ]
+    assert (
+        await service.rebind_replica_certificates(
+            db,
+            holder,
+            request_id=request_id,
+            storage_incarnation=incarnation,
+            old_cert_pubkey_hash=old_cert_hash,
+            placements=[
+                {
+                    "object_id": "a-rebound",
+                    "ciphertext_sha256": "a" * 64,
+                    "ciphertext_size_bytes": 11,
+                },
+                {
+                    "object_id": "b-not-current",
+                    "ciphertext_sha256": "b" * 64,
+                    "ciphertext_size_bytes": 12,
+                },
+            ],
+        )
+        == response
+    )
+    with pytest.raises(DBAPIError, match="audit rows are immutable"):
+        await db.execute(
+            update(StorageReplicaCertRebindAudit)
+            .where(StorageReplicaCertRebindAudit.request_id == request_id)
+            .values(response_json={})
+        )
+        await db.commit()
+    await db.rollback()
+
+
+async def test_new_incarnation_retires_old_erase_tasks_with_immutable_audit(pg_session):
+    db, redis = pg_session
+    fresh = await _server(db, redis, "fresh-bind-holder", "fresh-bind-host")
+    first_incarnation = fresh.storage_incarnation
+    fresh.storage_incarnation = None
+    await db.commit()
+    assert await service._bind_storage_identity(db, fresh, first_incarnation) == set()
+    await db.commit()
+    await db.refresh(fresh)
+    assert fresh.storage_incarnation == first_incarnation
+
+    holder = await _server(db, redis, "erase-rollover-holder", "erase-rollover-host")
+    old_incarnation = holder.storage_incarnation
+    old_cert_hash = holder.attested_cert_pubkey_hash
+    volume = await _volume(db, 1)
+    obj = await _object(
+        db,
+        volume,
+        "retired-incarnation-bytes",
+        sha256="9" * 64,
+        size_bytes=19,
+    )
+    placement = await _placement(db, obj, holder, status="present")
+    holder_id = holder.server_id
+    placement_id = placement.placement_id
+    object_id = obj.object_id
+    volume_id = volume.volume_id
+    assert await service._refresh_object_durability(db, obj, volume=volume) == 1
+    await db.commit()
+    assert await service._bind_storage_identity(db, holder, old_incarnation) == set()
+    await db.commit()
+    now = datetime.now(timezone.utc)
+    tasks = [
+        StorageEraseTask(
+            object_id="erase-pending",
+            volume_id="erase-volume",
+            server_id=holder.server_id,
+            storage_incarnation=old_incarnation,
+            holder_cert_pubkey_hash=old_cert_hash,
+            reason="object_deleted",
+            state="pending",
+            retention_deadline=now + timedelta(days=1),
+        ),
+        StorageEraseTask(
+            object_id="erase-claimed",
+            volume_id="erase-volume",
+            server_id=holder.server_id,
+            storage_incarnation=old_incarnation,
+            holder_cert_pubkey_hash=old_cert_hash,
+            reason="object_deleted",
+            state="claimed",
+            claimed_at=now,
+            lease_expires_at=now + timedelta(minutes=1),
+            claim_cert_pubkey_hash=old_cert_hash,
+            retention_deadline=now + timedelta(days=1),
+        ),
+        StorageEraseTask(
+            object_id="erase-already-terminal",
+            volume_id="erase-volume",
+            server_id=holder.server_id,
+            storage_incarnation=old_incarnation,
+            holder_cert_pubkey_hash=old_cert_hash,
+            reason="object_deleted",
+            state="erased",
+            completed_at=now,
+            erased_file_was_present=True,
+            retention_deadline=now + timedelta(days=1),
+        ),
+        StorageEraseTask(
+            object_id="erase-other-incarnation",
+            volume_id="erase-volume",
+            server_id=holder.server_id,
+            storage_incarnation=str(uuid.uuid4()),
+            holder_cert_pubkey_hash=old_cert_hash,
+            reason="object_deleted",
+            state="pending",
+            retention_deadline=now + timedelta(days=1),
+        ),
+    ]
+    db.add_all(tasks)
+    await db.commit()
+    task_ids = [task.task_id for task in tasks]
+    new_incarnation = str(uuid.uuid4())
+
+    await service._bind_storage_identity(db, holder, new_incarnation)
+    await db.commit()
+    await service.reconcile_storage(db)
+    db.expire_all()
+    rows = {task_id: await db.get(StorageEraseTask, task_id) for task_id in task_ids}
+    retired = [rows[task_ids[0]], rows[task_ids[1]]]
+    assert [task.state for task in retired] == ["retired", "retired"]
+    assert all(task.erased_file_was_present is None for task in retired)
+    assert all(task.completed_at is not None for task in retired)
+    assert all(task.claimed_at is None and task.lease_expires_at is None for task in retired)
+    assert all(task.last_error == "attested_incarnation_retired_unreachable" for task in retired)
+    assert rows[task_ids[2]].state == "erased"
+    assert rows[task_ids[2]].retirement_audit_id is None
+    assert rows[task_ids[3]].state == "pending"
+    assert rows[task_ids[3]].retirement_audit_id is None
+
+    audit_id = retired[0].retirement_audit_id
+    assert audit_id and retired[1].retirement_audit_id == audit_id
+    audit = await db.get(StorageIncarnationRetirementAudit, audit_id)
+    assert audit.previous_storage_incarnation == old_incarnation
+    assert audit.replacement_storage_incarnation == new_incarnation
+    assert audit.replacement_cert_pubkey_hash == old_cert_hash
+    assert audit.retired_task_ids == sorted(task.task_id for task in retired)
+    assert audit.retired_holder_cert_pubkey_hashes == [old_cert_hash]
+
+    holder = await db.get(Server, holder_id)
+    with pytest.raises(HTTPException, match="permanently retired") as reused:
+        await service._bind_storage_identity(db, holder, old_incarnation)
+    assert reused.value.status_code == 409
+    await db.rollback()
+    with pytest.raises(DBAPIError, match="permanently retired"):
+        await db.execute(
+            update(Server)
+            .where(Server.server_id == holder_id)
+            .values(storage_incarnation=old_incarnation)
+        )
+        await db.commit()
+    await db.rollback()
+    db.expire_all()
+    holder = await db.get(Server, holder_id)
+    placement = await db.get(ReplicaPlacement, placement_id)
+    obj = await db.get(StorageObject, object_id)
+    volume = await db.get(StorageVolume, volume_id)
+    assert holder.storage_incarnation == new_incarnation
+    assert placement.storage_incarnation == old_incarnation
+    assert placement.status == "evicted"
+    assert await service._refresh_object_durability(db, obj, volume=volume) == 0
+    await db.commit()
+
+    with pytest.raises(DBAPIError, match="audit rows are immutable"):
+        await db.execute(
+            update(StorageIncarnationRetirementAudit)
+            .where(StorageIncarnationRetirementAudit.audit_id == audit_id)
+            .values(retired_task_ids=[])
+        )
+        await db.commit()
+    await db.rollback()
+
+
 async def test_placement_skips_full_nodes_and_never_duplicates_hosts(pg_session):
     db, redis = pg_session
     full = await _server(db, redis, "full", "shared-host", disk_free_gb=10)
@@ -3184,6 +3523,7 @@ async def test_reordered_commit_loses_cas_without_replacing_winner(pg_session):
     assert later.lifecycle_state == "committed"
     assert earlier.lifecycle_state == "tombstoned"
     assert volume.used_bytes == 21
+    assert volume.grant_revocation_epoch == 1
 
 
 async def test_repeated_overwrites_detach_terminal_chain_and_purge_in_bounds(
@@ -3652,9 +3992,11 @@ async def test_locate_and_list_switch_only_after_generation_commit(pg_session):
     located_after, _peers, _count = await service.locate_object(db, volume, old.object_key)
     listed_after = await service.list_objects(db, volume, None, 100)
     await db.refresh(old)
+    await db.refresh(volume)
     assert located_after.object_id == replacement.object_id
     assert [item.object_id for item in listed_after] == [replacement.object_id]
     assert old.lifecycle_state == "superseded"
+    assert volume.grant_revocation_epoch == 1
 
 
 async def test_empty_commit_is_distinct_from_abandoned_pending_reservation(

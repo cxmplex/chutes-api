@@ -21,6 +21,7 @@ from api.gpu_contracts import (
     GpuRegistrationNonceV2,
     GpuRegistrationRequestV2,
     GpuRegistrationResponseV2,
+    GpuReleaseRolloverResponseV1,
     GpuResetReceiptV1,
     GpuSourceReaderResultV1,
 )
@@ -35,7 +36,7 @@ from api.gpu_models import GpuLifecycleOperation
 from api.host.schemas import canonical_json_bytes, canonical_sha256
 
 _FIXTURE = Path(__file__).parents[1] / "fixtures" / "gpu_runtime_contracts_v1_v2.json"
-_FIXTURE_SHA256 = "b4849121e3110fad7350dd79b764bf3cdc5dd7324b4de7fd48e1409414d4881f"
+_FIXTURE_SHA256 = "36d5bd2d0aa40d8d7aea54bb3789d484b7d01e460f27eb4843eb4a942fd8ea19"
 
 
 def _load_fixture() -> dict:
@@ -91,6 +92,7 @@ def test_lifecycle_v1_fixture_bytes_validate() -> None:
     GpuRecoveryAuthorizationEnvelopeV1.model_validate(lifecycle["recovery_authorization"])
     for event in lifecycle["recovery_events"]:
         GpuRecoveryEventV1.model_validate(event)
+    GpuReleaseRolloverResponseV1.model_validate(lifecycle["release_rollover_envelope"])
     GpuHotplugCommandV1.model_validate(lifecycle["hotplug_command"])
     GpuHotplugCommandAckV1.model_validate(lifecycle["hotplug_acked"])
     GpuHotplugCommandAckV1.model_validate(lifecycle["hotplug_failed"])

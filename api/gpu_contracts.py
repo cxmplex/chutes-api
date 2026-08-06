@@ -291,6 +291,9 @@ class GpuLifecycleOperationV1(FrozenWireModel):
     management_mode: Optional[Literal["platform", "miner"]] = None
     migration_id: Optional[str] = None
     recovery_authorization_id: Optional[str] = None
+    current_gpu_release_id: Optional[str] = None
+    desired_gpu_release_id: Optional[str] = None
+    desired_release_target_sha256: Optional[str] = Field(None, pattern=_HEX)
     group_state: Optional[
         Literal[
             "discovered",
@@ -350,6 +353,18 @@ class GpuLifecycleOperationV1(FrozenWireModel):
                 raise ValueError("pre-slot lineage must be either absent or complete")
         elif not all(present):
             raise ValueError("reservation-backed lifecycle intent requires complete lineage")
+        rollover = (
+            self.current_gpu_release_id,
+            self.desired_gpu_release_id,
+            self.desired_release_target_sha256,
+        )
+        if self.operation_type == "release_rollover":
+            if any(value is None for value in rollover):
+                raise ValueError("release rollover requires immutable old/new release identity")
+            if self.current_gpu_release_id == self.desired_gpu_release_id:
+                raise ValueError("release rollover requires distinct old/new releases")
+        elif any(value is not None for value in rollover):
+            raise ValueError("only release rollover may carry old/new release identity")
         if self.phase == "quarantined":
             if not self.failure_code or not self.failure_reason:
                 raise ValueError(
@@ -364,6 +379,60 @@ class GpuLifecycleOperationV1(FrozenWireModel):
         terminal = self.phase in {"finalized", "quarantined"}
         if terminal != (self.finalized_at is not None):
             raise ValueError("lifecycle finalized_at must be present exactly for terminal phases")
+        return self
+
+
+class GpuReleaseRolloverEnsureRequestV1(FrozenWireModel):
+    """Exact old/new release identity used to create or replay a rollover intent."""
+
+    schema: Literal["chutes.gpu-release-rollover-ensure.v1"] = (
+        "chutes.gpu-release-rollover-ensure.v1"
+    )
+    version: Literal[1] = 1
+    reservation_id: str
+    reservation_generation: int = Field(..., ge=1)
+    claims_sha256: str = Field(..., pattern=_HEX)
+    current_gpu_release_id: str
+    desired_gpu_release_id: str
+    desired_release_target_sha256: str = Field(..., pattern=_HEX)
+
+    @model_validator(mode="after")
+    def _release_changed(self) -> "GpuReleaseRolloverEnsureRequestV1":
+        if self.current_gpu_release_id == self.desired_gpu_release_id:
+            raise ValueError("GPU release rollover requires distinct current and desired releases")
+        return self
+
+
+class GpuReleaseRolloverResponseV1(FrozenWireModel):
+    """Durable release-rollover envelope embedded in dispatch and poll responses."""
+
+    schema: Literal["chutes.gpu-release-rollover.v1"] = "chutes.gpu-release-rollover.v1"
+    version: Literal[1] = 1
+    host_id: str
+    reservation_id: str
+    reservation_generation: int = Field(..., ge=1)
+    claims_sha256: str = Field(..., pattern=_HEX)
+    current_gpu_release_id: str
+    desired_gpu_release_id: str
+    desired_release_target_sha256: str = Field(..., pattern=_HEX)
+    operation: GpuLifecycleOperationV1
+
+    @model_validator(mode="after")
+    def _exact_operation(self) -> "GpuReleaseRolloverResponseV1":
+        operation = self.operation
+        if (
+            operation.operation_type != "release_rollover"
+            or operation.host_id != self.host_id
+            or operation.reservation_id != self.reservation_id
+            or operation.reservation_generation != self.reservation_generation
+            or operation.claims_sha256 != self.claims_sha256
+            or operation.current_gpu_release_id != self.current_gpu_release_id
+            or operation.desired_gpu_release_id != self.desired_gpu_release_id
+            or operation.desired_release_target_sha256 != self.desired_release_target_sha256
+        ):
+            raise ValueError("GPU release rollover response has mismatched lifecycle lineage")
+        if self.current_gpu_release_id == self.desired_gpu_release_id:
+            raise ValueError("GPU release rollover requires distinct current and desired releases")
         return self
 
 

@@ -521,6 +521,17 @@ class GpuLifecycleOperation(Base):
     management_mode = Column(String, nullable=True)
     migration_id = Column(String, nullable=True)
     recovery_authorization_id = Column(String, nullable=True)
+    current_gpu_release_id = Column(
+        String,
+        ForeignKey("guest_releases.release_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    desired_gpu_release_id = Column(
+        String,
+        ForeignKey("guest_releases.release_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    desired_release_target_sha256 = Column(String(64), nullable=True)
     intent = Column(JSONB, nullable=False)
     intent_sha256 = Column(String(64), nullable=False)
     physical_result = Column(JSONB, nullable=True)
@@ -587,6 +598,18 @@ class GpuLifecycleOperation(Base):
         CheckConstraint(
             "management_mode IS NULL OR management_mode IN ('platform', 'miner')",
             name="ck_gpu_lifecycle_mode",
+        ),
+        CheckConstraint(
+            "(operation_type = 'release_rollover' "
+            "AND current_gpu_release_id IS NOT NULL "
+            "AND desired_gpu_release_id IS NOT NULL "
+            "AND current_gpu_release_id <> desired_gpu_release_id "
+            "AND desired_release_target_sha256 ~ '^[0-9a-f]{64}$') OR "
+            "(operation_type <> 'release_rollover' "
+            "AND current_gpu_release_id IS NULL "
+            "AND desired_gpu_release_id IS NULL "
+            "AND desired_release_target_sha256 IS NULL)",
+            name="ck_gpu_lifecycle_release_rollover",
         ),
         CheckConstraint(
             "(phase = 'intent' AND physical_result IS NULL AND physical_result_sha256 IS NULL "
@@ -1311,6 +1334,9 @@ _GPU_LIFECYCLE_TRANSITION_FUNCTION = DDL(
            OR NEW.management_mode IS DISTINCT FROM OLD.management_mode
            OR NEW.migration_id IS DISTINCT FROM OLD.migration_id
            OR NEW.recovery_authorization_id IS DISTINCT FROM OLD.recovery_authorization_id
+           OR NEW.current_gpu_release_id IS DISTINCT FROM OLD.current_gpu_release_id
+           OR NEW.desired_gpu_release_id IS DISTINCT FROM OLD.desired_gpu_release_id
+           OR NEW.desired_release_target_sha256 IS DISTINCT FROM OLD.desired_release_target_sha256
            OR NEW.intent IS DISTINCT FROM OLD.intent
            OR NEW.intent_sha256 IS DISTINCT FROM OLD.intent_sha256
            OR NEW.created_at IS DISTINCT FROM OLD.created_at

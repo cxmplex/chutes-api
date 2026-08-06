@@ -37,6 +37,7 @@ from api.gpu_contracts import (
     GpuLifecycleOperationV1,
     GpuLocalReleaseAckV1,
     GpuPhysicalResultV1,
+    GpuReleaseRolloverEnsureRequestV1,
     GpuRegistrationNonceRequestV2,
     GpuRegistrationRequestV2,
     GpuResetReceiptV1,
@@ -47,7 +48,10 @@ from api.gpu_lifecycle_service import (
     GpuLifecycleError,
     authorize_gpu_recovery,
     create_gpu_lifecycle_operation,
+    ensure_gpu_release_rollover,
+    ensure_release_rollovers_for_release,
     ensure_reservation_lifecycle_operation,
+    existing_release_rollovers_for_host,
     finalize_gpu_host_loss,
     get_gpu_lifecycle_operation,
     record_gpu_local_release_ack,
@@ -349,7 +353,8 @@ async def postgres_schema():
             key_id=key_id,
             key_sha256=token_key_fingerprints(keys)[key_id],
             state="staged",
-            required_replica_ids=[replica_id],
+            cohort_id="test-api",
+            required_ack_count=1,
         )
         session.add(epoch)
         await session.flush()
@@ -357,6 +362,7 @@ async def postgres_schema():
             ChuteFSTokenKeyReplicaAck(
                 replica_id=replica_id,
                 key_id=key_id,
+                cohort_id="test-api",
                 key_ids=sorted(keys),
                 key_fingerprints=token_key_fingerprints(keys),
                 keyring_sha256=token_keyset_sha256(keys),
@@ -2548,6 +2554,105 @@ async def test_release_rollover_persists_intent_before_fence_and_finalizes(
         await session.commit()
 
 
+async def test_release_rollover_activation_is_durable_exact_and_never_retargets(
+    postgres_schema,
+):
+    sessions, _schema = postgres_schema
+    await _seed(sessions)
+    async with sessions() as session:
+        reservation_response = await reserve_gpu_group(session, "gpu-host", _request())
+        host = await session.get(Host, "gpu-host")
+        current = await session.get(GuestRelease, "gpu-release")
+        current.status = "retired"
+        await session.flush()
+        desired = GuestRelease(
+            release_id="gpu-release-r2",
+            channel=current.channel,
+            tee_type=current.tee_type,
+            compute_type=current.compute_type,
+            status="active",
+            images=current.images,
+            l0_manifest=current.l0_manifest,
+            l0_manifest_digest=current.l0_manifest_digest,
+            l0_manifest_generation=current.l0_manifest_generation,
+            l0_manifest_key_id=current.l0_manifest_key_id,
+            l0_manifest_key_epoch=current.l0_manifest_key_epoch,
+        )
+        session.add(desired)
+        await session.flush()
+
+        produced = await ensure_release_rollovers_for_release(session, desired)
+        assert len(produced) == 1
+        rollover = produced[0]
+        assert rollover.host_id == host.host_id
+        assert rollover.reservation_id == reservation_response.claims.reservation_id
+        assert rollover.current_gpu_release_id == "gpu-release"
+        assert rollover.desired_gpu_release_id == "gpu-release-r2"
+        assert rollover.operation.operation_type == "release_rollover"
+        assert rollover.operation.phase == "intent"
+        operation_id = rollover.operation.operation_id
+        reservation = await session.get(
+            gpu_allocations.GpuLaunchReservation,
+            reservation_response.claims.reservation_id,
+        )
+        assert reservation.teardown_reason == "GPU release rolled"
+
+        exact_request = GpuReleaseRolloverEnsureRequestV1(
+            reservation_id=rollover.reservation_id,
+            reservation_generation=rollover.reservation_generation,
+            claims_sha256=rollover.claims_sha256,
+            current_gpu_release_id=rollover.current_gpu_release_id,
+            desired_gpu_release_id=rollover.desired_gpu_release_id,
+            desired_release_target_sha256=rollover.desired_release_target_sha256,
+        )
+        replay = await ensure_gpu_release_rollover(session, host, exact_request)
+        assert replay == rollover
+        for field, value in (
+            ("current_gpu_release_id", "wrong-current"),
+            ("desired_gpu_release_id", "wrong-desired"),
+            ("desired_release_target_sha256", "f" * 64),
+        ):
+            with pytest.raises(GpuLifecycleError, match="differs from locked"):
+                await ensure_gpu_release_rollover(
+                    session,
+                    host,
+                    exact_request.model_copy(update={field: value}),
+                )
+
+        desired.status = "superseded"
+        await session.flush()
+        third = GuestRelease(
+            release_id="gpu-release-r3",
+            channel=current.channel,
+            tee_type=current.tee_type,
+            compute_type=current.compute_type,
+            status="active",
+            images=current.images,
+            l0_manifest=current.l0_manifest,
+            l0_manifest_digest=current.l0_manifest_digest,
+            l0_manifest_generation=current.l0_manifest_generation,
+            l0_manifest_key_id=current.l0_manifest_key_id,
+            l0_manifest_key_epoch=current.l0_manifest_key_epoch,
+        )
+        session.add(third)
+        await session.flush()
+        assert await ensure_release_rollovers_for_release(session, third) == []
+        projected = await existing_release_rollovers_for_host(session, host.host_id, third)
+        assert len(projected) == 1
+        assert projected[0].operation.operation_id == operation_id
+        assert projected[0].current_gpu_release_id == "gpu-release"
+        assert projected[0].desired_gpu_release_id == "gpu-release-r2"
+
+        with pytest.raises(DBAPIError, match="intent identity is immutable"):
+            await session.execute(
+                update(GpuLifecycleOperation)
+                .where(GpuLifecycleOperation.operation_id == operation_id)
+                .values(desired_gpu_release_id="gpu-release-r3")
+            )
+            await session.commit()
+        await session.rollback()
+
+
 async def test_late_registration_creates_one_replayable_launch_rollback_intent(
     postgres_schema,
 ):
@@ -2621,7 +2726,6 @@ async def test_late_registration_creates_one_replayable_launch_rollback_intent(
     [
         ("pre_slot_claim_quarantine", "reserved"),
         ("launch_rollback", "claimed"),
-        ("release_rollover", "reserved"),
         ("normal_delete", "running"),
     ],
 )
@@ -2655,9 +2759,6 @@ async def test_reservation_lifecycle_producers_use_two_phase_release_and_replay(
         if operation_type == "pre_slot_claim_quarantine":
             reservation.launch_command_id = "focused-launch-command"
             reservation.launch_dispatched_at = now
-        elif operation_type == "release_rollover":
-            reservation.failure_code = "launch_active_release_changed"
-            reservation.failure_reason = "focused release rollover"
         elif operation_type == "normal_delete":
             reservation.running_at = now
             group.state = "running"
@@ -9029,6 +9130,7 @@ async def test_gpu_decommission_rejects_active_and_serializes_exact_retry(
                     name="decommission-registered",
                     netuid=64,
                     compute_type="gpu",
+                    attested_cert_pubkey_hash="d" * 64,
                 ),
             ]
         )
@@ -9056,6 +9158,7 @@ async def test_gpu_decommission_rejects_active_and_serializes_exact_retry(
                 "decommission-registered",
                 "owner",
                 request,
+                replay_attested_spki_sha256="d" * 64,
             )
             await session.commit()
             return result
@@ -9067,6 +9170,7 @@ async def test_gpu_decommission_rejects_active_and_serializes_exact_retry(
         audits = list((await session.execute(select(GpuServerDecommission))).scalars())
         assert len(audits) == 1
         assert audits[0].response_json == first.model_dump(mode="json")
+        assert audits[0].replay_attested_spki_sha256 == "d" * 64
         retained = await session.get(Server, "decommission-registered")
         assert retained is not None
         assert retained.gpu_retired_at is not None

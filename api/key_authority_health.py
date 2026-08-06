@@ -132,9 +132,17 @@ def key_authority_health() -> dict[str, dict[str, object]]:
             and state.last_error is None
             and age is not None
             and not stale
-            and not state.missing_referenced_key_ids
         )
-        if ready:
+        if ready and state.missing_referenced_key_ids:
+            # A retired/predecessor key is needed only by the exact persisted
+            # operation that references it. Keep the replica serving while that
+            # path fails closed locally; the database-active key remains fatal.
+            status = "degraded"
+            error = (
+                "Database-referenced predecessor keys are unavailable on this "
+                "replica: " + ", ".join(state.missing_referenced_key_ids)
+            )
+        elif ready:
             status = "ready"
             error = None
         elif not state.initialized:
@@ -148,12 +156,6 @@ def key_authority_health() -> dict[str, dict[str, object]]:
         elif state.last_error is not None:
             status = "degraded"
             error = state.last_error
-        elif state.missing_referenced_key_ids:
-            status = "degraded"
-            error = (
-                "Database-referenced predecessor keys are unavailable on this "
-                "replica: " + ", ".join(state.missing_referenced_key_ids)
-            )
         else:
             status = "degraded"
             error = state.last_error

@@ -166,9 +166,9 @@ async def test_referenced_predecessor_degrades_without_aborting_and_recovers(
 
     health = authority_health.key_authority_health()
     assert health[degraded_authority]["status"] == "degraded"
-    assert health[degraded_authority]["ready"] is False
+    assert health[degraded_authority]["ready"] is True
     assert health[degraded_authority]["missing_referenced_key_ids"] == ["retiring-key-v1"]
-    assert authority_health.key_authorities_ready(health) is False
+    assert authority_health.key_authorities_ready(health) is True
 
     degraded.return_value = KeyAuthorityRefreshResult()
     await authority_health.refresh_key_authority_acks_once()

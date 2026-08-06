@@ -314,13 +314,14 @@ class LaunchStorageExchangeResponse(BaseModel):
 
 
 class ChuteFSTokenKeyStageRequest(BaseModel):
-    """Stage one successor epoch for an exact set of currently serving replicas."""
+    """Stage one successor for a stable rollout cohort and quorum count."""
 
     model_config = ConfigDict(extra="forbid")
 
     request_id: str
     key_id: str
-    required_replica_ids: List[str] = Field(..., min_length=1, max_length=256)
+    cohort_id: Optional[str] = Field(None, min_length=1, max_length=128)
+    required_ack_count: Optional[int] = Field(None, ge=1, le=256)
 
     @field_validator("request_id")
     @classmethod
@@ -337,15 +338,12 @@ class ChuteFSTokenKeyStageRequest(BaseModel):
             raise ValueError("key_id is malformed")
         return value
 
-    @field_validator("required_replica_ids")
+    @field_validator("cohort_id")
     @classmethod
-    def validate_replica_ids(cls, values: List[str]) -> List[str]:
-        if any(_REPLICA_ID_RE.fullmatch(value) is None for value in values):
-            raise ValueError("required_replica_ids contains a malformed replica identity")
-        if len(set(values)) != len(values):
-            raise ValueError("required_replica_ids must be unique")
-        return sorted(values)
-
+    def validate_cohort_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and _REPLICA_ID_RE.fullmatch(value) is None:
+            raise ValueError("cohort_id is malformed")
+        return value
 
 class ChuteFSTokenKeyTransitionRequest(BaseModel):
     """Activate or retire one exact staged/retiring key epoch."""
@@ -366,24 +364,49 @@ class ChuteFSTokenKeyTransitionRequest(BaseModel):
         return ChuteFSTokenKeyStageRequest.validate_key_id(value)
 
 
+class ChuteFSTokenKeyCancelRequest(ChuteFSTokenKeyTransitionRequest):
+    reason: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reason must contain non-whitespace characters")
+        return value
+
+
 class ChuteFSTokenKeyEpochResponse(BaseModel):
     """Stable response persisted for exact administrator retry."""
 
     model_config = ConfigDict(extra="forbid")
 
     request_id: str
-    operation: Literal["stage", "activate", "retire"]
+    operation: Literal["stage", "activate", "retire", "cancel"]
     key_id: str
     predecessor_key_id: Optional[str] = None
-    state: Literal["staged", "active", "retired"]
+    state: Literal["staged", "active", "retired", "cancelled"]
     active_key_id: Optional[str] = None
-    required_replica_ids: List[str] = Field(default_factory=list)
+    cohort_id: Optional[str] = None
+    required_ack_count: Optional[int] = None
+    retired_key_ids: List[str] = Field(default_factory=list)
 
 
 class DefaultGrantRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     op: Literal["put", "get", "list"]
+    object_id: Optional[str] = Field(None, min_length=1, max_length=128)
+    generation: Optional[str] = Field(None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "DefaultGrantRequest":
+        has_identity = self.object_id is not None or self.generation is not None
+        if self.op == "list" and has_identity:
+            raise ValueError("list grants must not include object identity")
+        if self.op != "list" and (self.object_id is None or self.generation is None):
+            raise ValueError("put/get grants require exact object_id and generation")
+        return self
 
 
 class CreateVolumeRequest(BaseModel):
@@ -459,6 +482,7 @@ class PlacementRequest(BaseModel):
 
 class PlacementResponse(BaseModel):
     object_id: str
+    generation: str
     expected_predecessor_id: Optional[str] = None
     lifecycle_state: Literal["pending"]
     salt: str = Field(
@@ -488,6 +512,7 @@ class CommitObjectRequest(BaseModel):
 
 class CommitObjectResponse(BaseModel):
     object_id: str
+    generation: str
     lifecycle_state: Literal["committed"]
     size_bytes: int
     used_bytes: int
@@ -506,6 +531,7 @@ class LocateObjectRequest(BaseModel):
 
 class LocateObjectResponse(BaseModel):
     object_id: str
+    generation: str
     lifecycle_state: Literal["committed"]
     key: str
     size_bytes: int
@@ -530,6 +556,7 @@ class ListObjectsRequest(BaseModel):
 
 class ObjectInfo(BaseModel):
     object_id: str
+    generation: str
     lifecycle_state: Literal["committed"]
     key: str
     size_bytes: int
@@ -755,6 +782,79 @@ class ReplicaAnnounceRequest(BaseModel):
         return _canonical_incarnation(value)
 
 
+class ReplicaCertRebindEntry(BaseModel):
+    """Exact committed bytes re-proven after a same-disk certificate rotation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    object_id: str = Field(..., min_length=1, max_length=128)
+    ciphertext_sha256: str
+    ciphertext_size_bytes: int = Field(..., ge=0, le=_MAX_INT64, strict=True)
+
+    @field_validator("ciphertext_sha256")
+    @classmethod
+    def validate_ciphertext_sha256(cls, value: str) -> str:
+        return _canonical_sha256(value)
+
+
+class ReplicaCertRebindRequest(BaseModel):
+    """Audited same-server/incarnation placement rebind to the caller's current cert."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    storage_incarnation: str
+    old_cert_pubkey_hash: str
+    placements: List[ReplicaCertRebindEntry] = Field(..., min_length=1, max_length=250)
+
+    @field_validator("request_id")
+    @classmethod
+    def validate_request_id(cls, value: str) -> str:
+        try:
+            canonical = str(UUID(value))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("request_id must be a canonical UUID") from exc
+        if canonical != value:
+            raise ValueError("request_id must be a canonical UUID")
+        return value
+
+    @field_validator("storage_incarnation")
+    @classmethod
+    def validate_storage_incarnation(cls, value: str) -> str:
+        return _canonical_incarnation(value)
+
+    @field_validator("old_cert_pubkey_hash")
+    @classmethod
+    def validate_old_cert_pubkey_hash(cls, value: str) -> str:
+        return _canonical_sha256(value)
+
+    @model_validator(mode="after")
+    def validate_unique_objects(self) -> "ReplicaCertRebindRequest":
+        object_ids = [entry.object_id for entry in self.placements]
+        if len(object_ids) != len(set(object_ids)):
+            raise ValueError("placements must contain unique object_id values")
+        return self
+
+
+class ReplicaCertRebindOutcome(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object_id: str
+    outcome: Literal["rebound", "not_current", "unassigned"]
+
+
+class ReplicaCertRebindResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    server_id: str
+    storage_incarnation: str
+    old_cert_pubkey_hash: str
+    new_cert_pubkey_hash: str
+    rebound_object_ids: List[str] = Field(default_factory=list)
+    outcomes: List[ReplicaCertRebindOutcome] = Field(default_factory=list)
+
+
 class LegacyReplicaAdoptionReceipt(BaseModel):
     object_id: str = Field(..., min_length=1, max_length=128)
     result: Literal["verified", "corrupt"]
@@ -829,6 +929,7 @@ class ReplicaAuthorizationResponse(BaseModel):
     """The calling target TD's current assignment for an incoming object write."""
 
     object_id: str
+    generation: str
     volume_id: str
     placement_status: Literal["pending"]
     lifecycle_state: Literal["pending", "committed"]
@@ -927,7 +1028,11 @@ class GrantRequest(BaseModel):
     capability and never accepts this owner grant.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     volume_id: str
+    object_id: Optional[str] = Field(None, min_length=1, max_length=128)
+    generation: Optional[str] = Field(None, min_length=1, max_length=128)
     ops: List[str] = Field(
         ...,
         min_length=1,
@@ -950,6 +1055,16 @@ class GrantRequest(BaseModel):
             )
         return unique
 
+    @model_validator(mode="after")
+    def validate_scope(self) -> "GrantRequest":
+        op = self.ops[0]
+        has_identity = self.object_id is not None or self.generation is not None
+        if op == "list" and has_identity:
+            raise ValueError("list grants must not include object identity")
+        if op != "list" and (self.object_id is None or self.generation is None):
+            raise ValueError("put/get grants require exact object_id and generation")
+        return self
+
 
 class GrantResponse(BaseModel):
     grant: str
@@ -957,9 +1072,22 @@ class GrantResponse(BaseModel):
 
 
 class GrantVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     grant: str
     volume_id: str
-    op: str
+    op: Literal["put", "get", "list"]
+    object_id: Optional[str] = Field(None, min_length=1, max_length=128)
+    generation: Optional[str] = Field(None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "GrantVerifyRequest":
+        has_identity = self.object_id is not None or self.generation is not None
+        if self.op == "list" and has_identity:
+            raise ValueError("list verification must not include object identity")
+        if self.op != "list" and (self.object_id is None or self.generation is None):
+            raise ValueError("put/get verification requires exact object_id and generation")
+        return self
 
 
 class GrantVerifyResponse(BaseModel):
@@ -967,3 +1095,11 @@ class GrantVerifyResponse(BaseModel):
     user_id: Optional[str] = None
     volume_id: Optional[str] = None
     ops: List[str] = Field(default_factory=list)
+    object_id: Optional[str] = None
+    generation: Optional[str] = None
+    revocation_epoch: Optional[int] = None
+
+
+class GrantRevocationResponse(BaseModel):
+    volume_id: str
+    revocation_epoch: int = Field(..., ge=1)

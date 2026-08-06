@@ -16,6 +16,8 @@ from api.gpu_contracts import (
     GpuLifecycleOperationV1,
     GpuLocalReleaseAckV1,
     GpuPhysicalResultV1,
+    GpuReleaseRolloverEnsureRequestV1,
+    GpuReleaseRolloverResponseV1,
     GpuRecoveryAuthorizationEnvelopeV1,
     GpuRecoveryEventV1,
     GpuResetReceiptV1,
@@ -27,11 +29,15 @@ from api.gpu_models import (
     GpuRecoveryEvent,
 )
 from api.host.gpu_allocations import (
+    _active_gpu_release,
+    _gpu_release_target_sha256,
     _quarantine_group,
     _quarantine_reservation,
     _retire_gpu_runtime_lineage,
     _validate_row_claims,
 )
+from api.releases.provenance import load_canonical_provenance
+from api.releases.schemas import GuestRelease
 from api.host.locks import acquire_gpu_lifecycle_lock
 from api.host.schemas import (
     GpuAllocationGroup,
@@ -212,6 +218,10 @@ def _assert_reservation_snapshot(
         or reservation.server_id != intent.stable_server_id
         or reservation.management_mode != intent.management_mode
         or reservation.legacy_migration_id != intent.migration_id
+        or (
+            intent.operation_type == "release_rollover"
+            and reservation.gpu_release_id != intent.current_gpu_release_id
+        )
         or group.reservation_id != reservation.reservation_id
         or group.reservation_generation != reservation.reservation_generation
         or group.process_incarnation != reservation.process_incarnation
@@ -1320,6 +1330,7 @@ async def create_gpu_lifecycle_operation(
     intent: GpuLifecycleOperationV1,
     *,
     authorized_recovery: bool = False,
+    authorized_release_rollover: bool = False,
     recovery_prior_lineage: tuple[int, int] | None = None,
 ) -> GpuLifecycleOperationV1:
     """Persist reset intent before any physical ownership mutation."""
@@ -1328,6 +1339,12 @@ async def create_gpu_lifecycle_operation(
         "ownerless_group_recovery",
         "forced_dead_guest_recovery",
     }
+    if intent.operation_type == "release_rollover" and not authorized_release_rollover:
+        raise GpuLifecycleError(
+            "GPU release rollover must be created by the atomic rollover producer."
+        )
+    if intent.operation_type != "release_rollover" and authorized_release_rollover:
+        raise GpuLifecycleError("Release-rollover authority cannot create another operation type.")
     if is_recovery and not authorized_recovery:
         raise GpuLifecycleError(
             "GPU recovery intents may only be created by an administrator authorization."
@@ -1417,6 +1434,9 @@ async def create_gpu_lifecycle_operation(
         management_mode=intent.management_mode,
         migration_id=intent.migration_id,
         recovery_authorization_id=intent.recovery_authorization_id,
+        current_gpu_release_id=intent.current_gpu_release_id,
+        desired_gpu_release_id=intent.desired_gpu_release_id,
+        desired_release_target_sha256=intent.desired_release_target_sha256,
         intent=intent_document,
         intent_sha256=intent_sha256,
         reporting_state="pending",
@@ -1448,6 +1468,9 @@ async def ensure_reservation_lifecycle_operation(
     reservation_id: str,
     *,
     operation_type: Optional[str] = None,
+    current_gpu_release_id: str | None = None,
+    desired_gpu_release_id: str | None = None,
+    desired_release_target_sha256: str | None = None,
 ) -> GpuLifecycleOperationV1:
     """Create or replay the one authoritative physical-release intent for a reservation."""
 
@@ -1461,6 +1484,12 @@ async def ensure_reservation_lifecycle_operation(
     ).scalar_one_or_none()
     if host is None:
         raise GpuLifecycleError("GPU lifecycle reservation host is unknown.")
+    expected_operation_type = _derived_reservation_operation_type(reservation)
+    if operation_type is not None and operation_type != expected_operation_type:
+        raise GpuLifecycleError(
+            "Requested lifecycle producer type differs from server-side custody state."
+        )
+    operation_type = expected_operation_type
     existing = (
         (
             await db.execute(
@@ -1482,17 +1511,52 @@ async def ensure_reservation_lifecycle_operation(
         .first()
     )
     if existing is not None:
-        if operation_type is not None and existing.operation_type != operation_type:
+        if existing.operation_type != operation_type:
             raise GpuLifecycleError(
                 "GPU reservation already has another authoritative lifecycle operation."
             )
+        if existing.operation_type == "release_rollover" and any(
+            value is None
+            for value in (
+                existing.current_gpu_release_id,
+                existing.desired_gpu_release_id,
+                existing.desired_release_target_sha256,
+            )
+        ):
+            raise GpuLifecycleError(
+                "Existing GPU release rollover lacks immutable release identity."
+            )
         return await gpu_lifecycle_operation_response(db, existing, group=group)
-    expected_operation_type = _derived_reservation_operation_type(reservation)
-    if operation_type is not None and operation_type != expected_operation_type:
-        raise GpuLifecycleError(
-            "Requested lifecycle producer type differs from server-side custody state."
+    rollover_identity = (
+        current_gpu_release_id,
+        desired_gpu_release_id,
+        desired_release_target_sha256,
+    )
+    if operation_type == "release_rollover" and any(
+        value is None for value in rollover_identity
+    ):
+        desired_release, _image, _provenance = await _active_gpu_release(db, host)
+        current_gpu_release_id = reservation.gpu_release_id
+        desired_gpu_release_id = desired_release.release_id
+        desired_release_target_sha256 = _release_rollover_target_sha256(
+            desired_release,
+            reservation,
+            group,
         )
-    operation_type = expected_operation_type
+        rollover_identity = (
+            current_gpu_release_id,
+            desired_gpu_release_id,
+            desired_release_target_sha256,
+        )
+    if operation_type == "release_rollover":
+        if (
+            any(value is None for value in rollover_identity)
+            or current_gpu_release_id != reservation.gpu_release_id
+            or current_gpu_release_id == desired_gpu_release_id
+        ):
+            raise GpuLifecycleError("GPU release rollover identity is incomplete or stale.")
+    elif any(value is not None for value in rollover_identity):
+        raise GpuLifecycleError("Only release rollover may carry release identity.")
     intent = GpuLifecycleOperationV1(
         operation_id=generate_uuid(),
         operation_type=operation_type,
@@ -1512,8 +1576,303 @@ async def ensure_reservation_lifecycle_operation(
         stable_server_id=reservation.server_id,
         management_mode=reservation.management_mode,
         migration_id=reservation.legacy_migration_id,
+        current_gpu_release_id=current_gpu_release_id,
+        desired_gpu_release_id=desired_gpu_release_id,
+        desired_release_target_sha256=desired_release_target_sha256,
     )
-    return await create_gpu_lifecycle_operation(db, host, intent)
+    return await create_gpu_lifecycle_operation(
+        db,
+        host,
+        intent,
+        authorized_release_rollover=operation_type == "release_rollover",
+    )
+
+
+def _release_rollover_target_sha256(
+    release: GuestRelease,
+    reservation: GpuLaunchReservation,
+    group: GpuAllocationGroup,
+) -> str:
+    """Derive the exact replacement reservation target from signed release provenance."""
+
+    image = (release.images or {}).get("gpu")
+    if not isinstance(image, dict):
+        raise GpuLifecycleError("Desired GPU release has no GPU image.")
+    payload = image.get("provenance_payload")
+    if not isinstance(payload, str) or not payload:
+        raise GpuLifecycleError("Desired GPU release has no canonical provenance.")
+    try:
+        provenance = load_canonical_provenance(payload)
+    except Exception as exc:  # noqa: BLE001 - normalized into the lifecycle contract
+        raise GpuLifecycleError("Desired GPU release provenance is invalid.") from exc
+    environment = next(
+        (
+            item
+            for item in provenance.get("launch_environments", [])
+            if item.get("profile_id") == group.profile_id
+        ),
+        None,
+    )
+    measurement = next(
+        (
+            item
+            for item in provenance.get("measurements", [])
+            if item.get("profile_id") == group.profile_id
+            and item.get("management_mode") == reservation.management_mode
+        ),
+        None,
+    )
+    artifacts = provenance.get("artifacts")
+    if (
+        environment is None
+        or measurement is None
+        or not isinstance(artifacts, dict)
+        or provenance.get("profile_contract_sha256") != group.profile_contract_sha256
+    ):
+        raise GpuLifecycleError(
+            "Desired GPU release does not contain the reservation's exact signed profile."
+        )
+    return _gpu_release_target_sha256(
+        release=release,
+        image=image,
+        group=group,
+        management_mode=reservation.management_mode,
+        measurement_name=measurement["name"],
+        environment=environment,
+        artifacts=artifacts,
+    )
+
+
+async def _ensure_locked_release_rollover(
+    db: AsyncSession,
+    reservation: GpuLaunchReservation,
+    group: GpuAllocationGroup,
+    desired_release: GuestRelease,
+    *,
+    expected: GpuReleaseRolloverEnsureRequestV1 | None = None,
+) -> GpuReleaseRolloverResponseV1:
+    existing_row = (
+        await db.execute(
+            select(GpuLifecycleOperation)
+            .where(
+                GpuLifecycleOperation.allocation_group_id
+                == reservation.allocation_group_id,
+                GpuLifecycleOperation.allocation_group_generation
+                == reservation.allocation_group_generation,
+                GpuLifecycleOperation.reservation_id == reservation.reservation_id,
+            )
+            .order_by(GpuLifecycleOperation.created_at, GpuLifecycleOperation.operation_id)
+            .with_for_update()
+        )
+    ).scalars().first()
+    if existing_row is not None:
+        if existing_row.operation_type != "release_rollover":
+            raise GpuLifecycleError(
+                "GPU reservation already has another authoritative lifecycle operation."
+            )
+        if expected is not None and (
+            expected.reservation_id != reservation.reservation_id
+            or expected.reservation_generation != reservation.reservation_generation
+            or not secrets.compare_digest(expected.claims_sha256, reservation.claims_sha256)
+            or expected.current_gpu_release_id != reservation.gpu_release_id
+            or expected.desired_gpu_release_id != existing_row.desired_gpu_release_id
+            or not secrets.compare_digest(
+                expected.desired_release_target_sha256,
+                existing_row.desired_release_target_sha256 or "",
+            )
+        ):
+            raise GpuLifecycleError(
+                "GPU release rollover request differs from locked reservation identity."
+            )
+        operation = await gpu_lifecycle_operation_response(db, existing_row, group=group)
+        return GpuReleaseRolloverResponseV1(
+            host_id=reservation.host_id,
+            reservation_id=reservation.reservation_id,
+            reservation_generation=reservation.reservation_generation,
+            claims_sha256=reservation.claims_sha256,
+            current_gpu_release_id=operation.current_gpu_release_id,
+            desired_gpu_release_id=operation.desired_gpu_release_id,
+            desired_release_target_sha256=operation.desired_release_target_sha256,
+            operation=operation,
+        )
+    desired_target_sha256 = _release_rollover_target_sha256(
+        desired_release,
+        reservation,
+        group,
+    )
+    if reservation.gpu_release_id == desired_release.release_id:
+        raise GpuLifecycleError("GPU reservation already uses the active release.")
+    if expected is not None and (
+        expected.reservation_id != reservation.reservation_id
+        or expected.reservation_generation != reservation.reservation_generation
+        or not secrets.compare_digest(expected.claims_sha256, reservation.claims_sha256)
+        or expected.current_gpu_release_id != reservation.gpu_release_id
+        or expected.desired_gpu_release_id != desired_release.release_id
+        or not secrets.compare_digest(
+            expected.desired_release_target_sha256,
+            desired_target_sha256,
+        )
+    ):
+        raise GpuLifecycleError(
+            "GPU release rollover request differs from locked reservation or desired release."
+        )
+    now = _now()
+    reservation.teardown_requested_at = reservation.teardown_requested_at or now
+    reservation.teardown_reason = "GPU release rolled"
+    operation = await ensure_reservation_lifecycle_operation(
+        db,
+        reservation.reservation_id,
+        operation_type="release_rollover",
+        current_gpu_release_id=reservation.gpu_release_id,
+        desired_gpu_release_id=desired_release.release_id,
+        desired_release_target_sha256=desired_target_sha256,
+    )
+    return GpuReleaseRolloverResponseV1(
+        host_id=reservation.host_id,
+        reservation_id=reservation.reservation_id,
+        reservation_generation=reservation.reservation_generation,
+        claims_sha256=reservation.claims_sha256,
+        current_gpu_release_id=operation.current_gpu_release_id,
+        desired_gpu_release_id=operation.desired_gpu_release_id,
+        desired_release_target_sha256=operation.desired_release_target_sha256,
+        operation=operation,
+    )
+
+
+async def ensure_gpu_release_rollover(
+    db: AsyncSession,
+    authenticated_host: Host,
+    request: GpuReleaseRolloverEnsureRequestV1,
+) -> GpuReleaseRolloverResponseV1:
+    """Atomically create or replay one host-authenticated release-rollover operation."""
+
+    await acquire_gpu_lifecycle_lock(db)
+    host = await _locked_host(db, authenticated_host)
+    if (
+        authenticated_host.host_id != host.host_id
+        or authenticated_host.active_key_generation != host.active_key_generation
+        or authenticated_host.boot_generation != host.boot_generation
+        or host.compute_type != "gpu"
+        or host.tee_type != "tdx"
+    ):
+        raise GpuLifecycleError(
+            "Authenticated GPU host identity changed before release rollover."
+        )
+    reservation = await _locked_reservation(db, request.reservation_id)
+    if reservation is None or reservation.host_id != host.host_id:
+        raise GpuLifecycleError("GPU release rollover reservation belongs to another host.")
+    group = await _locked_group(db, reservation.allocation_group_id)
+    desired_release, _image, _provenance = await _active_gpu_release(db, host)
+    return await _ensure_locked_release_rollover(
+        db,
+        reservation,
+        group,
+        desired_release,
+        expected=request,
+    )
+
+
+async def ensure_release_rollovers_for_release(
+    db: AsyncSession,
+    desired_release: GuestRelease,
+    *,
+    host_id: str | None = None,
+) -> list[GpuReleaseRolloverResponseV1]:
+    """Produce rollover intents for every live reservation in one activated GPU stream."""
+
+    if desired_release.compute_type != "gpu" or desired_release.tee_type != "tdx":
+        return []
+    await acquire_gpu_lifecycle_lock(db)
+    query = (
+        select(GpuLaunchReservation)
+        .join(Host, Host.host_id == GpuLaunchReservation.host_id)
+        .where(
+            Host.compute_type == "gpu",
+            Host.tee_type == "tdx",
+            Host.release_channel == desired_release.channel,
+            GpuLaunchReservation.gpu_release_id != desired_release.release_id,
+            GpuLaunchReservation.management_mode.in_(("platform", "miner")),
+            GpuLaunchReservation.state.in_(("reserved", "claimed", "launching", "running")),
+        )
+        .order_by(
+            GpuLaunchReservation.host_id,
+            GpuLaunchReservation.allocation_group_id,
+            GpuLaunchReservation.reservation_generation,
+        )
+        .with_for_update()
+    )
+    if host_id is not None:
+        query = query.where(GpuLaunchReservation.host_id == host_id)
+    reservations = (await db.execute(query)).scalars().all()
+    responses: list[GpuReleaseRolloverResponseV1] = []
+    for reservation in reservations:
+        group = await _locked_group(db, reservation.allocation_group_id)
+        responses.append(
+            await _ensure_locked_release_rollover(
+                db,
+                reservation,
+                group,
+                desired_release,
+            )
+        )
+    return responses
+
+
+async def existing_release_rollovers_for_host(
+    db: AsyncSession,
+    host_id: str,
+    _desired_release: GuestRelease,
+) -> list[GpuReleaseRolloverResponseV1]:
+    """Read-only projection of already-produced rollover operations for manifest polling."""
+
+    rows = (
+        (
+            await db.execute(
+                select(GpuLifecycleOperation, GpuLaunchReservation, GpuAllocationGroup)
+                .join(
+                    GpuLaunchReservation,
+                    GpuLaunchReservation.reservation_id == GpuLifecycleOperation.reservation_id,
+                )
+                .join(
+                    GpuAllocationGroup,
+                    GpuAllocationGroup.allocation_group_id
+                    == GpuLaunchReservation.allocation_group_id,
+                )
+                .where(
+                    GpuLifecycleOperation.host_id == host_id,
+                    GpuLifecycleOperation.operation_type == "release_rollover",
+                    GpuLifecycleOperation.phase.notin_(
+                        ("local_release_acked", "finalized", "quarantined")
+                    ),
+                )
+                .order_by(
+                    GpuLaunchReservation.reservation_generation,
+                    GpuLifecycleOperation.operation_id,
+                )
+            )
+        )
+        .all()
+    )
+    responses: list[GpuReleaseRolloverResponseV1] = []
+    for operation_row, reservation, group in rows:
+        operation = await gpu_lifecycle_operation_response(
+            db,
+            operation_row,
+            group=group,
+        )
+        responses.append(
+            GpuReleaseRolloverResponseV1(
+                host_id=reservation.host_id,
+                reservation_id=reservation.reservation_id,
+                reservation_generation=reservation.reservation_generation,
+                claims_sha256=reservation.claims_sha256,
+                current_gpu_release_id=operation.current_gpu_release_id,
+                desired_gpu_release_id=operation.desired_gpu_release_id,
+                desired_release_target_sha256=operation.desired_release_target_sha256,
+                operation=operation,
+            )
+        )
+    return responses
 
 
 async def _locked_operation(

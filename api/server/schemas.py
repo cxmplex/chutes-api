@@ -1091,6 +1091,7 @@ class GpuRuntimeSessionResponse(BaseModel):
     allowed_purposes: List[
         Literal[
             "cache",
+            "gpu-decommission",
             "gpu-infra",
             "instances",
             "launch",
@@ -2725,6 +2726,7 @@ class GpuServerDecommission(Base):
     reservation_generation = Column(Integer, nullable=True)
     allocation_group_id = Column(String, nullable=True)
     allocation_group_generation = Column(Integer, nullable=True)
+    replay_attested_spki_sha256 = Column(String(64), nullable=True)
     migration_ids = Column(JSONB, nullable=False, default=list, server_default="[]")
     response_json = Column(JSONB, nullable=False)
     decommissioned_at = Column(DateTime(timezone=True), nullable=False)
@@ -2737,7 +2739,9 @@ class GpuServerDecommission(Base):
             "AND ((reservation_id IS NULL AND reservation_generation IS NULL) OR "
             "(reservation_id IS NOT NULL AND reservation_generation > 0)) "
             "AND ((allocation_group_id IS NULL AND allocation_group_generation IS NULL) OR "
-            "(allocation_group_id IS NOT NULL AND allocation_group_generation > 0))",
+            "(allocation_group_id IS NOT NULL AND allocation_group_generation > 0)) "
+            "AND (replay_attested_spki_sha256 IS NULL OR "
+            "replay_attested_spki_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_gpu_server_decommission_audit",
         ),
         Index("idx_gpu_server_decommissions_owner", "owner_hotkey", "decommissioned_at"),
@@ -2955,6 +2959,7 @@ class StorageVolume(Base):
         BigInteger, nullable=False, default=10737418240, server_default="10737418240"
     )
     used_bytes = Column(BigInteger, nullable=False, default=0, server_default="0")
+    grant_revocation_epoch = Column(BigInteger, nullable=False, default=0, server_default="0")
     deleted = Column(Boolean, nullable=False, default=False, server_default="false")
     delete_requested_at = Column(DateTime(timezone=True), nullable=True)
     key_shredded_at = Column(DateTime(timezone=True), nullable=True)
@@ -2965,6 +2970,10 @@ class StorageVolume(Base):
     objects = relationship("StorageObject", back_populates="volume", cascade="all, delete-orphan")
 
     __table_args__ = (
+        CheckConstraint(
+            "grant_revocation_epoch >= 0",
+            name="ck_storage_volume_grant_revocation_epoch",
+        ),
         # Name uniqueness scoped to non-deleted volumes (a soft-deleted name can be reused).
         Index(
             "uq_storage_volume_user_name",
@@ -3183,11 +3192,13 @@ class ChuteFSTokenKeyEpoch(Base):
     )
     key_sha256 = Column(String(64), nullable=False)
     state = Column(String, nullable=False)
-    required_replica_ids = Column(JSONB, nullable=False)
+    cohort_id = Column(String(128), nullable=False, default="api", server_default="api")
+    required_ack_count = Column(Integer, nullable=False, default=1, server_default="1")
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     activated_at = Column(DateTime(timezone=True), nullable=True)
     retiring_at = Column(DateTime(timezone=True), nullable=True)
     retired_at = Column(DateTime(timezone=True), nullable=True)
+    cancelled_at = Column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index(
@@ -3197,24 +3208,26 @@ class ChuteFSTokenKeyEpoch(Base):
             postgresql_where=state == "active",
         ),
         CheckConstraint(
-            "state IN ('staged', 'active', 'retiring', 'retired') "
+            "state IN ('staged', 'active', 'retiring', 'retired', 'cancelled') "
             "AND key_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_chutefs_token_key_epoch_state",
         ),
         CheckConstraint(
-            "jsonb_typeof(required_replica_ids) = 'array' "
-            "AND jsonb_array_length(required_replica_ids) > 0",
+            "cohort_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' "
+            "AND required_ack_count BETWEEN 1 AND 256",
             name="ck_chutefs_token_key_epoch_replicas",
         ),
         CheckConstraint(
             "(state = 'staged' AND activated_at IS NULL "
-            "AND retiring_at IS NULL AND retired_at IS NULL) OR "
+            "AND retiring_at IS NULL AND retired_at IS NULL AND cancelled_at IS NULL) OR "
             "(state = 'active' AND activated_at IS NOT NULL "
-            "AND retiring_at IS NULL AND retired_at IS NULL) OR "
+            "AND retiring_at IS NULL AND retired_at IS NULL AND cancelled_at IS NULL) OR "
             "(state = 'retiring' AND activated_at IS NOT NULL "
-            "AND retiring_at IS NOT NULL AND retired_at IS NULL) OR "
+            "AND retiring_at IS NOT NULL AND retired_at IS NULL AND cancelled_at IS NULL) OR "
             "(state = 'retired' AND activated_at IS NOT NULL "
-            "AND retiring_at IS NOT NULL AND retired_at IS NOT NULL)",
+            "AND retiring_at IS NOT NULL AND retired_at IS NOT NULL AND cancelled_at IS NULL) OR "
+            "(state = 'cancelled' AND activated_at IS NULL "
+            "AND retiring_at IS NULL AND retired_at IS NULL AND cancelled_at IS NOT NULL)",
             name="ck_chutefs_token_key_epoch_timestamps",
         ),
     )
@@ -3231,6 +3244,7 @@ class ChuteFSTokenKeyReplicaAck(Base):
         ForeignKey("chutefs_token_key_epochs.key_id", ondelete="CASCADE"),
         primary_key=True,
     )
+    cohort_id = Column(String(128), nullable=False, default="api", server_default="api")
     key_ids = Column(JSONB, nullable=False)
     key_fingerprints = Column(JSONB, nullable=False)
     keyring_sha256 = Column(String(64), nullable=False)
@@ -3238,7 +3252,8 @@ class ChuteFSTokenKeyReplicaAck(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "jsonb_typeof(key_ids) = 'array' "
+            "cohort_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$' "
+            "AND jsonb_typeof(key_ids) = 'array' "
             "AND key_ids ? key_id "
             "AND jsonb_typeof(key_fingerprints) = 'object' "
             "AND key_fingerprints ? key_id "
@@ -3265,19 +3280,28 @@ class ChuteFSTokenKeyEpochOperation(Base):
     requested_by_user_id = Column(String, nullable=False)
     # Preserve Python ``None`` as SQL NULL so the operation-shape check can
     # distinguish transition records from a JSON ``null`` payload.
-    required_replica_ids = Column(JSONB(none_as_null=True), nullable=True)
+    cohort_id = Column(String(128), nullable=True)
+    required_ack_count = Column(Integer, nullable=True)
+    reason = Column(String, nullable=True)
     response_json = Column(JSONB, nullable=False)
+    response_sha256 = Column(String(64), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    replay_expires_at = Column(DateTime(timezone=True), nullable=False)
 
     __table_args__ = (
         CheckConstraint(
             "request_sha256 ~ '^[0-9a-f]{64}$' "
-            "AND operation_type IN ('stage', 'activate', 'retire') "
+            "AND response_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND replay_expires_at > created_at "
+            "AND operation_type IN ('stage', 'activate', 'retire', 'cancel') "
             "AND ((operation_type = 'stage' "
-            "AND jsonb_typeof(required_replica_ids) = 'array' "
-            "AND jsonb_array_length(required_replica_ids) > 0) "
+            "AND cohort_id IS NOT NULL AND required_ack_count BETWEEN 1 AND 256 "
+            "AND reason IS NULL) "
             "OR (operation_type IN ('activate', 'retire') "
-            "AND required_replica_ids IS NULL))",
+            "AND cohort_id IS NULL AND required_ack_count IS NULL AND reason IS NULL) "
+            "OR (operation_type = 'cancel' AND cohort_id IS NULL "
+            "AND required_ack_count IS NULL "
+            "AND length(reason) BETWEEN 1 AND 2000))",
             name="ck_chutefs_token_key_epoch_operation",
         ),
     )
@@ -3312,6 +3336,7 @@ class StorageObject(Base):
     __tablename__ = "storage_objects"
 
     object_id = Column(String, primary_key=True, default=generate_uuid)
+    generation = Column(String, nullable=False, default=generate_uuid)
     volume_id = Column(
         String,
         ForeignKey("storage_volumes.volume_id", ondelete="CASCADE"),
@@ -3437,6 +3462,12 @@ class StorageObject(Base):
             postgresql_where=lifecycle_state.in_(("pending", "committed", "superseded")),
         ),
         Index("idx_storage_objects_volume", "volume_id", "object_id"),
+        UniqueConstraint(
+            "volume_id",
+            "generation",
+            name="uq_storage_object_volume_generation",
+        ),
+        CheckConstraint("length(generation) > 0", name="ck_storage_object_generation"),
         CheckConstraint(
             "lifecycle_state IN ('pending', 'committed', 'superseded', 'tombstoned')",
             name="ck_storage_object_lifecycle_state",
@@ -3589,6 +3620,84 @@ class ReplicaPlacement(Base):
         CheckConstraint(
             "proof_plaintext_sha256 IS NULL OR proof_plaintext_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_replica_plaintext_hash",
+        ),
+    )
+
+
+class StorageReplicaCertRebindAudit(Base):
+    """Immutable exact-byte audit for a same-incarnation placement certificate rebind."""
+
+    __tablename__ = "storage_replica_cert_rebind_audits"
+
+    request_id = Column(String, primary_key=True)
+    request_sha256 = Column(String(64), nullable=False)
+    server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    storage_incarnation = Column(String, nullable=False)
+    old_cert_pubkey_hash = Column(String(64), nullable=False)
+    new_cert_pubkey_hash = Column(String(64), nullable=False)
+    object_bindings = Column(JSONB, nullable=False)
+    response_json = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "request_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND old_cert_pubkey_hash ~ '^[0-9a-f]{64}$' "
+            "AND new_cert_pubkey_hash ~ '^[0-9a-f]{64}$' "
+            "AND old_cert_pubkey_hash <> new_cert_pubkey_hash "
+            "AND jsonb_typeof(object_bindings) = 'array' "
+            "AND jsonb_typeof(response_json) = 'object'",
+            name="ck_storage_replica_cert_rebind_audit",
+        ),
+        Index(
+            "idx_storage_replica_cert_rebind_server",
+            "server_id",
+            "storage_incarnation",
+            "created_at",
+        ),
+    )
+
+
+class StorageIncarnationRetirementAudit(Base):
+    """Immutable proof that a current attested disk replaced an unreachable incarnation."""
+
+    __tablename__ = "storage_incarnation_retirement_audits"
+
+    audit_id = Column(String, primary_key=True, default=generate_uuid)
+    server_id = Column(
+        String,
+        ForeignKey("servers.server_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    previous_storage_incarnation = Column(String, nullable=False)
+    replacement_storage_incarnation = Column(String, nullable=False)
+    replacement_cert_pubkey_hash = Column(String(64), nullable=False)
+    retired_task_ids = Column(JSONB, nullable=False)
+    retired_holder_cert_pubkey_hashes = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "server_id",
+            "previous_storage_incarnation",
+            "replacement_storage_incarnation",
+            name="uq_storage_incarnation_retirement_transition",
+        ),
+        CheckConstraint(
+            "previous_storage_incarnation <> replacement_storage_incarnation "
+            "AND replacement_cert_pubkey_hash ~ '^[0-9a-f]{64}$' "
+            "AND jsonb_typeof(retired_task_ids) = 'array' "
+            "AND jsonb_typeof(retired_holder_cert_pubkey_hashes) = 'array'",
+            name="ck_storage_incarnation_retirement_audit",
+        ),
+        Index(
+            "idx_storage_incarnation_retirement_server",
+            "server_id",
+            "created_at",
         ),
     )
 
@@ -3860,6 +3969,11 @@ class StorageEraseTask(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     erased_file_was_present = Column(Boolean, nullable=True)
     retired_by_user_id = Column(String, nullable=True)
+    retirement_audit_id = Column(
+        String,
+        ForeignKey("storage_incarnation_retirement_audits.audit_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     last_error = Column(String, nullable=True)
     metadata_purged_at = Column(DateTime(timezone=True), nullable=True)
 
@@ -3881,6 +3995,11 @@ class StorageEraseTask(Base):
         ),
         Index("idx_storage_erase_object", "object_id", "state"),
         Index("idx_storage_erase_volume", "volume_id", "state"),
+        Index(
+            "idx_storage_erase_retirement_audit",
+            "retirement_audit_id",
+            postgresql_where=retirement_audit_id.isnot(None),
+        ),
         Index(
             "idx_storage_erase_retention",
             "retention_deadline",

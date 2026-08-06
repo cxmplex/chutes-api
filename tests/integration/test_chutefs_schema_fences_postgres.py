@@ -8,12 +8,15 @@ import uuid
 from datetime import datetime
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from api.instance.schemas import Instance, LaunchConfig
+from api.server.schemas import StorageObject, StorageVolume
 from api.storage import launch_sessions
+from api.storage import service as storage_service
 from api.user.schemas import User
 from tests.integration import test_gpu_chutefs_postgres as chutefs_pg
 from tests.integration import test_storage_reconciliation_postgres as storage_pg
@@ -30,6 +33,7 @@ pytestmark = [
 
 DEFAULT_VOLUME_MIGRATION = "20260724234500_gpu_chutefs_default_volume.sql"
 ROTATION_MIGRATION = "20260726121000_chutefs_session_rotation_replay.sql"
+TRUST_BOUNDARY_MIGRATION = "20260806120000_api_trust_boundary_hardening.sql"
 
 
 @pytest.fixture(autouse=True)
@@ -282,3 +286,149 @@ async def test_helper_rejects_pending_orm_writes_before_preflight_autoflush(pg_s
         select(User.username).where(User.user_id == storage_pg.USER_ID)
     )
     assert persisted_username == original_username
+
+
+async def test_object_generation_grants_are_exact_and_durably_revocable(pg_session):
+    db, _redis = pg_session
+    await _apply_up(db, ROTATION_MIGRATION)
+    await _apply_up(db, TRUST_BOUNDARY_MIGRATION)
+    volume = await storage_pg._volume(db, replication_factor=1)
+    generation = await storage_pg._object(
+        db,
+        volume,
+        f"grant-generation-{uuid.uuid4().hex}",
+    )
+    volume_id = volume.volume_id
+    object_id = generation.object_id
+    generation_id = generation.generation
+    object_key = generation.object_key
+    other_generation = await storage_pg._object(
+        db,
+        volume,
+        f"grant-cross-object-{uuid.uuid4().hex}",
+    )
+
+    grant = await storage_service.issue_grant(
+        db,
+        storage_pg.USER_ID,
+        volume_id,
+        ["put"],
+        object_id=object_id,
+        generation=generation_id,
+    )
+    verified = await storage_service.verify_grant(
+        grant,
+        volume_id,
+        "put",
+        object_id=object_id,
+        generation=generation_id,
+        db=db,
+    )
+    assert verified is not None
+    assert verified["object_id"] == object_id
+    assert verified["generation"] == generation_id
+    assert verified["revocation_epoch"] == 0
+    assert (
+        await storage_service.verify_grant(
+            grant,
+            volume_id,
+            "put",
+            object_id=object_id,
+            generation="different-generation",
+            db=db,
+        )
+        is None
+    )
+    assert (
+        await storage_service.verify_grant(
+            grant,
+            volume_id,
+            "put",
+            object_id=other_generation.object_id,
+            generation=other_generation.generation,
+            db=db,
+        )
+        is None
+    )
+
+    assert (
+        await storage_service.revoke_volume_grants(
+            db,
+            volume_id,
+            storage_pg.USER_ID,
+        )
+        == 1
+    )
+    assert (
+        await storage_service.verify_grant(
+            grant,
+            volume_id,
+            "put",
+            object_id=object_id,
+            generation=generation_id,
+            db=db,
+        )
+        is None
+    )
+
+    with pytest.raises(DBAPIError, match="cannot decrease"):
+        await db.execute(
+            update(StorageVolume)
+            .where(StorageVolume.volume_id == volume_id)
+            .values(grant_revocation_epoch=0)
+        )
+        await db.commit()
+    await db.rollback()
+
+    with pytest.raises(DBAPIError, match="generation is immutable"):
+        await db.execute(
+            update(StorageObject)
+            .where(StorageObject.object_id == object_id)
+            .values(generation="mutated-generation")
+        )
+        await db.commit()
+    await db.rollback()
+
+    replacement_grant = await storage_service.issue_grant(
+        db,
+        storage_pg.USER_ID,
+        volume_id,
+        ["put"],
+        object_id=object_id,
+        generation=generation_id,
+    )
+    volume = await db.get(StorageVolume, volume_id)
+    await storage_service.delete_object(db, volume, object_key)
+    await db.refresh(volume)
+    assert volume.grant_revocation_epoch == 2
+    assert (
+        await storage_service.verify_grant(
+            replacement_grant,
+            volume_id,
+            "put",
+            object_id=object_id,
+            generation=generation_id,
+            db=db,
+        )
+        is None
+    )
+
+    list_grant = await storage_service.issue_grant(
+        db,
+        storage_pg.USER_ID,
+        volume_id,
+        ["list"],
+    )
+    await storage_service.delete_volume(db, volume_id, storage_pg.USER_ID)
+    await db.refresh(volume)
+    assert volume.deleted is True
+    assert volume.grant_revocation_epoch == 3
+    assert (
+        await storage_service.verify_grant(
+            list_grant,
+            volume_id,
+            "list",
+            db=db,
+        )
+        is None
+    )

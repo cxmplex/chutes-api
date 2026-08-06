@@ -1139,6 +1139,13 @@ class Settings(BaseSettings):
         "CHUTEFS_TOKEN_REPLICA_ID",
         os.getenv("HOSTNAME", "local-dev"),
     )
+    chutefs_token_replica_cohort: str = os.getenv(
+        "CHUTEFS_TOKEN_REPLICA_COHORT",
+        "api",
+    )
+    chutefs_token_required_ack_count: int = int(
+        os.getenv("CHUTEFS_TOKEN_REQUIRED_ACK_COUNT", "1")
+    )
     gpu_registration_recovery_key_id: str = os.getenv(
         "GPU_REGISTRATION_RECOVERY_KEY_ID",
         "gpu-registration-dev-key-v1",
@@ -1212,6 +1219,17 @@ class Settings(BaseSettings):
             is None
         ):
             raise ValueError("CHUTEFS_TOKEN_REPLICA_ID is malformed")
+        if (
+            not isinstance(self.chutefs_token_replica_cohort, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                self.chutefs_token_replica_cohort,
+            )
+            is None
+        ):
+            raise ValueError("CHUTEFS_TOKEN_REPLICA_COHORT is malformed")
+        if not 1 <= self.chutefs_token_required_ack_count <= 256:
+            raise ValueError("CHUTEFS_TOKEN_REQUIRED_ACK_COUNT must be between 1 and 256")
         return dict(keys)
 
     @property

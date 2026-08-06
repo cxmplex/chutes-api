@@ -10,6 +10,7 @@ from api.config import _max_plaintext_for_ciphertext_limit, settings
 from api.storage.schemas import (
     CommitObjectRequest,
     CreateVolumeRequest,
+    DefaultGrantRequest,
     EraseTaskResultRequest,
     GrantRequest,
     InventoryObject,
@@ -162,3 +163,52 @@ def test_erase_ack_and_failure_have_explicit_evidence():
 def test_owner_grants_are_single_operation_for_semantic_api_key_scopes():
     with pytest.raises(ValidationError, match="exactly one"):
         GrantRequest(volume_id="volume", ops=["get", "put"])
+
+
+@pytest.mark.parametrize(
+    "request_factory",
+    [
+        lambda: GrantRequest(volume_id="volume", ops=["put"]),
+        lambda: GrantRequest(
+            volume_id="volume",
+            ops=["get"],
+            object_id="object-id",
+        ),
+        lambda: GrantRequest(
+            volume_id="volume",
+            ops=["list"],
+            object_id="object-id",
+            generation="generation-id",
+        ),
+        lambda: DefaultGrantRequest(op="put"),
+        lambda: DefaultGrantRequest(op="get", object_id="object-id"),
+        lambda: DefaultGrantRequest(
+            op="list",
+            object_id="object-id",
+            generation="generation-id",
+        ),
+    ],
+)
+def test_owner_grants_require_exact_object_generation_scope(request_factory):
+    with pytest.raises(ValidationError):
+        request_factory()
+
+
+def test_list_grants_omit_identity_and_object_grants_echo_exact_identity():
+    assert GrantRequest(volume_id="volume", ops=["list"]).object_id is None
+    exact = GrantRequest(
+        volume_id="volume",
+        ops=["get"],
+        object_id="object-id",
+        generation="generation-id",
+    )
+    assert (exact.object_id, exact.generation) == ("object-id", "generation-id")
+    default_exact = DefaultGrantRequest(
+        op="put",
+        object_id="object-id",
+        generation="generation-id",
+    )
+    assert (default_exact.object_id, default_exact.generation) == (
+        "object-id",
+        "generation-id",
+    )

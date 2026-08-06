@@ -37,6 +37,7 @@ from api.storage.schemas import (
     CommitObjectRequest,
     CommitObjectResponse,
     ChuteFSTokenKeyEpochResponse,
+    ChuteFSTokenKeyCancelRequest,
     ChuteFSTokenKeyStageRequest,
     ChuteFSTokenKeyTransitionRequest,
     CreateVolumeRequest,
@@ -49,6 +50,7 @@ from api.storage.schemas import (
     EraseTasksResponse,
     GrantRequest,
     GrantResponse,
+    GrantRevocationResponse,
     GrantVerifyRequest,
     GrantVerifyResponse,
     DefaultGrantRequest,
@@ -79,6 +81,8 @@ from api.storage.schemas import (
     RepairTask,
     RepairTasksResponse,
     ReplicaAnnounceRequest,
+    ReplicaCertRebindRequest,
+    ReplicaCertRebindResponse,
     ReplicaAuthorizationResponse,
     ReplicationCapabilityBinding,
     ReplicationCapabilityCompleteRequest,
@@ -203,6 +207,27 @@ async def announce_replicas(
     return AnnounceResponse(recorded=recorded)
 
 
+@router.post("/replicas/rebind-cert", response_model=ReplicaCertRebindResponse)
+async def rebind_replica_certificates(
+    body: ReplicaCertRebindRequest,
+    db: AsyncSession = Depends(get_db_session),
+    caller: Server = Depends(require_fresh_storage_caller),
+):
+    """Audit and rebind exact same-incarnation bytes to the caller's rotated cert."""
+    return ReplicaCertRebindResponse(
+        **(
+            await service.rebind_replica_certificates(
+                db,
+                caller,
+                request_id=body.request_id,
+                storage_incarnation=body.storage_incarnation,
+                old_cert_pubkey_hash=body.old_cert_pubkey_hash,
+                placements=[entry.model_dump() for entry in body.placements],
+            )
+        )
+    )
+
+
 @router.post("/replicas/adopt-legacy", response_model=LegacyReplicaAdoptionResponse)
 async def adopt_legacy_replicas(
     body: LegacyReplicaAdoptionRequest,
@@ -324,7 +349,8 @@ async def stage_chutefs_token_key(
                 administrator_id=administrator.user_id,
                 request_id=body.request_id,
                 key_id=body.key_id,
-                required_replica_ids=body.required_replica_ids,
+                cohort_id=body.cohort_id,
+                required_ack_count=body.required_ack_count,
             )
         )
     )
@@ -369,6 +395,29 @@ async def retire_chutefs_token_key(
                 administrator_id=administrator.user_id,
                 request_id=body.request_id,
                 key_id=body.key_id,
+            )
+        )
+    )
+
+
+@router.post(
+    "/admin/chutefs/token-keys/cancel",
+    response_model=ChuteFSTokenKeyEpochResponse,
+)
+async def cancel_chutefs_token_key(
+    body: ChuteFSTokenKeyCancelRequest,
+    db: AsyncSession = Depends(get_db_session),
+    administrator: User = Depends(require_storage_administrator),
+):
+    """Cancel one exact staged successor so a replacement can be staged."""
+    return ChuteFSTokenKeyEpochResponse(
+        **(
+            await key_epochs.cancel_token_key_epoch(
+                db,
+                administrator_id=administrator.user_id,
+                request_id=body.request_id,
+                key_id=body.key_id,
+                reason=body.reason,
             )
         )
     )
@@ -856,6 +905,7 @@ async def plan_default_placement(
     )
     return PlacementResponse(
         object_id=obj.object_id,
+        generation=obj.generation,
         expected_predecessor_id=obj.expected_predecessor_id,
         lifecycle_state=obj.lifecycle_state,
         salt=obj.salt,
@@ -888,6 +938,7 @@ async def commit_default_object(
     )
     return CommitObjectResponse(
         object_id=obj.object_id,
+        generation=obj.generation,
         lifecycle_state=obj.lifecycle_state,
         size_bytes=obj.size_bytes,
         used_bytes=authorized.volume.used_bytes,
@@ -918,6 +969,7 @@ async def locate_default_object(
     )
     return LocateObjectResponse(
         object_id=obj.object_id,
+        generation=obj.generation,
         lifecycle_state=obj.lifecycle_state,
         key=obj.object_key,
         size_bytes=obj.size_bytes,
@@ -951,6 +1003,7 @@ async def list_default_objects(
         objects=[
             ObjectInfo(
                 object_id=obj.object_id,
+                generation=obj.generation,
                 lifecycle_state=obj.lifecycle_state,
                 key=obj.object_key,
                 size_bytes=obj.size_bytes,
@@ -1016,6 +1069,8 @@ async def issue_default_volume_grant(
         user_id,
         volume_id,
         [body.op],
+        object_id=body.object_id,
+        generation=body.generation,
         launch_session_id=session_id,
         launch_session_generation=generation,
         ttl_seconds=effective_ttl,
@@ -1052,6 +1107,7 @@ async def plan_placement(
     )
     return PlacementResponse(
         object_id=obj.object_id,
+        generation=obj.generation,
         expected_predecessor_id=obj.expected_predecessor_id,
         lifecycle_state=obj.lifecycle_state,
         salt=obj.salt,
@@ -1081,6 +1137,7 @@ async def commit_object(
     )
     return CommitObjectResponse(
         object_id=obj.object_id,
+        generation=obj.generation,
         lifecycle_state=obj.lifecycle_state,
         size_bytes=obj.size_bytes,
         used_bytes=volume.used_bytes,
@@ -1103,6 +1160,7 @@ async def locate_object(
     obj, peers, replicas_confirmed = await service.locate_object(db, volume, body.key)
     return LocateObjectResponse(
         object_id=obj.object_id,
+        generation=obj.generation,
         lifecycle_state=obj.lifecycle_state,
         key=obj.object_key,
         size_bytes=obj.size_bytes,
@@ -1134,6 +1192,7 @@ async def list_objects(
         objects=[
             ObjectInfo(
                 object_id=o.object_id,
+                generation=o.generation,
                 lifecycle_state=o.lifecycle_state,
                 key=o.object_key,
                 size_bytes=o.size_bytes,
@@ -1177,7 +1236,14 @@ async def issue_grant(
     current_user: User = Depends(get_current_user(require_v2=True)),
 ):
     """A volume owner mints a short-lived grant the storage TDs verify to authorize its object ops."""
-    grant = await service.issue_grant(db, current_user.user_id, body.volume_id, body.ops)
+    grant = await service.issue_grant(
+        db,
+        current_user.user_id,
+        body.volume_id,
+        body.ops,
+        object_id=body.object_id,
+        generation=body.generation,
+    )
     from api.storage.service import GRANT_TTL_SECONDS
 
     return GrantResponse(grant=grant, expires_in=GRANT_TTL_SECONDS)
@@ -1190,7 +1256,14 @@ async def verify_grant(
     _=Depends(require_attested_caller),
 ):
     """A storage TD verifies a presented grant authorizes an object op on a volume."""
-    payload = await service.verify_grant(body.grant, body.volume_id, body.op, db=db)
+    payload = await service.verify_grant(
+        body.grant,
+        body.volume_id,
+        body.op,
+        object_id=body.object_id,
+        generation=body.generation,
+        db=db,
+    )
     if payload is None:
         return GrantVerifyResponse(ok=False)
     return GrantVerifyResponse(
@@ -1198,7 +1271,24 @@ async def verify_grant(
         user_id=payload.get("user_id"),
         volume_id=payload.get("volume_id"),
         ops=payload.get("ops", []),
+        object_id=payload.get("object_id"),
+        generation=payload.get("generation"),
+        revocation_epoch=payload.get("revocation_epoch"),
     )
+
+
+@router.post(
+    "/volumes/{volume_id}/grants/revoke",
+    response_model=GrantRevocationResponse,
+)
+async def revoke_grants(
+    volume_id: str,
+    db: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(get_current_user(require_v2=True)),
+):
+    """Invalidate every outstanding grant for a volume by advancing its epoch."""
+    epoch = await service.revoke_volume_grants(db, volume_id, current_user.user_id)
+    return GrantRevocationResponse(volume_id=volume_id, revocation_epoch=epoch)
 
 
 # --- per-volume key release (attested storage TD only) -----------------------------------------

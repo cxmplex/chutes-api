@@ -1201,6 +1201,10 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     if release.status == RELEASE_STATUS_ACTIVE:
         if release.targets_captured_at is None:
             await _capture_release_targets(db, release)
+        if _compute_type(release) == "gpu":
+            from api.gpu_lifecycle_service import ensure_release_rollovers_for_release
+
+            await ensure_release_rollovers_for_release(db, release)
         if _compute_type(release) == "cpu" and release.tee_type == "tdx":
             await _refresh_active_gpu_storage_intents(
                 db,
@@ -1226,6 +1230,10 @@ async def activate_release(db: AsyncSession, release_id: str) -> GuestRelease:
     release.status = RELEASE_STATUS_ACTIVE
     release.activated_at = datetime.now(timezone.utc)
     await _capture_release_targets(db, release)
+    if _compute_type(release) == "gpu":
+        from api.gpu_lifecycle_service import ensure_release_rollovers_for_release
+
+        await ensure_release_rollovers_for_release(db, release)
     if _compute_type(release) == "cpu" and release.tee_type == "tdx":
         await _refresh_active_gpu_storage_intents(
             db,
@@ -2130,9 +2138,17 @@ async def _manifest_for_logical_host(
         )
     manifest = release_manifest(release)
     if _compute_type(release) == "gpu":
+        from api.gpu_lifecycle_service import existing_release_rollovers_for_host
+
         sibling = await _gpu_storage_sibling_for_host(db, release, host)
         await _ensure_gpu_storage_launch_intent_for_host(db, release, host)
-        manifest = manifest.model_copy(update={"storage_sibling": sibling})
+        rollovers = await existing_release_rollovers_for_host(db, host.host_id, release)
+        manifest = manifest.model_copy(
+            update={
+                "storage_sibling": sibling,
+                "gpu_release_rollovers": rollovers,
+            }
+        )
     return manifest
 
 

@@ -9,7 +9,7 @@ import pytest
 from fastapi import HTTPException
 
 from api.config import settings
-from api.server.schemas import GpuRuntimeSessionResponse
+from api.server.schemas import GpuRuntimeSessionResponse, GpuServerDecommission
 from api.gpu_hotplug_service import GpuHotplugError
 from api.server.gpu_sessions import (
     GPU_RUNTIME_SESSION_IAT_SKEW_SECONDS,
@@ -80,9 +80,18 @@ def _attestation(mode="miner"):
     )
 
 
-def _runtime_session_authority_db(server, attestation):
+def _runtime_session_authority_db(server, attestation, *, reservation_state="running"):
     reservation = SimpleNamespace(
-        state="running",
+        reservation_id=server.gpu_launch_reservation_id,
+        state=reservation_state,
+        reset_completed_at=(
+            datetime.now(timezone.utc) if reservation_state == "released" else None
+        ),
+        released_at=(datetime.now(timezone.utc) if reservation_state == "released" else None),
+        claimed_at=None,
+        launching_at=None,
+        running_at=(datetime.now(timezone.utc) if reservation_state == "running" else None),
+        launch_dispatched_at=None,
         registration_attestation_id=attestation.attestation_id,
         server_id=server.server_id,
         management_mode=server.gpu_management_mode,
@@ -101,6 +110,8 @@ def _runtime_session_authority_db(server, attestation):
     db = AsyncMock()
 
     async def get(model, key):
+        if model is GpuServerDecommission:
+            return None
         if model.__name__ == "Server":
             assert key == server.server_id
             return server
@@ -284,6 +295,142 @@ async def test_runtime_session_expiry_has_no_clock_skew_grace():
     assert exc.value.status_code == 401
     db.get.assert_not_awaited()
     db.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_expired_runtime_session_only_replays_cert_bound_decommission_audit():
+    issued_at = datetime.now(timezone.utc).replace(microsecond=0)
+    replay_at = issued_at + timedelta(minutes=30)
+    server = _server()
+    attestation = _attestation()
+    with patch("api.server.gpu_sessions._runtime_session_now", return_value=issued_at):
+        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+
+    server.gpu_management_mode = None
+    server.gpu_launch_reservation_id = None
+    server.attested_cert_pubkey_hash = None
+    server.gpu_runtime_session_attestation_id = None
+    server.gpu_runtime_session_expires_at = None
+    server.gpu_retired_at = issued_at + timedelta(seconds=1)
+    audit = SimpleNamespace(
+        owner_hotkey=server.miner_hotkey,
+        replay_attested_spki_sha256="a" * 64,
+    )
+    db = AsyncMock()
+
+    async def get(model, key):
+        if model.__name__ == "Server":
+            return server
+        if model is GpuServerDecommission:
+            return audit
+        return None
+
+    db.get.side_effect = get
+    db.execute.return_value = SimpleNamespace(scalar_one_or_none=lambda: None)
+    with (
+        patch("api.server.gpu_sessions._runtime_session_now", return_value=replay_at),
+        patch("api.server.gpu_sessions.acquire_gpu_lifecycle_lock", AsyncMock()),
+    ):
+        replay_server, payload = await validate_gpu_runtime_session(
+            db,
+            token,
+            required_purpose="gpu-decommission",
+        )
+    assert replay_server is server
+    assert payload["attested_spki_sha256"] == "a" * 64
+
+    audit.replay_attested_spki_sha256 = "b" * 64
+    with (
+        patch("api.server.gpu_sessions._runtime_session_now", return_value=replay_at),
+        patch("api.server.gpu_sessions.acquire_gpu_lifecycle_lock", AsyncMock()),
+        pytest.raises(HTTPException, match="replay identity is invalid") as wrong_cert,
+    ):
+        await validate_gpu_runtime_session(
+            db,
+            token,
+            required_purpose="gpu-decommission",
+        )
+    assert wrong_cert.value.status_code == 401
+
+    audit.replay_attested_spki_sha256 = None
+    with (
+        patch("api.server.gpu_sessions._runtime_session_now", return_value=replay_at),
+        patch("api.server.gpu_sessions.acquire_gpu_lifecycle_lock", AsyncMock()),
+        pytest.raises(HTTPException, match="replay identity is invalid") as unbound,
+    ):
+        await validate_gpu_runtime_session(
+            db,
+            token,
+            required_purpose="gpu-decommission",
+        )
+    assert unbound.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_expired_session_still_authorizes_exact_initial_terminal_decommission_only():
+    issued_at = datetime.now(timezone.utc).replace(microsecond=0)
+    decommission_at = issued_at + timedelta(minutes=30)
+    server = _server()
+    attestation = _attestation()
+    with patch("api.server.gpu_sessions._runtime_session_now", return_value=issued_at):
+        token, _expires_at = mint_gpu_runtime_session(server, attestation)
+
+    terminal_db = _runtime_session_authority_db(
+        server,
+        attestation,
+        reservation_state="released",
+    )
+    with (
+        patch(
+            "api.server.gpu_sessions._runtime_session_now",
+            return_value=decommission_at,
+        ),
+        patch("api.server.gpu_sessions.acquire_gpu_lifecycle_lock", AsyncMock()),
+    ):
+        authorized_server, payload = await validate_gpu_runtime_session(
+            terminal_db,
+            token,
+            required_purpose="gpu-decommission",
+        )
+    assert authorized_server is server
+    assert payload["attested_spki_sha256"] == server.attested_cert_pubkey_hash
+
+    active_db = _runtime_session_authority_db(server, attestation)
+    with (
+        patch(
+            "api.server.gpu_sessions._runtime_session_now",
+            return_value=decommission_at,
+        ),
+        patch("api.server.gpu_sessions.acquire_gpu_lifecycle_lock", AsyncMock()),
+        pytest.raises(HTTPException, match="invalid or expired") as nonterminal,
+    ):
+        await validate_gpu_runtime_session(
+            active_db,
+            token,
+            required_purpose="gpu-decommission",
+        )
+    assert nonterminal.value.status_code == 401
+
+    server.attested_cert_pubkey_hash = "b" * 64
+    stale_cert_db = _runtime_session_authority_db(
+        server,
+        attestation,
+        reservation_state="released",
+    )
+    with (
+        patch(
+            "api.server.gpu_sessions._runtime_session_now",
+            return_value=decommission_at,
+        ),
+        patch("api.server.gpu_sessions.acquire_gpu_lifecycle_lock", AsyncMock()),
+        pytest.raises(HTTPException, match="no longer exact") as stale_cert,
+    ):
+        await validate_gpu_runtime_session(
+            stale_cert_db,
+            token,
+            required_purpose="gpu-decommission",
+        )
+    assert stale_cert.value.status_code == 401
 
 
 @pytest.mark.asyncio

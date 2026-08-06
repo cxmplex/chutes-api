@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
 from sqlalchemy import text
@@ -83,6 +83,7 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
     configured_keys = settings.chutefs_token_keys
     configured_key_ids = sorted(configured_keys)
     replica_id = settings.chutefs_token_replica_id
+    cohort_id = settings.chutefs_token_replica_cohort
     keyset_json = json.dumps(configured_key_ids, separators=(",", ":"))
     key_fingerprints = token_key_fingerprints(configured_keys)
     key_fingerprints_json = json.dumps(
@@ -109,26 +110,28 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
         ).all()
         bootstrap = not epoch_rows
         if bootstrap:
-            # The first epoch must be staged before its acknowledgement because
-            # the acknowledgement has a foreign key to the epoch. Only then may
-            # the transition trigger permit staged -> active.
+            # Bootstrap establishes the configured authority directly. Quorum is
+            # required for every successor transition, not for creating the first
+            # database row from the deployment's already-selected secret.
             await connection.execute(
                 text(
                     "INSERT INTO chutefs_token_key_epochs "
-                    "(key_id, key_sha256, state, required_replica_ids) "
-                    "VALUES (:key_id, :key_sha256, 'staged', "
-                    "CAST(:replicas AS jsonb))"
+                    "(key_id, key_sha256, state, cohort_id, required_ack_count, activated_at) "
+                    "VALUES (:key_id, :key_sha256, 'active', :cohort_id, "
+                    ":required_ack_count, :activated_at)"
                 ),
                 {
                     "key_id": settings.chutefs_token_key_id,
                     "key_sha256": key_fingerprints[settings.chutefs_token_key_id],
-                    "replicas": json.dumps([replica_id], separators=(",", ":")),
+                    "cohort_id": cohort_id,
+                    "required_ack_count": settings.chutefs_token_required_ack_count,
+                    "activated_at": now,
                 },
             )
             epoch_rows = [
                 (
                     settings.chutefs_token_key_id,
-                    "staged",
+                    "active",
                     key_fingerprints[settings.chutefs_token_key_id],
                 )
             ]
@@ -154,12 +157,13 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
             await connection.execute(
                 text(
                     "INSERT INTO chutefs_token_key_replica_acks "
-                    "(replica_id, key_id, key_ids, key_fingerprints, "
+                    "(replica_id, key_id, cohort_id, key_ids, key_fingerprints, "
                     "keyring_sha256, acknowledged_at) "
-                    "VALUES (:replica_id, :key_id, CAST(:key_ids AS jsonb), "
+                    "VALUES (:replica_id, :key_id, :cohort_id, CAST(:key_ids AS jsonb), "
                     "CAST(:key_fingerprints AS jsonb), "
                     ":keyring_sha256, :acknowledged_at) "
                     "ON CONFLICT (replica_id, key_id) DO UPDATE SET "
+                    "cohort_id = EXCLUDED.cohort_id, "
                     "key_ids = EXCLUDED.key_ids, "
                     "key_fingerprints = EXCLUDED.key_fingerprints, "
                     "keyring_sha256 = EXCLUDED.keyring_sha256, "
@@ -170,11 +174,14 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
                     "IS DISTINCT FROM EXCLUDED.key_fingerprints "
                     "OR chutefs_token_key_replica_acks.keyring_sha256 "
                     "IS DISTINCT FROM EXCLUDED.keyring_sha256 "
+                    "OR chutefs_token_key_replica_acks.cohort_id "
+                    "IS DISTINCT FROM EXCLUDED.cohort_id "
                     "OR chutefs_token_key_replica_acks.acknowledged_at "
                     "<= to_timestamp(:refresh_before)"
                 ),
                 {
                     "replica_id": replica_id,
+                    "cohort_id": cohort_id,
                     "key_id": key_id,
                     "key_ids": keyset_json,
                     "key_fingerprints": key_fingerprints_json,
@@ -184,18 +191,18 @@ async def require_chutefs_token_key_retention() -> KeyAuthorityRefreshResult:
                 },
             )
 
-        if bootstrap:
-            await connection.execute(
-                text(
-                    "UPDATE chutefs_token_key_epochs "
-                    "SET state = 'active', activated_at = :activated_at "
-                    "WHERE key_id = :key_id AND state = 'staged'"
-                ),
-                {
-                    "key_id": settings.chutefs_token_key_id,
-                    "activated_at": now,
-                },
-            )
+        # Dynamic cohort membership is represented by fresh ACKs, not a frozen
+        # set of pod UIDs. Remove departed replica rows after a bounded grace.
+        await connection.execute(
+            text(
+                "DELETE FROM chutefs_token_key_replica_acks "
+                "WHERE acknowledged_at < :departed_before"
+            ),
+            {
+                "departed_before": now
+                - timedelta(seconds=5 * TOKEN_KEY_ACK_MAX_AGE_SECONDS),
+            },
+        )
 
         active_rows = (
             (
