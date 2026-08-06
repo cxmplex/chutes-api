@@ -3190,6 +3190,198 @@ async def test_certificate_rebind_mixed_journal_is_atomic_ordered_and_replayable
     await db.rollback()
 
 
+async def test_certificate_rebind_recovers_reconcile_winner_and_rejects_near_misses(
+    pg_session,
+):
+    db, redis = pg_session
+    old_identity = _attested_identity("cert-rebind-race-old")
+    holder = await _server(
+        db,
+        redis,
+        "cert-rebind-race-holder",
+        "cert-rebind-race-host",
+        attested_identity=old_identity,
+    )
+    holder_id = holder.server_id
+    incarnation = holder.storage_incarnation
+    old_cert_hash = holder.attested_cert_pubkey_hash
+    volume = await _volume(db, 1)
+    objects = {}
+    placements = {}
+    for index, name in enumerate(("winner", "wrong-reason", "no-audit", "extra-change"), 1):
+        obj = await _object(
+            db,
+            volume,
+            f"cert-rebind-race-{name}",
+            sha256=f"{index}" * 64,
+            size_bytes=10 + index,
+        )
+        objects[name] = obj
+        placements[name] = await _placement(db, obj, holder, status="present")
+    object_ids = {name: obj.object_id for name, obj in objects.items()}
+    object_hashes = {name: obj.sha256 for name, obj in objects.items()}
+    object_sizes = {name: obj.ciphertext_size_bytes for name, obj in objects.items()}
+    placement_ids = {
+        name: placement.placement_id for name, placement in placements.items()
+    }
+    stale_bystander = await _server(
+        db,
+        redis,
+        "cert-rebind-stale-bystander",
+        "cert-rebind-stale-bystander-host",
+        attestation_age=timedelta(hours=2),
+    )
+    await _placement(db, objects["winner"], stale_bystander, status="present")
+    assert await service._refresh_object_durability(
+        db,
+        objects["winner"],
+        volume=volume,
+    ) == 1
+    await db.commit()
+
+    new_identity = _attested_identity("cert-rebind-race-new")
+    holder.attested_cert = new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    holder.attested_cert_pubkey_hash = get_public_key_hash(new_identity[1])
+    await db.commit()
+    new_cert_hash = holder.attested_cert_pubkey_hash
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as reconcile_winner, factory() as rebinder:
+        await reconcile_winner.execute(
+            select(StorageObject)
+            .where(StorageObject.object_id == object_ids["winner"])
+            .with_for_update()
+        )
+        reconcile_placement = (
+            await reconcile_winner.execute(
+                select(ReplicaPlacement)
+                .where(ReplicaPlacement.placement_id == placement_ids["winner"])
+                .with_for_update()
+            )
+        ).scalar_one()
+        reconcile_placement.status = "evicted"
+        reconcile_placement.last_error = "stale_storage_identity"
+        await reconcile_winner.flush()
+
+        rebound_caller = await rebinder.get(Server, holder_id)
+        rebound = asyncio.create_task(
+            service.rebind_replica_certificates(
+                rebinder,
+                rebound_caller,
+                request_id=str(uuid.uuid4()),
+                storage_incarnation=incarnation,
+                old_cert_pubkey_hash=old_cert_hash,
+                placements=[
+                    {
+                        "object_id": object_ids["winner"],
+                        "ciphertext_sha256": object_hashes["winner"],
+                        "ciphertext_size_bytes": object_sizes["winner"],
+                    }
+                ],
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert not rebound.done()
+        await reconcile_winner.commit()
+        response = await asyncio.wait_for(rebound, timeout=5)
+    assert response["rebound_object_ids"] == [object_ids["winner"]]
+    recovered = await db.get(ReplicaPlacement, placement_ids["winner"])
+    recovered_object = await db.get(StorageObject, object_ids["winner"])
+    await db.refresh(recovered)
+    await db.refresh(recovered_object)
+    assert recovered.status == "present"
+    assert recovered.last_error is None
+    assert recovered.target_cert_pubkey_hash == new_cert_hash
+    assert recovered_object.durable_replica_count == 1
+    assert recovered_object.durability_state == "healthy"
+    assert recovered_object.durability_updated_at is not None
+
+    wrong_reason = await db.get(ReplicaPlacement, placement_ids["wrong-reason"])
+    wrong_reason.status = "evicted"
+    wrong_reason.last_error = "pending_target_unavailable"
+    no_audit = await db.get(ReplicaPlacement, placement_ids["no-audit"])
+    no_audit.status = "evicted"
+    no_audit.last_error = "stale_storage_identity"
+    extra_change = await db.get(ReplicaPlacement, placement_ids["extra-change"])
+    extra_change.status = "evicted"
+    extra_change.last_error = "stale_storage_identity"
+    extra_attempt_count = extra_change.attempt_count
+    await db.commit()
+
+    holder = await db.get(Server, holder_id)
+    with pytest.raises(HTTPException, match="present placement or a reconcile-evicted") as rejected:
+        await service.rebind_replica_certificates(
+            db,
+            holder,
+            request_id=str(uuid.uuid4()),
+            storage_incarnation=incarnation,
+            old_cert_pubkey_hash=old_cert_hash,
+            placements=[
+                {
+                    "object_id": object_ids["wrong-reason"],
+                    "ciphertext_sha256": object_hashes["wrong-reason"],
+                    "ciphertext_size_bytes": object_sizes["wrong-reason"],
+                }
+            ],
+        )
+    assert rejected.value.status_code == 409
+    await db.rollback()
+
+    with pytest.raises(DBAPIError, match="lacks exact immutable audit authority"):
+        await db.execute(
+            update(ReplicaPlacement)
+            .where(ReplicaPlacement.placement_id == placement_ids["no-audit"])
+            .values(
+                status="present",
+                last_error=None,
+                target_cert_pubkey_hash=new_cert_hash,
+            )
+        )
+        await db.commit()
+    await db.rollback()
+
+    request_id = str(uuid.uuid4())
+    db.add(
+        StorageReplicaCertRebindAudit(
+            request_id=request_id,
+            request_sha256="f" * 64,
+            server_id=holder_id,
+            storage_incarnation=incarnation,
+            old_cert_pubkey_hash=old_cert_hash,
+            new_cert_pubkey_hash=new_cert_hash,
+            object_bindings=[
+                {
+                    "object_id": object_ids["extra-change"],
+                    "ciphertext_sha256": object_hashes["extra-change"],
+                    "ciphertext_size_bytes": object_sizes["extra-change"],
+                }
+            ],
+            response_json={},
+        )
+    )
+    await db.flush()
+    await db.execute(
+        text("SELECT set_config('chutes.storage_cert_rebind_request_id', :request_id, true)"),
+        {"request_id": request_id},
+    )
+    with pytest.raises(
+        DBAPIError,
+        match="exact present rebind or stale-identity recovery",
+    ):
+        await db.execute(
+            update(ReplicaPlacement)
+            .where(ReplicaPlacement.placement_id == placement_ids["extra-change"])
+            .values(
+                status="present",
+                last_error=None,
+                target_cert_pubkey_hash=new_cert_hash,
+                attempt_count=extra_attempt_count + 1,
+            )
+        )
+        await db.commit()
+    await db.rollback()
+
+
 async def test_new_incarnation_retires_old_erase_tasks_with_immutable_audit(pg_session):
     db, redis = pg_session
     fresh = await _server(db, redis, "fresh-bind-holder", "fresh-bind-host")
@@ -3331,6 +3523,286 @@ async def test_new_incarnation_retires_old_erase_tasks_with_immutable_audit(pg_s
         )
         await db.commit()
     await db.rollback()
+
+
+async def test_delete_after_incarnation_retirement_creates_only_audited_terminal_work(pg_session):
+    db, redis = pg_session
+    holder = await _server(db, redis, "late-erase-holder", "late-erase-host")
+    holder_id = holder.server_id
+    old_incarnation = holder.storage_incarnation
+    volume = await _volume(db, 1)
+    obj = await _object(
+        db,
+        volume,
+        "late-erase-object",
+        object_key="late-erase-key",
+        sha256="7" * 64,
+        size_bytes=23,
+    )
+    placement = await _placement(db, obj, holder, status="present")
+    volume_id = volume.volume_id
+    object_id = obj.object_id
+    object_hash = obj.sha256
+    object_size = obj.ciphertext_size_bytes
+    placement_id = placement.placement_id
+    holder_cert_hash = placement.target_cert_pubkey_hash
+    await service._bind_storage_identity(db, holder, str(uuid.uuid4()))
+    await db.commit()
+
+    representative, _used_bytes, pending_tasks = await service.delete_object(
+        db,
+        volume,
+        "late-erase-key",
+    )
+    assert representative.object_id == object_id
+    assert pending_tasks == 0
+    task = (
+        await db.execute(
+            select(StorageEraseTask).where(
+                StorageEraseTask.object_id == object_id,
+                StorageEraseTask.server_id == holder_id,
+                StorageEraseTask.storage_incarnation == old_incarnation,
+            )
+        )
+    ).scalar_one()
+    task_id = task.task_id
+    audit_id = task.retirement_audit_id
+    audit = await db.get(StorageIncarnationRetirementAudit, audit_id)
+    assert task.state == "retired"
+    assert task.completed_at is not None
+    assert task.retirement_audit_id is not None
+    assert task.last_error == "attested_incarnation_retired_unreachable"
+    assert audit.server_id == holder_id
+    assert audit.previous_storage_incarnation == old_incarnation
+    assert placement_id == task.placement_id
+    assert object_hash == representative.sha256
+    assert object_size == representative.ciphertext_size_bytes
+    linked_completed_at = task.completed_at
+
+    assert await service._retire_deleted_volume_batch(db, volume, limit=10) == (0, 1)
+    await db.commit()
+    await db.refresh(task)
+    assert task.state == "retired"
+    assert task.reason == "volume_deleted"
+    assert task.retirement_audit_id == audit_id
+    assert task.completed_at == linked_completed_at
+
+    with pytest.raises(DBAPIError, match="lacks exact incarnation-retirement audit authority"):
+        await db.execute(
+            StorageEraseTask.__table__.insert().values(
+                task_id=str(uuid.uuid4()),
+                object_id="late-direct-pending",
+                volume_id=volume_id,
+                server_id=holder_id,
+                storage_incarnation=old_incarnation,
+                holder_cert_pubkey_hash=holder_cert_hash,
+                reason="object_deleted",
+                state="pending",
+                retention_deadline=datetime.now(timezone.utc) + timedelta(days=1),
+            )
+        )
+        await db.commit()
+    await db.rollback()
+
+    with pytest.raises(DBAPIError, match="lacks exact incarnation-retirement audit authority"):
+        await db.execute(
+            StorageEraseTask.__table__.insert().values(
+                task_id=str(uuid.uuid4()),
+                object_id="late-direct-unlinked-terminal",
+                volume_id=volume_id,
+                server_id=holder_id,
+                storage_incarnation=old_incarnation,
+                holder_cert_pubkey_hash=holder_cert_hash,
+                reason="object_deleted",
+                state="retired",
+                completed_at=datetime.now(timezone.utc),
+                retention_deadline=datetime.now(timezone.utc) + timedelta(days=1),
+                last_error="attested_incarnation_retired_unreachable",
+            )
+        )
+        await db.commit()
+    await db.rollback()
+
+    with pytest.raises(DBAPIError, match="lacks exact incarnation-retirement audit authority"):
+        await db.execute(
+            StorageEraseTask.__table__.insert().values(
+                task_id=str(uuid.uuid4()),
+                object_id="late-direct-wrong-audit",
+                volume_id=volume_id,
+                server_id=holder_id,
+                storage_incarnation=old_incarnation,
+                holder_cert_pubkey_hash=holder_cert_hash,
+                reason="object_deleted",
+                state="retired",
+                completed_at=datetime.now(timezone.utc),
+                retirement_audit_id=str(uuid.uuid4()),
+                retention_deadline=datetime.now(timezone.utc) + timedelta(days=1),
+                last_error="attested_incarnation_retired_unreachable",
+            )
+        )
+        await db.commit()
+    await db.rollback()
+
+    with pytest.raises(DBAPIError, match="audited storage incarnation retirement is immutable"):
+        await db.execute(
+            update(StorageEraseTask)
+            .where(StorageEraseTask.task_id == task_id)
+            .values(
+                state="pending",
+                completed_at=None,
+                retirement_audit_id=None,
+                last_error=None,
+            )
+        )
+        await db.commit()
+    await db.rollback()
+
+    with pytest.raises(DBAPIError, match="audited storage incarnation retirement is immutable"):
+        await db.execute(
+            update(StorageEraseTask)
+            .where(StorageEraseTask.task_id == task_id)
+            .values(completed_at=linked_completed_at + timedelta(seconds=1))
+        )
+        await db.commit()
+    await db.rollback()
+
+
+@pytest.mark.parametrize(
+    "identity_wins",
+    [False, True],
+    ids=["volume-enqueue-wins", "identity-retirement-wins"],
+)
+async def test_incarnation_retirement_and_mixed_volume_enqueue_serialize_both_orders(
+    pg_session,
+    identity_wins,
+):
+    db, redis = pg_session
+    suffix = "identity" if identity_wins else "volume"
+    holder = await _server(
+        db,
+        redis,
+        f"mixed-retirement-{suffix}",
+        f"mixed-retirement-host-{suffix}",
+    )
+    holder_id = holder.server_id
+    old_incarnation = holder.storage_incarnation
+    old_cert_hash = holder.attested_cert_pubkey_hash
+    volume = await _volume(db, 1)
+    existing_obj = await _object(
+        db,
+        volume,
+        f"mixed-existing-{suffix}",
+        sha256="8" * 64,
+        size_bytes=31,
+    )
+    missing_obj = await _object(
+        db,
+        volume,
+        f"mixed-missing-{suffix}",
+        sha256="9" * 64,
+        size_bytes=37,
+    )
+    existing_placement = await _placement(db, existing_obj, holder, status="present")
+    await _placement(db, missing_obj, holder, status="present")
+    volume_id = volume.volume_id
+    existing_object_id = existing_obj.object_id
+    missing_object_id = missing_obj.object_id
+    existing_placement_id = existing_placement.placement_id
+    now = datetime.now(timezone.utc)
+    existing_task = StorageEraseTask(
+        object_id=existing_object_id,
+        volume_id=volume_id,
+        placement_id=existing_placement_id,
+        server_id=holder_id,
+        storage_incarnation=old_incarnation,
+        holder_cert_pubkey_hash=old_cert_hash,
+        reason="object_deleted",
+        state="erased",
+        completed_at=now,
+        erased_file_was_present=True,
+        retention_deadline=now + timedelta(days=1),
+    )
+    db.add(existing_task)
+    await db.commit()
+    new_incarnation = str(uuid.uuid4())
+
+    factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as identity_worker, factory() as volume_worker:
+        identity_holder = await identity_worker.get(Server, holder_id)
+        deleted_volume = await volume_worker.get(StorageVolume, volume_id)
+        if identity_wins:
+            await service._bind_storage_identity(
+                identity_worker,
+                identity_holder,
+                new_incarnation,
+            )
+            volume_retirement = asyncio.create_task(
+                service._retire_deleted_volume_batch(volume_worker, deleted_volume, limit=10)
+            )
+            await asyncio.sleep(0.05)
+            assert not volume_retirement.done()
+            await identity_worker.commit()
+            assert await asyncio.wait_for(volume_retirement, timeout=5) == (2, 1)
+            await volume_worker.commit()
+        else:
+            assert await service._retire_deleted_volume_batch(
+                volume_worker,
+                deleted_volume,
+                limit=10,
+            ) == (2, 1)
+            identity_retirement = asyncio.create_task(
+                service._bind_storage_identity(
+                    identity_worker,
+                    identity_holder,
+                    new_incarnation,
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not identity_retirement.done()
+            await volume_worker.commit()
+            await asyncio.wait_for(identity_retirement, timeout=5)
+            await identity_worker.commit()
+
+    db.expire_all()
+    audit = (
+        await db.execute(
+            select(StorageIncarnationRetirementAudit).where(
+                StorageIncarnationRetirementAudit.server_id == holder_id,
+                StorageIncarnationRetirementAudit.previous_storage_incarnation == old_incarnation,
+            )
+        )
+    ).scalar_one()
+    tasks = list(
+        (
+            await db.execute(
+                select(StorageEraseTask)
+                .where(
+                    StorageEraseTask.server_id == holder_id,
+                    StorageEraseTask.storage_incarnation == old_incarnation,
+                )
+                .order_by(StorageEraseTask.object_id)
+            )
+        ).scalars()
+    )
+    task_by_object_id = {task.object_id: task for task in tasks}
+    assert set(task_by_object_id) == {
+        existing_object_id,
+        missing_object_id,
+    }
+    existing_result = task_by_object_id[existing_object_id]
+    missing_result = task_by_object_id[missing_object_id]
+    assert missing_result.state == "retired"
+    assert missing_result.retirement_audit_id == audit.audit_id
+    if identity_wins:
+        assert existing_result.state == "erased"
+        assert existing_result.retirement_audit_id is None
+        assert existing_result.erased_file_was_present is True
+    else:
+        assert existing_result.state == "retired"
+        assert existing_result.retirement_audit_id == audit.audit_id
+        assert existing_result.erased_file_was_present is None
+    assert all(task.reason == "volume_deleted" for task in tasks)
+    assert all(task.completed_at is not None for task in tasks)
 
 
 async def test_placement_skips_full_nodes_and_never_duplicates_hosts(pg_session):

@@ -232,23 +232,90 @@ CREATE INDEX IF NOT EXISTS idx_storage_erase_retirement_audit
     ON storage_erase_tasks(retirement_audit_id)
     WHERE retirement_audit_id IS NOT NULL;
 
+CREATE OR REPLACE FUNCTION enforce_storage_erase_retirement_audit()
+RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    matching_audit_id VARCHAR;
+    grandfathered_terminal BOOLEAN := false;
+BEGIN
+    IF TG_OP = 'UPDATE'
+       AND OLD.retirement_audit_id IS NOT NULL
+       AND (to_jsonb(NEW) - 'reason' - 'retention_deadline' - 'metadata_purged_at')
+           IS DISTINCT FROM
+           (to_jsonb(OLD) - 'reason' - 'retention_deadline' - 'metadata_purged_at')
+    THEN
+        RAISE EXCEPTION 'audited storage incarnation retirement is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    SELECT audit.audit_id
+      INTO matching_audit_id
+      FROM storage_incarnation_retirement_audits audit
+     WHERE audit.server_id = NEW.server_id
+       AND audit.previous_storage_incarnation = NEW.storage_incarnation
+     ORDER BY audit.created_at
+     LIMIT 1;
+    grandfathered_terminal := TG_OP = 'UPDATE'
+        AND OLD.retirement_audit_id IS NULL
+        AND NEW.retirement_audit_id IS NULL
+        AND OLD.state IN ('erased', 'retired')
+        AND NEW.state = OLD.state
+        AND NEW.server_id IS NOT DISTINCT FROM OLD.server_id
+        AND NEW.storage_incarnation IS NOT DISTINCT FROM OLD.storage_incarnation
+        AND (to_jsonb(NEW) - 'reason' - 'retention_deadline' - 'metadata_purged_at')
+            = (to_jsonb(OLD) - 'reason' - 'retention_deadline' - 'metadata_purged_at');
+    IF matching_audit_id IS NOT NULL AND NOT grandfathered_terminal THEN
+        IF NEW.retirement_audit_id IS DISTINCT FROM matching_audit_id
+           OR NEW.state <> 'retired'
+           OR NEW.completed_at IS NULL
+           OR NEW.claimed_at IS NOT NULL
+           OR NEW.lease_expires_at IS NOT NULL
+           OR NEW.claim_cert_pubkey_hash IS NOT NULL
+           OR NEW.erased_file_was_present IS NOT NULL
+           OR NEW.retired_by_user_id IS NOT NULL
+           OR NEW.last_error IS DISTINCT FROM 'attested_incarnation_retired_unreachable'
+        THEN
+            RAISE EXCEPTION 'erase task lacks exact incarnation-retirement audit authority'
+                USING ERRCODE = '23514';
+        END IF;
+    ELSIF matching_audit_id IS NULL AND NEW.retirement_audit_id IS NOT NULL THEN
+        RAISE EXCEPTION 'erase task references no exact incarnation-retirement audit'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS trg_storage_erase_retirement_audit ON storage_erase_tasks;
+CREATE TRIGGER trg_storage_erase_retirement_audit
+BEFORE INSERT OR UPDATE ON storage_erase_tasks
+FOR EACH ROW EXECUTE FUNCTION enforce_storage_erase_retirement_audit();
+
 -- The pre-existing placement trigger remains authoritative for every transition except an exact
--- present->present certificate-only rebind. A second trigger admits that one change only when the
--- transaction points at the immutable audit inserted by the service.
+-- present->present certificate-only rebind and exact recovery from reconcile's stale-identity
+-- eviction. A second trigger admits those changes only when the transaction points at the immutable
+-- audit inserted by the service.
 CREATE OR REPLACE FUNCTION enforce_replica_cert_rebind()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     authority_request_id VARCHAR;
     authorized BOOLEAN;
+    present_rebind BOOLEAN;
+    stale_identity_recovery BOOLEAN;
 BEGIN
     IF OLD.target_cert_pubkey_hash IS NOT DISTINCT FROM NEW.target_cert_pubkey_hash THEN
         RETURN NEW;
     END IF;
-    IF OLD.status <> 'present' OR NEW.status <> 'present'
-       OR (to_jsonb(NEW) - 'target_cert_pubkey_hash')
-          IS DISTINCT FROM (to_jsonb(OLD) - 'target_cert_pubkey_hash')
-    THEN
-        RAISE EXCEPTION 'replica certificate rebind must be an exact present cert-only update'
+    present_rebind := OLD.status = 'present' AND NEW.status = 'present'
+        AND (to_jsonb(NEW) - 'target_cert_pubkey_hash')
+            = (to_jsonb(OLD) - 'target_cert_pubkey_hash');
+    stale_identity_recovery := OLD.status = 'evicted'
+        AND OLD.last_error = 'stale_storage_identity'
+        AND NEW.status = 'present'
+        AND NEW.last_error IS NULL
+        AND (to_jsonb(NEW) - 'target_cert_pubkey_hash' - 'status' - 'last_error')
+            = (to_jsonb(OLD) - 'target_cert_pubkey_hash' - 'status' - 'last_error');
+    IF NOT (present_rebind OR stale_identity_recovery) THEN
+        RAISE EXCEPTION
+            'replica certificate rebind must be exact present rebind or stale-identity recovery'
             USING ERRCODE = '23514';
     END IF;
     authority_request_id := current_setting('chutes.storage_cert_rebind_request_id', true);
@@ -288,10 +355,17 @@ CREATE TRIGGER trg_replica_placement_transition_update
 BEFORE UPDATE ON replica_placement
 FOR EACH ROW
 WHEN (NOT (
-    OLD.status = 'present' AND NEW.status = 'present'
-    AND OLD.target_cert_pubkey_hash IS DISTINCT FROM NEW.target_cert_pubkey_hash
-    AND (to_jsonb(NEW) - 'target_cert_pubkey_hash')
-        = (to_jsonb(OLD) - 'target_cert_pubkey_hash')
+    OLD.target_cert_pubkey_hash IS DISTINCT FROM NEW.target_cert_pubkey_hash
+    AND (
+        (OLD.status = 'present' AND NEW.status = 'present'
+         AND (to_jsonb(NEW) - 'target_cert_pubkey_hash')
+             = (to_jsonb(OLD) - 'target_cert_pubkey_hash'))
+        OR
+        (OLD.status = 'evicted' AND OLD.last_error = 'stale_storage_identity'
+         AND NEW.status = 'present' AND NEW.last_error IS NULL
+         AND (to_jsonb(NEW) - 'target_cert_pubkey_hash' - 'status' - 'last_error')
+             = (to_jsonb(OLD) - 'target_cert_pubkey_hash' - 'status' - 'last_error'))
+    )
 ))
 EXECUTE FUNCTION enforce_replica_placement_transition();
 CREATE TRIGGER trg_replica_placement_cert_rebind_guard
@@ -725,6 +799,8 @@ BEFORE INSERT OR UPDATE ON replica_placement
 FOR EACH ROW EXECUTE FUNCTION enforce_replica_placement_transition();
 DROP FUNCTION IF EXISTS enforce_replica_cert_rebind();
 
+DROP TRIGGER IF EXISTS trg_storage_erase_retirement_audit ON storage_erase_tasks;
+DROP FUNCTION IF EXISTS enforce_storage_erase_retirement_audit();
 ALTER TABLE storage_erase_tasks DROP CONSTRAINT fk_storage_erase_task_retirement_audit;
 DROP INDEX IF EXISTS idx_storage_erase_retirement_audit;
 ALTER TABLE storage_erase_tasks DROP COLUMN retirement_audit_id;

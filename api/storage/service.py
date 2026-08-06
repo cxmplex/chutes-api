@@ -580,14 +580,32 @@ async def _bind_storage_identity(
         # unreachability evidence, not proof that individual files were erased.
         # Terminalize only the exact old incarnation and preserve an immutable audit.
         now = datetime.now(timezone.utc)
-        tasks = list(
+        # Lock order is Server -> sorted old-incarnation placements -> sorted erase tasks. Enqueue
+        # paths take Placement -> Task and never reach back for Server, so either their task is
+        # included below or they observe the committed retirement audit after the placement wait.
+        list(
+            (
+                await db.execute(
+                    select(ReplicaPlacement.placement_id)
+                    .where(
+                        ReplicaPlacement.server_id == server.server_id,
+                        ReplicaPlacement.storage_incarnation == previous_incarnation,
+                    )
+                    .order_by(ReplicaPlacement.placement_id)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Lock terminal rows too because deleted-volume retirement may reset erased work to pending.
+        locked_tasks = list(
             (
                 await db.execute(
                     select(StorageEraseTask)
                     .where(
                         StorageEraseTask.server_id == server.server_id,
                         StorageEraseTask.storage_incarnation == previous_incarnation,
-                        StorageEraseTask.state.not_in(ERASE_TERMINAL_STATES),
                     )
                     .order_by(StorageEraseTask.task_id)
                     .with_for_update()
@@ -596,6 +614,7 @@ async def _bind_storage_identity(
             .scalars()
             .all()
         )
+        tasks = [task for task in locked_tasks if task.state not in ERASE_TERMINAL_STATES]
         audit = StorageIncarnationRetirementAudit(
             server_id=server.server_id,
             previous_storage_incarnation=previous_incarnation,
@@ -613,14 +632,7 @@ async def _bind_storage_identity(
         db.add(audit)
         await db.flush([audit])
         for task in tasks:
-            task.state = "retired"
-            task.completed_at = now
-            task.claimed_at = None
-            task.lease_expires_at = None
-            task.claim_cert_pubkey_hash = None
-            task.erased_file_was_present = None
-            task.retirement_audit_id = audit.audit_id
-            task.last_error = "attested_incarnation_retired_unreachable"
+            _retire_erase_task_for_incarnation(task, audit, now=now)
     server.storage_incarnation = storage_incarnation
     server.storage_incarnation_announced_at = func.now()
     marker_identity_changed = (
@@ -639,6 +651,50 @@ async def _bind_storage_identity(
         await db.execute(delete(ContentHolding).where(ContentHolding.server_id == server.server_id))
     await db.flush()
     return set()
+
+
+async def _storage_incarnation_retirement_audit(
+    db: AsyncSession,
+    *,
+    server_id: str,
+    storage_incarnation: Optional[str],
+) -> Optional[StorageIncarnationRetirementAudit]:
+    """Return immutable authority proving that one exact holder incarnation is unreachable."""
+    if not storage_incarnation:
+        return None
+    return (
+        await db.execute(
+            select(StorageIncarnationRetirementAudit)
+            .where(
+                StorageIncarnationRetirementAudit.server_id == server_id,
+                StorageIncarnationRetirementAudit.previous_storage_incarnation
+                == storage_incarnation,
+            )
+            .order_by(StorageIncarnationRetirementAudit.created_at)
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def _retire_erase_task_for_incarnation(
+    task: StorageEraseTask,
+    audit: StorageIncarnationRetirementAudit,
+    *,
+    now: datetime,
+    reason: Optional[str] = None,
+) -> None:
+    """Terminalize one exact old-incarnation task under immutable audit authority."""
+    if reason is not None:
+        task.reason = reason
+    task.state = "retired"
+    task.completed_at = now
+    task.claimed_at = None
+    task.lease_expires_at = None
+    task.claim_cert_pubkey_hash = None
+    task.erased_file_was_present = None
+    task.retired_by_user_id = None
+    task.retirement_audit_id = audit.audit_id
+    task.last_error = "attested_incarnation_retired_unreachable"
 
 
 def _refresh_model_inventory_marker_freshness(
@@ -2012,6 +2068,12 @@ async def _enqueue_erase_tasks_for_generations(
     retention_deadline = now + timedelta(seconds=settings.storage_erase_retention_seconds)
     for placement in placements:
         generation = generation_by_id[placement.object_id]
+        # Placement is the serialization point with identity replacement. Never acquire Server here.
+        retirement_audit = await _storage_incarnation_retirement_audit(
+            db,
+            server_id=placement.server_id,
+            storage_incarnation=placement.storage_incarnation,
+        )
         existing_task = (
             await db.execute(
                 select(StorageEraseTask)
@@ -2028,6 +2090,24 @@ async def _enqueue_erase_tasks_for_generations(
             )
         ).scalar_one_or_none()
         if existing_task is not None:
+            if retirement_audit is not None:
+                # A terminal row that predates the audit remains immutable evidence. Only a
+                # nonterminal row is converted to the audit-linked unreachable terminal state.
+                if existing_task.state not in ERASE_TERMINAL_STATES:
+                    _retire_erase_task_for_incarnation(
+                        existing_task,
+                        retirement_audit,
+                        now=now,
+                        reason=reason if reason == "volume_deleted" else None,
+                    )
+                if reason == "volume_deleted":
+                    existing_task.reason = reason
+                    existing_task.retention_deadline = retention_deadline
+                    existing_task.metadata_purged_at = None
+                if placement.status in ("pending", "present"):
+                    placement.status = "evicted"
+                placement.last_error = reason
+                continue
             if reason == "volume_deleted":
                 # Even an already-erased historical generation is polled once more so every former
                 # key holder drops its bounded in-process volume-key cache before validator shred.
@@ -2045,23 +2125,28 @@ async def _enqueue_erase_tasks_for_generations(
                 placement.status = "evicted"
             placement.last_error = reason
             continue
-        statement = (
-            pg_insert(StorageEraseTask)
-            .values(
-                object_id=generation.object_id,
-                volume_id=generation.volume_id,
-                placement_id=placement.placement_id,
-                server_id=placement.server_id,
-                storage_incarnation=placement.storage_incarnation,
-                holder_cert_pubkey_hash=placement.target_cert_pubkey_hash,
-                reason=reason,
-                state="pending",
-                retention_deadline=retention_deadline,
+        values: Dict[str, Any] = {
+            "object_id": generation.object_id,
+            "volume_id": generation.volume_id,
+            "placement_id": placement.placement_id,
+            "server_id": placement.server_id,
+            "storage_incarnation": placement.storage_incarnation,
+            "holder_cert_pubkey_hash": placement.target_cert_pubkey_hash,
+            "reason": reason,
+            "state": "pending",
+            "retention_deadline": retention_deadline,
+        }
+        if retirement_audit is not None:
+            values.update(
+                state="retired",
+                completed_at=now,
+                retirement_audit_id=retirement_audit.audit_id,
+                last_error="attested_incarnation_retired_unreachable",
             )
-            .on_conflict_do_nothing()
-        )
+        statement = pg_insert(StorageEraseTask).values(**values).on_conflict_do_nothing()
         result = await db.execute(statement)
-        enqueued += int(result.rowcount or 0)
+        if retirement_audit is None:
+            enqueued += int(result.rowcount or 0)
         if placement.status in ("pending", "present"):
             placement.status = "evicted"
         placement.last_error = reason
@@ -2099,34 +2184,27 @@ async def _retire_deleted_volume_batch(
     limit: int,
 ) -> tuple[int, int]:
     now = datetime.now(timezone.utc)
-    historical_tasks = list(
+    # Candidate identities are unlocked hints. Lock every candidate/selected-generation placement
+    # first, then revalidate and lock tasks: Volume/Generation -> Placement -> Task never inverts
+    # identity bind's Server -> Placement -> Task order.
+    historical_candidates = list(
         (
             await db.execute(
-                select(StorageEraseTask)
+                select(
+                    StorageEraseTask.task_id,
+                    StorageEraseTask.placement_id,
+                    StorageEraseTask.state,
+                )
                 .where(
                     StorageEraseTask.volume_id == volume.volume_id,
                     StorageEraseTask.reason != "volume_deleted",
                 )
                 .order_by(StorageEraseTask.task_id)
                 .limit(limit)
-                .with_for_update(skip_locked=True)
             )
-        )
-        .scalars()
-        .all()
+        ).all()
     )
-    for task in historical_tasks:
-        task.reason = "volume_deleted"
-        task.retention_deadline = now + timedelta(seconds=settings.storage_erase_retention_seconds)
-        task.metadata_purged_at = None
-        if task.state in ERASE_TERMINAL_STATES:
-            task.state = "pending"
-            task.completed_at = None
-            task.erased_file_was_present = None
-            task.retired_by_user_id = None
-            task.last_error = None
-
-    generation_limit = max(0, limit - len(historical_tasks))
+    generation_limit = max(0, limit - len(historical_candidates))
     generations = list(
         (
             await db.execute(
@@ -2145,6 +2223,79 @@ async def _retire_deleted_volume_batch(
         .scalars()
         .all()
     )
+    generation_ids = [generation.object_id for generation in generations]
+    candidate_placement_ids = [
+        placement_id
+        for _task_id, placement_id, _state in historical_candidates
+        if placement_id is not None
+    ]
+    if generation_ids or candidate_placement_ids:
+        list(
+            (
+                await db.execute(
+                    select(ReplicaPlacement.placement_id)
+                    .where(
+                        or_(
+                            ReplicaPlacement.object_id.in_(generation_ids or [""]),
+                            ReplicaPlacement.placement_id.in_(candidate_placement_ids or [""]),
+                        )
+                    )
+                    .order_by(ReplicaPlacement.placement_id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+
+    candidate_by_task_id = {
+        task_id: (placement_id, state)
+        for task_id, placement_id, state in historical_candidates
+    }
+    historical_tasks = []
+    if candidate_by_task_id:
+        historical_tasks = list(
+            (
+                await db.execute(
+                    select(StorageEraseTask)
+                    .where(
+                        StorageEraseTask.task_id.in_(list(candidate_by_task_id)),
+                        StorageEraseTask.volume_id == volume.volume_id,
+                        StorageEraseTask.reason != "volume_deleted",
+                    )
+                    .order_by(StorageEraseTask.task_id)
+                    .with_for_update(skip_locked=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        historical_tasks = [
+            task
+            for task in historical_tasks
+            if candidate_by_task_id.get(task.task_id) == (task.placement_id, task.state)
+        ]
+    for task in historical_tasks:
+        retirement_audit = await _storage_incarnation_retirement_audit(
+            db,
+            server_id=task.server_id,
+            storage_incarnation=task.storage_incarnation,
+        )
+        task.reason = "volume_deleted"
+        task.retention_deadline = now + timedelta(seconds=settings.storage_erase_retention_seconds)
+        task.metadata_purged_at = None
+        if retirement_audit is not None and task.state not in ERASE_TERMINAL_STATES:
+            _retire_erase_task_for_incarnation(
+                task,
+                retirement_audit,
+                now=now,
+                reason="volume_deleted",
+            )
+        elif retirement_audit is None and task.state in ERASE_TERMINAL_STATES:
+            task.state = "pending"
+            task.completed_at = None
+            task.erased_file_was_present = None
+            task.retired_by_user_id = None
+            task.last_error = None
+
     for generation in generations:
         if generation.lifecycle_state != OBJECT_TOMBSTONED:
             generation.lifecycle_state = OBJECT_TOMBSTONED
@@ -6810,6 +6961,12 @@ async def rebind_replica_certificates(
     otherwise-forbidden certificate-only identity update.
     """
 
+    # Observe Redis before row locks, then intersect with current attestation using DB-only work.
+    observed_live_storage_ids = await observe_storage_liveness(db)
+    verified_live_storage_ids = await _live_attested_server_ids(
+        db,
+        observed_live_storage_ids=observed_live_storage_ids,
+    )
     storage_incarnation = _normalize_incarnation(storage_incarnation)
     old_cert_pubkey_hash = old_cert_pubkey_hash.lower()
     locked_server = (
@@ -6908,6 +7065,7 @@ async def rebind_replica_certificates(
     placement_by_id = {placement.object_id: placement for placement in placement_rows}
     rebound_bindings: List[Dict[str, Any]] = []
     rebound_placements: List[ReplicaPlacement] = []
+    recovered_objects: Dict[str, StorageObject] = {}
     outcomes: List[Dict[str, str]] = []
     for binding in bindings:
         object_id = binding["object_id"]
@@ -6916,12 +7074,18 @@ async def rebind_replica_certificates(
         if obj is None or obj.lifecycle_state != OBJECT_COMMITTED:
             outcomes.append({"object_id": object_id, "outcome": "not_current"})
             continue
-        if placement is None or placement.status != "present":
+        stale_identity_recovery = bool(
+            placement is not None
+            and placement.status == "evicted"
+            and placement.last_error == "stale_storage_identity"
+        )
+        if placement is None or not (placement.status == "present" or stale_identity_recovery):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    "Certificate rebind requires one exact present placement on the "
-                    f"authenticated server for object {binding['object_id']}."
+                    "Certificate rebind requires one exact present placement or a reconcile-evicted "
+                    "stale-storage-identity placement on the authenticated server for object "
+                    f"{binding['object_id']}."
                 ),
             )
         if (
@@ -6943,6 +7107,8 @@ async def rebind_replica_certificates(
             )
         rebound_bindings.append(binding)
         rebound_placements.append(placement)
+        if stale_identity_recovery:
+            recovered_objects[obj.object_id] = obj
         outcomes.append({"object_id": object_id, "outcome": "rebound"})
 
     response = {
@@ -6972,7 +7138,16 @@ async def rebind_replica_certificates(
     )
     for placement in rebound_placements:
         placement.target_cert_pubkey_hash = new_cert_pubkey_hash
+        if placement.status == "evicted":
+            placement.status = "present"
+            placement.last_error = None
     await db.flush()
+    for obj in recovered_objects.values():
+        await _refresh_object_durability(
+            db,
+            obj,
+            live_ids=verified_live_storage_ids,
+        )
     await db.commit()
     return response
 
