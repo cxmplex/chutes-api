@@ -29,7 +29,7 @@ from api.database import get_session
 from api.chute.schemas import Chute
 from api.image.schemas import Image
 from api.exceptions import EnvdumpMissing
-from sqlalchemy import text, update, func, select
+from sqlalchemy import update, func, select
 from sqlalchemy.orm import joinedload, selectinload
 import api.database.orms  # noqa
 import api.miner_client as miner_client
@@ -51,18 +51,6 @@ TCP_STATES = {
     "0B": "CLOSING",
     "0C": "NEW_SYN_RECV",
 }
-
-# Short lived chutes (probably just to get bounties).
-SHORT_LIVED_CHUTES = """
-SELECT instance_audit.chute_id AS chute_id, EXTRACT(EPOCH FROM MAX(instance_audit.deleted_at) - MIN(instance_audit.created_at)) AS lifetime
-FROM instance_audit
-LEFT OUTER JOIN chutes ON instance_audit.chute_id = chutes.chute_id
-WHERE chutes.name IS NULL
-AND deleted_at >= now() - interval '7 days'
-GROUP BY instance_audit.chute_id
-HAVING EXTRACT(EPOCH FROM MAX(instance_audit.deleted_at) - MIN(instance_audit.created_at)) <= 86400
-"""
-
 
 def use_encrypted_slurp(chutes_version: str) -> bool:
     """
@@ -880,74 +868,6 @@ async def check_all_chutes():
         await asyncio.gather(*[check_chute(chute_id) for chute_id in batch])
     delta = int(time.time()) - started_at
     logger.info(f"Finished probing all instances of {len(chute_ids)} chutes in {delta} seconds.")
-
-
-async def generate_confirmed_reports(chute_id, reason):
-    """
-    When a chute is confirmed bad, generate reports for it.
-    """
-    from api.user.service import chutes_user_id
-
-    async with get_session() as session:
-        report_query = text("""
-        WITH inserted AS (
-            INSERT INTO reports
-            (invocation_id, user_id, timestamp, confirmed_at, confirmed_by, reason)
-            SELECT
-                parent_invocation_id,
-                :user_id,
-                now(),
-                now(),
-                :confirmed_by,
-                :reason
-            FROM invocations i
-            WHERE chute_id = :chute_id
-            AND NOT EXISTS (
-                SELECT 1 FROM reports r
-                WHERE r.invocation_id = i.parent_invocation_id
-            )
-            ON CONFLICT (invocation_id) DO NOTHING
-            RETURNING invocation_id
-        )
-        SELECT COUNT(*) AS report_count FROM inserted;
-        """)
-        count = (
-            await session.execute(
-                report_query,
-                {
-                    "user_id": await chutes_user_id(),
-                    "confirmed_by": await chutes_user_id(),
-                    "chute_id": chute_id,
-                    "reason": reason,
-                },
-            )
-        ).scalar()
-        logger.success(f"Generated {count} reports for chute {chute_id}")
-        await session.commit()
-
-
-async def report_short_lived_chutes():
-    """
-    Generate reports for chutes that only existed for a short time, likely from scummy miners to get bounties.
-    """
-    query = text(SHORT_LIVED_CHUTES)
-    bad_chutes = []
-    async with get_session() as session:
-        result = await session.execute(query)
-        rows = result.fetchall()
-        for row in rows:
-            chute_id = row.chute_id
-            lifetime = row.lifetime
-            bad_chutes.append(
-                (chute_id, f"chute was very short lived: {lifetime=}, likely bounty scam")
-            )
-            logger.warning(
-                f"Detected short-lived chute {chute_id} likely part of bounty scam: {lifetime=}"
-            )
-
-    # Generate the reports in separate sessions so we don't have massive transactions.
-    for chute_id, reason in bad_chutes:
-        await generate_confirmed_reports(chute_id, reason)
 
 
 async def procs_check():

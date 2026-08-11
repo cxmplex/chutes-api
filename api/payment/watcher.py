@@ -26,7 +26,8 @@ import api.database.orms  # noqa: F401
 from api.user.schemas import User, InvocationQuota
 from api.payment.schemas import Payment, PaymentMonitorState
 from api.config import settings
-from api.database import get_session, engine, Base
+from api.database import get_session
+from api.database.migrations import run_database_migrations
 from api.autostaker import upsert_pending_stake, DUST_THRESHOLD_RAO
 from api.agent_registration.schemas import AgentRegistration
 
@@ -782,8 +783,7 @@ async def lifespan(app: FastAPI):
     gc.set_threshold(5000, 50, 50)
     install_asyncio_exception_handler()
     logger.info("Inside the lifespan...")
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await run_database_migrations()
     logger.info("Initialized the database...")
     await monitor.initialize()
     monitor_task = asyncio.create_task(monitor.monitor_transfers())

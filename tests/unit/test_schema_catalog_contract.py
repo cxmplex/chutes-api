@@ -1,22 +1,128 @@
 """Static catalog contracts shared by ORM bootstrap and unshipped SQL migrations."""
 
+import json
 from pathlib import Path
 
 import pytest
 
+import api.database.orms  # noqa: F401
+from api.database import Base
 from api.host.schemas import RegistrySession, TdLaunchReservation
 from api.instance.schemas import Instance, LaunchConfig
+from api.invocation.util import DIFFUSION_METRICS_QUERY
 from api.node.schemas import Node
 from api.server.schemas import Server, ServerAttestation, ServerAttestationSubject
 
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "api/migrations"
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def _foreign_key(model, column_name):
     foreign_keys = list(model.__table__.columns[column_name].foreign_keys)
     assert len(foreign_keys) == 1
     return foreign_keys[0]
+
+
+def test_filtered_orm_bootstrap_owns_tables_but_never_materializes_views():
+    assert "audit_entries" in Base.metadata.tables
+    balance = Base.metadata.tables["user_current_balance"]
+    assert balance.info["is_view"] is True
+
+    for relative_path in (
+        "api/database/migrations.py",
+        "api/payment/watcher.py",
+        "tasks.py",
+        "tests/scripts/init_db.py",
+    ):
+        source = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert "Base.metadata.create_all" not in source
+        if relative_path == "api/database/migrations.py":
+            assert "create_application_tables" in source
+        if relative_path in (
+            "api/payment/watcher.py",
+            "tasks.py",
+            "tests/scripts/init_db.py",
+        ):
+            assert "run_database_migrations" in source
+
+    init_source = (ROOT / "tests/scripts/init_db.py").read_text(encoding="utf-8")
+    assert (
+        "Applying the complete production-base and dbmate migration chain"
+        in init_source
+    )
+    assert (
+        "--recreate cannot safely infer a disposable database boundary" in init_source
+    )
+    assert 'os.environ["POSTGRESQL"] = test_database_url' in init_source
+    assert 'os.environ.setdefault("POSTGRESQL"' not in init_source
+
+    tasks_source = (ROOT / "tasks.py").read_text(encoding="utf-8")
+    assert "Partial ORM drop/reset is unsupported" in tasks_source
+    assert "Base.metadata.drop_all" not in tasks_source
+
+
+def test_active_production_base_sql_has_tracked_cache_and_revenue_contracts():
+    source = (ROOT / "api/database/production_base.sql").read_text(encoding="utf-8")
+    assert "CREATE TABLE IF NOT EXISTS vllm_metrics" in source
+    assert "CREATE TABLE IF NOT EXISTS diffusion_metrics" in source
+    assert "CREATE MATERIALIZED VIEW daily_revenue_summary" in source
+    assert "CREATE TABLE IF NOT EXISTS subscription_history" not in source
+    assert "CREATE MATERIALIZED VIEW subscription_history" not in source
+    assert (
+        "producer provenance are pinned from an authoritative production snapshot"
+        in source
+    )
+    for mapping in (
+        "quota IN (300, 301) THEN 3",
+        "quota IN (2000, 2001) THEN 10",
+        "quota IN (5000, 5001) THEN 20",
+    ):
+        assert mapping in source
+
+    assert "get_diffusion_metrics" not in DIFFUSION_METRICS_QUERY
+    assert "INSERT INTO diffusion_metrics" in DIFFUSION_METRICS_QUERY
+    watchtower = (ROOT / "watchtower.py").read_text(encoding="utf-8")
+    assert "generate_confirmed_reports" not in watchtower
+    assert "report_short_lived_chutes" not in watchtower
+    assert "INSERT INTO reports" not in watchtower
+
+
+def test_wheel_force_includes_runtime_catalog_contract_artifacts():
+    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    for artifact in (
+        "api/database/production_base.sql",
+        "api/database/production_base_catalog.json",
+    ):
+        assert f'"{artifact}" = "{artifact}"' in project
+
+
+def test_production_base_and_positive_ci_are_pinned_to_postgresql_15():
+    manifest = json.loads(
+        (ROOT / "api/database/production_base_catalog.json").read_text(encoding="utf-8")
+    )
+    assert manifest["postgres_major"] == 15
+    workflow = (ROOT / ".github/workflows/lint.yml").read_text(encoding="utf-8")
+    assert workflow.count("image: postgres:15") == 2
+    assert workflow.count("image: postgres:16") == 1
+    assert "production-base-pg16-rejection:" in workflow
+    for compose_path in ("docker-compose.yml", "docker/docker-compose.yaml"):
+        assert "postgres:15" in (ROOT / compose_path).read_text(encoding="utf-8")
+
+
+def test_dbmate_binary_is_version_and_checksum_pinned_everywhere():
+    expected_version = "2.34.1"
+    expected_sha256 = "b002d5249d53d0c6c482ed761b5a806c6fb9a364fcc5f9db3e8763c1d9e40e1d"
+    for relative_path in (
+        "Dockerfile",
+        "tests/docker/Dockerfile.db-init",
+        ".github/workflows/lint.yml",
+    ):
+        source = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert "dbmate/releases/latest" not in source
+        assert expected_version in source
+        assert expected_sha256 in source
+        assert "dbmate --version" in source
 
 
 @pytest.mark.parametrize(
@@ -93,7 +199,9 @@ def test_unshipped_migrations_create_the_same_named_lineage_constraints():
         "fk_nodes_gpu_allocation_group",
     ):
         assert f"ADD CONSTRAINT {constraint_name}" in migration_sources
-    server_migration = (MIGRATIONS / "20260529160000_instance_server_id.sql").read_text()
+    server_migration = (
+        MIGRATIONS / "20260529160000_instance_server_id.sql"
+    ).read_text()
     assert (
         "CONSTRAINT fk_launch_configs_server\n"
         "            FOREIGN KEY (server_id) REFERENCES servers(server_id) ON DELETE RESTRICT"
@@ -117,12 +225,12 @@ def test_registry_closure_check_matches_final_manifest_tag_shape():
         maxsplit=1,
     )[1]
     assert "jsonb_typeof(manifest_tag_digests) = 'object'" in registry_rewrite
-    assert down.index("DROP CONSTRAINT IF EXISTS ck_registry_session_closure") < down.index(
-        "DROP COLUMN IF EXISTS manifest_tag_digests"
-    )
-    restored = down.split("ADD CONSTRAINT ck_registry_session_closure", maxsplit=1)[1].split(
-        "DROP COLUMN IF EXISTS manifest_tag_digests", maxsplit=1
-    )[0]
+    assert down.index(
+        "DROP CONSTRAINT IF EXISTS ck_registry_session_closure"
+    ) < down.index("DROP COLUMN IF EXISTS manifest_tag_digests")
+    restored = down.split("ADD CONSTRAINT ck_registry_session_closure", maxsplit=1)[
+        1
+    ].split("DROP COLUMN IF EXISTS manifest_tag_digests", maxsplit=1)[0]
     assert "manifest_tag_digests" not in restored
 
 
@@ -137,7 +245,9 @@ def test_attestation_attempt_order_is_database_generated_and_catalog_aligned():
     )
     assert index.unique is True
 
-    migration = (MIGRATIONS / "20260714070000_release_attestation_identity.sql").read_text()
+    migration = (
+        MIGRATIONS / "20260714070000_release_attestation_identity.sql"
+    ).read_text()
     up = migration.split("-- migrate:down", maxsplit=1)[0]
     assert "CREATE SEQUENCE server_attestation_attempt_sequence" in up
     assert "partial server attestation attempt sequence catalog" in up
@@ -145,7 +255,9 @@ def test_attestation_attempt_order_is_database_generated_and_catalog_aligned():
     assert "idx_server_attestations_attempt_sequence has invalid definition" in up
     assert "ROW_NUMBER() OVER" in up
     assert "ORDER BY created_at ASC NULLS LAST, attestation_id ASC" in up
-    assert "SET DEFAULT nextval(''server_attestation_attempt_sequence''::regclass)" in up
+    assert (
+        "SET DEFAULT nextval(''server_attestation_attempt_sequence''::regclass)" in up
+    )
     assert "ON server_attestations (server_id, attempt_sequence DESC)" in up
 
     release_index = next(
@@ -171,7 +283,9 @@ def test_attestation_attempt_order_is_database_generated_and_catalog_aligned():
     )[1]
     for included in release_index.dialect_options["postgresql"]["include"]:
         assert included in release_rebuild
-    assert "ON server_attestations (server_id, attempt_sequence DESC)" in release_rebuild
+    assert (
+        "ON server_attestations (server_id, attempt_sequence DESC)" in release_rebuild
+    )
 
     gpu_migration = (
         (MIGRATIONS / "20260724100000_gpu_platform_scheduler.sql")
@@ -261,16 +375,18 @@ def test_attestation_subject_and_model_b_attribution_catalogs_are_fail_closed():
 
 
 def test_default_volume_migration_contains_final_unshipped_authority_shape():
-    migration = (MIGRATIONS / "20260724234500_gpu_chutefs_default_volume.sql").read_text()
+    migration = (
+        MIGRATIONS / "20260724234500_gpu_chutefs_default_volume.sql"
+    ).read_text()
     up = migration.split("-- migrate:down", maxsplit=1)[0]
-    session_table = up.split("CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (", maxsplit=1)[
-        1
-    ].split(");", maxsplit=1)[0]
+    session_table = up.split(
+        "CREATE TABLE IF NOT EXISTS chutefs_launch_sessions (", maxsplit=1
+    )[1].split(");", maxsplit=1)[0]
     assert "revocation_epoch               BIGINT NOT NULL," in session_table
     assert "revocation_epoch               BIGINT NOT NULL DEFAULT" not in session_table
-    scope = up.split("CONSTRAINT ck_chutefs_launch_session_scope CHECK (", maxsplit=1)[1].split(
-        "CONSTRAINT ck_chutefs_launch_session_access_hash", maxsplit=1
-    )[0]
+    scope = up.split("CONSTRAINT ck_chutefs_launch_session_scope CHECK (", maxsplit=1)[
+        1
+    ].split("CONSTRAINT ck_chutefs_launch_session_access_hash", maxsplit=1)[0]
     assert "attested_cert_pubkey_hash ~ '^[0-9a-f]{64}$'" in scope
     identity = up.split(
         "CREATE OR REPLACE FUNCTION enforce_chutefs_launch_session_identity()",
@@ -293,9 +409,9 @@ def test_default_volume_migration_contains_final_unshipped_authority_shape():
         maxsplit=1,
     )[1].split("$$;", maxsplit=1)[0]
     assert "NEW.attested_cert_pubkey_hash" in server_change
-    trigger = up.split("CREATE TRIGGER trg_revoke_chutefs_session_on_server_change", maxsplit=1)[
-        1
-    ].split(";", maxsplit=1)[0]
+    trigger = up.split(
+        "CREATE TRIGGER trg_revoke_chutefs_session_on_server_change", maxsplit=1
+    )[1].split(";", maxsplit=1)[0]
     assert "attested_cert_pubkey_hash ON servers" in trigger
     terminal = up.split(
         "CREATE OR REPLACE FUNCTION revoke_registry_scope_on_launch_terminal()",

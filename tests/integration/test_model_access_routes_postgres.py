@@ -188,6 +188,7 @@ async def _seed_launch(
     env_type: str,
     requester_identity=None,
     requested_revision: str = COMMIT,
+    job_id: str | None = None,
 ):
     suffix = uuid.uuid4().hex
     image_id = f"image-{suffix}"
@@ -305,6 +306,26 @@ async def _seed_launch(
         ]
     )
     await db.flush()
+    job = None
+    if job_id is not None:
+        job = Job(
+            job_id=job_id,
+            user_id=api_pg.USER_ID,
+            chute_id=chute_id,
+            version="1",
+            method="run",
+            instance_id=None,
+            active=True,
+            verified=True,
+            job_args={},
+            status="running",
+            miner_history=[],
+            compute_multiplier=1.0,
+        )
+        db.add(job)
+        # LaunchConfig.job_id is immutable storage identity, so the job must exist before
+        # the launch is created and the relationship must be bound on the initial INSERT.
+        await db.flush()
     launch = LaunchConfig(
         config_id=config_id,
         seed=1,
@@ -314,6 +335,7 @@ async def _seed_launch(
         compute_type="cpu" if env_type == "tee" else "gpu",
         default_volume_id=default_volume.volume_id,
         storage_session_exchange_allowed=False,
+        job_id=job_id,
         host="127.0.0.20",
         port=8000,
         env_type=env_type,
@@ -339,6 +361,9 @@ async def _seed_launch(
         server_id=requester.server_id if requester else None,
     )
     db.add_all([launch, instance])
+    await db.flush()
+    if job is not None:
+        job.instance_id = instance_id
     target_identity = api_pg._attested_identity(f"target-{suffix}")
     target = await api_pg._server(
         db,
@@ -669,35 +694,15 @@ async def test_model_capability_consume_rechecks_terminal_chute_and_job_authorit
 ):
     db, _ = pg_session
     redis = real_capability_redis
+    job_id = f"job-{uuid.uuid4().hex}" if revocation == "finished_job" else None
     launch, _, _, _target, target_identity = await _seed_launch(
         db,
         redis,
         env_type="graval",
+        job_id=job_id,
     )
     instance = await db.scalar(select(Instance).where(Instance.config_id == launch.config_id))
     assert instance is not None
-    job_id = None
-    if revocation == "finished_job":
-        job_id = f"job-{uuid.uuid4().hex}"
-        db.add(
-            Job(
-                job_id=job_id,
-                user_id=api_pg.USER_ID,
-                chute_id=launch.chute_id,
-                version="1",
-                method="run",
-                instance_id=instance.instance_id,
-                active=True,
-                verified=True,
-                job_args={},
-                status="running",
-                miner_history=[],
-                compute_multiplier=1.0,
-            )
-        )
-        launch.job_id = job_id
-        await db.commit()
-
     token = create_launch_jwt_v2(launch)
     app = _route_app(db.bind)
     async with AsyncClient(

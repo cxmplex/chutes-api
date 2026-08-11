@@ -128,7 +128,13 @@ ENTRYPOINT ["uv", "run", "python", "-m", "api.image.forge"]
 ###
 FROM base AS api
 RUN cosign verify-blob --help >/dev/null
-RUN curl -fsSL -o /usr/local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64 && chmod +x /usr/local/bin/dbmate
+ARG DBMATE_VERSION=2.34.1
+ARG DBMATE_LINUX_AMD64_SHA256=b002d5249d53d0c6c482ed761b5a806c6fb9a364fcc5f9db3e8763c1d9e40e1d
+RUN curl -fsSL -o /usr/local/bin/dbmate \
+    "https://github.com/amacneil/dbmate/releases/download/v${DBMATE_VERSION}/dbmate-linux-amd64" \
+    && echo "${DBMATE_LINUX_AMD64_SHA256}  /usr/local/bin/dbmate" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/dbmate \
+    && test "$(/usr/local/bin/dbmate --version)" = "dbmate version ${DBMATE_VERSION}"
 RUN useradd chutes -s /bin/bash -d /home/chutes && mkdir -p /home/chutes && chown chutes:chutes /home/chutes
 RUN mkdir -p /app && chown chutes:chutes /app
 RUN ln -s /usr/bin/python3 /usr/bin/python

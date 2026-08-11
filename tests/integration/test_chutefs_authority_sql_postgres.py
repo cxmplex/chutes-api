@@ -36,19 +36,6 @@ def nv_attest():
     yield
 
 
-async def _install_rotation_migration(db) -> None:
-    await db.commit()
-    async with db.bind.begin() as connection:
-        raw = await connection.get_raw_connection()
-        await raw.driver_connection.execute(
-            storage_pg._migration_up_sql("20260724234500_gpu_chutefs_default_volume.sql")
-        )
-        await raw.driver_connection.execute(
-            storage_pg._migration_up_sql("20260726121000_chutefs_session_rotation_replay.sql")
-        )
-    await db.rollback()
-
-
 async def _assert_authority_update_rejected(
     db,
     session_id: str,
@@ -73,7 +60,6 @@ async def test_every_chutefs_authority_and_replay_field_is_sql_immutable(
     pg_session,
 ):
     db, _redis = pg_session
-    await _install_rotation_migration(db)
     chute = await chutefs_pg._chute(
         db,
         storage_pg.USER_ID,

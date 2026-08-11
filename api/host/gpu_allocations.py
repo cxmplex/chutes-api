@@ -3658,15 +3658,40 @@ async def request_gpu_lifecycle_fence(
     reservation, _group = await _locked_reservation_group(db, reservation_id)
     if reservation.state in {"released", "expired"}:
         return None
+    from api.gpu_models import GpuLifecycleOperation
+
+    existing_operation = (
+        (
+            await db.execute(
+                select(GpuLifecycleOperation)
+                .where(
+                    GpuLifecycleOperation.allocation_group_id
+                    == reservation.allocation_group_id,
+                    GpuLifecycleOperation.allocation_group_generation
+                    == reservation.allocation_group_generation,
+                    GpuLifecycleOperation.reservation_id == reservation.reservation_id,
+                )
+                .order_by(
+                    GpuLifecycleOperation.created_at,
+                    GpuLifecycleOperation.operation_id,
+                )
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
     now = _utcnow()
     reservation.teardown_requested_at = reservation.teardown_requested_at or now
     reservation.teardown_reason = reservation.teardown_reason or reason[:2000]
-    # The producer code is needed only while deriving the immutable operation type;
-    # create_gpu_lifecycle_operation clears mutable failure projections afterwards.
-    reservation.failure_code = code[:128]
-    reservation.failure_reason = reason[:2000]
-    reservation.failure_metadata = metadata or {}
-    await db.flush()
+    if existing_operation is None:
+        # The producer code is needed only while deriving the immutable operation type;
+        # create_gpu_lifecycle_operation clears mutable failure projections afterwards.
+        # A replay must not repopulate those mutable fields after the intent is durable.
+        reservation.failure_code = code[:128]
+        reservation.failure_reason = reason[:2000]
+        reservation.failure_metadata = metadata or {}
+        await db.flush()
     from api.gpu_lifecycle_service import (
         GpuLifecycleError,
         ensure_reservation_lifecycle_operation,

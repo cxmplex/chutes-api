@@ -104,16 +104,22 @@ class FakeRedis:
 
 
 def _migration_up_sql(filename: str) -> str:
-    migration = (Path(__file__).resolve().parents[2] / f"api/migrations/{filename}").read_text()
+    migration = (
+        Path(__file__).resolve().parents[2] / f"api/migrations/{filename}"
+    ).read_text()
     return migration.split("-- migrate:up", 1)[1].split("-- migrate:down", 1)[0]
 
 
 def _migration_down_sql(filename: str) -> str:
-    migration = (Path(__file__).resolve().parents[2] / f"api/migrations/{filename}").read_text()
+    migration = (
+        Path(__file__).resolve().parents[2] / f"api/migrations/{filename}"
+    ).read_text()
     return migration.split("-- migrate:down", 1)[1]
 
 
-async def _wait_for_postgres_blocker(engine, blocked_pid: int, blocker_pid: int) -> None:
+async def _wait_for_postgres_blocker(
+    engine, blocked_pid: int, blocker_pid: int
+) -> None:
     for _ in range(500):
         async with engine.connect() as observer:
             blocked = await observer.scalar(
@@ -273,7 +279,12 @@ async def _apply_restore_migration(engine) -> None:
         await raw.driver_connection.execute(
             _migration_up_sql("20260713170000_secure_replication.sql")
         )
-        await raw.driver_connection.execute(_migration_up_sql("20260713220000_storage_hygiene.sql"))
+        await raw.driver_connection.execute(
+            _migration_up_sql("20260713220000_storage_hygiene.sql")
+        )
+        await raw.driver_connection.execute(
+            _migration_up_sql("20260724234500_gpu_chutefs_default_volume.sql")
+        )
         await raw.driver_connection.execute(
             _migration_up_sql("20260726121000_chutefs_session_rotation_replay.sql")
         )
@@ -387,8 +398,8 @@ async def _server(
     )
     verified_at = NOW - attestation_age
     measurement = _storage_measurement()
-    config_fingerprint = measurement.config_fingerprint or measurement_config_fingerprint(
-        measurement
+    config_fingerprint = (
+        measurement.config_fingerprint or measurement_config_fingerprint(measurement)
     )
     trust_set_fingerprint = measurement_trust_set_fingerprint(settings.tee_measurements)
     server.version = measurement.version
@@ -573,7 +584,9 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
         await _rewind_to_legacy_schema(engine)
 
         legacy_identity = _attested_identity("legacy-storage")
-        legacy_cert = legacy_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+        legacy_cert = (
+            legacy_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+        )
         cert_hash = get_public_key_hash(legacy_identity[1])
         volume_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
@@ -701,7 +714,9 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
         redis = FakeRedis()
         await redis.setex("storage:online:legacy-storage", 180, "1")
         monkeypatch.setattr(settings, "_redis_client", redis)
-        session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        session_factory = sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
         async with session_factory() as db:
             good = await db.get(ReplicaPlacement, "placement-legacy-good")
             bad = await db.get(ReplicaPlacement, "placement-legacy-bad")
@@ -721,10 +736,13 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
             legacy_server.storage_incarnation = incarnation
             legacy_server.storage_incarnation_announced_at = datetime.now(timezone.utc)
             measurement = _storage_measurement()
-            config_fingerprint = measurement.config_fingerprint or measurement_config_fingerprint(
-                measurement
+            config_fingerprint = (
+                measurement.config_fingerprint
+                or measurement_config_fingerprint(measurement)
             )
-            trust_set_fingerprint = measurement_trust_set_fingerprint(settings.tee_measurements)
+            trust_set_fingerprint = measurement_trust_set_fingerprint(
+                settings.tee_measurements
+            )
             legacy_server.version = measurement.version
             legacy_server.measurement_name = measurement.name
             legacy_server.measurement_config_fingerprint = config_fingerprint
@@ -922,7 +940,10 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
                 }
             ]
             await db.refresh(bad)
-            assert bad.last_error == "legacy_adoption_quarantined:authenticated_decrypt_failed"
+            assert (
+                bad.last_error
+                == "legacy_adoption_quarantined:authenticated_decrypt_failed"
+            )
 
             located, peers, count = await service.locate_object(db, volume, "good")
             assert located.object_id == good_obj.object_id
@@ -992,7 +1013,9 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
             target.proof_plaintext_sha256 = "d" * 64
             target.proof_mode = "legacy_adoption"
             target.proof_at = exploit_started_at
-            with pytest.raises(Exception, match="legacy adoption proof is not eligible"):
+            with pytest.raises(
+                Exception, match="legacy adoption proof is not eligible"
+            ):
                 await db.flush()
             await db.rollback()
             await db.refresh(target)
@@ -1012,7 +1035,9 @@ async def test_one_time_legacy_adoption_restores_only_intact_assigned_bytes(
             )
             assert lease["target_placement_attempt"] == target.attempt_count
             signature = _sign_capability(legacy_identity, lease["capability"])
-            await service.consume_replication_capability(db, other, lease["capability"], signature)
+            await service.consume_replication_capability(
+                db, other, lease["capability"], signature
+            )
             await service.complete_replication_capability(
                 db,
                 other,
@@ -1168,7 +1193,9 @@ async def test_secure_replication_migration_down_up_round_trip(pg_session):
         sha256="a" * 64,
         generation="migration-object",
     )
-    legacy_placement = await _placement(db, legacy_object, legacy_server, status="present")
+    legacy_placement = await _placement(
+        db, legacy_object, legacy_server, status="present"
+    )
     legacy_object_id = legacy_object.object_id
     legacy_placement_id = legacy_placement.placement_id
     connection = await db.connection()
@@ -1391,7 +1418,9 @@ async def test_orm_bootstrap_cannot_skip_secure_replication_quarantine():
                 "20260713160000_transactional_storage_objects.sql",
             ):
                 await driver.execute(_migration_up_sql(migration_name))
-            await driver.execute(_migration_up_sql("20260713170000_secure_replication.sql"))
+            await driver.execute(
+                _migration_up_sql("20260713170000_secure_replication.sql")
+            )
             assert (
                 await driver.fetchval(
                     """
@@ -1412,7 +1441,9 @@ async def test_orm_bootstrap_cannot_skip_secure_replication_quarantine():
                 )
                 == "secure_replication_requires_new_receipt"
             )
-            await driver.execute(_migration_up_sql("20260713220000_storage_hygiene.sql"))
+            await driver.execute(
+                _migration_up_sql("20260713220000_storage_hygiene.sql")
+            )
             assert await driver.fetchval(
                 """
                 SELECT EXISTS (
@@ -1646,7 +1677,9 @@ async def test_image_compute_type_migration_rekeys_legacy_rows():
                 "partitioned_invocations",
             ):
                 migrated = set(
-                    (await connection.execute(text(f"SELECT image_id FROM {table}"))).scalars()
+                    (
+                        await connection.execute(text(f"SELECT image_id FROM {table}"))
+                    ).scalars()
                 )
                 assert migrated == set(canonical_ids.values())
 
@@ -1676,7 +1709,9 @@ async def test_image_compute_type_migration_rekeys_legacy_rows():
             )
         async with engine.connect() as connection:
             assert set(
-                (await connection.execute(text("SELECT image_id FROM images"))).scalars()
+                (
+                    await connection.execute(text("SELECT image_id FROM images"))
+                ).scalars()
             ) == set(legacy_ids.values())
             columns = set(
                 (
@@ -1703,7 +1738,9 @@ async def test_image_compute_type_migration_rekeys_legacy_rows():
         await admin.dispose()
 
 
-@pytest.mark.skipif(not DBMATE_BIN, reason="DBMATE_BIN is required for migration-runner test")
+@pytest.mark.skipif(
+    not DBMATE_BIN, reason="DBMATE_BIN is required for migration-runner test"
+)
 @pytest.mark.parametrize("legacy_upgrade", [False, True])
 async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
     schema = f"storage_dbmate_chain_{int(legacy_upgrade)}_{uuid.uuid4().hex}"
@@ -1717,15 +1754,30 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
             poolclass=NullPool,
             connect_args={"server_settings": {"search_path": schema}},
         )
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
         if legacy_upgrade:
+            # Model a deployed pre-remediation catalog: ORM objects plus the exact immutable
+            # 64-version ledger, but without the one-time raw production-base contract marker.
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+                await connection.execute(
+                    text(
+                        "CREATE TABLE schema_migrations "
+                        "(version VARCHAR(255) PRIMARY KEY)"
+                    )
+                )
+                for version in database_migrations.historical_migration_versions():
+                    await connection.execute(
+                        text(
+                            "INSERT INTO schema_migrations(version) VALUES (:version)"
+                        ),
+                        {"version": version},
+                    )
             await _rewind_to_legacy_schema(engine)
             async with engine.connect() as connection:
                 raw = await connection.get_raw_connection()
                 await raw.driver_connection.execute(FORWARD_MIGRATION_HAZARD_DDL)
         async with engine.connect() as connection:
-            await database_migrations.record_historical_migration_baseline(connection)
+            await database_migrations.bootstrap_production_base(connection)
 
         sync_url = TEST_DATABASE_URL.replace("+asyncpg", "")
         separator = "&" if "?" in sync_url else "?"
@@ -1758,7 +1810,9 @@ async def test_dbmate_applies_enforced_storage_chain(legacy_upgrade):
             )
             expected_versions = {
                 path.name.split("_", 1)[0]
-                for path in (Path(__file__).resolve().parents[2] / "api/migrations").glob("*.sql")
+                for path in (
+                    Path(__file__).resolve().parents[2] / "api/migrations"
+                ).glob("*.sql")
             }
             assert versions == expected_versions
             server_health_shape = (
@@ -1861,7 +1915,9 @@ async def test_erasure_finalization_has_matching_composite_indexes(pg_session):
             },
         )
     ).all()
-    definitions = {name: " ".join(definition.lower().split()) for name, definition in rows}
+    definitions = {
+        name: " ".join(definition.lower().split()) for name, definition in rows
+    }
     assert set(definitions) == {
         "idx_storage_objects_terminal_erase",
         "idx_storage_objects_expected_predecessor",
@@ -1875,7 +1931,10 @@ async def test_erasure_finalization_has_matching_composite_indexes(pg_session):
     assert "(object_id, placement_id)" in definitions["idx_replica_placement_object"]
     assert "(volume_id, object_id)" in definitions["idx_storage_objects_volume"]
     assert "(object_id, task_id)" in definitions["idx_storage_erase_terminal_unpurged"]
-    assert "metadata_purged_at is null" in definitions["idx_storage_erase_terminal_unpurged"]
+    assert (
+        "metadata_purged_at is null"
+        in definitions["idx_storage_erase_terminal_unpurged"]
+    )
     assert (
         "(volume_id, state, reason, metadata_purged_at)"
         in definitions["idx_storage_erase_volume_finalize"]
@@ -2219,8 +2278,8 @@ async def test_precommit_target_receipt_promotes_only_after_exact_hash_commit(
     assert target.storage_incarnation == original_incarnation
 
     measurement = _storage_measurement()
-    config_fingerprint = measurement.config_fingerprint or measurement_config_fingerprint(
-        measurement
+    config_fingerprint = (
+        measurement.config_fingerprint or measurement_config_fingerprint(measurement)
     )
     verified_at = datetime.now(timezone.utc)
     db.add(
@@ -2230,7 +2289,9 @@ async def test_precommit_target_receipt_promotes_only_after_exact_hash_commit(
             measurement_version=measurement.version,
             measurement_name=measurement.name,
             measurement_config_fingerprint=config_fingerprint,
-            trust_set_fingerprint=measurement_trust_set_fingerprint(settings.tee_measurements),
+            trust_set_fingerprint=measurement_trust_set_fingerprint(
+                settings.tee_measurements
+            ),
             created_at=verified_at,
             verified_at=verified_at,
         )
@@ -2314,7 +2375,9 @@ async def test_one_use_capability_drives_initial_copy_and_repair(pg_session):
 
     # Simulate a serial queue that reaches this descriptor after the old placement deadline. The
     # capability is leased only now, atomically advancing the attempt and deadline.
-    target_placement.pending_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+    target_placement.pending_deadline = datetime.now(timezone.utc) - timedelta(
+        seconds=1
+    )
     await db.commit()
     initial_peers = await service.object_replica_peers(db, obj.object_id)
     assert target.server_id in {peer.server_id for peer in initial_peers}
@@ -2351,7 +2414,9 @@ async def test_one_use_capability_drives_initial_copy_and_repair(pg_session):
     await db.refresh(target_placement)
     assert target_placement.pending_deadline > datetime.now(timezone.utc)
     with pytest.raises(HTTPException) as replay:
-        await service.consume_replication_capability(db, target, lease["capability"], signature)
+        await service.consume_replication_capability(
+            db, target, lease["capability"], signature
+        )
     assert replay.value.status_code == 409
 
     with pytest.raises(HTTPException) as wrong_receipt_hash:
@@ -2396,7 +2461,9 @@ async def test_one_use_capability_drives_initial_copy_and_repair(pg_session):
         digest,
         ciphertext_size,
     )
-    replacement_signature = _sign_capability(source_identity, replacement_transfer["capability"])
+    replacement_signature = _sign_capability(
+        source_identity, replacement_transfer["capability"]
+    )
     await service.consume_replication_capability(
         db, wrong_target, replacement_transfer["capability"], replacement_signature
     )
@@ -2466,7 +2533,9 @@ async def test_one_use_capability_drives_initial_copy_and_repair(pg_session):
     assert target_placement.proof_capability_id == lease["capability_id"]
 
     repair_placement = await _placement(db, committed, repair_target, status="pending")
-    repair_placement.pending_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+    repair_placement.pending_deadline = datetime.now(timezone.utc) - timedelta(
+        seconds=1
+    )
     await db.commit()
     queued = await service.repair_tasks_for_server(db, source.server_id)
     assert queued
@@ -2743,7 +2812,9 @@ async def test_capability_rejects_wrong_object_hash_size_expiry_and_incarnation(
         ciphertext_size,
     )
     with pytest.raises(HTTPException) as source_proof:
-        await service.consume_replication_capability(db, target, bad_signature["capability"], "00")
+        await service.consume_replication_capability(
+            db, target, bad_signature["capability"], "00"
+        )
     assert source_proof.value.status_code == 403
 
     expired = await service.issue_replication_capability(
@@ -2769,7 +2840,9 @@ async def test_capability_rejects_wrong_object_hash_size_expiry_and_incarnation(
         .hex()
     )
     with pytest.raises(HTTPException) as expired_error:
-        await service.consume_replication_capability(db, target, expired["capability"], signature)
+        await service.consume_replication_capability(
+            db, target, expired["capability"], signature
+        )
     assert expired_error.value.status_code == 410
     expired_target_placement = (
         await db.execute(
@@ -3016,7 +3089,9 @@ async def test_replication_issue_and_fail_preserve_presented_identity_across_ref
         )
         object_id = obj.object_id
         await _placement(replacement, obj, current_source, status="pending")
-        target_placement = await _placement(replacement, obj, current_target, status="pending")
+        target_placement = await _placement(
+            replacement, obj, current_target, status="pending"
+        )
         target_placement_id = target_placement.placement_id
         direct_receipt = {
             "object_id": object_id,
@@ -3069,7 +3144,10 @@ async def test_replication_issue_and_fail_preserve_presented_identity_across_ref
                 "stale_presenter_must_not_terminalize",
             )
         assert stale_failure_report.value.status_code == 403
-        assert "current bound source or target identity" in stale_failure_report.value.detail
+        assert (
+            "current bound source or target identity"
+            in stale_failure_report.value.detail
+        )
         await stale_reporter.rollback()
 
     db.expire_all()
@@ -3159,7 +3237,9 @@ async def test_stale_attestation_cannot_revive_storage_liveness(pg_session):
         "stale",
         "host-stale",
         live=False,
-        attestation_age=timedelta(seconds=service.STORAGE_ATTESTATION_MAX_AGE_SECONDS + 1),
+        attestation_age=timedelta(
+            seconds=service.STORAGE_ATTESTATION_MAX_AGE_SECONDS + 1
+        ),
     )
     assert not await service.is_freshly_attested_storage_server(db, stale)
     with pytest.raises(Exception):
@@ -3243,7 +3323,9 @@ async def test_new_disk_incarnation_invalidates_old_present_receipts(pg_session)
     assert obj.durability_state == "irrecoverable"
 
 
-async def test_certificate_rebind_mixed_journal_is_atomic_ordered_and_replayable(pg_session):
+async def test_certificate_rebind_mixed_journal_is_atomic_ordered_and_replayable(
+    pg_session,
+):
     db, redis = pg_session
     old_identity = _attested_identity("cert-rebind-old")
     holder = await _server(
@@ -3282,7 +3364,9 @@ async def test_certificate_rebind_mixed_journal_is_atomic_ordered_and_replayable
     mismatch_placement = await _placement(db, mismatched, holder, status="present")
 
     new_identity = _attested_identity("cert-rebind-new")
-    holder.attested_cert = new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    holder.attested_cert = (
+        new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    )
     holder.attested_cert_pubkey_hash = get_public_key_hash(new_identity[1])
     assert await service._refresh_object_durability(db, rebound, volume=volume) == 0
     await db.commit()
@@ -3431,7 +3515,9 @@ async def test_certificate_rebind_recovers_reconcile_winner_and_rejects_near_mis
     volume = await _volume(db, 1)
     objects = {}
     placements = {}
-    for index, name in enumerate(("winner", "wrong-reason", "no-audit", "extra-change"), 1):
+    for index, name in enumerate(
+        ("winner", "wrong-reason", "no-audit", "extra-change"), 1
+    ):
         obj = await _object(
             db,
             volume,
@@ -3455,15 +3541,20 @@ async def test_certificate_rebind_recovers_reconcile_winner_and_rejects_near_mis
         attestation_age=timedelta(hours=2),
     )
     await _placement(db, objects["winner"], stale_bystander, status="present")
-    assert await service._refresh_object_durability(
-        db,
-        objects["winner"],
-        volume=volume,
-    ) == 1
+    assert (
+        await service._refresh_object_durability(
+            db,
+            objects["winner"],
+            volume=volume,
+        )
+        == 1
+    )
     await db.commit()
 
     new_identity = _attested_identity("cert-rebind-race-new")
-    holder.attested_cert = new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    holder.attested_cert = (
+        new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    )
     holder.attested_cert_pubkey_hash = get_public_key_hash(new_identity[1])
     await db.commit()
     new_cert_hash = holder.attested_cert_pubkey_hash
@@ -3532,7 +3623,9 @@ async def test_certificate_rebind_recovers_reconcile_winner_and_rejects_near_mis
     await db.commit()
 
     holder = await db.get(Server, holder_id)
-    with pytest.raises(HTTPException, match="present placement or a reconcile-evicted") as rejected:
+    with pytest.raises(
+        HTTPException, match="present placement or a reconcile-evicted"
+    ) as rejected:
         await service.rebind_replica_certificates(
             db,
             holder,
@@ -3584,7 +3677,9 @@ async def test_certificate_rebind_recovers_reconcile_winner_and_rejects_near_mis
     )
     await db.flush()
     await db.execute(
-        text("SELECT set_config('chutes.storage_cert_rebind_request_id', :request_id, true)"),
+        text(
+            "SELECT set_config('chutes.storage_cert_rebind_request_id', :request_id, true)"
+        ),
         {"request_id": request_id},
     )
     with pytest.raises(
@@ -3698,8 +3793,13 @@ async def test_new_incarnation_retires_old_erase_tasks_with_immutable_audit(pg_s
     assert [task.state for task in retired] == ["retired", "retired"]
     assert all(task.erased_file_was_present is None for task in retired)
     assert all(task.completed_at is not None for task in retired)
-    assert all(task.claimed_at is None and task.lease_expires_at is None for task in retired)
-    assert all(task.last_error == "attested_incarnation_retired_unreachable" for task in retired)
+    assert all(
+        task.claimed_at is None and task.lease_expires_at is None for task in retired
+    )
+    assert all(
+        task.last_error == "attested_incarnation_retired_unreachable"
+        for task in retired
+    )
     assert rows[task_ids[2]].state == "erased"
     assert rows[task_ids[2]].retirement_audit_id is None
     assert rows[task_ids[3]].state == "pending"
@@ -3748,7 +3848,9 @@ async def test_new_incarnation_retires_old_erase_tasks_with_immutable_audit(pg_s
     await db.rollback()
 
 
-async def test_delete_after_incarnation_retirement_creates_only_audited_terminal_work(pg_session):
+async def test_delete_after_incarnation_retirement_creates_only_audited_terminal_work(
+    pg_session,
+):
     db, redis = pg_session
     holder = await _server(db, redis, "late-erase-holder", "late-erase-host")
     holder_id = holder.server_id
@@ -3810,7 +3912,9 @@ async def test_delete_after_incarnation_retirement_creates_only_audited_terminal
     assert task.retirement_audit_id == audit_id
     assert task.completed_at == linked_completed_at
 
-    with pytest.raises(DBAPIError, match="lacks exact incarnation-retirement audit authority"):
+    with pytest.raises(
+        DBAPIError, match="lacks exact incarnation-retirement audit authority"
+    ):
         await db.execute(
             StorageEraseTask.__table__.insert().values(
                 task_id=str(uuid.uuid4()),
@@ -3827,7 +3931,9 @@ async def test_delete_after_incarnation_retirement_creates_only_audited_terminal
         await db.commit()
     await db.rollback()
 
-    with pytest.raises(DBAPIError, match="lacks exact incarnation-retirement audit authority"):
+    with pytest.raises(
+        DBAPIError, match="lacks exact incarnation-retirement audit authority"
+    ):
         await db.execute(
             StorageEraseTask.__table__.insert().values(
                 task_id=str(uuid.uuid4()),
@@ -3846,7 +3952,9 @@ async def test_delete_after_incarnation_retirement_creates_only_audited_terminal
         await db.commit()
     await db.rollback()
 
-    with pytest.raises(DBAPIError, match="lacks exact incarnation-retirement audit authority"):
+    with pytest.raises(
+        DBAPIError, match="lacks exact incarnation-retirement audit authority"
+    ):
         await db.execute(
             StorageEraseTask.__table__.insert().values(
                 task_id=str(uuid.uuid4()),
@@ -3866,7 +3974,9 @@ async def test_delete_after_incarnation_retirement_creates_only_audited_terminal
         await db.commit()
     await db.rollback()
 
-    with pytest.raises(DBAPIError, match="audited storage incarnation retirement is immutable"):
+    with pytest.raises(
+        DBAPIError, match="audited storage incarnation retirement is immutable"
+    ):
         await db.execute(
             update(StorageEraseTask)
             .where(StorageEraseTask.task_id == task_id)
@@ -3880,7 +3990,9 @@ async def test_delete_after_incarnation_retirement_creates_only_audited_terminal
         await db.commit()
     await db.rollback()
 
-    with pytest.raises(DBAPIError, match="audited storage incarnation retirement is immutable"):
+    with pytest.raises(
+        DBAPIError, match="audited storage incarnation retirement is immutable"
+    ):
         await db.execute(
             update(StorageEraseTask)
             .where(StorageEraseTask.task_id == task_id)
@@ -3960,7 +4072,9 @@ async def test_incarnation_retirement_and_mixed_volume_enqueue_serialize_both_or
                 new_incarnation,
             )
             volume_retirement = asyncio.create_task(
-                service._retire_deleted_volume_batch(volume_worker, deleted_volume, limit=10)
+                service._retire_deleted_volume_batch(
+                    volume_worker, deleted_volume, limit=10
+                )
             )
             await asyncio.sleep(0.05)
             assert not volume_retirement.done()
@@ -3991,7 +4105,8 @@ async def test_incarnation_retirement_and_mixed_volume_enqueue_serialize_both_or
         await db.execute(
             select(StorageIncarnationRetirementAudit).where(
                 StorageIncarnationRetirementAudit.server_id == holder_id,
-                StorageIncarnationRetirementAudit.previous_storage_incarnation == old_incarnation,
+                StorageIncarnationRetirementAudit.previous_storage_incarnation
+                == old_incarnation,
             )
         )
     ).scalar_one()
@@ -4078,7 +4193,11 @@ async def test_bind_and_multigeneration_enqueue_share_server_publication_fence(
     new_incarnation = str(uuid.uuid4())
 
     factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
-    async with factory() as gate, factory() as identity_worker, factory() as enqueue_worker:
+    async with (
+        factory() as gate,
+        factory() as identity_worker,
+        factory() as enqueue_worker,
+    ):
         gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
         await service._lock_storage_publication_servers(
             gate,
@@ -4162,7 +4281,8 @@ async def test_bind_and_multigeneration_enqueue_share_server_publication_fence(
         await db.execute(
             select(StorageIncarnationRetirementAudit).where(
                 StorageIncarnationRetirementAudit.server_id == holder_id,
-                StorageIncarnationRetirementAudit.previous_storage_incarnation == old_incarnation,
+                StorageIncarnationRetirementAudit.previous_storage_incarnation
+                == old_incarnation,
             )
         )
     ).scalar_one()
@@ -4181,7 +4301,9 @@ async def test_bind_and_multigeneration_enqueue_share_server_publication_fence(
     assert all(task.state == "retired" for task in tasks)
     assert all(task.retirement_audit_id == audit.audit_id for task in tasks)
     assert all(task.completed_at is not None for task in tasks)
-    assert all(task.last_error == "attested_incarnation_retired_unreachable" for task in tasks)
+    assert all(
+        task.last_error == "attested_incarnation_retired_unreachable" for task in tasks
+    )
     assert all(task.claimed_at is None for task in tasks)
     assert all(task.lease_expires_at is None for task in tasks)
     assert all(task.erased_file_was_present is None for task in tasks)
@@ -4206,7 +4328,11 @@ async def test_replication_identity_reads_share_server_publication_fence(
     holder_id = holder.server_id
     replacement_incarnation = str(uuid.uuid4())
     factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
-    async with factory() as gate, factory() as identity_worker, factory() as transfer_worker:
+    async with (
+        factory() as gate,
+        factory() as identity_worker,
+        factory() as transfer_worker,
+    ):
         gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
         await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
         identity_holder = await identity_worker.get(Server, holder_id)
@@ -4223,7 +4349,9 @@ async def test_replication_identity_reads_share_server_publication_fence(
             )
             await _wait_for_postgres_blocker(db.bind, identity_pid, gate_pid)
             reading = asyncio.create_task(
-                service._locked_replication_servers(transfer_worker, holder_id, holder_id)
+                service._locked_replication_servers(
+                    transfer_worker, holder_id, holder_id
+                )
             )
             await _wait_for_postgres_blocker(db.bind, transfer_pid, identity_pid)
             await gate.commit()
@@ -4234,7 +4362,9 @@ async def test_replication_identity_reads_share_server_publication_fence(
             await transfer_worker.commit()
         else:
             reading = asyncio.create_task(
-                service._locked_replication_servers(transfer_worker, holder_id, holder_id)
+                service._locked_replication_servers(
+                    transfer_worker, holder_id, holder_id
+                )
             )
             await _wait_for_postgres_blocker(db.bind, transfer_pid, gate_pid)
             binding = asyncio.create_task(
@@ -4270,8 +4400,12 @@ async def test_reconcile_reassignment_and_bind_use_fence_before_server(
 ):
     db, redis = pg_session
     suffix = "identity" if identity_wins else "reconcile"
-    source = await _server(db, redis, f"reconcile-source-{suffix}", f"source-host-{suffix}")
-    target = await _server(db, redis, f"reconcile-target-{suffix}", f"target-host-{suffix}")
+    source = await _server(
+        db, redis, f"reconcile-source-{suffix}", f"source-host-{suffix}"
+    )
+    target = await _server(
+        db, redis, f"reconcile-target-{suffix}", f"target-host-{suffix}"
+    )
     target_id = target.server_id
     old_incarnation = target.storage_incarnation
     replacement_incarnation = str(uuid.uuid4())
@@ -4283,7 +4417,11 @@ async def test_reconcile_reassignment_and_bind_use_fence_before_server(
     await db.commit()
 
     factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
-    async with factory() as gate, factory() as identity_worker, factory() as reconcile_worker:
+    async with (
+        factory() as gate,
+        factory() as identity_worker,
+        factory() as reconcile_worker,
+    ):
         gate_pid = await gate.scalar(text("SELECT pg_backend_pid()"))
         await service._lock_storage_publication_servers(gate, [target_id], shared=False)
         identity_target = await identity_worker.get(Server, target_id)
@@ -4301,7 +4439,9 @@ async def test_reconcile_reassignment_and_bind_use_fence_before_server(
             ):
                 # reconcile_storage commits between phases and may therefore reconnect. Capture
                 # the backend that actually joins this publication frontier, not an earlier PID.
-                reconcile_pid["value"] = await lock_db.scalar(text("SELECT pg_backend_pid()"))
+                reconcile_pid["value"] = await lock_db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
                 reconcile_publication_entered.set()
             return await original_locked_server_rows(lock_db, server_ids)
 
@@ -4373,7 +4513,9 @@ async def test_reconcile_reassignment_and_bind_use_fence_before_server(
             for task in (binding, reconciling):
                 if task is not None and not task.done():
                     task.cancel()
-            pending_tasks = [task for task in (binding, reconciling) if task is not None]
+            pending_tasks = [
+                task for task in (binding, reconciling) if task is not None
+            ]
             if pending_tasks:
                 with suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(
@@ -4405,7 +4547,9 @@ async def test_reconcile_reassignment_and_bind_use_fence_before_server(
     )
 
 
-async def test_bind_revalidates_authority_after_waiting_for_publication_fence(pg_session):
+async def test_bind_revalidates_authority_after_waiting_for_publication_fence(
+    pg_session,
+):
     db, redis = pg_session
     holder = await _server(db, redis, "bind-authority-holder", "bind-authority-host")
     holder_id = holder.server_id
@@ -4436,7 +4580,9 @@ async def test_bind_revalidates_authority_after_waiting_for_publication_fence(pg
 
 async def test_bind_rejects_newer_failed_attestation_after_publication_wait(pg_session):
     db, redis = pg_session
-    holder = await _server(db, redis, "bind-attestation-holder", "bind-attestation-host")
+    holder = await _server(
+        db, redis, "bind-attestation-holder", "bind-attestation-host"
+    )
     holder_id = holder.server_id
     old_incarnation = holder.storage_incarnation
     replacement_incarnation = str(uuid.uuid4())
@@ -4475,9 +4621,13 @@ async def test_bind_rejects_newer_failed_attestation_after_publication_wait(pg_s
     )
 
 
-async def test_erase_claim_rejects_newer_failed_attestation_after_publication_wait(pg_session):
+async def test_erase_claim_rejects_newer_failed_attestation_after_publication_wait(
+    pg_session,
+):
     db, redis = pg_session
-    holder = await _server(db, redis, "claim-attestation-holder", "claim-attestation-host")
+    holder = await _server(
+        db, redis, "claim-attestation-holder", "claim-attestation-host"
+    )
     holder_id = holder.server_id
     volume = await _volume(db, 1)
     generation = await _object(
@@ -4491,7 +4641,9 @@ async def test_erase_claim_rejects_newer_failed_attestation_after_publication_wa
     await service.delete_object(db, volume, generation.object_key)
     task = (
         await db.execute(
-            select(StorageEraseTask).where(StorageEraseTask.object_id == generation.object_id)
+            select(StorageEraseTask).where(
+                StorageEraseTask.object_id == generation.object_id
+            )
         )
     ).scalar_one()
     task_id = task.task_id
@@ -4502,7 +4654,9 @@ async def test_erase_claim_rejects_newer_failed_attestation_after_publication_wa
         await service._lock_storage_publication_servers(gate, [holder_id], shared=False)
         stale_caller = await claimant.get(Server, holder_id)
         claimant_pid = await claimant.scalar(text("SELECT pg_backend_pid()"))
-        claiming = asyncio.create_task(service.claim_erase_tasks(claimant, stale_caller, 10))
+        claiming = asyncio.create_task(
+            service.claim_erase_tasks(claimant, stale_caller, 10)
+        )
         await _wait_for_postgres_blocker(db.bind, claimant_pid, gate_pid)
         await _commit_failed_attestation(attestor, holder_id)
         await gate.commit()
@@ -4516,7 +4670,9 @@ async def test_erase_claim_rejects_newer_failed_attestation_after_publication_wa
     assert task.attempt_count == 0
 
 
-async def test_certificate_rebind_rejects_newer_failed_attestation_after_wait(pg_session):
+async def test_certificate_rebind_rejects_newer_failed_attestation_after_wait(
+    pg_session,
+):
     db, redis = pg_session
     old_identity = _attested_identity("rebind-attestation-old")
     holder = await _server(
@@ -4530,7 +4686,9 @@ async def test_certificate_rebind_rejects_newer_failed_attestation_after_wait(pg
     incarnation = holder.storage_incarnation
     old_cert_hash = holder.attested_cert_pubkey_hash
     volume = await _volume(db, 1)
-    obj = await _object(db, volume, "rebind-attestation-object", sha256="8" * 64, size_bytes=31)
+    obj = await _object(
+        db, volume, "rebind-attestation-object", sha256="8" * 64, size_bytes=31
+    )
     placement = await _placement(db, obj, holder, status="present")
     object_id = obj.object_id
     object_sha256 = obj.sha256
@@ -4540,7 +4698,9 @@ async def test_certificate_rebind_rejects_newer_failed_attestation_after_wait(pg
     await db.commit()
 
     new_identity = _attested_identity("rebind-attestation-new")
-    holder.attested_cert = new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    holder.attested_cert = (
+        new_identity[1].public_bytes(serialization.Encoding.PEM).decode()
+    )
     holder.attested_cert_pubkey_hash = get_public_key_hash(new_identity[1])
     assert await service._refresh_object_durability(db, obj, volume=volume) == 0
     await db.commit()
@@ -4588,7 +4748,9 @@ async def test_certificate_rebind_rejects_newer_failed_attestation_after_wait(pg
     assert new_cert_hash != old_cert_hash
 
 
-async def test_deferred_active_placement_guard_validates_final_committed_identity(pg_session):
+async def test_deferred_active_placement_guard_validates_final_committed_identity(
+    pg_session,
+):
     db, redis = pg_session
     trigger_flags = (
         await db.execute(
@@ -4604,14 +4766,18 @@ async def test_deferred_active_placement_guard_validates_final_committed_identit
     ).one()
     assert tuple(trigger_flags) == (True, True, True)
 
-    holder = await _server(db, redis, "deferred-placement-holder", "deferred-placement-host")
+    holder = await _server(
+        db, redis, "deferred-placement-holder", "deferred-placement-host"
+    )
     holder_id = holder.server_id
     old_incarnation = holder.storage_incarnation
     old_cert_hash = holder.attested_cert_pubkey_hash
     volume = await _volume(db, 1)
     rejected_object = await _object(db, volume, "deferred-stale-active", size_bytes=13)
     evicted_object = await _object(db, volume, "deferred-final-evicted", size_bytes=17)
-    pre_retirement_object = await _object(db, volume, "deferred-pre-retirement", size_bytes=19)
+    pre_retirement_object = await _object(
+        db, volume, "deferred-pre-retirement", size_bytes=19
+    )
     rejected_object_id = rejected_object.object_id
     evicted_object_id = evicted_object.object_id
     pre_retirement_object_id = pre_retirement_object.object_id
@@ -4673,7 +4839,9 @@ async def test_deferred_active_placement_guard_validates_final_committed_identit
 async def test_placement_skips_full_nodes_and_never_duplicates_hosts(pg_session):
     db, redis = pg_session
     full = await _server(db, redis, "full", "shared-host", disk_free_gb=10)
-    roomy_same_host = await _server(db, redis, "roomy-a", "shared-host", disk_free_gb=100)
+    roomy_same_host = await _server(
+        db, redis, "roomy-a", "shared-host", disk_free_gb=100
+    )
     roomy_b = await _server(db, redis, "roomy-b", "host-b", disk_free_gb=80)
     roomy_c = await _server(db, redis, "roomy-c", "host-c", disk_free_gb=70)
     reserved = await _server(db, redis, "reserved", "host-reserved", disk_free_gb=200)
@@ -4758,8 +4926,12 @@ async def test_concurrent_first_put_commits_are_serialized_by_generation_cas(
     server = await _server(db, redis, "cas-target", "cas-host")
     volume = await _volume(db, 1)
     volume_id = volume.volume_id
-    first, _ = await service.plan_object_placement(db, volume, str(uuid.uuid4()), "shared-key", 11)
-    second, _ = await service.plan_object_placement(db, volume, str(uuid.uuid4()), "shared-key", 17)
+    first, _ = await service.plan_object_placement(
+        db, volume, str(uuid.uuid4()), "shared-key", 11
+    )
+    second, _ = await service.plan_object_placement(
+        db, volume, str(uuid.uuid4()), "shared-key", 17
+    )
     first_id = first.object_id
     second_id = second.object_id
     assert first.object_id != second.object_id
@@ -4940,7 +5112,9 @@ async def test_repeated_overwrites_detach_terminal_chain_and_purge_in_bounds(
     audit_tasks = list(
         (
             await db.execute(
-                select(StorageEraseTask).where(StorageEraseTask.object_id.in_(retired_ids))
+                select(StorageEraseTask).where(
+                    StorageEraseTask.object_id.in_(retired_ids)
+                )
             )
         )
         .scalars()
@@ -5042,7 +5216,9 @@ async def test_delayed_commit_after_delete_cannot_resurrect_generation(pg_sessio
     )
     await _store_generation_receipt(db, server, replacement, "7" * 64)
 
-    deleted, used, erase_tasks_pending = await service.delete_object(db, volume, old.object_key)
+    deleted, used, erase_tasks_pending = await service.delete_object(
+        db, volume, old.object_key
+    )
     assert deleted.object_id == old.object_id
     assert used == 0
     assert erase_tasks_pending >= 1
@@ -5209,7 +5385,9 @@ async def test_overwrite_quota_reserves_positive_delta_and_releases_expiry(pg_se
         )
         placement = (
             await db.execute(
-                select(ReplicaPlacement).where(ReplicaPlacement.object_id == generation.object_id)
+                select(ReplicaPlacement).where(
+                    ReplicaPlacement.object_id == generation.object_id
+                )
             )
         ).scalar_one()
         placement.pending_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -5251,7 +5429,9 @@ async def test_overwrite_quota_reserves_positive_delta_and_releases_expiry(pg_se
     aggregate_volume.used_bytes = 8
     await db.commit()
 
-    replacement = await reserve_then_expire(aggregate_volume, aggregate_predecessor.object_key, 10)
+    replacement = await reserve_then_expire(
+        aggregate_volume, aggregate_predecessor.object_key, 10
+    )
     assert replacement.expected_predecessor_id == aggregate_predecessor.object_id
     with pytest.raises(HTTPException) as aggregate_limit:
         await service.plan_object_placement(
@@ -5318,7 +5498,9 @@ async def test_locate_and_list_switch_only_after_generation_commit(pg_session):
         db, volume, str(uuid.uuid4()), old.object_key, 15
     )
 
-    located_before, _peers, _count = await service.locate_object(db, volume, old.object_key)
+    located_before, _peers, _count = await service.locate_object(
+        db, volume, old.object_key
+    )
     listed_before = await service.list_objects(db, volume, None, 100)
     assert located_before.object_id == old.object_id
     assert [item.object_id for item in listed_before] == [old.object_id]
@@ -5334,7 +5516,9 @@ async def test_locate_and_list_switch_only_after_generation_commit(pg_session):
         "0" * 64,
         server.server_id,
     )
-    located_after, _peers, _count = await service.locate_object(db, volume, old.object_key)
+    located_after, _peers, _count = await service.locate_object(
+        db, volume, old.object_key
+    )
     listed_after = await service.list_objects(db, volume, None, 100)
     await db.refresh(old)
     await db.refresh(volume)
@@ -5350,7 +5534,9 @@ async def test_empty_commit_is_distinct_from_abandoned_pending_reservation(
     db, redis = pg_session
     server = await _server(db, redis, "empty-target", "empty-host")
     volume = await _volume(db, 1)
-    empty, _ = await service.plan_object_placement(db, volume, str(uuid.uuid4()), "empty", 0)
+    empty, _ = await service.plan_object_placement(
+        db, volume, str(uuid.uuid4()), "empty", 0
+    )
     abandoned, _ = await service.plan_object_placement(
         db, volume, str(uuid.uuid4()), "abandoned", 0
     )
@@ -5448,18 +5634,24 @@ async def test_offline_delete_rejoins_erases_exact_generation_then_purges(pg_ses
     db, redis = pg_session
     holder = await _server(db, redis, "erase-holder", "erase-host")
     volume = await _volume(db, 1)
-    generation = await _object(db, volume, "erase-generation", sha256="a" * 64, size_bytes=31)
+    generation = await _object(
+        db, volume, "erase-generation", sha256="a" * 64, size_bytes=31
+    )
     placement = await _placement(db, generation, holder, status="present")
     volume.used_bytes = 31
     await db.commit()
 
-    deleted, used_bytes, pending = await service.delete_object(db, volume, generation.object_key)
+    deleted, used_bytes, pending = await service.delete_object(
+        db, volume, generation.object_key
+    )
     assert deleted.object_id == generation.object_id
     assert used_bytes == 0
     assert pending == 1
     task = (
         await db.execute(
-            select(StorageEraseTask).where(StorageEraseTask.object_id == generation.object_id)
+            select(StorageEraseTask).where(
+                StorageEraseTask.object_id == generation.object_id
+            )
         )
     ).scalar_one()
     task_id = task.task_id
@@ -5523,13 +5715,17 @@ async def test_volume_delete_shreds_key_only_after_all_holder_tasks_terminal(
 
     task = (
         await db.execute(
-            select(StorageEraseTask).where(StorageEraseTask.volume_id == volume.volume_id)
+            select(StorageEraseTask).where(
+                StorageEraseTask.volume_id == volume.volume_id
+            )
         )
     ).scalar_one()
     volume_id = volume.volume_id
     claimed = await service.claim_erase_tasks(db, holder, 10)
     assert [item["task_id"] for item in claimed] == [task.task_id]
-    await service.record_erase_task_result(db, holder, task.task_id, "erased", False, None)
+    await service.record_erase_task_result(
+        db, holder, task.task_id, "erased", False, None
+    )
     await service.reconcile_storage(db)
     db.expire_all()
     volume = await db.get(StorageVolume, volume_id)
@@ -5549,7 +5745,9 @@ async def test_volume_delete_shreds_key_only_after_all_holder_tasks_terminal(
     assert repeated["key_shredded"]
 
 
-async def _volume_key_release_fixture(db, redis, prefix: str, placement_status: str = "pending"):
+async def _volume_key_release_fixture(
+    db, redis, prefix: str, placement_status: str = "pending"
+):
     holder = await _server(db, redis, f"{prefix}-holder", f"{prefix}-host")
     volume = await _volume(db, 1)
     if placement_status == "present":
@@ -5563,7 +5761,11 @@ async def _volume_key_release_fixture(db, redis, prefix: str, placement_status: 
     else:
         obj = await _object(db, volume, f"{prefix}-object", size_bytes=41)
     placement = await _placement(db, obj, holder, status=placement_status)
-    db.add(StorageVolumeKey(volume_id=volume.volume_id, encrypted_key="encrypted-volume-key"))
+    db.add(
+        StorageVolumeKey(
+            volume_id=volume.volume_id, encrypted_key="encrypted-volume-key"
+        )
+    )
     await db.commit()
     return holder, volume, obj, placement
 
@@ -5588,7 +5790,9 @@ def _mock_volume_key_release_attestation(
     original_server_lock = service._locked_storage_publication_server_rows
     runtime_quote = object()
 
-    monkeypatch.setattr(service, "build_runtime_quote", lambda *args, **kwargs: runtime_quote)
+    monkeypatch.setattr(
+        service, "build_runtime_quote", lambda *args, **kwargs: runtime_quote
+    )
 
     async def verify_without_database_locks(quote, expected_nonce, expected_cert_hash):
         assert quote is runtime_quote
@@ -5623,7 +5827,9 @@ def _mock_volume_key_release_attestation(
         "get_matching_measurement_config",
         lambda quote: _storage_measurement(),
     )
-    monkeypatch.setattr(service, "_lock_storage_object_transactions", object_lock_after_quote)
+    monkeypatch.setattr(
+        service, "_lock_storage_object_transactions", object_lock_after_quote
+    )
     monkeypatch.setattr(
         service,
         "_locked_storage_publication_server_rows",
@@ -5871,7 +6077,9 @@ async def test_volume_key_release_rechecks_pending_deadline_after_server_lock_wa
 
         async def capture_release_backend(lock_db, server_ids):
             if lock_db is releaser and not publication_entered.is_set():
-                release_pid["value"] = await lock_db.scalar(text("SELECT pg_backend_pid()"))
+                release_pid["value"] = await lock_db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
                 publication_entered.set()
             return await observed_server_lock(lock_db, server_ids)
 
@@ -5920,7 +6128,9 @@ async def test_inventory_is_authoritative_only_after_complete_snapshot(pg_sessio
     db, redis = pg_session
     holder = await _server(db, redis, "inventory-holder", "inventory-host")
     volume = await _volume(db, 1)
-    generation = await _object(db, volume, "inventory-generation", sha256="c" * 64, size_bytes=51)
+    generation = await _object(
+        db, volume, "inventory-generation", sha256="c" * 64, size_bytes=51
+    )
     placement = await _placement(db, generation, holder, status="present")
     snapshot_id = str(uuid.uuid4())
     entry = {
@@ -5975,7 +6185,9 @@ async def test_inventory_is_authoritative_only_after_complete_snapshot(pg_sessio
     )
     assert response["erase_tasks_enqueued"] == 1
     orphan_task = (
-        await db.execute(select(StorageEraseTask).where(StorageEraseTask.object_id == orphan_id))
+        await db.execute(
+            select(StorageEraseTask).where(StorageEraseTask.object_id == orphan_id)
+        )
     ).scalar_one()
     assert orphan_task.reason == "inventory_untracked_or_mismatched_file"
 
@@ -6041,7 +6253,9 @@ async def test_inventory_cutoff_preserves_new_and_proven_during_scan_placements(
     pg_session,
 ):
     db, redis = pg_session
-    holder = await _server(db, redis, "inventory-cutoff-holder", "inventory-cutoff-host")
+    holder = await _server(
+        db, redis, "inventory-cutoff-holder", "inventory-cutoff-host"
+    )
     volume = await _volume(db, 1)
     proving, _ = await service.plan_object_placement(
         db,
@@ -6238,7 +6452,9 @@ async def test_concurrent_volume_and_placement_creates_are_conflict_safe(
 
     holder = await _server(db, redis, "idempotent-holder", "idempotent-host")
     volume = (
-        await db.execute(select(StorageVolume).where(StorageVolume.name == "concurrent-volume"))
+        await db.execute(
+            select(StorageVolume).where(StorageVolume.name == "concurrent-volume")
+        )
     ).scalar_one()
     request_id = str(uuid.uuid4())
 
@@ -6254,7 +6470,9 @@ async def test_concurrent_volume_and_placement_creates_are_conflict_safe(
             )
             return generation.object_id
 
-    reservations = await asyncio.gather(reserve_same_generation(), reserve_same_generation())
+    reservations = await asyncio.gather(
+        reserve_same_generation(), reserve_same_generation()
+    )
     assert reservations[0] == reservations[1]
     assert holder.server_id
 
@@ -6278,10 +6496,12 @@ async def test_literal_prefix_volume_pagination_and_holdings_omission(pg_session
         )
     await db.commit()
     assert [
-        generation.object_key for generation in await service.list_objects(db, volume, "%", 100)
+        generation.object_key
+        for generation in await service.list_objects(db, volume, "%", 100)
     ] == ["%literal"]
     assert [
-        generation.object_key for generation in await service.list_objects(db, volume, "_", 100)
+        generation.object_key
+        for generation in await service.list_objects(db, volume, "_", 100)
     ] == ["_literal"]
 
     for index in range(5):
@@ -6296,7 +6516,9 @@ async def test_literal_prefix_volume_pagination_and_holdings_omission(pg_session
         )
     await db.commit()
     first_page, _aggregate = await service.list_volumes(db, USER_ID, 2)
-    second_page, _aggregate = await service.list_volumes(db, USER_ID, 2, first_page[-1].volume_id)
+    second_page, _aggregate = await service.list_volumes(
+        db, USER_ID, 2, first_page[-1].volume_id
+    )
     assert len(first_page) == len(second_page) == 2
     assert {item.volume_id for item in first_page}.isdisjoint(
         {item.volume_id for item in second_page}
@@ -6318,7 +6540,9 @@ async def test_literal_prefix_volume_pagination_and_holdings_omission(pg_session
         ],
         True,
     )
-    await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=1000)
+    await service._reconcile_model_inventory_snapshots(
+        db, max_snapshots=1, max_entries=1000
+    )
     second_snapshot = str(uuid.uuid4())
     await service.announce_model_holdings(
         db,
@@ -6332,7 +6556,9 @@ async def test_literal_prefix_volume_pagination_and_holdings_omission(pg_session
         [{"repo_id": "org/a", "revision": "main", "bytes": 1}],
         True,
     )
-    await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=1000)
+    await service._reconcile_model_inventory_snapshots(
+        db, max_snapshots=1, max_entries=1000
+    )
     assert (
         await db.execute(
             select(func.count())
@@ -6341,7 +6567,9 @@ async def test_literal_prefix_volume_pagination_and_holdings_omission(pg_session
         )
     ).scalar_one() == 1
     holding = (
-        await db.execute(select(ContentHolding).where(ContentHolding.server_id == holder.server_id))
+        await db.execute(
+            select(ContentHolding).where(ContentHolding.server_id == holder.server_id)
+        )
     ).scalar_one()
     holding.announced_at = datetime.now(timezone.utc) - timedelta(hours=1)
     holder.model_inventory_fresh_at = datetime.now(timezone.utc) - timedelta(hours=1)
@@ -6367,7 +6595,9 @@ async def test_model_inventory_heartbeat_bridges_reconcile_cadence_jitter(pg_ses
         [{"repo_id": "org/authoritative", "revision": "a" * 40, "bytes": 7}],
         True,
     )
-    await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=100)
+    await service._reconcile_model_inventory_snapshots(
+        db, max_snapshots=1, max_entries=100
+    )
     db.expire_all()
     holder = await db.get(Server, holder_id)
     marker_order = (
@@ -6407,7 +6637,8 @@ async def test_model_inventory_heartbeat_bridges_reconcile_cadence_jitter(pg_ses
         holder.model_inventory_snapshot_id,
     ) == marker_order
     assert [
-        peer.server_id for peer in await service.model_peers(db, "org/authoritative", "a" * 40)
+        peer.server_id
+        for peer in await service.model_peers(db, "org/authoritative", "a" * 40)
     ] == [holder_id]
     assert await service.model_peers(db, "org/staged", "b" * 40) == []
     assert (
@@ -6417,7 +6648,9 @@ async def test_model_inventory_heartbeat_bridges_reconcile_cadence_jitter(pg_ses
             .where(ContentHolding.server_id == holder_id)
         )
     ).scalar_one() == 1
-    scanning_snapshot = await db.get(StorageModelInventorySnapshot, scanning_snapshot_id)
+    scanning_snapshot = await db.get(
+        StorageModelInventorySnapshot, scanning_snapshot_id
+    )
     assert scanning_snapshot.state == "scanning"
 
 
@@ -6452,7 +6685,9 @@ async def test_more_than_ten_active_model_streams_keep_waiting_marker_fresh(
             ],
             True,
         )
-        await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=100)
+        await service._reconcile_model_inventory_snapshots(
+            db, max_snapshots=1, max_entries=100
+        )
         streams.append(
             (
                 holder.server_id,
@@ -6487,7 +6722,9 @@ async def test_more_than_ten_active_model_streams_keep_waiting_marker_fresh(
         )
         snapshot = await db.get(StorageModelInventorySnapshot, snapshot_id)
         snapshot.state = "applying"
-        snapshot.application_started_at = active_started_at + timedelta(microseconds=stream_index)
+        snapshot.application_started_at = active_started_at + timedelta(
+            microseconds=stream_index
+        )
     await db.commit()
 
     assert (
@@ -6538,15 +6775,21 @@ async def test_more_than_ten_active_model_streams_keep_waiting_marker_fresh(
         ) == marker_order
         assert [
             peer.server_id
-            for peer in await service.model_peers(db, "org/authoritative-10", f"{10:040x}")
+            for peer in await service.model_peers(
+                db, "org/authoritative-10", f"{10:040x}"
+            )
         ] == [target_id]
         assert await service.model_peers(db, "org/active-10-0000", f"{0:040x}") == []
 
-        await service._reconcile_model_inventory_snapshots(db, max_snapshots=10, max_entries=250)
+        await service._reconcile_model_inventory_snapshots(
+            db, max_snapshots=10, max_entries=250
+        )
         db.expire_all()
         target = await db.get(Server, target_id)
 
-    target_active_snapshot = await db.get(StorageModelInventorySnapshot, target_active_snapshot_id)
+    target_active_snapshot = await db.get(
+        StorageModelInventorySnapshot, target_active_snapshot_id
+    )
     assert target_active_snapshot.state == "applying"
     assert target_active_snapshot.applied_entries == 0
     assert (
@@ -6621,17 +6864,21 @@ async def test_model_inventory_replacement_identity_remains_fail_closed(
         [{"repo_id": "org/old-identity", "revision": "d" * 40, "bytes": 17}],
         True,
     )
-    await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=100)
+    await service._reconcile_model_inventory_snapshots(
+        db, max_snapshots=1, max_entries=100
+    )
     assert [
-        peer.server_id for peer in await service.model_peers(db, "org/old-identity", "d" * 40)
+        peer.server_id
+        for peer in await service.model_peers(db, "org/old-identity", "d" * 40)
     ] == [holder_id]
 
     replacement_incarnation = holder.storage_incarnation
     if replacement == "certificate":
         replacement_at = datetime.now(timezone.utc)
         measurement = _storage_measurement()
-        config_fingerprint = measurement.config_fingerprint or measurement_config_fingerprint(
-            measurement
+        config_fingerprint = (
+            measurement.config_fingerprint
+            or measurement_config_fingerprint(measurement)
         )
         holder.attested_cert_pubkey_hash = hashlib.sha256(
             b"replacement-attested-certificate"
@@ -6729,7 +6976,9 @@ async def test_model_holding_snapshot_over_one_thousand_is_atomic_until_final_pa
         False,
     )
     assert first == {"recorded": 1000, "complete": False}
-    await service._reconcile_model_inventory_snapshots(db, max_snapshots=10, max_entries=200)
+    await service._reconcile_model_inventory_snapshots(
+        db, max_snapshots=10, max_entries=200
+    )
     assert (
         await db.execute(
             select(func.count())
@@ -6754,7 +7003,9 @@ async def test_model_holding_snapshot_over_one_thousand_is_atomic_until_final_pa
     )
     assert final == {"recorded": 5, "complete": True}
     for _ in range(20):
-        await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=200)
+        await service._reconcile_model_inventory_snapshots(
+            db, max_snapshots=1, max_entries=200
+        )
         db.expire_all()
         snapshot = await db.get(StorageModelInventorySnapshot, snapshot_id)
         if snapshot.state == "reconciled":
@@ -6847,7 +7098,11 @@ async def test_newest_completed_model_snapshot_wins_when_reconciliation_overlaps
     assert older.application_started_at is None
     assert newer.state == "reconciled"
     holdings = list(
-        (await db.execute(select(ContentHolding).where(ContentHolding.server_id == holder_id)))
+        (
+            await db.execute(
+                select(ContentHolding).where(ContentHolding.server_id == holder_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -6862,7 +7117,11 @@ async def test_newest_completed_model_snapshot_wins_when_reconciliation_overlaps
     db.expire_all()
     older = await db.get(StorageModelInventorySnapshot, older_snapshot_id)
     holdings = list(
-        (await db.execute(select(ContentHolding).where(ContentHolding.server_id == holder_id)))
+        (
+            await db.execute(
+                select(ContentHolding).where(ContentHolding.server_id == holder_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -6916,7 +7175,9 @@ async def test_later_serialized_model_snapshot_uses_database_wall_clock(pg_sessi
 
     db.expire_all()
     empty_snapshot = await db.get(StorageModelInventorySnapshot, empty_snapshot_id)
-    authoritative_snapshot = await db.get(StorageModelInventorySnapshot, authoritative_snapshot_id)
+    authoritative_snapshot = await db.get(
+        StorageModelInventorySnapshot, authoritative_snapshot_id
+    )
     assert empty_snapshot.started_at < authoritative_snapshot.started_at
     assert authoritative_snapshot.started_at > anchored_at
 
@@ -6950,7 +7211,11 @@ async def test_later_serialized_model_snapshot_uses_database_wall_clock(pg_sessi
         pytest.fail("serialized model inventory snapshots did not reconcile")
 
     holdings = list(
-        (await db.execute(select(ContentHolding).where(ContentHolding.server_id == holder_id)))
+        (
+            await db.execute(
+                select(ContentHolding).where(ContentHolding.server_id == holder_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -6964,7 +7229,9 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
     pg_session,
 ):
     db, redis = pg_session
-    holder = await _server(db, redis, "continuous-model-holder", "continuous-model-host")
+    holder = await _server(
+        db, redis, "continuous-model-holder", "continuous-model-host"
+    )
     holder_id = holder.server_id
     holder_incarnation = holder.storage_incarnation
     active_snapshot_id = str(uuid.uuid4())
@@ -7054,16 +7321,21 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
             ],
             True,
         )
-        await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=250)
+        await service._reconcile_model_inventory_snapshots(
+            db, max_snapshots=1, max_entries=250
+        )
         db.expire_all()
-        active_snapshot = await db.get(StorageModelInventorySnapshot, active_snapshot_id)
+        active_snapshot = await db.get(
+            StorageModelInventorySnapshot, active_snapshot_id
+        )
         active_count = (
             await db.execute(
                 select(func.count())
                 .select_from(StorageModelInventorySnapshot)
                 .where(
                     StorageModelInventorySnapshot.server_id == holder_id,
-                    StorageModelInventorySnapshot.storage_incarnation == holder_incarnation,
+                    StorageModelInventorySnapshot.storage_incarnation
+                    == holder_incarnation,
                     StorageModelInventorySnapshot.state.in_(("applying", "omitting")),
                 )
             )
@@ -7072,12 +7344,16 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
         if version == 0:
             assert [
                 peer.server_id
-                for peer in await service.model_peers(db, "org/active-0000", f"{0:040x}")
+                for peer in await service.model_peers(
+                    db, "org/active-0000", f"{0:040x}"
+                )
             ] == [holder_id]
         if active_snapshot.state == "reconciled":
             break
     else:
-        pytest.fail("active model snapshot did not finish under continuous newer arrivals")
+        pytest.fail(
+            "active model snapshot did not finish under continuous newer arrivals"
+        )
 
     assert active_snapshot.applied_entries == 1001
     assert len(waiting_snapshot_ids) > 1
@@ -7093,7 +7369,9 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
     assert newest_waiting_id is not None
     newest_waiting_version = waiting_snapshot_ids.index(newest_waiting_id)
     for _ in range(20):
-        await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=250)
+        await service._reconcile_model_inventory_snapshots(
+            db, max_snapshots=1, max_entries=250
+        )
         db.expire_all()
         newest_waiting = await db.get(StorageModelInventorySnapshot, newest_waiting_id)
         if newest_waiting.state == "reconciled":
@@ -7103,18 +7381,25 @@ async def test_active_large_model_snapshot_finishes_while_newer_snapshots_keep_a
 
     assert newest_waiting.application_started_at is not None
     for superseded_id in (
-        snapshot_id for snapshot_id in waiting_snapshot_ids if snapshot_id != newest_waiting_id
+        snapshot_id
+        for snapshot_id in waiting_snapshot_ids
+        if snapshot_id != newest_waiting_id
     ):
         superseded = await db.get(StorageModelInventorySnapshot, superseded_id)
         assert superseded.state == "reconciled"
         assert superseded.application_started_at is None
     final_holdings = list(
-        (await db.execute(select(ContentHolding).where(ContentHolding.server_id == holder_id)))
+        (
+            await db.execute(
+                select(ContentHolding).where(ContentHolding.server_id == holder_id)
+            )
+        )
         .scalars()
         .all()
     )
     assert [
-        (holding.repo_id, holding.bytes, holding.last_snapshot_id) for holding in final_holdings
+        (holding.repo_id, holding.bytes, holding.last_snapshot_id)
+        for holding in final_holdings
     ] == [("org/winner", newest_waiting_version, newest_waiting_id)]
 
 
@@ -7122,7 +7407,9 @@ async def test_newer_snapshot_omits_late_applied_older_rows_but_not_future_rows(
     pg_session,
 ):
     db, redis = pg_session
-    holder = await _server(db, redis, "ordered-omission-holder", "ordered-omission-host")
+    holder = await _server(
+        db, redis, "ordered-omission-holder", "ordered-omission-host"
+    )
     holder_id = holder.server_id
     holder_incarnation = holder.storage_incarnation
     older_snapshot_id = str(uuid.uuid4())
@@ -7147,7 +7434,9 @@ async def test_newer_snapshot_omits_late_applied_older_rows_but_not_future_rows(
         older_holdings,
         True,
     )
-    await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=100)
+    await service._reconcile_model_inventory_snapshots(
+        db, max_snapshots=1, max_entries=100
+    )
     await service.announce_model_holdings(
         db,
         MINER,
@@ -7164,7 +7453,9 @@ async def test_newer_snapshot_omits_late_applied_older_rows_but_not_future_rows(
     newer_started_at = newer_snapshot.started_at
 
     for _ in range(20):
-        await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=100)
+        await service._reconcile_model_inventory_snapshots(
+            db, max_snapshots=1, max_entries=100
+        )
         db.expire_all()
         older_snapshot = await db.get(StorageModelInventorySnapshot, older_snapshot_id)
         if older_snapshot.state == "reconciled":
@@ -7200,7 +7491,9 @@ async def test_newer_snapshot_omits_late_applied_older_rows_but_not_future_rows(
     await db.commit()
 
     for _ in range(20):
-        await service._reconcile_model_inventory_snapshots(db, max_snapshots=1, max_entries=100)
+        await service._reconcile_model_inventory_snapshots(
+            db, max_snapshots=1, max_entries=100
+        )
         db.expire_all()
         newer_snapshot = await db.get(StorageModelInventorySnapshot, newer_snapshot_id)
         if newer_snapshot.state == "reconciled":
@@ -7268,7 +7561,9 @@ async def test_administrative_erase_retirement_is_explicit_and_overdue_only(
     await db.commit()
     task_id = task.task_id
 
-    monkeypatch.setattr(settings, "storage_allow_administrative_erase_retirement", False)
+    monkeypatch.setattr(
+        settings, "storage_allow_administrative_erase_retirement", False
+    )
     with pytest.raises(HTTPException) as disabled:
         await service.administratively_retire_erase_tasks(
             db, "administrator", [task_id], "approved device loss"
@@ -7314,7 +7609,9 @@ async def test_reconcile_advisory_lock_survives_work_commits(pg_session, monkeyp
             contender_results.append(
                 (
                     await contender.execute(
-                        text("SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"),
+                        text(
+                            "SELECT pg_try_advisory_lock(hashtextextended(:lock_key, 0))"
+                        ),
                         {"lock_key": storage_reconcile._RECONCILE_LOCK_KEY},
                     )
                 ).scalar_one()
@@ -7460,8 +7757,12 @@ async def test_reconcile_new_candidate_and_unassigned_announce_share_object_fron
         original_lock_objects = service._lock_storage_object_transactions
 
         async def observe_reconcile_object_frontier(lock_db, object_ids):
-            if lock_db is reconciler and object_id in {str(value) for value in object_ids}:
-                reconcile_pid["value"] = await lock_db.scalar(text("SELECT pg_backend_pid()"))
+            if lock_db is reconciler and object_id in {
+                str(value) for value in object_ids
+            }:
+                reconcile_pid["value"] = await lock_db.scalar(
+                    text("SELECT pg_backend_pid()")
+                )
                 reconcile_object_frontier_entered.set()
             return await original_lock_objects(lock_db, object_ids)
 
@@ -7487,16 +7788,24 @@ async def test_reconcile_new_candidate_and_unassigned_announce_share_object_fron
             if announce_wins:
                 announcing = asyncio.create_task(announce())
                 await _wait_for_postgres_blocker(db.bind, announce_pid, gate_pid)
-                reconciling = asyncio.create_task(service.reconcile_storage(reconciler, 10))
-                await asyncio.wait_for(reconcile_object_frontier_entered.wait(), timeout=10)
+                reconciling = asyncio.create_task(
+                    service.reconcile_storage(reconciler, 10)
+                )
+                await asyncio.wait_for(
+                    reconcile_object_frontier_entered.wait(), timeout=10
+                )
                 await _wait_for_postgres_blocker(
                     db.bind,
                     reconcile_pid["value"],
                     announce_pid,
                 )
             else:
-                reconciling = asyncio.create_task(service.reconcile_storage(reconciler, 10))
-                await asyncio.wait_for(reconcile_object_frontier_entered.wait(), timeout=10)
+                reconciling = asyncio.create_task(
+                    service.reconcile_storage(reconciler, 10)
+                )
+                await asyncio.wait_for(
+                    reconcile_object_frontier_entered.wait(), timeout=10
+                )
                 await _wait_for_postgres_blocker(
                     db.bind,
                     reconcile_pid["value"],
@@ -7849,7 +8158,9 @@ async def test_inventory_page_revalidates_presented_authority_after_publication_
             with pytest.raises(HTTPException) as rejected:
                 await asyncio.wait_for(recording, timeout=10)
             assert rejected.value.status_code == 403
-            assert "current storage certificate and incarnation" in rejected.value.detail
+            assert (
+                "current storage certificate and incarnation" in rejected.value.detail
+            )
             await recorder.rollback()
         finally:
             if gate.in_transaction():
@@ -7901,7 +8212,9 @@ async def _claimed_authority_erase_task_fixture(db, redis, suffix):
     ).scalar_one()
     task_id = task.task_id
     claimed = await service.claim_erase_tasks(db, holder, 10)
-    assert [item["task_id"] for item in claimed if item["object_id"] == object_id] == [task_id]
+    assert [item["task_id"] for item in claimed if item["object_id"] == object_id] == [
+        task_id
+    ]
     db.expire_all()
     return holder_id, object_id, task_id
 
@@ -8238,7 +8551,10 @@ async def test_plan_revalidates_selected_peer_under_server_lock(
 
     factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
     async with factory() as planner, factory() as authority_writer:
-        async def pause_after_peer_selection(upsert_db, candidate_obj, candidate_server):
+
+        async def pause_after_peer_selection(
+            upsert_db, candidate_obj, candidate_server
+        ):
             if upsert_db is planner and candidate_server.server_id == holder_id:
                 upsert_entered.set()
                 await release_upsert.wait()
@@ -8298,9 +8614,13 @@ async def test_plan_revalidates_selected_peer_under_server_lock(
     )
 
 
-async def test_commit_rechecks_latest_attestation_after_waiting_for_server_row(pg_session):
+async def test_commit_rechecks_latest_attestation_after_waiting_for_server_row(
+    pg_session,
+):
     db, redis = pg_session
-    holder = await _server(db, redis, "commit-attestation-holder", "commit-attestation-host")
+    holder = await _server(
+        db, redis, "commit-attestation-holder", "commit-attestation-host"
+    )
     holder_id = holder.server_id
     volume = await _volume(db, 1)
     volume_id = volume.volume_id
@@ -8393,7 +8713,9 @@ async def test_concurrent_plans_serialize_final_capacity_in_server_order(
     monkeypatch,
 ):
     db, redis = pg_session
-    first_holder = await _server(db, redis, "capacity-lock-a", "capacity-lock-host-a", disk_free_gb=11)
+    first_holder = await _server(
+        db, redis, "capacity-lock-a", "capacity-lock-host-a", disk_free_gb=11
+    )
     second_holder = await _server(
         db,
         redis,
@@ -8458,6 +8780,7 @@ async def test_concurrent_plans_serialize_final_capacity_in_server_order(
 
     factory = sessionmaker(db.bind, class_=AsyncSession, expire_on_commit=False)
     async with factory() as first_planner, factory() as second_planner:
+
         async def run_plan(planner, volume_id, suffix):
             planner_volume = await planner.get(StorageVolume, volume_id)
             try:
@@ -8483,8 +8806,12 @@ async def test_concurrent_plans_serialize_final_capacity_in_server_order(
 
         assert sorted(selected_ids[id(first_planner)]) == holder_ids
         assert sorted(selected_ids[id(second_planner)]) == holder_ids
-        assert upsert_order[id(first_planner)] == sorted(upsert_order[id(first_planner)])
-        assert upsert_order[id(second_planner)] == sorted(upsert_order[id(second_planner)])
+        assert upsert_order[id(first_planner)] == sorted(
+            upsert_order[id(first_planner)]
+        )
+        assert upsert_order[id(second_planner)] == sorted(
+            upsert_order[id(second_planner)]
+        )
 
     successes = [result for result in results if isinstance(result, tuple)]
     failures = [result for result in results if isinstance(result, Exception)]
@@ -8501,7 +8828,9 @@ async def test_concurrent_plans_serialize_final_capacity_in_server_order(
                     ReplicaPlacement.server_id,
                     func.sum(StorageObject.projected_size_bytes),
                 )
-                .join(StorageObject, StorageObject.object_id == ReplicaPlacement.object_id)
+                .join(
+                    StorageObject, StorageObject.object_id == ReplicaPlacement.object_id
+                )
                 .where(ReplicaPlacement.status == "pending")
                 .group_by(ReplicaPlacement.server_id)
             )
@@ -8529,6 +8858,7 @@ async def test_storage_liveness_is_observed_before_authority_locks(
             _target_placement,
         ) = await _replication_fence_fixture(db, redis, suffix)
         if operation == "issue":
+
             async def invocation():
                 return await service.issue_replication_capability(
                     db,
@@ -8555,11 +8885,13 @@ async def test_storage_liveness_is_observed_before_authority_locks(
                     lease["capability"],
                     _sign_capability(source_identity, lease["capability"]),
                 )
+
         first_lock_name = "_lock_storage_object_transactions"
     else:
         holder = await _server(db, redis, f"{suffix}-holder", f"{suffix}-host")
         volume = await _volume(db, 1)
         if operation == "plan":
+
             async def invocation():
                 return await service.plan_object_placement(
                     db,
@@ -8600,6 +8932,7 @@ async def test_storage_liveness_is_observed_before_authority_locks(
                     obj.object_key,
                     obj.salt,
                 )
+
         first_lock_name = "_lock_storage_user"
 
     observed = False
@@ -8658,7 +8991,9 @@ async def test_consume_rejects_stale_presented_target_after_identity_rebind(pg_s
         presented_target = await stale_consumer.get(Server, target_id)
         old_incarnation = presented_target.storage_incarnation
         current_target = await binder.get(Server, target_id)
-        await service._bind_storage_identity(binder, current_target, replacement_incarnation)
+        await service._bind_storage_identity(
+            binder, current_target, replacement_incarnation
+        )
         await binder.commit()
         assert presented_target.storage_incarnation == old_incarnation
 
@@ -8745,10 +9080,14 @@ async def test_user_erasure_prelocks_cross_volume_object_frontier_globally(
 
     monkeypatch.setattr(settings, "storage_reconcile_batch_size", 2)
     monkeypatch.setattr(service, "_deleted_volume_retirement_hints", capture_hints)
-    monkeypatch.setattr(service, "_lock_storage_object_transactions", capture_object_frontier)
+    monkeypatch.setattr(
+        service, "_lock_storage_object_transactions", capture_object_frontier
+    )
     outcome = await service.prepare_user_storage_erasure(db, USER_ID)
 
-    assert [(volume_id, limit) for volume_id, limit, _objects, _history in hint_pages] == [
+    assert [
+        (volume_id, limit) for volume_id, limit, _objects, _history in hint_pages
+    ] == [
         (first_volume.volume_id, 2),
         (second_volume.volume_id, 1),
         (empty_page_volume.volume_id, 0),
@@ -8762,7 +9101,9 @@ async def test_user_erasure_prelocks_cross_volume_object_frontier_globally(
     assert outcome["ready"] is False
     assert set(outcome["purge_pending"]) == volume_ids
     db.expire_all()
-    assert (await db.get(StorageObject, deferred_object_id)).lifecycle_state == "pending"
+    assert (
+        await db.get(StorageObject, deferred_object_id)
+    ).lifecycle_state == "pending"
 
 
 async def test_reconcile_skip_releases_outer_locks_before_next_liveness_observation(
@@ -8840,7 +9181,9 @@ async def test_reconcile_skip_releases_outer_locks_before_next_liveness_observat
             .where(StorageObject.object_id == first_object_id)
             .with_for_update()
         )
-        reconciling = asyncio.create_task(service.reconcile_storage(reconciler, max_objects=2))
+        reconciling = asyncio.create_task(
+            service.reconcile_storage(reconciler, max_objects=2)
+        )
         try:
             summary = await asyncio.wait_for(reconciling, timeout=20)
         finally:
@@ -8875,7 +9218,9 @@ async def test_erasure_finalizer_pages_large_dependent_frontier_with_bounded_que
             lifecycle_state="tombstoned",
             size_bytes=0,
             projected_size_bytes=0,
-            salt=base64.b64encode(hashlib.sha256(predecessor_id.encode()).digest()).decode(),
+            salt=base64.b64encode(
+                hashlib.sha256(predecessor_id.encode()).digest()
+            ).decode(),
             durability_state="irrecoverable",
             durable_replica_count=0,
             tombstoned_at=now,

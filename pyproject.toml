@@ -78,6 +78,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["api", "metasync"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"api/database/production_base.sql" = "api/database/production_base.sql"
+"api/database/production_base_catalog.json" = "api/database/production_base_catalog.json"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 

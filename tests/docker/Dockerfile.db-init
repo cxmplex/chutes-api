@@ -12,6 +12,14 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+ARG DBMATE_VERSION=2.34.1
+ARG DBMATE_LINUX_AMD64_SHA256=b002d5249d53d0c6c482ed761b5a806c6fb9a364fcc5f9db3e8763c1d9e40e1d
+RUN curl -fsSL -o /usr/local/bin/dbmate \
+    "https://github.com/amacneil/dbmate/releases/download/v${DBMATE_VERSION}/dbmate-linux-amd64" \
+    && echo "${DBMATE_LINUX_AMD64_SHA256}  /usr/local/bin/dbmate" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/dbmate \
+    && test "$(/usr/local/bin/dbmate --version)" = "dbmate version ${DBMATE_VERSION}"
+
 # Install Poetry
 RUN pip install --no-cache-dir poetry
 

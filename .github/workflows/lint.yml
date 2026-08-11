@@ -62,7 +62,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # The production-base catalog manifest is intentionally qualified against PostgreSQL 15.
+        # A different server major must fail before DDL rather than silently changing deparse bytes.
+        image: postgres:15
         env:
           POSTGRES_USER: user
           POSTGRES_PASSWORD: password
@@ -87,14 +89,18 @@ jobs:
       TEST_DATABASE_URL: postgresql+asyncpg://user:password@127.0.0.1:5432/chutes
       TEST_REDIS_URL: redis://127.0.0.1:6379/15
       DBMATE_BIN: /usr/local/bin/dbmate
+      DBMATE_VERSION: 2.34.1
+      DBMATE_LINUX_AMD64_SHA256: b002d5249d53d0c6c482ed761b5a806c6fb9a364fcc5f9db3e8763c1d9e40e1d
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - name: Install dbmate
-        run: >-
-          sudo curl -fsSL -o /usr/local/bin/dbmate
-          https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64
-          && sudo chmod +x /usr/local/bin/dbmate
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/dbmate \
+            "https://github.com/amacneil/dbmate/releases/download/v${DBMATE_VERSION}/dbmate-linux-amd64"
+          echo "${DBMATE_LINUX_AMD64_SHA256}  /usr/local/bin/dbmate" | sha256sum -c -
+          sudo chmod 0755 /usr/local/bin/dbmate
+          test "$(/usr/local/bin/dbmate --version)" = "dbmate version ${DBMATE_VERSION}"
       - name: Install cosign
         run: |
           curl -fsSLO https://github.com/sigstore/cosign/releases/download/v2.5.3/cosign_2.5.3_amd64.deb
@@ -148,7 +154,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:15
         env:
           POSTGRES_USER: user
           POSTGRES_PASSWORD: password
@@ -208,6 +214,34 @@ jobs:
           root=E.parse('cross-repository-contracts.xml').getroot();
           skipped=sum(int(s.get('skipped', 0)) for s in ([root] if root.tag == 'testsuite' else root.findall('testsuite')));
           assert skipped == 0, f'{skipped} cross-repository fixtures skipped'"
+
+  production-base-pg16-rejection:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: chutes
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d chutes"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://user:password@127.0.0.1:5432/chutes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install test dependencies
+        run: uv sync --extra dev
+      - name: Prove unsupported PostgreSQL rejects before catalog mutation
+        run: >-
+          uv run pytest -q
+          tests/integration/test_production_base_unsupported_pg.py
 
   api-runtime-cosign:
     runs-on: ubuntu-latest

@@ -50,6 +50,18 @@ async def _apply_up(db: AsyncSession, migration: str) -> None:
     await db.rollback()
 
 
+async def _rewind_trust_boundary(db: AsyncSession) -> None:
+    """Restore the exact rotation-migration catalog before exercising its DOWN path."""
+
+    await db.commit()
+    async with db.bind.begin() as connection:
+        raw = await connection.get_raw_connection()
+        await raw.driver_connection.execute(
+            storage_pg._migration_down_sql(TRUST_BOUNDARY_MIGRATION)
+        )
+    await db.rollback()
+
+
 async def _run_down(
     engine,
     migration: str,
@@ -224,8 +236,7 @@ async def test_rotation_down_accepts_bootstrap_and_does_not_invert_real_helper(
     monkeypatch,
 ):
     db, _redis = pg_session
-    await _apply_up(db, DEFAULT_VOLUME_MIGRATION)
-    await _apply_up(db, ROTATION_MIGRATION)
+    await _rewind_trust_boundary(db)
     await _bootstrap_epoch(db)
 
     await _run_runtime_helper_across_down(
@@ -240,7 +251,7 @@ async def test_rotation_down_rejects_nonbootstrap_history_without_catalog_damage
     pg_session,
 ):
     db, _redis = pg_session
-    await _apply_up(db, ROTATION_MIGRATION)
+    await _rewind_trust_boundary(db)
     await _bootstrap_epoch(db)
     await db.execute(
         text(

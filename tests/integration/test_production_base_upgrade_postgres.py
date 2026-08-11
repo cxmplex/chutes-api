@@ -23,7 +23,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 import api.database.orms  # noqa: F401
 from api.database import Base
-from api.database.migrations import historical_migration_versions
+from api.database.migrations import bootstrap_production_base, historical_migration_versions
+from api.database.production_base_catalog import validate_production_base_catalog
 
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
@@ -133,25 +134,11 @@ def _reset_metadata_foreign_key_create_rules() -> None:
 
 
 async def _install_current_orm_and_baseline(engine) -> None:
-    """Mirror startup's create_all plus immutable production-ledger recording."""
+    """Mirror startup's filtered ORM/raw contract plus immutable ledger recording."""
     _reset_metadata_foreign_key_create_rules()
     try:
-        async with engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-            await connection.execute(
-                text(
-                    "CREATE TABLE IF NOT EXISTS "
-                    "schema_migrations (version VARCHAR(255) PRIMARY KEY)"
-                )
-            )
-            for version in historical_migration_versions():
-                await connection.execute(
-                    text(
-                        "INSERT INTO schema_migrations(version) VALUES (:version) "
-                        "ON CONFLICT (version) DO NOTHING"
-                    ),
-                    {"version": version},
-                )
+        async with engine.connect() as connection:
+            await bootstrap_production_base(connection)
     finally:
         _reset_metadata_foreign_key_create_rules()
 
@@ -222,14 +209,48 @@ async def _query_rows(engine, statement: str, schema: str):
 
 
 async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
+    relations = await _query_rows(
+        engine,
+        """
+        SELECT relation.relname AS relation_name,
+               relation.relkind::text AS relation_kind,
+               relation.relpersistence::text AS persistence,
+               access_method.amname AS access_method,
+               relation.relrowsecurity AS row_security,
+               relation.relforcerowsecurity AS force_row_security,
+               relation.relispopulated AS populated,
+               relation.relreplident::text AS replica_identity,
+               relation.relispartition AS is_partition,
+               relation.reloptions::text AS options,
+               relation.relacl::text AS acl,
+               pg_get_userbyid(relation.relowner) = current_user AS owner_is_current,
+               tablespace.spcname AS tablespace,
+               pg_get_partkeydef(relation.oid) AS partition_key,
+               pg_get_expr(relation.relpartbound, relation.oid, true) AS partition_bound
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+          LEFT JOIN pg_am AS access_method ON access_method.oid = relation.relam
+          LEFT JOIN pg_tablespace AS tablespace ON tablespace.oid = relation.reltablespace
+         WHERE namespace.nspname = :schema
+           AND relation.relkind IN ('r', 'p', 'v', 'm', 'S')
+         ORDER BY relation.relname
+        """,
+        schema,
+    )
     columns = await _query_rows(
         engine,
         """
         SELECT relation.relname AS table_name,
                relation.relkind::text AS relation_kind,
+               attribute.attnum AS column_position,
                attribute.attname AS column_name,
                format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
                attribute.attnotnull AS not_null,
+               CASE
+                   WHEN attribute.attcollation = 0 THEN '<none>'
+                   WHEN attribute.attcollation = type_row.typcollation THEN '<type_default>'
+                   ELSE format('%I.%I', collation_namespace.nspname, collation_row.collname)
+               END AS collation,
                pg_get_expr(attribute_default.adbin, attribute_default.adrelid, true)
                    AS default_expression,
                attribute.attidentity::text AS identity_kind,
@@ -237,6 +258,11 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
           FROM pg_class AS relation
           JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
           JOIN pg_attribute AS attribute ON attribute.attrelid = relation.oid
+          JOIN pg_type AS type_row ON type_row.oid = attribute.atttypid
+          LEFT JOIN pg_collation AS collation_row
+            ON collation_row.oid = attribute.attcollation
+          LEFT JOIN pg_namespace AS collation_namespace
+            ON collation_namespace.oid = collation_row.collnamespace
           LEFT JOIN pg_attrdef AS attribute_default
             ON attribute_default.adrelid = relation.oid
            AND attribute_default.adnum = attribute.attnum
@@ -264,7 +290,7 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
           JOIN pg_class AS relation ON relation.oid = constraint_row.conrelid
           JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
          WHERE namespace.nspname = :schema
-           AND constraint_row.contype IN ('p', 'u', 'c', 'f')
+           AND constraint_row.contype IN ('p', 'u', 'c', 'f', 'x')
          ORDER BY relation.relname, constraint_row.conname
         """,
         schema,
@@ -276,7 +302,24 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
                index_relation.relname AS index_name,
                index_row.indisunique AS is_unique,
                index_row.indisprimary AS is_primary,
+               index_row.indisexclusion AS is_exclusion,
+               index_row.indimmediate AS is_immediate,
+               index_row.indisclustered AS is_clustered,
+               index_row.indisvalid AS is_valid,
+               index_row.indisready AS is_ready,
+               index_row.indislive AS is_live,
+               index_row.indisreplident AS is_replica_identity,
+               index_row.indnullsnotdistinct AS nulls_not_distinct,
+               index_row.indnatts AS attribute_count,
+               index_row.indnkeyatts AS key_attribute_count,
                access_method.amname AS access_method,
+               tablespace.spcname AS tablespace,
+               index_relation.reloptions::text AS options,
+               ARRAY(
+                   SELECT pg_get_indexdef(index_row.indexrelid, position, true)
+                     FROM generate_series(1, index_row.indnatts) AS position
+                    ORDER BY position
+               ) AS keys,
                pg_get_expr(index_row.indpred, index_row.indrelid, true) AS predicate,
                pg_get_indexdef(index_row.indexrelid, 0, true) AS definition
           FROM pg_index AS index_row
@@ -284,6 +327,7 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
           JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
           JOIN pg_class AS index_relation ON index_relation.oid = index_row.indexrelid
           JOIN pg_am AS access_method ON access_method.oid = index_relation.relam
+          LEFT JOIN pg_tablespace AS tablespace ON tablespace.oid = index_relation.reltablespace
          WHERE namespace.nspname = :schema
          ORDER BY relation.relname, index_relation.relname
         """,
@@ -329,8 +373,129 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
         """,
         schema,
     )
+    views = await _query_rows(
+        engine,
+        """
+        SELECT relation.relname AS view_name,
+               relation.relkind::text AS relation_kind,
+               relation.relispopulated AS populated,
+               pg_get_viewdef(relation.oid, false) AS definition,
+               obj_description(relation.oid, 'pg_class') AS comment
+          FROM pg_class AS relation
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = :schema
+           AND relation.relkind IN ('v', 'm')
+         ORDER BY relation.relname
+        """,
+        schema,
+    )
+    sequences = await _query_rows(
+        engine,
+        """
+        SELECT sequence_relation.relname AS sequence_name,
+               format_type(sequence_row.seqtypid, NULL) AS data_type,
+               sequence_row.seqstart AS start_value,
+               sequence_row.seqincrement AS increment_by,
+               sequence_row.seqmax AS maximum_value,
+               sequence_row.seqmin AS minimum_value,
+               sequence_row.seqcache AS cache_size,
+               sequence_row.seqcycle AS cycles,
+               dependency.deptype::text AS dependency_type,
+               owned_relation.relname AS owned_table,
+               owned_attribute.attname AS owned_column,
+               pg_get_expr(attribute_default.adbin, attribute_default.adrelid, true)
+                   AS column_default
+          FROM pg_class AS sequence_relation
+          JOIN pg_namespace AS namespace ON namespace.oid = sequence_relation.relnamespace
+          JOIN pg_sequence AS sequence_row ON sequence_row.seqrelid = sequence_relation.oid
+          LEFT JOIN pg_depend AS dependency
+            ON dependency.classid = 'pg_class'::regclass
+           AND dependency.objid = sequence_relation.oid
+           AND dependency.refclassid = 'pg_class'::regclass
+           AND dependency.deptype IN ('a', 'i')
+          LEFT JOIN pg_class AS owned_relation ON owned_relation.oid = dependency.refobjid
+          LEFT JOIN pg_attribute AS owned_attribute
+            ON owned_attribute.attrelid = dependency.refobjid
+           AND owned_attribute.attnum = dependency.refobjsubid
+          LEFT JOIN pg_attrdef AS attribute_default
+            ON attribute_default.adrelid = dependency.refobjid
+           AND attribute_default.adnum = dependency.refobjsubid
+         WHERE namespace.nspname = :schema
+         ORDER BY sequence_relation.relname
+        """,
+        schema,
+    )
+    inheritance = await _query_rows(
+        engine,
+        """
+        SELECT child.relname AS child_name,
+               parent.relname AS parent_name,
+               inheritance.inhseqno AS sequence_number,
+               pg_get_expr(child.relpartbound, child.oid, true) AS partition_bound
+          FROM pg_inherits AS inheritance
+          JOIN pg_class AS child ON child.oid = inheritance.inhrelid
+          JOIN pg_namespace AS child_namespace ON child_namespace.oid = child.relnamespace
+          JOIN pg_class AS parent ON parent.oid = inheritance.inhparent
+         WHERE child_namespace.nspname = :schema
+         ORDER BY child.relname, parent.relname
+        """,
+        schema,
+    )
+    rules = await _query_rows(
+        engine,
+        """
+        SELECT relation.relname AS table_name,
+               rule.rulename AS rule_name,
+               pg_get_ruledef(rule.oid, true) AS definition
+          FROM pg_rewrite AS rule
+          JOIN pg_class AS relation ON relation.oid = rule.ev_class
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = :schema
+           AND rule.rulename <> '_RETURN'
+         ORDER BY relation.relname, rule.rulename
+        """,
+        schema,
+    )
+    policies = await _query_rows(
+        engine,
+        """
+        SELECT relation.relname AS table_name,
+               policy.polname AS policy_name,
+               policy.polcmd::text AS command,
+               policy.polpermissive AS permissive,
+               policy.polroles::text AS roles,
+               pg_get_expr(policy.polqual, policy.polrelid, true) AS using_expression,
+               pg_get_expr(policy.polwithcheck, policy.polrelid, true) AS check_expression
+          FROM pg_policy AS policy
+          JOIN pg_class AS relation ON relation.oid = policy.polrelid
+          JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = :schema
+         ORDER BY relation.relname, policy.polname
+        """,
+        schema,
+    )
 
     return {
+        "relations": sorted(
+            (
+                row["relation_name"],
+                row["relation_kind"],
+                row["persistence"],
+                row["access_method"],
+                row["row_security"],
+                row["force_row_security"],
+                row["populated"],
+                row["replica_identity"],
+                row["is_partition"],
+                row["options"],
+                row["acl"],
+                row["owner_is_current"],
+                row["tablespace"],
+                _normalize_sql(row["partition_key"], schema),
+                _normalize_sql(row["partition_bound"], schema),
+            )
+            for row in relations
+        ),
         "columns": sorted(
             (
                 row["table_name"],
@@ -338,6 +503,7 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
                 row["column_name"],
                 row["data_type"],
                 row["not_null"],
+                row["collation"],
                 _normalize_sql(row["default_expression"], schema),
                 row["identity_kind"],
                 row["generated_kind"],
@@ -368,7 +534,20 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
                 _normalized_index_name(row["table_name"], row["index_name"]),
                 row["is_unique"],
                 row["is_primary"],
+                row["is_exclusion"],
+                row["is_immediate"],
+                row["is_clustered"],
+                row["is_valid"],
+                row["is_ready"],
+                row["is_live"],
+                row["is_replica_identity"],
+                row["nulls_not_distinct"],
+                row["attribute_count"],
+                row["key_attribute_count"],
                 row["access_method"],
+                row["tablespace"],
+                row["options"],
+                tuple(_normalize_sql(key, schema) for key in row["keys"]),
                 _normalize_sql(row["predicate"], schema),
                 _normalize_sql(row["definition"], schema),
             )
@@ -393,12 +572,69 @@ async def _normalized_catalog(engine, schema: str) -> dict[str, list[tuple]]:
             )
             for row in triggers
         ),
+        "views": sorted(
+            (
+                row["view_name"],
+                row["relation_kind"],
+                row["populated"],
+                _normalize_sql(row["definition"], schema),
+                row["comment"],
+            )
+            for row in views
+        ),
+        "sequences": sorted(
+            (
+                row["sequence_name"],
+                row["data_type"],
+                row["start_value"],
+                row["increment_by"],
+                row["maximum_value"],
+                row["minimum_value"],
+                row["cache_size"],
+                row["cycles"],
+                row["dependency_type"],
+                row["owned_table"],
+                row["owned_column"],
+                _normalize_sql(row["column_default"], schema),
+            )
+            for row in sequences
+        ),
+        "inheritance": sorted(
+            (
+                row["child_name"],
+                row["parent_name"],
+                row["sequence_number"],
+                _normalize_sql(row["partition_bound"], schema),
+            )
+            for row in inheritance
+        ),
+        "rules": sorted(
+            (
+                row["table_name"],
+                row["rule_name"],
+                _normalize_sql(row["definition"], schema),
+            )
+            for row in rules
+        ),
+        "policies": sorted(
+            (
+                row["table_name"],
+                row["policy_name"],
+                row["command"],
+                row["permissive"],
+                row["roles"],
+                _normalize_sql(row["using_expression"], schema),
+                _normalize_sql(row["check_expression"], schema),
+            )
+            for row in policies
+        ),
     }
 
 
 def _assert_catalogs_equal(upgraded: dict[str, list[tuple]], fresh: dict[str, list[tuple]]):
+    assert set(upgraded) == set(fresh)
     differences = []
-    for section in ("columns", "constraints", "indexes", "functions", "triggers"):
+    for section in sorted(upgraded):
         upgraded_counter = Counter(upgraded[section])
         fresh_counter = Counter(fresh[section])
         if upgraded_counter == fresh_counter:
@@ -416,6 +652,20 @@ def _assert_catalogs_equal(upgraded: dict[str, list[tuple]], fresh: dict[str, li
             "production-base upgrade catalog differs from fresh install:\n\n"
             + "\n\n".join(differences)
         )
+
+
+def test_catalog_comparator_rejects_same_columns_with_different_view_body():
+    common_columns = [("derived_view", "m", 1, "value", "integer", False)]
+    upgraded = {
+        "columns": common_columns,
+        "views": [("derived_view", "m", True, "SELECT 1 AS value;", None)],
+    }
+    fresh = {
+        "columns": common_columns,
+        "views": [("derived_view", "m", True, "SELECT 2 AS value;", None)],
+    }
+    with pytest.raises(pytest.fail.Exception, match="normalized views catalog differs"):
+        _assert_catalogs_equal(upgraded, fresh)
 
 
 async def _assert_synthetic_history_preserved(engine) -> None:
@@ -546,6 +796,11 @@ async def test_b4f439b_upgrade_converges_with_fresh_catalog_and_preserves_histor
         await _install_current_orm_and_baseline(fresh_engine)
         await _migrate_with_dbmate(upgraded_schema)
         await _migrate_with_dbmate(fresh_schema)
+
+        async with upgraded_engine.connect() as connection:
+            await validate_production_base_catalog(connection, upgraded_schema)
+        async with fresh_engine.connect() as connection:
+            await validate_production_base_catalog(connection, fresh_schema)
 
         await _assert_synthetic_history_preserved(upgraded_engine)
         upgraded_catalog = await _normalized_catalog(upgraded_engine, upgraded_schema)

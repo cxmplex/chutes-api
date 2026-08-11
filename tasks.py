@@ -10,7 +10,8 @@ from sqlalchemy.exc import IntegrityError
 import typer
 from loguru import logger
 from api.api_key.schemas import APIKey, APIKeyArgs
-from api.database import Base, get_db, engine
+from api.database import get_db
+from api.database.migrations import run_database_migrations
 from sqlalchemy import delete, select
 
 # The below have to be here to prevent SQLAlchemy initialization errors
@@ -23,9 +24,7 @@ app = typer.Typer(no_args_is_help=True)
 
 async def _run_migrations():
     """Run database migrations."""
-
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    await run_database_migrations()
     logger.info("Migrations run successfully.")
 
 
@@ -218,8 +217,11 @@ def list_users():
 
 
 async def _destroy_database():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+    raise RuntimeError(
+        "Partial ORM drop/reset is unsupported now that the database contains owned views, "
+        "partitions, functions, and audit triggers. Recreate the explicitly disposable dev "
+        "database, then run the normal migration owner; never use this command on durable data."
+    )
 
 
 @app.command()

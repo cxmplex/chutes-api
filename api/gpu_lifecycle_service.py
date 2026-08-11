@@ -1484,12 +1484,6 @@ async def ensure_reservation_lifecycle_operation(
     ).scalar_one_or_none()
     if host is None:
         raise GpuLifecycleError("GPU lifecycle reservation host is unknown.")
-    expected_operation_type = _derived_reservation_operation_type(reservation)
-    if operation_type is not None and operation_type != expected_operation_type:
-        raise GpuLifecycleError(
-            "Requested lifecycle producer type differs from server-side custody state."
-        )
-    operation_type = expected_operation_type
     existing = (
         (
             await db.execute(
@@ -1511,7 +1505,7 @@ async def ensure_reservation_lifecycle_operation(
         .first()
     )
     if existing is not None:
-        if existing.operation_type != operation_type:
+        if operation_type is not None and existing.operation_type != operation_type:
             raise GpuLifecycleError(
                 "GPU reservation already has another authoritative lifecycle operation."
             )
@@ -1527,6 +1521,12 @@ async def ensure_reservation_lifecycle_operation(
                 "Existing GPU release rollover lacks immutable release identity."
             )
         return await gpu_lifecycle_operation_response(db, existing, group=group)
+    expected_operation_type = _derived_reservation_operation_type(reservation)
+    if operation_type is not None and operation_type != expected_operation_type:
+        raise GpuLifecycleError(
+            "Requested lifecycle producer type differs from server-side custody state."
+        )
+    operation_type = expected_operation_type
     rollover_identity = (
         current_gpu_release_id,
         desired_gpu_release_id,
@@ -2290,7 +2290,19 @@ async def _finalize_local_release(
     reservation = await _locked_reservation(db, row.reservation_id)
     if group.state != "release_pending":
         raise GpuLifecycleError("GPU group left release-pending before final ACK.")
-    now = _now()
+    # Wall time can step backwards between the durable local ACK and finalization.
+    # Never make completion precede either that ACK or an authorized recovery start.
+    now = max(
+        timestamp
+        for timestamp in (
+            _now(),
+            row.local_release_acked_at,
+            row.receipt_accepted_at,
+            row.created_at,
+            group.recovery_started_at,
+        )
+        if timestamp is not None
+    )
     if group.failure_code == "gpu_inventory_changed_during_release":
         reason = group.failure_reason or (
             "GPU inventory changed after reset began; the group cannot be reused."
@@ -2410,7 +2422,15 @@ async def record_gpu_local_release_ack(
             raise GpuLifecycleError("GPU lifecycle operation cannot accept local release.")
         row.local_release_ack = ack_document
         row.local_release_ack_sha256 = ack_sha256
-        row.local_release_acked_at = _now()
+        row.local_release_acked_at = max(
+            timestamp
+            for timestamp in (
+                _now(),
+                row.receipt_accepted_at,
+                row.created_at,
+            )
+            if timestamp is not None
+        )
         row.phase = "local_release_acked"
         row.reporting_state = "local_release_acked"
         row.updated_at = row.local_release_acked_at

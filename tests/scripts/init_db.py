@@ -9,6 +9,19 @@ import os
 import sys
 from unittest.mock import AsyncMock, Mock
 
+
+DEFAULT_TEST_DATABASE_URL = (
+    "postgresql+asyncpg://testuser:testpass@localhost:5432/chutes_test"
+)
+# Production constructs its engine while importing ``api.database``. Point that same serialized
+# migration owner at the explicitly disposable test database before any API import can cache the
+# settings object or engine.
+test_database_url = os.environ.get("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
+# TEST_DATABASE_URL is the explicit disposable-test boundary. Never let a pre-existing
+# production-style POSTGRESQL variable redirect this migration owner to another database.
+os.environ["POSTGRESQL"] = test_database_url
+os.environ.setdefault("DB_SSL", "disable")
+
 # Mock Redis and taskiq before any imports that might trigger events
 sys.modules["redis.asyncio"] = Mock()
 sys.modules["taskiq"] = Mock()
@@ -26,9 +39,11 @@ api.image.forge.forge = mock_forge
 from api.image.schemas import Image  # noqa
 from api.user.schemas import User  # noqa
 
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession  # noqa
+from sqlalchemy.engine import make_url  # noqa
+from sqlalchemy.ext.asyncio import AsyncSession  # noqa
 from sqlalchemy.orm import sessionmaker  # noqa
-from api.database import Base  # noqa
+from api.database import engine  # noqa
+from api.database.migrations import run_database_migrations  # noqa
 from api.config import settings  # noqa
 
 # Import all ORM modules exactly like production does
@@ -37,29 +52,18 @@ from api.util import gen_random_token  # noqa
 
 
 async def create_test_database():
-    """Create database schema using SQLAlchemy."""
-    # Use test database connection string
-    test_db_url = "postgresql+asyncpg://testuser:testpass@localhost:5432/chutes_test"
-
-    # Override if environment variable is set
-    if "TEST_DATABASE_URL" in os.environ:
-        test_db_url = os.environ["TEST_DATABASE_URL"]
-
-    print(f"Connecting to test database: {test_db_url}")
-
-    # Create async engine
-    engine = create_async_engine(test_db_url, echo=True)
+    """Build the test schema through the same serialized production migration owner."""
+    test_db_url = settings.sqlalchemy
+    print(
+        "Connecting to test database: "
+        f"{make_url(test_db_url).render_as_string(hide_password=True)}"
+    )
 
     try:
-        # Create all tables
-        async with engine.begin() as conn:
-            print("Dropping existing tables...")
-            await conn.run_sync(Base.metadata.drop_all)
+        print("Applying the complete production-base and dbmate migration chain...")
+        await run_database_migrations()
 
-            print("Creating tables from ORM models...")
-            await conn.run_sync(Base.metadata.create_all)
-
-        print("Database schema created successfully!")
+        print("Database schema migrated successfully!")
 
         # Create test data
         await create_test_data(engine)
@@ -83,7 +87,9 @@ async def create_test_data(engine):
     print("Creating test data...")
 
     # Create async session
-    AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    AsyncSessionLocal = sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
 
     async with AsyncSessionLocal() as session:
         try:
@@ -116,7 +122,9 @@ async def create_test_data(engine):
                 )
 
                 # Add some test wallet addresses and balance
-                user.payment_address = f"bc1q{gen_random_token(k=20).lower()}"  # Mock BTC address
+                user.payment_address = (
+                    f"bc1q{gen_random_token(k=20).lower()}"  # Mock BTC address
+                )
                 user.balance = 100.0 if user_data["username"] == "testuser1" else 0.0
 
                 session.add(user)
@@ -129,9 +137,13 @@ async def create_test_data(engine):
             from sqlalchemy import select
 
             user_result = await session.execute(
-                select(User).where(User.username.in_(["testuser1", "testuser2", "integrationtest"]))
+                select(User).where(
+                    User.username.in_(["testuser1", "testuser2", "integrationtest"])
+                )
             )
-            committed_users = {user.username: user.user_id for user in user_result.scalars().all()}
+            committed_users = {
+                user.username: user.user_id for user in user_result.scalars().all()
+            }
 
             # Create test images using the actual user_ids
             test_images = [
@@ -184,7 +196,9 @@ async def cleanup_test_data(engine):
     """Clean up test data - useful for running between tests."""
     print("Cleaning up test data...")
 
-    AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    AsyncSessionLocal = sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
 
     async with AsyncSessionLocal() as session:
         try:
@@ -206,18 +220,24 @@ async def cleanup_test_data(engine):
             try:
                 from api.chute.schemas import Chute
 
-                await session.execute(delete(Chute).where(Chute.chute_id.like("test-chute-%")))
+                await session.execute(
+                    delete(Chute).where(Chute.chute_id.like("test-chute-%"))
+                )
             except ImportError:
                 pass
 
             # Delete images
-            await session.execute(delete(Image).where(Image.image_id.like("test-image-%")))
+            await session.execute(
+                delete(Image).where(Image.image_id.like("test-image-%"))
+            )
 
             # Delete logos
             try:
                 from api.logo.schemas import Logo
 
-                await session.execute(delete(Logo).where(Logo.logo_id.like("test-logo-%")))
+                await session.execute(
+                    delete(Logo).where(Logo.logo_id.like("test-logo-%"))
+                )
             except ImportError:
                 pass
 
@@ -236,9 +256,13 @@ async def cleanup_test_data(engine):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Database operations for integration tests")
+    parser = argparse.ArgumentParser(
+        description="Database operations for integration tests"
+    )
     parser.add_argument("--cleanup", action="store_true", help="Cleanup test data only")
-    parser.add_argument("--create", action="store_true", help="Create schema and test data")
+    parser.add_argument(
+        "--create", action="store_true", help="Create schema and test data"
+    )
     parser.add_argument(
         "--recreate", action="store_true", help="Drop, create, and populate database"
     )
@@ -247,11 +271,13 @@ if __name__ == "__main__":
 
     if args.cleanup:
         # Just cleanup
-        test_db_url = "postgresql+asyncpg://testuser:testpass@localhost:5432/chutes_test"
-        engine = create_async_engine(test_db_url)
         asyncio.run(cleanup_test_data(engine))
-    elif args.create or args.recreate or len(sys.argv) == 1:
-        # Create/recreate database
+    elif args.recreate:
+        parser.error(
+            "--recreate cannot safely infer a disposable database boundary; recreate the "
+            "explicit test database externally, then run --create"
+        )
+    elif args.create or len(sys.argv) == 1:
         asyncio.run(create_test_database())
     else:
         parser.print_help()

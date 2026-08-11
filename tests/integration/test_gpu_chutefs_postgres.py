@@ -1415,13 +1415,17 @@ async def test_refresh_and_instance_disable_share_lifecycle_lock_without_deadloc
     )
     assert rotated_context.config_id == config_id
     async with sessions() as candidate:
-        with pytest.raises(HTTPException, match="inactive"):
+        with pytest.raises(
+            HTTPException,
+            match="invalid, expired, or revoked",
+        ) as rejected:
             await launch_sessions.authorize_default_volume(
                 candidate,
                 f"Bearer {rotated_session.access_token}",
                 request,
                 "get",
             )
+        assert rejected.value.status_code == 401
 
 
 async def test_refresh_and_account_erasure_share_lock_order_without_deadlock(

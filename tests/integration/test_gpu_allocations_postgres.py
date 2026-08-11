@@ -1638,6 +1638,12 @@ async def test_failed_launch_ack_is_idempotent_and_persists_pre_slot_reset(
         assert reservation.launch_ack_status == "rejected"
         assert group.state == "resetting"
         assert group.reservation_id == reservation.reservation_id
+        assert reservation.failure_code is None
+        assert reservation.failure_reason is None
+        assert reservation.failure_metadata is None
+        assert group.failure_code is None
+        assert group.failure_reason is None
+        assert group.failure_metadata is None
         operation = (
             await session.execute(
                 select(GpuLifecycleOperation).where(
@@ -2392,6 +2398,26 @@ async def test_lifecycle_operation_type_is_derived_from_server_custody_state(
             operation_type=valid_type,
         )
         assert operation.operation_type == valid_type
+        explicit_replay = await ensure_reservation_lifecycle_operation(
+            session,
+            reservation.reservation_id,
+            operation_type=valid_type,
+        )
+        derived_replay = await ensure_reservation_lifecycle_operation(
+            session,
+            reservation.reservation_id,
+        )
+        assert explicit_replay.operation_id == operation.operation_id
+        assert derived_replay.operation_id == operation.operation_id
+        with pytest.raises(
+            GpuLifecycleError,
+            match="already has another authoritative lifecycle operation",
+        ):
+            await ensure_reservation_lifecycle_operation(
+                session,
+                reservation.reservation_id,
+                operation_type=invalid_type,
+            )
 
         if reservation_state == "running":
             physical = GpuPhysicalResultV1(
@@ -2718,6 +2744,12 @@ async def test_late_registration_creates_one_replayable_launch_rollback_intent(
         group = await session.get(GpuAllocationGroup, response.claims.allocation_group_id)
         assert reservation.state == group.state == "resetting"
         assert reservation.teardown_reason == ("GPU guest registration missed its launch deadline.")
+        assert reservation.failure_code is None
+        assert reservation.failure_reason is None
+        assert reservation.failure_metadata is None
+        assert group.failure_code is None
+        assert group.failure_reason is None
+        assert group.failure_metadata is None
         await session.commit()
 
 
@@ -4639,16 +4671,32 @@ async def test_failed_recovery_allows_one_fresh_report_successor_and_full_retry(
             local_state_sha256="c" * 64,
             observed_at=datetime.now(timezone.utc),
         )
-        finalized = await record_gpu_local_release_ack(
-            session,
-            host,
+        persisted_successor = await session.get(
+            GpuLifecycleOperation,
             successor_operation.operation_id,
-            ack,
         )
+        receipt_time = persisted_successor.receipt_accepted_at
+        assert receipt_time is not None
+        with patch(
+            "api.gpu_lifecycle_service._now",
+            side_effect=[
+                receipt_time - timedelta(minutes=1),
+                receipt_time - timedelta(minutes=2),
+            ],
+        ):
+            finalized = await record_gpu_local_release_ack(
+                session,
+                host,
+                successor_operation.operation_id,
+                ack,
+            )
         assert finalized.phase == "finalized"
         assert finalized.group_state == (
             "recovery_required" if recovery_mode == "forced" else "available"
         )
+        await session.refresh(persisted_successor)
+        assert persisted_successor.local_release_acked_at >= receipt_time
+        assert persisted_successor.finalized_at >= persisted_successor.local_release_acked_at
         finalized_bytes = finalized.model_dump(mode="json")
         await session.commit()
 

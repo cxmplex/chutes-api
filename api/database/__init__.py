@@ -50,6 +50,19 @@ SessionLocalRead = sessionmaker(
 Base = declarative_base()
 
 
+def create_application_tables(sync_connection) -> None:
+    """Create ORM-owned tables without materializing mapped database views as tables.
+
+    SQLAlchemy models such as ``UserCurrentBalance`` are useful for querying a view, but
+    ``MetaData.create_all`` otherwise creates a same-named ordinary table.  Every process that
+    bootstraps ORM tables must use this helper so a worker cannot race the migration owner and
+    replace a production materialized-view contract with an empty cache table.
+    """
+
+    tables = [table for table in Base.metadata.tables.values() if not table.info.get("is_view")]
+    Base.metadata.create_all(sync_connection, tables=tables)
+
+
 @asynccontextmanager
 async def get_session(readonly=False) -> AsyncGenerator[AsyncSession, None]:
     session_maker = SessionLocalRead if readonly else SessionLocal

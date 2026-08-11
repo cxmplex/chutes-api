@@ -37,9 +37,44 @@ ORDER BY date DESC, name;
 """
 
 DIFFUSION_METRICS_QUERY = """
-INSERT INTO diffusion_metrics
-SELECT * FROM get_diffusion_metrics('2025-01-30', DATE_TRUNC('day', NOW())::date)
-ORDER BY date DESC, name;
+INSERT INTO diffusion_metrics (
+    chute_id, name, date, total_steps, total_requests, average_sps
+)
+WITH min_date AS (
+    SELECT MIN(DATE(invocation.started_at)) AS min_date
+      FROM invocations AS invocation
+      JOIN chutes AS chute ON invocation.chute_id = chute.chute_id
+     WHERE chute.standard_template = 'diffusion'
+       AND invocation.metrics->>'steps' IS NOT NULL
+), date_series AS (
+    SELECT generate_series(
+        (SELECT min_date FROM min_date), DATE_TRUNC('day', NOW()), '1 day'::interval
+    )::date AS date
+), all_chutes AS (
+    SELECT chute_id, name FROM chutes WHERE standard_template = 'diffusion'
+), chute_dates AS (
+    SELECT chute.chute_id, chute.name, day.date
+      FROM all_chutes AS chute CROSS JOIN date_series AS day
+), metrics_data AS (
+    SELECT chute.chute_id, chute.name, DATE(invocation.started_at) AS date,
+           SUM((invocation.metrics->>'steps')::DOUBLE PRECISION)::BIGINT AS total_steps,
+           COUNT(*)::BIGINT AS total_requests,
+           AVG((invocation.metrics->>'sps')::DOUBLE PRECISION)::NUMERIC AS average_sps
+      FROM invocations AS invocation
+      JOIN chutes AS chute ON invocation.chute_id = chute.chute_id
+     WHERE chute.standard_template = 'diffusion'
+       AND invocation.metrics->>'steps' IS NOT NULL
+       AND invocation.error_message IS NULL
+       AND invocation.completed_at IS NOT NULL
+     GROUP BY chute.chute_id, chute.name, DATE(invocation.started_at)
+)
+SELECT date_grid.chute_id, date_grid.name, date_grid.date,
+       COALESCE(metric.total_steps, 0), COALESCE(metric.total_requests, 0),
+       COALESCE(metric.average_sps, 0)
+  FROM chute_dates AS date_grid
+  LEFT JOIN metrics_data AS metric
+    ON metric.chute_id = date_grid.chute_id AND metric.date = date_grid.date
+ ORDER BY date_grid.date DESC, date_grid.name;
 """
 
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
