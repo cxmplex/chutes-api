@@ -566,6 +566,24 @@ def test_known_nginx_final_hops_overwrite_resolved_ip(helm_binary, tmp_path):
     assert "$http_x_resolved_ip" not in attestation_config
 
 
+def test_cvm_log_body_limit_does_not_cap_attestation_payloads():
+    """The split log location is bounded while non-splittable quote payloads remain unbounded."""
+
+    template = (CHART_DIR / "templates/cvm-proxy-cm.yaml").read_text()
+    values = yaml.safe_load((CHART_DIR / "values.yaml").read_text())
+    log_location = template.split(
+        "location ~ ^/instances/launch_config/[^/]+/logs$ {", 1
+    )[1].split("# All CVM mTLS attestation endpoints", 1)[0]
+    attestation_location = template.split(
+        "location ~ ^/servers/(nonce|boot/attestation", 1
+    )[1].split("location / {", 1)[0]
+
+    assert values["cvmProxy"]["logsMaxBodySize"] == "8m"
+    assert "client_max_body_size {{ .Values.cvmProxy.logsMaxBodySize" in log_location
+    assert "client_max_body_size" not in attestation_location
+    assert template.count("client_max_body_size 0;") == 1
+
+
 @pytest.mark.parametrize(
     ("trusted_proxy_env", "expected"),
     [

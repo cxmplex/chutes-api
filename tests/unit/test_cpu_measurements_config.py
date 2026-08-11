@@ -1,6 +1,7 @@
 """Strict nested TEE measurement source parsing and runtime identity tests."""
 
 from copy import deepcopy
+import json
 from pathlib import Path
 
 import pytest
@@ -9,10 +10,12 @@ import yaml
 from api.config import (
     Settings,
     TeeMeasurementConfig,
+    _expand_nested_measurement_group,
     measurement_config_fingerprint,
     measurement_trust_set_fingerprint,
 )
 from api.main import _tee_trust_metrics
+from cross_repo_tests import repository_root
 
 
 HEX96_MRTD = "A" * 96
@@ -25,6 +28,31 @@ HEX64_PCR = "1" * 64
 TRUST_FINGERPRINT = "eadf05c46cc7758c943c10f78fb65633f93f9b780f6e0b301136ff919b99cef9"
 COMMITTED_TDX_FINGERPRINT = "22a6a665bb44323d386849ccb9890ebbc879b017f278e1e74af30721a516a1dd"
 _ABSENT = object()
+
+
+def test_sek8s_renderer_contract_flattens_exact_model_a_and_b_groups():
+    fixture_path = (
+        repository_root("sek8s", start=Path(__file__))
+        / "tests/fixtures/tee_measurement_renderer_api_contract.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    assert fixture["schema_version"] == 1
+    assert {case["id"] for case in fixture["cases"]} == {
+        "model-a-tdx-chute",
+        "model-a-tdx-storage",
+        "model-a-sev-snp-chute",
+        "model-a-sev-snp-storage",
+        "model-b-tdx-chute",
+        "model-b-tdx-storage",
+        "model-b-sev-snp-chute",
+        "model-b-sev-snp-storage",
+    }
+    for case in fixture["cases"]:
+        assert _expand_nested_measurement_group(
+            deepcopy(case["group"]),
+            fixture_path,
+        ) == [case["expected_flattened"]]
 
 
 def _document(*groups: dict, revoked: list[str] | None = None) -> dict:

@@ -1713,6 +1713,8 @@ async def test_attestation_migrations_reject_partial_or_wrong_create_all_catalog
 @pytest.mark.parametrize(
     "migration_name",
     [
+        "20260524000000_vm_auth_keys.sql",
+        "20260531120000_vm_root_ca_cert.sql",
         "20260722021500_l0_bootstrap_publications.sql",
         "20260722030000_host_enrollment_durability.sql",
         "20260722040000_storage_launch_intents.sql",
@@ -1748,6 +1750,54 @@ async def test_followup_migrations_apply_idempotently(
         )
         stdout, stderr = await process.communicate(up_sql.encode())
         assert process.returncode == 0, (stdout + stderr).decode(errors="replace")
+
+
+async def test_gpu_release_migration_normalizes_legacy_default_l0_primary_key(
+    postgres_schema,
+):
+    sessions, schema = postgres_schema
+    async with sessions() as session:
+        await session.execute(
+            text(
+                "ALTER TABLE l0_bootstrap_publications "
+                "DROP CONSTRAINT pk_l0_bootstrap_publications"
+            )
+        )
+        await session.execute(
+            text(
+                "ALTER TABLE l0_bootstrap_publications "
+                "ADD CONSTRAINT l0_bootstrap_publications_pkey "
+                "PRIMARY KEY (tee_type, channel, generation)"
+            )
+        )
+        await session.commit()
+
+    await _apply_sql_migration(schema, "20260723030000_gpu_release_compute_type.sql")
+
+    async with sessions() as session:
+        primary_keys = (
+            await session.execute(
+                text(
+                    "SELECT constraint_row.conname, "
+                    "pg_get_constraintdef(constraint_row.oid) "
+                    "FROM pg_constraint AS constraint_row "
+                    "JOIN pg_class AS relation "
+                    "ON relation.oid = constraint_row.conrelid "
+                    "JOIN pg_namespace AS namespace "
+                    "ON namespace.oid = relation.relnamespace "
+                    "WHERE namespace.nspname = current_schema() "
+                    "AND relation.relname = 'l0_bootstrap_publications' "
+                    "AND constraint_row.contype = 'p'"
+                )
+            )
+        ).all()
+
+    assert primary_keys == [
+        (
+            "pk_l0_bootstrap_publications",
+            "PRIMARY KEY (tee_type, channel, compute_type, generation)",
+        )
+    ]
 
 
 async def test_gpu_release_migration_preserves_cpu_identity_and_signed_v1_state(

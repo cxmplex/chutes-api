@@ -640,7 +640,10 @@ def test_boot_response_cannot_serialize_global_or_disk_key():
     assert payload == {"luks_quote_nonce": QUOTE_NONCE}
     assert "key" not in BootAttestationResponse.model_fields
     assert "key" not in payload
-    assert set(BootAttestationResponse.model_fields) == {"luks_quote_nonce"}
+    assert set(BootAttestationResponse.model_fields) == {
+        "luks_quote_nonce",
+        "vm_auth_ss58",
+    }
 
 
 def test_legacy_ambiguous_luks_route_is_absent():

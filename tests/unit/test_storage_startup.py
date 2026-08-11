@@ -98,7 +98,7 @@ def test_api_migration_file_set_and_bytes_are_frozen():
         frozen[filename] = match.group("digest")
 
     migration_files = {path.name: path for path in sorted(migration_dir.glob("*.sql"))}
-    assert len(frozen) == 110
+    assert len(frozen) == 112
     assert set(frozen) == set(migration_files), (
         "API migration file set changed; record every new migration explicitly and never "
         "rewrite migration history after its first remediation release"

@@ -229,8 +229,10 @@ def test_session_model_has_one_active_successor_and_replay_metadata():
         "key_id",
         "predecessor_key_id",
         "state",
-        "required_replica_ids",
+        "cohort_id",
+        "required_ack_count",
     }.issubset(ChuteFSTokenKeyEpoch.__table__.columns.keys())
+    assert "required_replica_ids" not in ChuteFSTokenKeyEpoch.__table__.columns
     assert {
         "replica_id",
         "key_id",
@@ -428,12 +430,13 @@ def test_rotation_migration_locks_and_guards_only_its_state():
     assert "FOR SHARE" in up
 
 
-def test_key_epoch_bootstrap_orders_stage_ack_then_activation():
+def test_key_epoch_bootstrap_establishes_active_authority_before_ack():
     source = inspect.getsource(storage_startup.require_chutefs_token_key_retention)
-    staged = source.index("INSERT INTO chutefs_token_key_epochs")
+    established = source.index("INSERT INTO chutefs_token_key_epochs")
     acknowledged = source.index("INSERT INTO chutefs_token_key_replica_acks")
-    activated = source.index("UPDATE chutefs_token_key_epochs")
-    assert staged < acknowledged < activated
+    assert established < acknowledged
+    assert "'active', :cohort_id" in source
+    assert "UPDATE chutefs_token_key_epochs" not in source
     assert "active key fingerprint" in source
 
 

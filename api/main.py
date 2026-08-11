@@ -51,6 +51,8 @@ from api.misc.router import router as misc_router
 from api.idp.router import router as idp_router
 from api.e2e.router import router as e2e_router
 from api.encrypted_logs.router import router as encrypted_logs_router
+from api.chute_logs.router import router as chute_logs_router
+from api.chute_logs.loki import LokiClient
 from api.model_alias.router import router as model_alias_router
 from api.chute.util import chute_id_by_slug
 from api.database import get_session
@@ -157,10 +159,11 @@ async def lifespan(_: FastAPI):
         authority_refresh_task.cancel()
         with suppress(asyncio.CancelledError):
             await authority_refresh_task
+        # Close the shared Loki connection pool on shutdown (no-op if never used).
+        await LokiClient.aclose()
 
 
 app = FastAPI(default_response_class=ORJSONResponse, lifespan=lifespan)
-
 os.makedirs("/tmp/prometheus_multiproc", exist_ok=True)
 Instrumentator(
     should_instrument_requests_inprogress=True,
@@ -195,6 +198,7 @@ default_router.include_router(e2e_router, prefix="/e2e", tags=["E2E Encryption"]
 default_router.include_router(
     encrypted_logs_router, prefix="/encrypted_logs", tags=["Encrypted Logs"]
 )
+default_router.include_router(chute_logs_router, prefix="/logs", tags=["Logs"])
 default_router.include_router(model_alias_router, prefix="/model_aliases", tags=["Model Aliases"])
 
 

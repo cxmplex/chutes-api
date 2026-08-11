@@ -36,7 +36,9 @@ from api.server.schemas import (
     BootAttestationNonceContext,
     RuntimeAttestationArgs,
     ServerArgs,
+    VmAuthKey,
 )
+from api.server.client import TeeServerClient
 from api.server.quote import BootTdxQuote, RuntimeTdxQuote, TdxVerificationResult
 from api.server.exceptions import (
     InvalidQuoteError,
@@ -45,6 +47,7 @@ from api.server.exceptions import (
     ServerNotFoundError,
     ServerRegistrationError,
     InvalidSignatureError,
+    GetEvidenceError,
 )
 from api.config import (
     TeeMeasurementConfig,
@@ -540,7 +543,8 @@ async def test_process_boot_attestation_success(
                 TEST_CERT_HASH,
             )
 
-        assert result == "test-luks-nonce"
+        assert result.luks_quote_nonce == "test-luks-nonce"
+        assert result.vm_auth_ss58 is None
 
         # Verify database operations
         mock_db_session.add.assert_called_once()
@@ -1107,7 +1111,8 @@ async def test_full_boot_flow_end_to_end(
                     TEST_CERT_HASH,
                 )
 
-            assert result == "test-luks-nonce"
+            assert result.luks_quote_nonce == "test-luks-nonce"
+            assert result.vm_auth_ss58 is None
 
 
 @pytest.mark.asyncio
@@ -1734,7 +1739,10 @@ async def test_verify_server_cpu_skips_gpu_evidence_and_persists_benchmark(
     )
 
     with (
-        patch("api.server.service.TeeServerClient", return_value=mock_client),
+        patch(
+            "api.server.service.TeeServerClient.create",
+            new=AsyncMock(return_value=mock_client),
+        ),
         patch(
             "api.server.service.get_matching_measurement_config",
             return_value=_cpu_measurement_config(),
@@ -1780,7 +1788,10 @@ async def test_verify_server_cpu_invalid_benchmark_raises(
     )
 
     with (
-        patch("api.server.service.TeeServerClient", return_value=mock_client),
+            patch(
+                "api.server.service.TeeServerClient.create",
+                new=AsyncMock(return_value=mock_client),
+            ),
         patch(
             "api.server.service.get_matching_measurement_config",
             return_value=_cpu_measurement_config(),
@@ -1798,3 +1809,64 @@ async def test_verify_server_cpu_invalid_benchmark_raises(
     # A failed CPU attestation record is still persisted (finally block).
     mock_util_functions["mock_verify_gpu"].assert_not_called()
     mock_db_session.add.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_tee_server_client_uses_exact_vm_key_at_cutoff(sample_server):
+    """New firmware uses only the encrypted signer assigned to that exact VM."""
+
+    from bittensor_wallet.keypair import Keypair
+
+    seed_hex = "0x" + secrets.token_hex(32)
+    expected = Keypair.create_from_seed(seed_hex)
+    sample_server.version = "1.4.0"
+    row = VmAuthKey(
+        miner_hotkey=sample_server.miner_hotkey,
+        vm_name=sample_server.name,
+        auth_seed="encrypted",
+    )
+    result = Mock()
+    result.scalar_one_or_none.return_value = row
+    db = AsyncMock(spec=AsyncSession)
+    db.execute.return_value = result
+
+    with patch("api.server.client.decrypt_passphrase", return_value=seed_hex):
+        client = await TeeServerClient.create(db, sample_server)
+
+    assert client._keypair.ss58_address == expected.ss58_address
+    db.execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tee_server_client_new_firmware_missing_vm_key_fails_closed(sample_server):
+    sample_server.version = "1.4.0"
+    result = Mock()
+    result.scalar_one_or_none.return_value = None
+    db = AsyncMock(spec=AsyncSession)
+    db.execute.return_value = result
+
+    with pytest.raises(GetEvidenceError, match="No vm_auth_key row"):
+        await TeeServerClient.create(db, sample_server)
+
+
+@pytest.mark.asyncio
+async def test_tee_server_client_legacy_firmware_ignores_stale_vm_key(sample_server):
+    """A stale row never makes pre-cutoff firmware receive an unsupported signer."""
+
+    sample_server.version = "1.3.1"
+    row = VmAuthKey(
+        miner_hotkey=sample_server.miner_hotkey,
+        vm_name=sample_server.name,
+        auth_seed="encrypted",
+    )
+    result = Mock()
+    result.scalar_one_or_none.return_value = row
+    db = AsyncMock(spec=AsyncSession)
+    db.execute.return_value = result
+    validator = Mock()
+
+    with patch("api.server.client.settings") as client_settings:
+        client_settings.validator_keypair = validator
+        client = await TeeServerClient.create(db, sample_server)
+
+    assert client._keypair is validator

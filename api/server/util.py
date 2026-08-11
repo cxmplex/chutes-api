@@ -17,7 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from urllib.parse import unquote
 from aiohttp import ClientError, ClientResponse
 from cryptography.fernet import Fernet
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
+from api.database import get_db_session
 from loguru import logger
 from dcap_qvl import (
     PHALA_PCCS_URL,
@@ -31,7 +32,9 @@ from api.server.intel_root import INTEL_SGX_ROOT_CA_DER
 from cryptography import x509
 from cryptography.x509 import Certificate
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding
 from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidSignature
 from api.server.exceptions import (
     AttestationError,
     AttestationVerifierUnavailableError,
@@ -57,6 +60,13 @@ from api.server.snp_verify import SnpVerificationResult, verify_snp_report
 import hashlib
 import os
 
+from api.constants import (
+    ATTESTATION_PROXY_AUTH_HEADER,
+    CVM_PROXY_AUTH_HEADER,
+    REGISTRY_PROXY_AUTH_HEADER,
+)
+from api.util import semcomp
+
 from api.server.schemas import (
     Server,
     VmCacheConfig,
@@ -76,6 +86,102 @@ def generate_nonce() -> str:
 def get_nonce_expiry_seconds(minutes: int = 10) -> int:
     """Get expiry time for a nonce in seconds."""
     return minutes * 60
+
+
+def _proxy_provenance(request: Request) -> tuple[bool, bool]:
+    """Return whether a request bears the CVM or legacy attestation proxy secret."""
+
+    def _matches(secret: Optional[str], header: str) -> bool:
+        if not secret:
+            return False
+        provided = request.headers.get(header, "")
+        return secrets.compare_digest(provided.encode(), secret.encode())
+
+    return (
+        _matches(settings.cvm_proxy_secret, CVM_PROXY_AUTH_HEADER),
+        _matches(settings.attestation_proxy_secret, ATTESTATION_PROXY_AUTH_HEADER),
+    )
+
+
+def require_attestation_proxy():
+    """Require provenance from either configured attestation terminator."""
+
+    async def _check(request: Request):
+        via_cvm, via_attestation = _proxy_provenance(request)
+        if not settings.cvm_proxy_secret and not settings.attestation_proxy_secret:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Attestation proxy secret is not configured.",
+            )
+        if not (via_cvm or via_attestation):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Request did not arrive via a trusted attestation proxy.",
+            )
+
+    return _check
+
+
+def require_cvm_proxy():
+    """Require provenance from the full-mTLS CVM proxy."""
+
+    async def _check(request: Request):
+        via_cvm, _ = _proxy_provenance(request)
+        if not settings.cvm_proxy_secret:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="CVM proxy secret is not configured.",
+            )
+        if not via_cvm:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This endpoint is only accessible via the CVM mTLS proxy.",
+            )
+
+    return _check
+
+
+def gate_legacy_attestation():
+    """Allow the legacy direct path only for pre-cutoff or not-yet-known VMs."""
+
+    async def _check(request: Request, db: AsyncSession = Depends(get_db_session)):
+        via_cvm, _ = _proxy_provenance(request)
+        if via_cvm:
+            return
+        client_ip = getattr(request.state, "client_ip", None)
+        result = await db.execute(select(Server).where(Server.ip == client_ip))
+        server = result.scalar_one_or_none()
+        if (
+            server is not None
+            and server.version
+            and semcomp(server.version, settings.tee_mtls_min_version) >= 0
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This VM must use the CVM mTLS proxy.",
+            )
+
+    return _check
+
+
+def require_proxy_secret(expected_secret: Optional[str], header_name: str):
+    """Require one configured proxy's constant-time bearer provenance header."""
+
+    async def _dep(request: Request):
+        if not expected_secret:
+            return
+        provided = request.headers.get(header_name, "")
+        if not secrets.compare_digest(provided.encode(), expected_secret.encode()):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Request did not arrive via the expected proxy.",
+            )
+
+    return _dep
+
+
+def require_registry_proxy_secret():
+    return require_proxy_secret(settings.registry_proxy_secret, REGISTRY_PROXY_AUTH_HEADER)
 
 
 def extract_client_cert_hash(
@@ -234,6 +340,39 @@ def cert_to_base64_der(cert: Certificate) -> str:
     cert_der = cert.public_bytes(serialization.Encoding.DER)
     cert_base64 = base64.b64encode(cert_der).decode("utf-8")
     return cert_base64
+
+
+def _parse_client_cert_header(request: Request) -> Optional[Certificate]:
+    """Parse the proxy-owned client-certificate header without assigning authority."""
+
+    cert_header = request.headers.get("X-Client-Cert")
+    if not cert_header:
+        return None
+    try:
+        return x509.load_pem_x509_certificate(unquote(cert_header).encode(), default_backend())
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed client certificate.",
+        ) from exc
+
+
+def extract_client_cert():
+    """Dependency returning a required, live proxy-presented client certificate."""
+
+    async def _dep(request: Request) -> Certificate:
+        return _get_client_certificate(request, require_proxy_verified=True)
+
+    return _dep
+
+
+def extract_optional_client_cert():
+    """Dependency for dual-auth routes; malformed present certificates still fail closed."""
+
+    async def _dep(request: Request) -> Optional[Certificate]:
+        return _parse_client_cert_header(request)
+
+    return _dep
 
 
 # The verification result the mTLS-terminating proxy must report (nginx $ssl_client_verify) for the
@@ -1318,6 +1457,49 @@ async def verify_quote(
     verify_measurements(quote)
 
     return result
+
+
+def verify_leaf_cert_signed_by_ca(leaf: Certificate, ca: Certificate) -> None:
+    """Verify a non-self-signed endpoint leaf against one recorded VM root CA."""
+
+    if leaf.subject == leaf.issuer:
+        raise InvalidClientCertError(detail="Self-signed leaf cert not allowed.")
+    if leaf.issuer != ca.subject:
+        raise InvalidClientCertError(detail="Leaf cert issuer does not match CA cert subject.")
+
+    ca_public_key = ca.public_key()
+    try:
+        if isinstance(ca_public_key, ec.EllipticCurvePublicKey):
+            ca_public_key.verify(
+                leaf.signature,
+                leaf.tbs_certificate_bytes,
+                ec.ECDSA(leaf.signature_hash_algorithm),
+            )
+        else:
+            ca_public_key.verify(
+                leaf.signature,
+                leaf.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                leaf.signature_hash_algorithm,
+            )
+    except InvalidSignature as exc:
+        raise InvalidClientCertError(detail="Leaf cert signature verification failed.") from exc
+    except InvalidClientCertError:
+        raise
+    except Exception as exc:
+        logger.warning(f"verify_leaf_cert_signed_by_ca unexpected error: {exc}")
+        raise InvalidClientCertError(detail="Leaf cert signature verification failed.") from exc
+
+
+def verify_server_cert(client_cert: Optional[Certificate], server: Server) -> None:
+    """Verify a presented VM leaf against the CA recorded for that exact server."""
+
+    ca = server.vm_root_ca_certificate
+    if client_cert is None or ca is None:
+        raise NoClientCertError(
+            detail="VM must present an mTLS leaf certificate signed by its registered CA."
+        )
+    verify_leaf_cert_signed_by_ca(client_cert, ca)
 
 
 async def verify_gpu_evidence(

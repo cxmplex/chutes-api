@@ -19,6 +19,8 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "90"
     nginx.ingress.kubernetes.io/configuration-snippet: |
+      # Proxy provenance is owned by the dedicated mTLS/registry frontends only.
+      more_clear_input_headers "X-Client-Cert" "X-Client-Verify" "X-Attestation-Proxy-Auth" "X-Cvm-Proxy-Auth" "X-Registry-Proxy-Auth";
       {{- include "chutes.apiIngressClientIpConfiguration" . | nindent 6 }}
     {{- include "chutes.apiIngressClientIpAnnotations" . | nindent 4 }}
 spec:

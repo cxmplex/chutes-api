@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError, DatabaseError
 from loguru import logger
+from cryptography.x509 import Certificate
 from api.request_context import bind_request_context
 
 from api.database import get_db_session
@@ -39,6 +40,8 @@ from api.constants import (
 )
 
 from api.server.schemas import (
+    ProvisionRequest,
+    ProvisionResponse,
     BootAttestationArgs,
     RuntimeAttestationArgs,
     RuntimeAttestationNonceContext,
@@ -111,10 +114,12 @@ from api.server.gpu_infra import (
     retire_gpu_infra_key,
 )
 from api.server.service import (
+    BootAttestationResult,
     create_nonce,
     validate_and_consume_nonce,
     issue_boot_attestation_nonce,
     process_boot_attestation,
+    process_provision_request,
     register_server,
     register_cpu_server,
     check_server_ownership,
@@ -139,6 +144,10 @@ from api.server.service import (
 from api.server.util import (
     extract_client_cert_hash,
     extract_client_cert_pem,
+    extract_client_cert,
+    get_public_key_hash,
+    require_attestation_proxy,
+    require_cvm_proxy,
 )
 from api.server.exceptions import (
     AttestationError,
@@ -264,6 +273,7 @@ async def verify_boot_attestation(
     request: Request,
     args: BootAttestationArgs,
     db: AsyncSession = Depends(get_db_session),
+    _proxy=Depends(require_attestation_proxy()),
     validated_nonce=Depends(require_boot_attestation_nonce),
     expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
 ):
@@ -276,11 +286,14 @@ async def verify_boot_attestation(
     try:
         server_ip = request.state.client_ip
         nonce, nonce_context = validated_nonce
-        luks_quote_nonce = await process_boot_attestation(
+        result: BootAttestationResult = await process_boot_attestation(
             db, server_ip, args, nonce, nonce_context, expected_cert_hash
         )
 
-        return BootAttestationResponse(luks_quote_nonce=luks_quote_nonce)
+        return BootAttestationResponse(
+            luks_quote_nonce=result.luks_quote_nonce,
+            vm_auth_ss58=result.vm_auth_ss58,
+        )
     except AttestationError as e:
         # Detection sites log private details; this boundary returns only safe domain data.
         raise HTTPException(status_code=e.http_status, detail=e.message)
@@ -1136,6 +1149,7 @@ async def attest_luks(
     body: LuksAttestRequest,
     db: AsyncSession = Depends(get_db_session),
     hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _proxy=Depends(require_attestation_proxy()),
     expected_cert_hash=Depends(extract_client_cert_hash(require_proxy_verified=True)),
     validated_capability=Depends(require_luks_quote_nonce),
 ):
@@ -1216,6 +1230,89 @@ async def confirm_luks_rotation(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="LUKS confirm failed",
         )
+
+
+@router.post(
+    "/{server_id}/provision",
+    response_model=ProvisionResponse,
+    response_model_exclude_none=True,
+)
+async def provision(
+    server_id: str,
+    body: ProvisionRequest,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _proxy=Depends(require_cvm_proxy()),
+    client_cert: Certificate = Depends(extract_client_cert()),
+    validated_capability=Depends(require_luks_quote_nonce),
+):
+    """Record the quote-bound VM root CA and issue exact generation storage leases."""
+
+    try:
+        result = await process_provision_request(
+            db,
+            server_id,
+            hotkey,
+            body,
+            validated_capability,
+            client_cert,
+        )
+        return ProvisionResponse(
+            volumes={
+                volume: LuksVolumeInfo(
+                    current=rotation.current,
+                    next=rotation.next,
+                    generation=rotation.generation,
+                    confirmed_generation=rotation.confirmed_generation,
+                    lease_reused=rotation.lease_reused,
+                )
+                for volume, rotation in result.volumes.items()
+            },
+            confirm_nonce=result.confirm_nonce,
+            k3s_encryption_key=result.k3s_encryption_key,
+        )
+    except AttestationError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.message)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Unexpected error in provision for {server_id}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Provisioning failed",
+        ) from exc
+
+
+@router.post("/{server_id}/provision/confirm", response_model=LuksConfirmResponse)
+async def provision_confirm(
+    server_id: str,
+    body: LuksConfirmRequest,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    _proxy=Depends(require_cvm_proxy()),
+    capability=Depends(require_confirm_nonce),
+    client_cert: Certificate = Depends(extract_client_cert()),
+):
+    """Confirm the exact generations issued by the provisioning endpoint."""
+
+    try:
+        result = await process_luks_confirm(
+            db,
+            server_id,
+            hotkey,
+            body,
+            capability,
+            get_public_key_hash(client_cert),
+        )
+        return LuksConfirmResponse(status="confirmed", volumes=result.volumes)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Unexpected error in provision confirm for {server_id}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Provision confirm failed",
+        ) from exc
 
 
 # Server Management Endpoints (Post-boot via CLI)
@@ -1363,6 +1460,19 @@ async def get_tee_measurements():
         for m in measurements
         if not m.rc
     ]
+
+
+@router.get("/signing-keys")
+async def get_signing_keys():
+    """Publish the signed public-key bundle used by measured guests."""
+
+    bundle = settings.signing_keys_bundle
+    if bundle is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Signing keys bundle not available",
+        )
+    return bundle
 
 
 @router.get("/maintenance/policy", response_model=MaintenancePolicyResponse)

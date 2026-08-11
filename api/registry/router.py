@@ -2,13 +2,15 @@
 
 from datetime import datetime, timedelta, timezone
 import re
-from typing import Annotated
+from typing import Annotated, Optional
 from urllib.parse import parse_qs, urlsplit
 
 import jwt
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from cryptography.x509 import Certificate
+from loguru import logger
 
 from api.config import settings
 from api.constants import (
@@ -50,6 +52,15 @@ from api.registry.oci import (
     OciDescriptorClosure,
     resolve_oci_descriptor_closure,
 )
+from api.server.service import lookup_server_by_ip
+from api.server.util import (
+    verify_server_cert,
+    require_registry_proxy_secret,
+    extract_optional_client_cert,
+)
+from api.server.exceptions import AttestationError
+from api.log import update_log_context
+from api.util import semcomp
 
 
 router = APIRouter()
@@ -966,10 +977,36 @@ async def registry_auth(
     authorization: str | None = Header(None, alias=AUTHORIZATION_HEADER),
     sig_version: str | None = Header(None, alias=SIG_VERSION_HEADER),
     client_verify: str | None = Header(None, alias="X-Client-Verify"),
-    client_cert: str | None = Header(None, alias="X-Client-Cert"),
+    client_cert_header: str | None = Header(None, alias="X-Client-Cert"),
     response: Response = None,
+    _proxy=Depends(require_registry_proxy_secret()),
+    client_cert: Optional[Certificate] = Depends(extract_optional_client_cert()),
 ):
-    """Authorize every token/manifest/blob request; session paths never fall back."""
+    """Authorize registry bytes without weakening exact repository/digest scope.
+
+    New mTLS-capable VMs must present a CA-authenticated client certificate *and* an exact,
+    current registry session. The certificate authenticates the VM transport; the session remains
+    the only authority for repository, manifest, descriptor closure, and request action. Older or
+    unknown VMs may use the legacy miner signature path until the configured cutoff.
+    """
+
+    # Direct unit calls leave FastAPI parameter markers in defaulted arguments. Production
+    # injection always supplies strings or None; normalize markers to that same contract.
+    def _header_value(value):
+        return value if isinstance(value, str) else None
+
+    registry_session = _header_value(registry_session)
+    attested_session = _header_value(attested_session)
+    original_method = _header_value(original_method)
+    original_uri = _header_value(original_uri)
+    launch_config_id = _header_value(launch_config_id)
+    hotkey = _header_value(hotkey)
+    signature = _header_value(signature)
+    nonce = _header_value(nonce)
+    authorization = _header_value(authorization)
+    sig_version = _header_value(sig_version)
+    client_verify = _header_value(client_verify)
+    client_cert_header = _header_value(client_cert_header)
 
     if attested_session:
         raise HTTPException(
@@ -980,8 +1017,30 @@ async def registry_auth(
             ),
         )
 
+    # FastAPI resolves the dependency to a Certificate. Direct unit calls that omit it leave the
+    # Depends marker in place; treat that as absent rather than as authenticated evidence.
+    parsed_client_cert = client_cert if isinstance(client_cert, Certificate) else None
+    state_ip = getattr(getattr(request, "state", None), "client_ip", None)
+    peer_ip = getattr(getattr(request, "client", None), "host", None)
+    client_ip = state_ip if isinstance(state_ip, str) and state_ip else None
+    if client_ip is None and isinstance(peer_ip, str) and peer_ip:
+        client_ip = peer_ip
+    server = await lookup_server_by_ip(db, client_ip) if client_ip else None
+    update_log_context(
+        ip=client_ip,
+        server_id=getattr(server, "server_id", None),
+        server_name=getattr(server, "name", None),
+        miner_hotkey=hotkey or request.headers.get(HOTKEY_HEADER),
+    )
+    requires_mtls = bool(
+        server is not None
+        and server.version
+        and semcomp(server.version, settings.registry_mtls_min_version) >= 0
+    )
     certificate_presented = bool(
-        client_cert or (client_verify and client_verify.strip().upper() not in {"", "NONE"})
+        parsed_client_cert
+        or client_cert_header
+        or (client_verify and client_verify.strip().upper() not in {"", "NONE"})
     )
     if registry_session or certificate_presented:
         if not registry_session:
@@ -994,6 +1053,8 @@ async def registry_auth(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Registry session request context is missing.",
             )
+        if requires_mtls:
+            _verify_mtls_client_cert(parsed_client_cert, server, client_ip)
         cert_hash = await extract_client_cert_hash(require_proxy_verified=True)(request)
         row = await _validate_registry_session(
             db,
@@ -1008,9 +1069,10 @@ async def registry_auth(
                 row, original_uri
             )
         return {"authenticated": True, "auth_type": "attested_registry_session"}
+    if requires_mtls:
+        _verify_mtls_client_cert(None, server, client_ip)
     await _legacy_registry_auth(
         request,
-        api_key=None,
         hotkey=hotkey,
         signature=signature,
         nonce=nonce,
@@ -1018,3 +1080,61 @@ async def registry_auth(
         sig_version=sig_version,
     )
     return {"authenticated": True, "auth_type": "legacy_miner"}
+
+
+def _verify_mtls_client_cert(
+    client_cert: Optional[Certificate], server, client_ip: str | None
+) -> None:
+    """Require a valid mTLS client cert for VMs at/above registry_mtls_min_version.
+
+    Delegates to the shared verify_server_cert: the client leaf (extracted from X-Client-Cert
+    by extract_optional_client_cert) is verified against the CA the VM recorded via
+    POST /servers/{vm_name}/provision, adding registry-context logging.
+
+    Raises NoClientCertError (403) if no client cert is presented or the VM has no CA on file,
+    or InvalidClientCertError (403) if the leaf fails verification (both are AttestationError).
+    """
+    try:
+        verify_server_cert(client_cert, server)
+    except AttestationError as e:
+        logger.warning(
+            f"registry: mTLS rejected for VM at {client_ip} "
+            f"(server={server.name}, version={server.version})"
+        )
+        raise HTTPException(status_code=e.http_status, detail=e.message)
+    logger.info(f"registry: mTLS auth accepted for VM at {client_ip} (server={server.name})")
+
+
+async def _legacy_registry_auth(
+    request: Request,
+    *,
+    hotkey: str | None = None,
+    signature: str | None = None,
+    nonce: str | None = None,
+    authorization: str | None = None,
+    sig_version: str | None = None,
+) -> None:
+    """
+    Perform legacy Bittensor SS58 hotkey/signature/nonce auth for registry pulls.
+
+    Manually extracts auth headers from the request and calls the authenticator so
+    that we can invoke it outside of FastAPI's dependency injection (it runs only on
+    the legacy branch, not unconditionally as a route dependency).
+
+    Raises HTTPException(401) if the credentials are absent or invalid.
+    """
+    authenticator = get_current_user(purpose="registry", registered_to=settings.netuid)
+    hotkey = hotkey or request.headers.get(HOTKEY_HEADER)
+    signature = signature or request.headers.get(SIGNATURE_HEADER)
+    nonce = nonce or request.headers.get(NONCE_HEADER)
+    authorization = authorization or request.headers.get(AUTHORIZATION_HEADER)
+    sig_version = sig_version or request.headers.get(SIG_VERSION_HEADER)
+    await authenticator(
+        request=request,
+        api_key=None,
+        hotkey=hotkey,
+        signature=signature,
+        nonce=nonce,
+        authorization=authorization,
+        sig_version=sig_version,
+    )

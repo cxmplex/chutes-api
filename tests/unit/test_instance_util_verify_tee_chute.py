@@ -20,6 +20,7 @@ from api.config import (
 from api.host.schemas import TdLaunchReservation
 from api.instance.util import verify_tee_chute, require_attested_client_cert
 from api.server.exceptions import NoClientCertError
+from api.server.client import ChuteEvidenceResponse
 from api.server.quote import BootTdxQuote
 from api.server.schemas import Server, ServerAttestation
 from tests.fixtures.gpus import TEST_GPU_NONCE
@@ -114,8 +115,10 @@ async def test_verify_tee_chute_chutes_060_uses_e2e_pubkey_hash(mock_db, sample_
         patch("api.instance.util.get_public_key_hash", return_value=EXPECTED_CERT_HASH),
     ):
         mock_client = MagicMock()
-        mock_client.get_chute_evidence = AsyncMock(return_value=(sample_quote, [], mock_cert))
-        mock_client_cls.return_value = mock_client
+        mock_client.get_chute_evidence = AsyncMock(
+            return_value=ChuteEvidenceResponse(sample_quote, [], mock_cert)
+        )
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
 
         await verify_tee_chute(mock_db, instance, launch_config, "deploy-123", EXPECTED_NONCE)
 
@@ -143,8 +146,10 @@ async def test_verify_tee_chute_cpu_skips_gpu_evidence(mock_db, sample_quote, mo
     ):
         mock_client = MagicMock()
         # CPU chute proxies return null nvtrust_evidence -> get_chute_evidence yields None.
-        mock_client.get_chute_evidence = AsyncMock(return_value=(sample_quote, None, mock_cert))
-        mock_client_cls.return_value = mock_client
+        mock_client.get_chute_evidence = AsyncMock(
+            return_value=ChuteEvidenceResponse(sample_quote, None, mock_cert)
+        )
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
 
         await verify_tee_chute(
             mock_db,
@@ -174,8 +179,10 @@ async def test_verify_tee_chute_chutes_059_uses_raw_nonce(mock_db, sample_quote,
         patch("api.instance.util.get_public_key_hash", return_value=EXPECTED_CERT_HASH),
     ):
         mock_client = MagicMock()
-        mock_client.get_chute_evidence = AsyncMock(return_value=(sample_quote, [], mock_cert))
-        mock_client_cls.return_value = mock_client
+        mock_client.get_chute_evidence = AsyncMock(
+            return_value=ChuteEvidenceResponse(sample_quote, [], mock_cert)
+        )
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
 
         await verify_tee_chute(mock_db, instance, launch_config, "deploy-123", EXPECTED_NONCE)
 
@@ -198,8 +205,10 @@ async def test_verify_tee_chute_chutes_060_missing_e2e_pubkey_raises_400(
         patch("api.instance.util.get_public_key_hash", return_value=EXPECTED_CERT_HASH),
     ):
         mock_client = MagicMock()
-        mock_client.get_chute_evidence = AsyncMock(return_value=(sample_quote, [], mock_cert))
-        mock_client_cls.return_value = mock_client
+        mock_client.get_chute_evidence = AsyncMock(
+            return_value=ChuteEvidenceResponse(sample_quote, [], mock_cert)
+        )
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
 
         with pytest.raises(HTTPException) as exc_info:
             await verify_tee_chute(mock_db, instance, launch_config, "deploy-123", EXPECTED_NONCE)
@@ -221,8 +230,10 @@ async def test_verify_tee_chute_chutes_060_extra_none_raises_400(mock_db, sample
         patch("api.instance.util.get_public_key_hash", return_value=EXPECTED_CERT_HASH),
     ):
         mock_client = MagicMock()
-        mock_client.get_chute_evidence = AsyncMock(return_value=(sample_quote, [], mock_cert))
-        mock_client_cls.return_value = mock_client
+        mock_client.get_chute_evidence = AsyncMock(
+            return_value=ChuteEvidenceResponse(sample_quote, [], mock_cert)
+        )
+        mock_client_cls.create = AsyncMock(return_value=mock_client)
 
         with pytest.raises(HTTPException) as exc_info:
             await verify_tee_chute(mock_db, instance, launch_config, "deploy-123", EXPECTED_NONCE)

@@ -4,12 +4,13 @@ Core server management and TDX attestation logic.
 
 import asyncio
 import hashlib
+from dataclasses import dataclass
 import pybase64 as base64
 from datetime import datetime, timezone, timedelta
 import json
 import secrets
 from typing import Awaitable, Callable, Dict, Any, Optional
-from fastapi import HTTPException, Header, Request, status
+from fastapi import Depends, HTTPException, Header, Request, status
 from loguru import logger
 from api.log import server_logger, LifecycleEvent, update_log_context
 from pydantic import ValidationError
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from cryptography import x509
+from cryptography import x509 as crypto_x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 
@@ -28,12 +30,14 @@ from api.config import (
 )
 from api.constants import (
     CHUTEFS_DATA_VOLUME,
+    HOTKEY_HEADER,
+    MIN_VM_AUTH_KEY_VERSION,
     NONCE_HEADER,
     NoncePurpose,
     LUKS_STORAGE_VOLUME,
 )
 from api.cpu import validate_cpu_benchmark
-from api.database import generate_uuid
+from api.database import generate_uuid, get_db_session
 from api.gpu import SUPPORTED_GPUS
 from api.metagraph import MetagraphNode
 from api.host.reservations import (
@@ -94,6 +98,8 @@ from api.server.schemas import (
     LuksCapabilityPurpose,
     LuksConfirmRequest,
     LuksConfirmResult,
+    ProvisionRequest,
+    VmAuthKey,
     BootAttestationNonceContext,
     ReplicaPlacement,
     StorageObject,
@@ -130,6 +136,8 @@ from api.server.util import (
     get_public_key_hash,
     cert_to_base64_der,
     validate_user_nonce,
+    extract_client_cert,
+    verify_server_cert,
 )
 from api.instance.schemas import Instance, LaunchConfig, instance_nodes
 from api.job.schemas import Job
@@ -145,6 +153,38 @@ from api.util import get_signing_message, nonce_is_valid_v2, semcomp
 BOOT_LUKS_ALLOWED_VOLUMES = ("storage", "tdx-cache")
 STORAGE_LUKS_ALLOWED_VOLUMES = (CHUTEFS_DATA_VOLUME,)
 BOOT_NONCE_SIGNATURE_PURPOSE = "boot_luks_nonce"
+
+
+@dataclass(frozen=True)
+class BootAttestationResult:
+    """Exact follow-up capability and the per-VM signing identity rotated at boot."""
+
+    luks_quote_nonce: str
+    vm_auth_ss58: Optional[str] = None
+
+
+async def _generate_and_store_vm_auth_key(
+    db: AsyncSession,
+    miner_hotkey: str,
+    vm_name: str,
+) -> Keypair:
+    """Rotate the VM-specific request-signing seed after a successful boot quote."""
+
+    seed_hex = "0x" + secrets.token_hex(32)
+    keypair = Keypair.create_from_seed(seed_hex)
+    encrypted_seed = encrypt_passphrase(seed_hex)
+    statement = pg_insert(VmAuthKey).values(
+        miner_hotkey=miner_hotkey,
+        vm_name=vm_name,
+        auth_seed=encrypted_seed,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=["miner_hotkey", "vm_name"],
+        set_={"auth_seed": encrypted_seed, "created_at": func.now()},
+    )
+    await db.execute(statement)
+    await db.commit()
+    return keypair
 
 
 class CpuRegistrationResult(dict):
@@ -714,7 +754,7 @@ async def process_boot_attestation(
     nonce: str,
     nonce_context: BootAttestationNonceContext,
     expected_cert_hash: str,
-) -> str:
+) -> BootAttestationResult:
     """
     Process a boot attestation request.
 
@@ -727,7 +767,7 @@ async def process_boot_attestation(
         expected_cert_hash: Expected certificate hash
 
     Returns:
-        A one-use, exact-identity LUKS quote capability.
+        A one-use exact-identity LUKS quote capability plus the rotated VM signing identity.
 
     Raises:
         NonceError: If nonce validation fails
@@ -804,10 +844,22 @@ async def process_boot_attestation(
             trust_set_fingerprint,
         )
 
+        vm_auth_ss58 = None
+        if semcomp(measurement_config.version, MIN_VM_AUTH_KEY_VERSION) >= 0:
+            vm_auth_key = await _generate_and_store_vm_auth_key(
+                db,
+                server.miner_hotkey,
+                server.name,
+            )
+            vm_auth_ss58 = vm_auth_key.ss58_address
+
         capability = _luks_capability_for_measurement(
             server, measurement_config, LuksCapabilityPurpose.BOOT
         )
-        return await generate_luks_quote_nonce(capability)
+        return BootAttestationResult(
+            luks_quote_nonce=await generate_luks_quote_nonce(capability),
+            vm_auth_ss58=vm_auth_ss58,
+        )
 
     except (InvalidQuoteError, MeasurementMismatchError) as e:
         # Create failed attestation record; set measurement_version if quote matched a config
@@ -3217,7 +3269,7 @@ async def verify_server(
     measurement_config = None
     update_log_context(server_id=server.server_id, ip=server.ip, miner_hotkey=miner_hotkey)
     try:
-        client = TeeServerClient(server)
+        client = await TeeServerClient.create(db, server)
 
         nonce = generate_nonce()
         logger.info(
@@ -3435,6 +3487,19 @@ async def get_server_by_name(db: AsyncSession, miner_hotkey: str, server_name: s
     if not server:
         raise ServerNotFoundError(f"{server_name}")
     update_log_context(server_id=server.server_id, ip=server.ip, miner_hotkey=miner_hotkey)
+    return server
+
+
+async def require_server_mtls(
+    vm_name: str,
+    db: AsyncSession = Depends(get_db_session),
+    hotkey: str | None = Header(None, alias=HOTKEY_HEADER),
+    client_cert: crypto_x509.Certificate = Depends(extract_client_cert()),
+) -> Server:
+    """Authenticate an exact registered VM using a leaf from its recorded root CA."""
+
+    server = await get_server_by_name(db, hotkey, vm_name)
+    verify_server_cert(client_cert, server)
     return server
 
 
@@ -4313,6 +4378,81 @@ async def process_luks_attest_request(
     )
 
 
+async def record_vm_ca_identity(
+    db: AsyncSession,
+    server: Server,
+    client_cert: crypto_x509.Certificate,
+) -> None:
+    """Stage the quote-bound VM root CA on the exact already-locked server row."""
+
+    server.vm_root_ca_cert = client_cert.public_bytes(serialization.Encoding.PEM).decode()
+
+
+async def process_provision_request(
+    db: AsyncSession,
+    server_id: str,
+    hotkey: str | None,
+    body: ProvisionRequest,
+    validated_capability: tuple[str, LuksCapabilityContext],
+    client_cert: crypto_x509.Certificate,
+) -> LuksAttestResult:
+    """Verify the generation-scoped runtime quote, record its CA, and lease boot secrets.
+
+    The CA assignment is staged before ``lease_luks_passphrases`` commits, so a caller never
+    receives a consumed provisioning capability whose storage lease became durable without its
+    authenticated CA identity becoming durable in the same transaction.
+    """
+
+    quote_nonce, capability = validated_capability
+    cert_hash = get_public_key_hash(client_cert)
+    server = await _validate_luks_capability_identity(
+        db,
+        capability,
+        server_id,
+        hotkey,
+        cert_hash,
+        body.volumes,
+    )
+    tee_type = (getattr(body, "tee_type", None) or "tdx").strip().lower()
+    if tee_type != capability.tee_type:
+        raise MeasurementMismatchError(
+            "Requested TEE type does not match the issued LUKS capability."
+        )
+    quote = build_runtime_quote(
+        body.quote,
+        tee_type,
+        getattr(body, "snp_cert_chain", None),
+        getattr(body, "vtpm_quote", None),
+    )
+    assert_gpu_external_work_allowed(db, "provisioning quote verification")
+    await verify_quote(
+        quote,
+        quote_nonce,
+        cert_hash,
+        expected_gcp_identity=_expected_gcp_identity(server.server_id),
+    )
+    measurement_config = get_matching_measurement_config(quote)
+    _validate_luks_capability_measurement(server, capability, measurement_config)
+    await record_vm_ca_identity(db, server, client_cert)
+
+    volumes_data, vm_config = await lease_luks_passphrases(db, capability, body.volumes)
+    k3s_b64: Optional[str] = None
+    if capability.purpose == LuksCapabilityPurpose.BOOT and LUKS_STORAGE_VOLUME in body.volumes:
+        if not vm_config.k3s_encryption_key:
+            k3s_b64 = base64.b64encode(secrets.token_bytes(32)).decode()
+            vm_config.k3s_encryption_key = encrypt_passphrase(k3s_b64)
+            await db.commit()
+        else:
+            k3s_b64 = decrypt_passphrase(vm_config.k3s_encryption_key)
+
+    confirm_nonce = await generate_confirm_nonce(capability, volumes_data)
+    return LuksAttestResult(
+        volumes=volumes_data,
+        confirm_nonce=confirm_nonce,
+        k3s_encryption_key=k3s_b64,
+    )
+
+
 async def process_luks_confirm(
     db: AsyncSession,
     server_id: str,
@@ -4415,21 +4555,25 @@ async def get_instance_server(db: AsyncSession, instance_id: str) -> tuple[Serve
 
 
 async def _get_instance_evidence(
-    server: Server, deployment_id: str, nonce: str
+    db: AsyncSession, server: Server, deployment_id: str, nonce: str
 ) -> TeeInstanceEvidence:
     """
     Get TEE instance evidence via the chute's evidence endpoint (third-party flow).
     Caller supplies nonce; we call chute-service-{deployment_id}/evidence?nonce=...
     Verification flow (no caller nonce) uses get_chute_evidence(deployment_id) → verify endpoint.
     """
-    client = TeeServerClient(server)
-    quote, gpu_evidence, cert = await client.get_chute_evidence(deployment_id, nonce=nonce)
+    client = await TeeServerClient.create(db, server)
+    evidence = await client.get_chute_evidence(deployment_id, nonce=nonce)
 
-    quote_base64 = base64.b64encode(quote.raw_bytes).decode("utf-8")
-    cert_base64 = cert_to_base64_der(cert)
+    quote_base64 = base64.b64encode(evidence.quote.raw_bytes).decode("utf-8")
+    cert_base64 = cert_to_base64_der(evidence.cert)
 
     return TeeInstanceEvidence(
-        quote=quote_base64, gpu_evidence=gpu_evidence, certificate=cert_base64
+        quote=quote_base64,
+        gpu_evidence=evidence.gpu_evidence or [],
+        certificate=cert_base64,
+        signature=evidence.signature,
+        attested_body=evidence.attested_body,
     )
 
 
@@ -4453,27 +4597,38 @@ async def get_instance_evidence(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Instance has no deployment_id; evidence is only available after TEE verification",
         )
-    return await _get_instance_evidence(server, instance.deployment_id, nonce)
+    return await _get_instance_evidence(db, server, instance.deployment_id, nonce)
 
 
 async def _fetch_instance_evidence(
-    instance: Instance, server: Optional[Server], nonce: str
+    instance: Instance,
+    client: Optional[TeeServerClient],
+    nonce: str,
 ) -> TeeInstanceEvidence | None:
     """Fetch evidence for a single instance, returning None on failure.
 
     The server is resolved by the caller (GPU chutes via Node rows, CPU chutes via
     host + miner_hotkey) so this coroutine performs no DB access and is safe under gather.
     """
-    if server is None:
+    if client is None:
         logger.error(f"No server resolved for instance {instance.instance_id}; cannot get evidence")
         return None
     try:
-        evidence = await _get_instance_evidence(server, instance.deployment_id, nonce)
+        response = await client.get_chute_evidence(instance.deployment_id, nonce=nonce)
+        evidence = TeeInstanceEvidence(
+            quote=base64.b64encode(response.quote.raw_bytes).decode("utf-8"),
+            gpu_evidence=response.gpu_evidence or [],
+            certificate=cert_to_base64_der(response.cert),
+            signature=response.signature,
+            attested_body=response.attested_body,
+        )
         return TeeInstanceEvidence(
             quote=evidence.quote,
             gpu_evidence=evidence.gpu_evidence,
             instance_id=instance.instance_id,
             certificate=evidence.certificate,
+            signature=evidence.signature,
+            attested_body=evidence.attested_body,
         )
     except GetEvidenceError as e:
         logger.error(f"Failed to get evidence for instance {instance.instance_id}: {str(e)}")
@@ -4546,8 +4701,16 @@ async def get_chute_instances_evidence(
                 )
                 servers.append(None)
 
+    # Resolve signing credentials serially on this AsyncSession, then parallelize only network I/O.
+    clients: list[Optional[TeeServerClient]] = []
+    for server in servers:
+        clients.append(await TeeServerClient.create(db, server) if server is not None else None)
+
     results = await asyncio.gather(
-        *[_fetch_instance_evidence(inst, server, nonce) for inst, server in zip(instances, servers)]
+        *[
+            _fetch_instance_evidence(inst, client, nonce)
+            for inst, client in zip(instances, clients)
+        ]
     )
     evidence_list: list[TeeInstanceEvidence] = []
     failed_instance_ids: list[str] = []
@@ -4986,3 +5149,10 @@ async def confirm_maintenance(
             max_concurrent_per_miner=active_window.max_concurrent_per_miner,
         ),
     )
+
+
+async def lookup_server_by_ip(db: AsyncSession, ip: str) -> Server | None:
+    """Resolve one registry caller by its direct proxy-reported source address."""
+
+    result = await db.execute(select(Server).where(Server.ip == ip))
+    return result.scalar_one_or_none()

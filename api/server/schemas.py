@@ -14,6 +14,9 @@ from pydantic import (
     model_validator,
 )
 from datetime import datetime, timezone
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.x509 import Certificate
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from sqlalchemy import (
@@ -65,6 +68,14 @@ class TeeInstanceEvidence(BaseModel):
     certificate: str = Field(
         ..., description="Base64-encoded DER format TLS certificate from the server"
     )
+    signature: Optional[str] = Field(
+        None,
+        description="Base64-encoded signature over attested_body from the attested TLS key.",
+    )
+    attested_body: Optional[str] = Field(
+        None,
+        description="Base64-encoded exact response bytes covered by signature.",
+    )
 
 
 class NonceResponse(BaseModel):
@@ -90,6 +101,10 @@ class BootAttestationResponse(BaseModel):
     """
 
     luks_quote_nonce: str
+    vm_auth_ss58: Optional[str] = Field(
+        None,
+        description="Per-VM signing address rotated by this successful boot attestation.",
+    )
 
 
 class RuntimeAttestationArgs(BaseModel):
@@ -458,6 +473,18 @@ class LuksConfirmResponse(BaseModel):
 
     status: str
     volumes: Dict[str, Any]
+
+
+class ProvisionRequest(LuksAttestRequest):
+    """Runtime provisioning request carrying a quote-bound VM root CA."""
+
+
+class ProvisionResponse(BaseModel):
+    """Generation-leased storage secrets returned by the provisioning endpoint."""
+
+    volumes: Dict[str, LuksVolumeInfo]
+    confirm_nonce: str
+    k3s_encryption_key: Optional[str] = None
 
 
 class GpuInfraLeaseRequestV1(BaseModel):
@@ -1667,6 +1694,11 @@ class Server(Base):
     # revocation_not_advertised value is auditable and never represented as a successful check.
     attestation_revocation_status = Column(JSONB, nullable=True)
 
+    # Root CA whose private key possession was proven by the RTMR3-bound provisioning call.
+    # It authorizes short-lived endpoint-specific mTLS leaves; NULL keeps legacy clients on the
+    # explicitly gated compatibility path.
+    vm_root_ca_cert = Column(Text, nullable=True)
+
     # True for 1-click CPU servers that self-registered via POST /servers/cpu/register
     # (the server attested + checked in itself), vs servers advertised by a miner control plane.
     self_registered = Column(Boolean, nullable=False, default=False, server_default="false")
@@ -1709,6 +1741,12 @@ class Server(Base):
     model_inventory_snapshot_id = Column(String, nullable=True)
     model_inventory_fresh_at = Column(DateTime(timezone=True), nullable=True)
     last_health_at = Column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def vm_root_ca_certificate(self) -> Optional[Certificate]:
+        if not self.vm_root_ca_cert:
+            return None
+        return x509.load_pem_x509_certificate(self.vm_root_ca_cert.encode(), default_backend())
 
     @property
     def in_maintenance(self) -> bool:
@@ -2378,6 +2416,19 @@ class VmCacheConfig(Base):
         Index("idx_vm_cache_miner", "miner_hotkey"),
         Index("idx_vm_cache_last_boot", "last_boot_at"),
     )
+
+
+class VmAuthKey(Base):
+    """Per-VM signing key rotated after each successful boot attestation."""
+
+    __tablename__ = "vm_auth_keys"
+
+    miner_hotkey = Column(String, primary_key=True)
+    vm_name = Column(String, primary_key=True)
+    auth_seed = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("idx_vm_auth_keys_miner", "miner_hotkey"),)
 
 
 class GpuMinerIdentity(Base):

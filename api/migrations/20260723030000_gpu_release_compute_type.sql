@@ -53,6 +53,8 @@ ALTER TABLE guest_releases
     CHECK (compute_type = 'cpu' OR tee_type = 'tdx');
 
 ALTER TABLE l0_bootstrap_publications
+    DROP CONSTRAINT IF EXISTS l0_bootstrap_publications_pkey;
+ALTER TABLE l0_bootstrap_publications
     DROP CONSTRAINT IF EXISTS pk_l0_bootstrap_publications;
 ALTER TABLE l0_bootstrap_publications
     ADD CONSTRAINT pk_l0_bootstrap_publications

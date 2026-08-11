@@ -117,6 +117,10 @@ app.kubernetes.io/name: cm-redis
 app.kubernetes.io/name: quota-redis
 {{- end }}
 
+{{- define "loki.labels" -}}
+app.kubernetes.io/name: loki
+{{- end }}
+
 
 {{- define "registry.labels" -}}
 app.kubernetes.io/name: registry
@@ -128,6 +132,10 @@ app.kubernetes.io/name: registry-proxy
 
 {{- define "attestationProxy.labels" -}}
 app.kubernetes.io/name: attestation-proxy
+{{- end }}
+
+{{- define "cvmProxy.labels" -}}
+app.kubernetes.io/name: cvm-proxy
 {{- end }}
 
 {{- define "claudeProxy.labels" -}}
@@ -466,11 +474,6 @@ acknowledges that an equivalent policy is managed outside this chart.
     secretKeyRef:
       name: {{ .Values.s3SecretName | default "s3-credentials" }}
       key: bucket
-- name: REGISTRY_PASSWORD
-  valueFrom:
-    secretKeyRef:
-      name: registry-secret
-      key: password
 - name: REGISTRY_INSECURE
   value: "true"
 {{- end -}}
@@ -617,26 +620,4 @@ Redis connection + Validator SS58 + Postgres credentials.
     secretKeyRef:
       name: postgres-secret
       key: readonly_url
-{{- end }}
-
-{{/*
-CronJob Job/pod retention. Resolution order: per-job override -> global .Values.cronjobDefaults -> hard default.
-Call with: (dict "root" . "job" .Values.<jobKey>)
-*/}}
-{{- define "chutes.successfulJobsHistoryLimit" -}}
-{{- $job := .job | default dict -}}
-{{- $def := .root.Values.cronjobDefaults | default dict -}}
-{{- $job.successfulJobsHistoryLimit | default $def.successfulJobsHistoryLimit | default 3 -}}
-{{- end }}
-
-{{- define "chutes.failedJobsHistoryLimit" -}}
-{{- $job := .job | default dict -}}
-{{- $def := .root.Values.cronjobDefaults | default dict -}}
-{{- $job.failedJobsHistoryLimit | default $def.failedJobsHistoryLimit | default 3 -}}
-{{- end }}
-
-{{- define "chutes.ttlSecondsAfterFinished" -}}
-{{- $job := .job | default dict -}}
-{{- $def := .root.Values.cronjobDefaults | default dict -}}
-{{- $job.ttlSecondsAfterFinished | default $def.ttlSecondsAfterFinished | default 3600 -}}
 {{- end }}
