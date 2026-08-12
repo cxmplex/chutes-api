@@ -670,6 +670,67 @@ def test_release_request_accepts_each_role_matrix_and_rejects_empty():
         CreateReleaseRequest(tee_type="sev-snp", compute_type="cpu")
 
 
+def test_release_request_identity_binds_exact_provenance_and_canonical_defaults():
+    image = ReleaseImage(
+        **_image(
+            provenance_payload='{"rebuild_sha256":"' + "1" * 64 + '"}',
+            provenance_signature="publisher-signature-a",
+        )
+    )
+    request = CreateReleaseRequest(
+        tee_type="SEV-SNP",
+        compute_type="cpu",
+        chute=image,
+    )
+    document = request.canonical_document()
+
+    assert document["tee_type"] == "sev-snp"
+    assert document["channel"] == "stable"
+    assert document["activate"] is False
+    assert document["chute"]["provenance_payload"] == image.provenance_payload
+    assert document["chute"]["provenance_signature"] == image.provenance_signature
+    assert len(request.canonical_sha256()) == 64
+
+    changed = CreateReleaseRequest(
+        tee_type="sev-snp",
+        compute_type="cpu",
+        chute=ReleaseImage(
+            **_image(
+                provenance_payload='{"rebuild_sha256":"' + "2" * 64 + '"}',
+                provenance_signature="publisher-signature-a",
+            )
+        ),
+    )
+    assert changed.canonical_sha256() != request.canonical_sha256()
+
+
+def test_release_create_request_rejects_ignored_identity_fields():
+    image = _image()
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        CreateReleaseRequest(
+            tee_type="sev-snp",
+            compute_type="cpu",
+            chute=ReleaseImage(**image),
+            unbound_build_identity="ignored",
+        )
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        ReleaseImage(**image, unbound_rebuild_identity="ignored")
+
+
+@pytest.mark.asyncio
+async def test_release_create_rejects_noncanonical_request_identity_before_database_use():
+    request = CreateReleaseRequest(
+        tee_type="sev-snp",
+        compute_type="cpu",
+        chute=ReleaseImage(**_image()),
+    )
+    db = AsyncMock()
+
+    with pytest.raises(rsvc.ReleaseRequestConflict, match="does not match"):
+        await rsvc.create_release(db, request, "0" * 64)
+    db.execute.assert_not_awaited()
+
+
 def test_gpu_release_request_is_tdx_only_and_requires_exact_dual_cmdlines():
     gpu = GpuReleaseImage(
         url="https://artifacts.chutes.ai/releases/gpu-1.11.0.qcow2",

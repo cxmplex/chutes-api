@@ -34,6 +34,7 @@ from api.releases.bootstrap import (
     verify_signed_l0_manifest,
 )
 from api.releases.schemas import (
+    CreateReleaseRequest,
     GuestRelease,
     L0ArtifactV1,
     L0BootstrapManifestV1,
@@ -249,6 +250,90 @@ def test_release_openapi_exposes_compute_scope_gpu_slot_and_l0_v2():
     assert "required_gpu_measurement_names" in schemas["ReleaseStatusResponse"]["properties"]
     assert schemas["L0BootstrapManifestV2-Output"]["properties"]["compute_type"]["const"] == "gpu"
     assert "storage_closure" in schemas["L0BootstrapManifestV2-Output"]["required"]
+    create_parameters = app.openapi()["paths"]["/releases"]["post"]["parameters"]
+    request_identity = next(
+        parameter
+        for parameter in create_parameters
+        if parameter["name"] == "X-Chutes-Release-Request-SHA256"
+    )
+    assert request_identity["in"] == "header"
+    assert request_identity["required"] is True
+    assert request_identity["schema"]["pattern"] == "^[0-9a-f]{64}$"
+
+
+def test_release_create_route_requires_exact_identity_maps_conflict_and_echoes_identity():
+    app = FastAPI()
+    app.include_router(releases_router, prefix="/releases")
+    database = object()
+    app.dependency_overrides[get_db_session] = lambda: database
+    create_route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/releases"
+        and "POST" in getattr(route, "methods", set())
+    )
+    admin = Mock()
+    admin.has_role.return_value = True
+    for dependency in create_route.dependant.dependencies:
+        if dependency.call is not get_db_session:
+            app.dependency_overrides[dependency.call] = lambda: admin
+
+    body = {
+        "tee_type": "sev-snp",
+        "compute_type": "cpu",
+        "channel": "idempotency-dev",
+        "chute": {
+            "url": "https://artifacts.chutes.ai/releases/route-idempotency.qcow2",
+            "sha256": "a" * 64,
+            "debug": False,
+            "version": "1.0.0",
+            "measurement_names": ["cpu-baremetal-snp-genoa-1.0.0-1vcpu"],
+        },
+        "activate": False,
+    }
+    request = CreateReleaseRequest.model_validate(body)
+    request_sha256 = request.canonical_sha256()
+
+    with TestClient(app) as client:
+        missing = client.post("/releases", json=body)
+        malformed = client.post(
+            "/releases",
+            json=body,
+            headers={"X-Chutes-Release-Request-SHA256": request_sha256.upper()},
+        )
+        conflict = client.post(
+            "/releases",
+            json=body,
+            headers={"X-Chutes-Release-Request-SHA256": "0" * 64},
+        )
+
+        release = GuestRelease(
+            release_id="route-release",
+            tee_type="sev-snp",
+            compute_type="cpu",
+            channel="idempotency-dev",
+            status="draft",
+            images={},
+            release_request_sha256=request_sha256,
+        )
+        with patch.object(
+            release_service,
+            "create_release",
+            AsyncMock(return_value=release),
+        ) as create:
+            accepted = client.post(
+                "/releases",
+                json=body,
+                headers={"X-Chutes-Release-Request-SHA256": request_sha256},
+            )
+
+    assert missing.status_code == 422
+    assert malformed.status_code == 422
+    assert conflict.status_code == 409
+    assert accepted.status_code == 200
+    assert accepted.json()["release_id"] == "route-release"
+    assert accepted.json()["release_request_sha256"] == request_sha256
+    create.assert_awaited_once_with(database, request, request_sha256)
 
 
 @pytest.mark.asyncio

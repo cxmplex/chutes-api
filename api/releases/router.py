@@ -20,6 +20,7 @@ from api.host import service as host_service
 from api.permissions import Permissioning
 from api.releases import service
 from api.releases.schemas import (
+    RELEASE_REQUEST_SHA256_HEADER,
     CreateReleaseRequest,
     GuestRelease,
     ReleaseManifest,
@@ -51,13 +52,23 @@ def _require_admin(current_user: Optional[User]) -> User:
 @router.post("/", response_model=ReleaseResponse)
 async def create_release_endpoint(
     req: CreateReleaseRequest,
+    release_request_sha256: str = Header(
+        ...,
+        alias=RELEASE_REQUEST_SHA256_HEADER,
+        pattern=r"^[0-9a-f]{64}$",
+        description=(
+            "SHA-256 of the validated release request encoded as sorted compact ASCII JSON."
+        ),
+    ),
     db: AsyncSession = Depends(get_db_session),
     current_user: User = Depends(get_current_user(raise_not_found=False)),
 ):
     """Create a draft release (optionally activate it). Admin only."""
     _require_admin(current_user)
     try:
-        release = await service.create_release(db, req)
+        release = await service.create_release(db, req, release_request_sha256)
+    except service.ReleaseRequestConflict as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except service.ReleaseError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return service.to_response(release)

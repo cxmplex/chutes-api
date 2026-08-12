@@ -39,6 +39,7 @@ RELEASE_CHANNEL_DEFAULT = "stable"
 RELEASE_STATUS_DRAFT = "draft"
 RELEASE_STATUS_ACTIVE = "active"
 RELEASE_STATUS_SUPERSEDED = "superseded"
+RELEASE_REQUEST_SHA256_HEADER = "X-Chutes-Release-Request-SHA256"
 _VALID_TEE_TYPES = ("sev-snp", "tdx")
 _VALID_COMPUTE_TYPES = ("cpu", "gpu")
 _DNS_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
@@ -219,6 +220,12 @@ class GuestRelease(Base):
             "l0_manifest_generation",
             postgresql_where=text("l0_manifest_generation IS NOT NULL"),
         ),
+        Index(
+            "uq_guest_releases_request_sha256",
+            "release_request_sha256",
+            unique=True,
+            postgresql_where=text("release_request_sha256 IS NOT NULL"),
+        ),
         CheckConstraint(
             "compute_type IN ('cpu', 'gpu')",
             name="ck_guest_releases_compute_type",
@@ -235,6 +242,11 @@ class GuestRelease(Base):
             "AND l0_manifest_generation > 0 AND l0_manifest_key_id IS NOT NULL "
             "AND l0_manifest_key_epoch > 0)",
             name="ck_guest_releases_l0_manifest_audit",
+        ),
+        CheckConstraint(
+            "release_request_sha256 IS NULL "
+            "OR release_request_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_guest_releases_request_sha256",
         ),
     )
 
@@ -258,6 +270,9 @@ class GuestRelease(Base):
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     activated_at = Column(DateTime(timezone=True), nullable=True)
+    # Immutable canonical POST /releases request identity. Historical rows remain NULL; every new
+    # API-created row is required to carry the caller-supplied digest enforced by the route/service.
+    release_request_sha256 = Column(String(64), nullable=True)
     # Immutable logical rollout target snapshot. Rows in guest_release_targets are captured once at
     # activation (or first rollout for a legacy active release), including an intentionally empty set.
     targets_captured_at = Column(DateTime(timezone=True), nullable=True)
@@ -551,6 +566,8 @@ class _ReleaseImageCommon(BaseModel):
         exclude=True,
         description="Detached cosign sign-blob signature for provenance_payload.",
     )
+
+    model_config = {"extra": "forbid"}
 
     @field_validator("sha256")
     @classmethod
@@ -949,6 +966,8 @@ class ReleaseL0(BaseModel):
         ),
     )
 
+    model_config = {"extra": "forbid"}
+
     @field_validator("squashfs_sha256")
     @classmethod
     def _valid_sha(cls, v: Optional[str]) -> Optional[str]:
@@ -1010,6 +1029,8 @@ class CreateReleaseRequest(BaseModel):
         description="Activate immediately after create (subject to the measurement gate)",
     )
 
+    model_config = {"extra": "forbid"}
+
     @field_validator("tee_type")
     @classmethod
     def _valid_tee(cls, v: str) -> str:
@@ -1033,6 +1054,31 @@ class CreateReleaseRequest(BaseModel):
             if self.gpu is None:
                 raise ValueError("GPU releases require exactly one gpu image slot")
         return self
+
+    def canonical_document(self) -> Dict:
+        """Return the one semantic document bound by the release request digest.
+
+        Pydantic intentionally excludes detached provenance from ordinary model dumps so it cannot
+        leak through response-shaped serialization. Release idempotency must nevertheless bind those
+        exact build/rebuild credentials, so they are restored explicitly here.
+        """
+
+        document = self.model_dump(mode="json", exclude_none=True)
+        for role in ("chute", "storage", "gpu"):
+            image = getattr(self, role)
+            if image is None:
+                continue
+            image_document = document[role]
+            if image.provenance_payload is not None:
+                image_document["provenance_payload"] = image.provenance_payload
+            if image.provenance_signature is not None:
+                image_document["provenance_signature"] = image.provenance_signature
+        return document
+
+    def canonical_sha256(self) -> str:
+        """Digest the validated request using sorted compact ASCII JSON."""
+
+        return canonical_sha256(self.canonical_document())
 
 
 class RolloutRequest(BaseModel):
@@ -1081,6 +1127,7 @@ class ReleaseResponse(BaseModel):
     notes: Optional[str] = None
     created_at: Optional[str] = None
     activated_at: Optional[str] = None
+    release_request_sha256: Optional[str] = None
 
 
 class RolloutHostResult(BaseModel):

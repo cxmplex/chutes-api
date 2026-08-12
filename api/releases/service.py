@@ -7,6 +7,7 @@ CPU size matrix or GPU profile-by-management-mode matrix before desired state ca
 
 import hashlib
 import re
+import secrets
 import shutil
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
@@ -19,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import and_, func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.config import (
@@ -165,6 +167,10 @@ def _verified_provenance_document(
 
 class ReleaseError(Exception):
     """Raised for release create/activate/rollout errors (mapped to HTTP 4xx by the router)."""
+
+
+class ReleaseRequestConflict(ReleaseError):
+    """The supplied durable request identity does not name this exact canonical request."""
 
 
 def _configured_gpu_launch_signer_identity() -> tuple[str, int]:
@@ -973,8 +979,59 @@ async def _mark_l0_publication_active(
         publication.activated_at = datetime.now(timezone.utc)
 
 
-async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRelease:
-    """Create a draft release. If req.activate, activate it immediately (subject to the gate)."""
+async def _release_for_request_sha256(
+    db: AsyncSession,
+    request_sha256: str,
+) -> Optional[GuestRelease]:
+    return (
+        await db.execute(
+            select(GuestRelease).where(
+                GuestRelease.release_request_sha256 == request_sha256,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _complete_release_request(
+    db: AsyncSession,
+    req: CreateReleaseRequest,
+    release: GuestRelease,
+) -> GuestRelease:
+    """Resume only the crash-safe unfinished portion of one exact create request."""
+
+    if req.activate and release.status == RELEASE_STATUS_DRAFT:
+        return await activate_release(db, release.release_id)
+    return release
+
+
+async def create_release(
+    db: AsyncSession,
+    req: CreateReleaseRequest,
+    request_sha256: str,
+) -> GuestRelease:
+    """Create or replay one durable canonical release request.
+
+    The client identity is the lowercase SHA-256 of ``req.canonical_document()``. The unique
+    database index is the concurrency arbiter: after a lost insert race we roll back, fetch the
+    committed winner, and return that exact row. ``activate=true`` is deliberately resumed only
+    while that row is still a draft, closing the post-create/pre-activate crash window without ever
+    reactivating an older release that was subsequently superseded.
+    """
+
+    canonical_request_sha256 = req.canonical_sha256()
+    if not re.fullmatch(r"[0-9a-f]{64}", request_sha256 or ""):
+        raise ReleaseRequestConflict(
+            "Release request identity must be exactly 64 lowercase hexadecimal characters."
+        )
+    if not secrets.compare_digest(request_sha256, canonical_request_sha256):
+        raise ReleaseRequestConflict(
+            "Release request identity does not match the canonical release request payload."
+        )
+
+    existing = await _release_for_request_sha256(db, request_sha256)
+    if existing is not None:
+        return await _complete_release_request(db, req, existing)
+
     images: Dict[str, dict] = {}
     if req.chute is not None:
         images["chute"] = _image_to_dict(req.chute)
@@ -994,25 +1051,33 @@ async def create_release(db: AsyncSession, req: CreateReleaseRequest) -> GuestRe
         status=RELEASE_STATUS_DRAFT,
         images=images,
         notes=req.notes,
+        release_request_sha256=request_sha256,
     )
     db.add(release)
+    created = False
     try:
         await db.flush()
         if req.l0 is not None:
             await _admit_l0_bootstrap(db, release)
         await db.commit()
+        created = True
+    except IntegrityError:
+        await db.rollback()
+        existing = await _release_for_request_sha256(db, request_sha256)
+        if existing is None:
+            raise
+        release = existing
     except Exception:
         await db.rollback()
         raise
-    await db.refresh(release)
-    logger.success(
-        f"Created draft guest release {release.release_id} (channel={release.channel} "
-        f"tee_type={release.tee_type} compute_type={release.compute_type})"
-    )
-    if req.activate:
-        await activate_release(db, release.release_id)
+    if created:
         await db.refresh(release)
-    return release
+        logger.success(
+            f"Created draft guest release {release.release_id} (channel={release.channel} "
+            f"tee_type={release.tee_type} compute_type={release.compute_type} "
+            f"request_sha256={request_sha256})"
+        )
+    return await _complete_release_request(db, req, release)
 
 
 async def _lock_release_streams(
@@ -3224,4 +3289,5 @@ def to_response(release: GuestRelease) -> Dict:
         "notes": release.notes,
         "created_at": release.created_at.isoformat() if release.created_at else None,
         "activated_at": release.activated_at.isoformat() if release.activated_at else None,
+        "release_request_sha256": release.release_request_sha256,
     }
